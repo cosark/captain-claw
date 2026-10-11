@@ -393,12 +393,23 @@ class AgentSessionMixin:
         ]
         try:
             max_tokens = min(2048, int(get_config().model.max_tokens))
-            response = await self._complete_with_guards(
-                messages=rewrite_messages,
-                tools=None,
-                interaction_label="compaction_summary",
-                max_tokens=max_tokens,
-            )
+            try:
+                response = await self._complete_with_guards(
+                    messages=rewrite_messages,
+                    tools=None,
+                    interaction_label="compaction_summary",
+                    max_tokens=max_tokens,
+                )
+            except Exception as e:
+                # A stream that breaks before its first token raises; the
+                # summary replaces the old history, so it gets one more try.
+                log.warning("Compaction summary call failed; retrying once", error=str(e))
+                response = await self._complete_with_guards(
+                    messages=rewrite_messages,
+                    tools=None,
+                    interaction_label="compaction_summary",
+                    max_tokens=max_tokens,
+                )
             # A thinking model can spend the cap on reasoning and stop mid
             # summary, or the stream can break; the summary replaces the old
             # history, so a cut-off one is retried once, with room to finish.
