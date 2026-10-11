@@ -7,6 +7,7 @@ import pytest
 
 from captain_claw.agent import Agent
 from captain_claw.config import get_config, set_config
+from captain_claw.exceptions import LLMError
 from captain_claw.llm import LiteLLMProvider, LLMProvider, LLMResponse, ToolCall
 from captain_claw.session import Session
 from captain_claw.tools.registry import Tool, ToolRegistry, ToolResult
@@ -27,7 +28,10 @@ class _Stub(LLMProvider):
     async def complete(self, messages, tools=None, temperature=None, max_tokens=None):
         self.calls.append(list(messages))
         if self.responses:
-            return self.responses.pop(0)
+            response = self.responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
         return LLMResponse(content="ok")
 
     async def complete_streaming(self, messages, tools=None, temperature=None, max_tokens=None):
@@ -112,6 +116,43 @@ async def test_a_broken_stream_is_marked_interrupted():
 async def test_a_cut_off_compaction_summary_is_retried_with_room():
     provider = _Stub([
         LLMResponse(content="Summary: the user", finish_reason="length"),
+        LLMResponse(content="Summary: the user planned a trip to Split.", finish_reason="stop"),
+    ])
+    agent = _agent(provider)
+
+    summary = await agent._summarize_for_compaction([
+        {"role": "user", "content": "plan a trip to Split"},
+        {"role": "assistant", "content": "Here is a plan."},
+    ])
+
+    assert summary == "Summary: the user planned a trip to Split."
+    assert len(provider.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_cut_off_answer_survives_a_failed_continuation():
+    # The continuation no longer fits the server's window: the call raises, and
+    # the answer so far is shipped instead of lost.
+    provider = _Stub([
+        LLMResponse(content="The report covers revenue, ", finish_reason="length"),
+        LLMError(
+            "openai streaming callback failed: prompt (32700 tokens) plus output "
+            "budget (23097) exceeds context capacity (32768)"
+        ),
+    ])
+    agent = _agent(provider)
+
+    result = await agent.complete("write the report")
+
+    assert result.startswith("The report covers revenue,")
+    assert len(provider.calls) == 2
+    assert agent.session.messages[-1]["content"].startswith("The report covers revenue,")
+
+
+@pytest.mark.asyncio
+async def test_a_failed_compaction_summary_call_is_retried_once():
+    provider = _Stub([
+        LLMError("openai streaming callback failed: connection reset by peer"),
         LLMResponse(content="Summary: the user planned a trip to Split.", finish_reason="stop"),
     ])
     agent = _agent(provider)

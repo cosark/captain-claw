@@ -2053,6 +2053,24 @@ class AgentOrchestrationMixin:
                         await asyncio.sleep(_delay)
                         continue
 
+                    # The call that would finish a cut-off answer failed — e.g.
+                    # the continuation no longer fits the server's context
+                    # window. Ship the answer so far rather than lose it.
+                    if _continuing_answer and _answer_parts:
+                        log.warning(
+                            "LLM call failed while continuing a cut-off answer; returning it as is",
+                            error=error_str,
+                            parts=len(_answer_parts),
+                        )
+                        final = _join_cut_off(_answer_parts)
+                        self._update_clarification_state(
+                            user_input=user_input,
+                            effective_user_input=effective_user_input,
+                            assistant_response=final,
+                        )
+                        await self._persist_assistant_response(final)
+                        return finish(final, success=False)
+
                     # Not transient or exhausted retries — handle as before
                     tool_output = self._collect_turn_tool_output(turn_start_idx)
                     if tool_output and "500" in error_str:

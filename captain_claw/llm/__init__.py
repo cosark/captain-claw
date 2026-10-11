@@ -364,7 +364,7 @@ async def _acompletion_tolerant(kwargs: dict[str, Any], provider: Any = None) ->
     """Call ``acompletion``; on a parameter-rejection 400, strip the offending
     parameter and retry once.
 
-    Two model-specific request-shape rejections are handled transparently so a
+    Model-specific request-shape rejections are handled transparently so a
     turn never crashes on a parameter the model simply won't accept:
 
     * **tool_choice** — thinking/reasoning models (e.g. DeepSeek thinking mode
@@ -380,6 +380,10 @@ async def _acompletion_tolerant(kwargs: dict[str, Any], provider: Any = None) ->
       "only 1 is allowed for this model"). We retry without it — the model then
       uses its own default — and remember it globally so later calls omit the
       parameter up front.
+
+    * **output budget** — a server whose context window can't hold the prompt
+      plus ``max_tokens`` names both numbers; we retry with the budget that
+      fits (see :func:`_output_budget_that_fits`).
 
     Each offending parameter costs at most one wasted call.
     """
@@ -425,6 +429,7 @@ def _is_healable_request_error(msg: str) -> bool:
         or _is_max_tokens_rejected_error(msg)
         or _is_reasoning_with_tools_rejected_error(msg)
         or _is_reasoning_content_required_error(msg)
+        or _output_budget_that_fits(msg) is not None
     )
 
 
@@ -473,6 +478,31 @@ def _heal_request_kwargs(
         base = str(kwargs.get("model", "")).split("/")[-1].lower()
         if base:
             _MAX_COMPLETION_TOKENS_MODELS.add(base)
+
+    # Output budget doesn't fit beside the prompt in the server's context
+    # window. Ask for what fits — but only when the error names the budget this
+    # request sent, not one quoted back from the conversation. The warning
+    # names the numbers so the tier/server mismatch can be fixed at the source.
+    overflow = _context_overflow(msg)
+    fits = _output_budget_that_fits(msg, kwargs) if overflow else None
+    if overflow and fits is not None:
+        key = (
+            "max_completion_tokens"
+            if "max_completion_tokens" in retry_kwargs
+            else "max_tokens"
+        )
+        current = retry_kwargs.get(key)
+        if current is None or (int(current) == overflow.requested and int(current) > fits):
+            retry_kwargs[key] = fits
+            stripped.append(key)
+            log.warning(
+                "Output budget exceeds the server's context window; shrinking it",
+                model=kwargs.get("model"),
+                context_capacity=overflow.capacity,
+                prompt_tokens=overflow.prompt_tokens,
+                requested=overflow.requested,
+                retry_with=fits,
+            )
 
     # Model refuses function tools unless reasoning is off (gpt-6-luna on
     # /v1/chat/completions). Keep the tools, turn reasoning off, and
@@ -801,7 +831,128 @@ def _is_reasoning_with_tools_rejected_error(msg: str) -> bool:
 
 def _is_max_tokens_rejected_error(msg: str) -> bool:
     """Whether *msg* (lowercased) is a 400 demanding ``max_completion_tokens``."""
+    # vLLM's context overflow names both keys ("'max_tokens' or
+    # 'max_completion_tokens' is too large") — it wants a smaller budget, not a
+    # renamed key.
+    if _context_overflow(msg) is not None:
+        return False
     return "max_tokens" in msg and "max_completion_tokens" in msg
+
+
+# A request whose output budget doesn't fit beside the prompt in the server's
+# context window — typically a local server started with a smaller window than
+# the tier's output budget (lithos-metal defaults to 32768). Each server's
+# sentence is matched whole, so the window, the prompt size and the budget it
+# rejected come from one sentence: LiteLLM repeats a mid-stream error's text
+# ("… Original exception: <same text>") and some servers echo request text.
+_CONTEXT_OVERFLOW_RES = (
+    # lithos-metal
+    re.compile(
+        r"prompt \((?P<prompt>\d+) tokens\) plus output budget \((?P<req>\d+)\)"
+        r" exceeds context capacity \((?P<cap>\d+)\)"
+    ),
+    # OpenAI and older vLLM; OpenAI splits the prompt into "x in the messages,
+    # y in the functions", summed.
+    re.compile(
+        r"maximum context length is (?P<cap>\d+) tokens\. however, you requested"
+        r" \d+ tokens \((?P<parts>[^)]*), (?P<req>\d+) in the completion\)"
+    ),
+    # vLLM 0.6–0.10
+    re.compile(
+        r"is too large: (?P<req>\d+)\. this model.s maximum context length is"
+        r" (?P<cap>\d+) tokens and your request has (?P<prompt>\d+) input tokens"
+    ),
+    # vLLM 0.11+. "at least n" is where its tokenizer stopped, not the prompt
+    # size, and a character count isn't a token count.
+    re.compile(
+        r"maximum context length is (?P<cap>\d+) tokens\. however, you requested"
+        r" (?P<req>\d+) output tokens and your prompt contains"
+        r" (?:(?P<floor>at least )?(?P<prompt>\d+) input tokens|\d+ characters)"
+    ),
+    # vLLM 0.11+, the budget alone is bigger than the window
+    re.compile(
+        r"max_(?:completion_)?tokens=(?P<req>\d+) ?cannot be greater than"
+        r" max_model_len=(?:max_total_tokens=)?(?P<cap>\d+)"
+    ),
+    # SGLang
+    re.compile(
+        r"maximum context length of (?P<cap>\d+) tokens\. you requested a total of"
+        r" \d+ tokens: (?P<prompt>\d+) tokens from the input messages and"
+        r" (?P<req>\d+) tokens for the completion"
+    ),
+    # TGI
+    re.compile(
+        r"`max_new_tokens` must be <= (?P<cap>\d+)\. given: (?P<prompt>\d+)"
+        r" `inputs` tokens and (?P<req>\d+) `max_new_tokens`"
+    ),
+)
+# Headroom left under the server's own count, so a healed request never fills
+# the window to the last token, and the smallest budget worth a retry — below
+# it the prompt fills the window and only compaction helps.
+_OUTPUT_BUDGET_MARGIN = 256
+_MIN_HEALED_OUTPUT_BUDGET = 256
+
+
+@dataclass(frozen=True)
+class _ContextOverflow:
+    capacity: int
+    requested: int
+    # None when the server didn't say; prompt_floor is then a lower bound.
+    prompt_tokens: int | None
+    prompt_floor: int = 0
+
+
+def _context_overflow(msg: str) -> _ContextOverflow | None:
+    """The overflow a context-window error *msg* (lowercased) describes, or
+    None when it isn't one."""
+    for pattern in _CONTEXT_OVERFLOW_RES:
+        match = pattern.search(msg)
+        if not match:
+            continue
+        groups = match.groupdict()
+        prompt_tokens = None
+        if groups.get("parts") is not None:
+            counts = re.findall(r"(\d+) in the (?:messages|functions|tools)", groups["parts"])
+            prompt_tokens = sum(int(n) for n in counts) if counts else None
+        elif groups.get("prompt") and not groups.get("floor"):
+            prompt_tokens = int(groups["prompt"])
+        return _ContextOverflow(
+            capacity=int(groups["cap"]),
+            requested=int(groups["req"]),
+            prompt_tokens=prompt_tokens,
+            prompt_floor=int(groups.get("prompt") or 0),
+        )
+    return None
+
+
+def _estimate_prompt_tokens(kwargs: dict[str, Any]) -> int:
+    """A deliberately high count of a request's prompt tokens, for servers that
+    don't report it: three characters a token over the JSON of its messages and
+    tools, where prose runs nearer four — so a budget computed from it errs small."""
+    try:
+        chars = len(json.dumps(kwargs.get("messages") or [], default=str))
+        chars += len(json.dumps(kwargs.get("tools") or [], default=str))
+    except Exception:
+        return 0
+    return chars // 3
+
+
+def _output_budget_that_fits(
+    msg: str, kwargs: dict[str, Any] | None = None
+) -> int | None:
+    """The output budget that fits beside the prompt in context-overflow error
+    *msg* (lowercased), or None when it isn't one or the prompt alone leaves no
+    useful room. When the server doesn't report the prompt size it's estimated
+    from *kwargs*; without them the server's lower bound is used."""
+    overflow = _context_overflow(msg)
+    if overflow is None:
+        return None
+    prompt_tokens = overflow.prompt_tokens
+    if prompt_tokens is None:
+        estimate = _estimate_prompt_tokens(kwargs) if kwargs is not None else 0
+        prompt_tokens = max(overflow.prompt_floor, estimate)
+    fits = overflow.capacity - prompt_tokens - _OUTPUT_BUDGET_MARGIN
+    return fits if fits >= _MIN_HEALED_OUTPUT_BUDGET else None
 
 
 # Model base-names discovered at runtime to reject the ``temperature`` value.
@@ -3274,6 +3425,12 @@ class LiteLLMProvider(LLMProvider):
             # it so the caller (complete_with_callback / complete) can fix the
             # request and retry, instead of silently returning an empty response.
             if _is_healable_request_error(str(e).lower()):
+                raise
+            # Nothing arrived before the error — no content, reasoning or tool
+            # call — so there is nothing to preserve, and an empty reply would
+            # hide the server's message behind "the model returned an empty
+            # response". Let the caller report the real error.
+            if not (content_parts or reasoning_parts or collected_tool_calls):
                 raise
             # Otherwise preserve whatever we collected so far rather than losing
             # the entire response, and say it was cut short: the turn loop

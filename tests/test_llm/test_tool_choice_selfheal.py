@@ -14,6 +14,7 @@ import pytest
 import captain_claw.llm as llm_mod
 from captain_claw.llm import (
     LiteLLMProvider,
+    LLMAPIError,
     Message,
     ToolDefinition,
     _is_tool_choice_unsupported_error,
@@ -114,9 +115,9 @@ async def test_complete_with_callback_self_heals_tool_choice(monkeypatch):
 
 
 async def test_complete_with_callback_does_not_retry_unrelated_stream_error(monkeypatch):
-    # An unrelated mid-stream error is NOT a tool_choice rejection, so the
-    # existing "preserve partial content" behavior stands: no retry, no
-    # provider flag flipped, and the collector returns what it had (empty here).
+    # An unrelated mid-stream error is NOT a tool_choice rejection: no retry and
+    # no provider flag flipped. Nothing streamed before it, so the error is
+    # reported rather than turned into an empty reply.
     provider = _forcing_provider()
     calls = {"n": 0}
 
@@ -126,11 +127,11 @@ async def test_complete_with_callback_does_not_retry_unrelated_stream_error(monk
 
     monkeypatch.setattr(llm_mod, "_acompletion_tolerant", fake_tolerant)
 
-    resp = await provider.complete_with_callback(
-        [Message(role="user", content="hi")], tools=_TOOLS, on_chunk=lambda _c: None
-    )
+    with pytest.raises(LLMAPIError, match="context length exceeded"):
+        await provider.complete_with_callback(
+            [Message(role="user", content="hi")], tools=_TOOLS, on_chunk=lambda _c: None
+        )
     assert calls["n"] == 1
-    assert resp.content == ""
     assert getattr(provider, "_tool_choice_unsupported", False) is False
 
 
