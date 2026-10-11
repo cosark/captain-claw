@@ -241,9 +241,19 @@ class _Model2VecEmbeddingProvider:
             return self._encoder
         with self._lock:
             if self._encoder is None:
+                import inspect
+
                 from model2vec import StaticModel
 
-                self._encoder = StaticModel.from_pretrained(self.model)
+                # model2vec 0.8 defaults to force_download=True: every load
+                # re-checks all files with the HF Hub even when the model is
+                # cached. A slow or rate-limited Hub then stalls the load for
+                # minutes — and the turn waiting on this lock with it. Use the
+                # cache; the Hub is only asked when the model isn't there.
+                kwargs: dict[str, Any] = {}
+                if "force_download" in inspect.signature(StaticModel.from_pretrained).parameters:
+                    kwargs["force_download"] = False
+                self._encoder = StaticModel.from_pretrained(self.model, **kwargs)
         return self._encoder
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
