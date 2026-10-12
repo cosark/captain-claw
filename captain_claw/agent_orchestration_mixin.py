@@ -130,6 +130,7 @@ _ECO_CORE_TOOLS: frozenset[str] = frozenset({
     "shell", "read", "write", "edit", "glob", "grep",
     "web_fetch", "web_search",
     "google_mail", "google_drive", "google_calendar",
+    "microsoft_mail", "microsoft_onedrive", "microsoft_calendar",
     "whatsapp_send_file", "intentions",
     # Scheduling: cron self-describes as a frozen/always-available tool, and
     # scheduling requests arrive in any language ("za 5 minuta", "in 5 min").
@@ -186,21 +187,24 @@ _ECO_INTENT_PATTERNS: list[tuple[_re.Pattern[str], frozenset[str]]] = [
     (_re.compile(r"\bimage\b|\bphoto\b|\bpicture\b|\bscreenshot\b|\bdraw\b|\bgenerate\s+(?:an?\s+)?image", _re.I),
      frozenset({"image_gen", "image_ocr", "image_vision", "screen_capture"})),
     # Email
-    (_re.compile(r"\bemail\b|\bmail\b|\bgmail\b|\bdraft\b|\bsend\s+(?:a\s+)?message\b", _re.I),
-     frozenset({"send_mail", "google_mail"})),
+    (_re.compile(r"\bemail\b|\bmail\b|\bgmail\b|\boutlook\b|\bdraft\b|\bsend\s+(?:a\s+)?message\b", _re.I),
+     frozenset({"send_mail", "google_mail", "microsoft_mail"})),
     # Attachments (EN / HR): google_mail / google_drive name the reader for a
     # saved file — the extract tools and image_vision must be in the schema.
     (_re.compile(r"\battach\w*|\bprilo[gzž]\w*|\bprivi[tc]\w*", _re.I),
-     frozenset({"google_mail", "pdf_extract", "docx_extract", "xlsx_extract",
-                "pptx_extract", "image_vision"})),
+     frozenset({"google_mail", "microsoft_mail", "pdf_extract", "docx_extract",
+                "xlsx_extract", "pptx_extract", "image_vision"})),
     # Calendar
     (_re.compile(r"\bcalendar\b|\bschedule\b|\bmeeting\b|\bagenda\b|\bevent\b", _re.I),
-     frozenset({"google_calendar"})),
+     frozenset({"google_calendar", "microsoft_calendar"})),
     # NOTE: cron is intentionally NOT matched here — it lives in _ECO_CORE_TOOLS
     # so scheduling works in any language, not just the English cues above.
     # Google Drive
     (_re.compile(r"\bdrive\b|\bgoogle\s+d(oc|rive)\b|\bshared\s+folder\b", _re.I),
      frozenset({"google_drive"})),
+    # OneDrive / SharePoint
+    (_re.compile(r"\bone\s?drive\b|\bsharepoint\b", _re.I),
+     frozenset({"microsoft_onedrive"})),
     # Data & database
     (_re.compile(r"\bdatastore\b|\bdatabase\b|\btable\b|\bsql\b|\binsert\b|\bquery\b", _re.I),
      frozenset({"datastore", "direct_api"})),
@@ -1263,6 +1267,10 @@ class AgentOrchestrationMixin:
                 "AFTER Step 2 with google_drive (sheet_update / sheet_append "
                 "/ sheet_clear, doc_replace_text / doc_append_text / "
                 "doc_insert_text) — never upload a modified copy of it.\n"
+                "MICROSOFT DATA (OneDrive, Outlook mail, Calendar) works the "
+                "same way: fetch first with microsoft_onedrive (download), "
+                "microsoft_mail, microsoft_calendar; upload results after "
+                "with microsoft_onedrive (upload / update).\n"
                 "==============================================\n"
             )
             if _credentials_block:
@@ -1847,6 +1855,13 @@ class AgentOrchestrationMixin:
                     await GoogleOAuthManager(self.session_manager).is_connected()
                 except Exception:
                     pass
+                # Microsoft is owner-only: a member's turn never refreshes it
+                # (the member allowlist has no microsoft_* tools anyway).
+                try:
+                    from captain_claw.microsoft_oauth_manager import MicrosoftOAuthManager
+                    await MicrosoftOAuthManager().is_connected()
+                except Exception:
+                    pass
 
             active_task_tool_policy = self._active_task_tool_policy_payload(planning_pipeline)
             tool_defs = self.tools.get_definitions(
@@ -1886,6 +1901,7 @@ class AgentOrchestrationMixin:
                 _SCRIPT_MODE_TOOLS = {
                     "shell", "write", "read", "edit", "glob",
                     "google_drive", "google_calendar", "google_mail",
+                    "microsoft_onedrive", "microsoft_calendar", "microsoft_mail",
                 }
                 _before = len(tool_defs)
                 tool_defs = [

@@ -1006,8 +1006,11 @@ async def _sole_user(db: FlightDeckDB) -> str:
     return str(users[0].get("id") or "") if users else ""
 
 
-async def _agent_owner(request: Request) -> str:
+async def _agent_owner(request: Request, *, service: str = "Google") -> str:
     """Which user's Google connection an agent call should use, or 403.
+
+    *service* only names the connection in the refusal text (the Microsoft
+    routes reuse this resolver).
 
     Resolved ONLY from this deck's own records, never from the agent's word:
 
@@ -1040,7 +1043,7 @@ async def _agent_owner(request: Request) -> str:
             status_code=403,
             detail=(
                 "Flight Deck can't identify this agent (no X-Agent-Auth) — only "
-                "agents spawned by this Flight Deck can use its Google "
+                f"agents spawned by this Flight Deck can use its {service} "
                 "connections; respawn it from Flight Deck"
             ),
         )
@@ -1214,8 +1217,12 @@ def _callback_html(
     detail: str = "",
     email: str = "",
     status_code: int = 200,
+    message_type: str = "captain-claw-google-oauth",
 ) -> HTMLResponse:
     """Render a popup-aware confirmation page.
+
+    *message_type* is the ``type`` the opener's listener filters on (the
+    Microsoft routes post ``captain-claw-microsoft-oauth``).
 
     Tries to ``postMessage`` the result to a same-origin ``window.opener`` (the
     Flight Deck tab) and close itself. Falls back to a redirect to ``/`` for
@@ -1231,7 +1238,7 @@ def _callback_html(
     status_word = "success" if ok else "error"
     payload = json.dumps(
         {
-            "type": "captain-claw-google-oauth",
+            "type": message_type,
             "status": status_word,
             "title": title,
             "detail": detail,

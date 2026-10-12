@@ -96,6 +96,9 @@ _TOOL_PROMPT_DESCRIPTIONS: dict[str, str] = {
     "google_drive": "Google Drive/Docs/Sheets/Slides — list (folder_id), search, read (returns content inline: Docs/Sheets/Slides exported, PDF/DOCX/XLSX/PPTX extracted), info (metadata), download (saves a local copy and returns its path — for scripts/extract tools), upload (local file → Drive), create, update. Takes a file/folder ID or a full Drive/Docs URL — never web_fetch/browser/curl a Google URL. Edit an existing Google Sheet/Doc IN PLACE — sheet_read/sheet_update/sheet_append/sheet_clear, doc_read/doc_replace_text/doc_append_text/doc_insert_text — never upload a modified copy.",
     "google_calendar": "Google Calendar — list_events, search_events, get_event, create_event, update_event, delete_event, list_calendars.",
     "google_mail": "Gmail — list_messages, search, read_message, get_thread, list_labels; create_draft / update_draft / list_drafts — write only when the user asked for that email (a draft is then the default; reading or summarizing mail never implies replying); send / send_draft ONLY when the user explicitly asked and sending is enabled; check list_drafts + search in:sent first — never repeat an email already drafted/sent.",
+    "microsoft_onedrive": "OneDrive — list, search, read (content inline: PDF/DOCX/XLSX/PPTX extracted), info, download (local copy), upload, create, create_folder, update (same file id); file ID, path or OneDrive/SharePoint share URL — never web_fetch a OneDrive link.",
+    "microsoft_calendar": "Outlook Calendar — list_events, search_events, get_event, create_event, update_event, delete_event, respond_event, list_calendars; changes that email attendees need notify_attendees=true (only when the user asked).",
+    "microsoft_mail": "Outlook mail — list_messages, search, read_message, get_thread, list_folders, get_attachment; create_draft / update_draft / list_drafts only when the user asked for that email; never sends (drafts wait in Outlook); no repeat drafts.",
     "datastore": "Manage persistent relational data tables (create, query, insert, update, delete, import/export)",
     "basna": "Read your past Basna multi-agent sessions like a datastore — list/search sessions and pull the compiled truth, cross-agent analysis, per-agent outputs, and generated files (read-only).",
     "bat": "Bat — the stubborn finisher: start a long-running autonomous run that keeps working a goal across retries and strategy changes until an independent judge says it's genuinely done (survives restarts, reports back when finished); also status/get/list/cancel.",
@@ -152,6 +155,9 @@ _TOOL_PROMPT_DESCRIPTIONS_MICRO: dict[str, str] = {
     "google_drive": "Drive/Docs/Sheets/Slides: list, search, read (content inline), info, download (local copy), upload, create, update; file ID or Drive URL; edit Sheets/Docs IN PLACE: sheet_read/sheet_update/sheet_append/sheet_clear, doc_read/doc_replace_text/doc_append_text/doc_insert_text",
     "google_calendar": "Calendar events: list/search/get/create/update/delete, list_calendars",
     "google_mail": "Gmail: list/search/read/thread, labels; drafts only when the user asked (then default); send only if user asked + enabled; check list_drafts + in:sent first, no repeats",
+    "microsoft_onedrive": "OneDrive: list, search, read (content inline), info, download, upload, create, create_folder, update",
+    "microsoft_calendar": "Outlook Calendar: list/search/get/create/update/delete/respond events; notify_attendees=true only when asked",
+    "microsoft_mail": "Outlook mail: list/search/read/thread, folders, attachments; drafts only when asked; never sends; no repeats",
     "datastore": "persistent relational tables",
     "basna": "read past Basna sessions (compiled truth, analysis, agent outputs, files)",
     "bat": "start/inspect a Bat run (stubborn finisher: works a goal until an independent judge says it's done)",
@@ -2291,6 +2297,12 @@ class AgentContextMixin:
             await GoogleOAuthManager(self.session_manager).is_connected()
         except Exception as _exc:
             log.debug("Google connection priming failed: %s", _exc)
+        # Same for Microsoft (Flight Deck only; a no-op standalone).
+        try:
+            from captain_claw.microsoft_oauth_manager import MicrosoftOAuthManager
+            await MicrosoftOAuthManager().is_connected()
+        except Exception as _exc:
+            log.debug("Microsoft connection priming failed: %s", _exc)
 
         self._initialized = True
         log.info("Agent initialized", session_id=self.session.id)
@@ -2317,6 +2329,9 @@ class AgentContextMixin:
         "google_drive": ["google_drive"],
         "google_calendar": ["google_calendar"],
         "google_mail": ["google_mail"],
+        "microsoft_onedrive": ["microsoft_onedrive"],
+        "microsoft_calendar": ["microsoft_calendar"],
+        "microsoft_mail": ["microsoft_mail"],
         "todo": ["todo"],
         "contacts": ["contacts"],
         "scripts": ["scripts"],
@@ -2351,6 +2366,9 @@ class AgentContextMixin:
             GoogleDriveTool,
             GoogleMailTool,
             ImageGenTool,
+            MicrosoftCalendarTool,
+            MicrosoftMailTool,
+            MicrosoftOneDriveTool,
             ImageOcrTool,
             ImageVisionTool,
             PdfExtractTool,
@@ -2457,6 +2475,12 @@ class AgentContextMixin:
                 self.tools.register(GoogleCalendarTool(), metadata={"requires_google": True})
             elif tool_name == "google_mail":
                 self.tools.register(GoogleMailTool(), metadata={"requires_google": True})
+            elif tool_name == "microsoft_onedrive":
+                self.tools.register(MicrosoftOneDriveTool(), metadata={"requires_microsoft": True})
+            elif tool_name == "microsoft_calendar":
+                self.tools.register(MicrosoftCalendarTool(), metadata={"requires_microsoft": True})
+            elif tool_name == "microsoft_mail":
+                self.tools.register(MicrosoftMailTool(), metadata={"requires_microsoft": True})
             elif tool_name == "whatsapp_send_file":
                 self.tools.register(WhatsAppSendFileTool())
             elif tool_name == "intentions":
@@ -3264,6 +3288,9 @@ class AgentContextMixin:
         google_block = self._build_conditional_section(
             ("google_drive", "google_calendar", "google_mail"),
             "section_google.md",
+        ) + self._build_conditional_section(
+            ("microsoft_onedrive", "microsoft_calendar", "microsoft_mail"),
+            "section_microsoft.md",
         )
         datastore_block = self._build_conditional_section(
             "datastore", "section_datastore.md",

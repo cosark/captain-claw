@@ -149,8 +149,8 @@ def _is_mcp_mail_write(tool: str) -> bool:
 
 
 def is_mail_write(spec: dict[str, Any] | None) -> bool:
-    """True for any spec that writes email: send_mail, or google_mail whose fixed
-    action is a write — or a google_mail spec with no fixed action (the action
+    """True for any spec that writes email: send_mail, or google_mail /
+    microsoft_mail whose fixed action is a write — or such a spec with no fixed action (the action
     would come from args, so assume a write). A custom action over a Gmail-like
     MCP proxy tool (``mcp_gmail_create_draft`` …) counts too."""
     if not spec:
@@ -160,7 +160,7 @@ def is_mail_write(spec: dict[str, Any] | None) -> bool:
         return True
     if _is_mcp_mail_write(tool):
         return True
-    if tool != "google_mail":
+    if tool not in ("google_mail", "microsoft_mail"):
         return False
     action = str((spec.get("base_args") or {}).get("action") or "").strip().lower()
     return not action or action in MAIL_WRITE_ACTIONS

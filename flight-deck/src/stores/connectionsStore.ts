@@ -10,8 +10,8 @@ import { useMCPStore, type MCPProbeResult } from './mcpStore'
 export type ConnectionHealth = 'green' | 'yellow' | 'red' | 'gray'
 
 export interface ConnectionStatus {
-  id: string            // 'google' | `mcp:${name}`
-  kind: 'google' | 'mcp'
+  id: string            // 'google' | 'microsoft' | `mcp:${name}`
+  kind: 'google' | 'microsoft' | 'mcp'
   label: string
   health: ConnectionHealth
   detail: string        // email / tool count / error message
@@ -80,6 +80,27 @@ async function probeGoogle(): Promise<ConnectionStatus> {
   }
 }
 
+// Microsoft only shows once an admin configured it (most decks never do —
+// a permanent red row would be noise).
+async function probeMicrosoft(): Promise<ConnectionStatus | null> {
+  const base: Omit<ConnectionStatus, 'health' | 'detail'> = {
+    id: 'microsoft',
+    kind: 'microsoft',
+    label: 'Microsoft',
+    checkedAt: Date.now(),
+  }
+  if (useAuthStore.getState().authEnabled === false) return null
+  try {
+    const r = await fetchJson('/fd/microsoft/probe')
+    if (!r.configured) return null
+    if (!r.connected) return { ...base, health: 'red', detail: r.error || 'Not connected' }
+    if (!r.ok) return { ...base, health: 'yellow', detail: r.error || 'Read-only test failed' }
+    return { ...base, health: 'green', detail: r.email ? `Connected as ${r.email}` : 'Connected' }
+  } catch {
+    return null  // a deck without /fd/microsoft
+  }
+}
+
 export const useConnectionsStore = create<ConnectionsStore>((set, get) => ({
   connections: [],
   checking: false,
@@ -99,6 +120,7 @@ export const useConnectionsStore = create<ConnectionsStore>((set, get) => ({
     const servers = useMCPStore.getState().servers
 
     const googleResult = await probeGoogle()
+    const microsoftResult = await probeMicrosoft()
 
     const mcpResults: ConnectionStatus[] = []
     for (const s of servers) {
@@ -131,7 +153,7 @@ export const useConnectionsStore = create<ConnectionsStore>((set, get) => ({
     }
 
     set({
-      connections: [googleResult, ...mcpResults],
+      connections: [googleResult, ...(microsoftResult ? [microsoftResult] : []), ...mcpResults],
       checking: false,
       lastCheckedAt: Date.now(),
     })

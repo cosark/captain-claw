@@ -1,5 +1,6 @@
 import { Plug } from 'lucide-react'
 import GoogleConnection from '../components/connections/GoogleConnection'
+import MicrosoftConnection from '../components/connections/MicrosoftConnection'
 import CodexConnection from '../components/connections/CodexConnection'
 import AntigravityConnection from '../components/connections/AntigravityConnection'
 import MCPConnection from '../components/connections/MCPConnection'
@@ -8,7 +9,7 @@ import TypesenseConnection from '../components/connections/TypesenseConnection'
 import WhatsAppNudgeConnection from '../components/connections/WhatsAppNudgeConnection'
 
 // `kiosk` — the locked Simple layout's Connections dialog: a person's own
-// connections only (their Google account, the deck's MCP servers). The ChatGPT
+// connections only (their Google / Microsoft account, the deck's MCP servers). The ChatGPT
 // subscription and the deep-memory server are deck setup, left to the full view;
 // WhatsApp nudges come from Autonomous Work, which the kiosk doesn't expose.
 export default function ConnectionsPage({ kiosk = false }: { kiosk?: boolean }) {
@@ -29,6 +30,7 @@ export default function ConnectionsPage({ kiosk = false }: { kiosk?: boolean }) 
 
         <div className="space-y-4">
           <GoogleConnection />
+          <MicrosoftConnection />
           {!kiosk && <CodexConnection />}
           {!kiosk && <AntigravityConnection />}
           <MCPConnection />

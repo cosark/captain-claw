@@ -400,7 +400,7 @@ _EN_SEND_NOUN_RE = re.compile(
 )
 _EN_SEND_BY_RE = re.compile(
     r"\bsend\b(?P<mid>.{0,60}?)\b(?:by|via|over|per|through|using)\s+"
-    r"(?:e-?mail|mail|gmail|google_mail|send_mail|outlook)\b"
+    r"(?:e-?mail|mail|gmail|google_mail|send_mail|outlook|microsoft_mail)\b"
 )
 # "send / forward / mail … to ana@x.co" (an address, an address-like
 # placeholder, or "to my inbox")
@@ -412,7 +412,8 @@ _EN_SEND_TO_RE = re.compile(
 # "use google_mail to send …", "via gmail create_draft …" — naming the mail
 # tool together with a write verb
 _EN_TOOL_WRITE_RE = re.compile(
-    r"\b(?:use|using|call|via|with|through)\s+(?:the\s+)?(?:google_mail|send_mail|gmail)\b"
+    r"\b(?:use|using|call|via|with|through)\s+(?:the\s+)?"
+    r"(?:google_mail|microsoft_mail|send_mail|gmail|outlook)\b"
     r"(?:\s+tool)?(?:\s+action)?[\s=:'\",]*(?:to\s+)?"
     r"(?:create_draft|send_draft|send|draft|reply|compose|write)\b"
 )
@@ -846,10 +847,14 @@ def _keep_shared_addresses(text: str, other: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Mailbox tools with create_draft / update_draft / send / send_draft actions.
+DRAFTING_MAIL_TOOLS = frozenset({"google_mail", "microsoft_mail"})
+
+
 def is_mail_write(tool: str, action: str | None) -> bool:
     if tool in ("send_mail", "mcp_mail"):
         return True
-    return tool == "google_mail" and action in MAIL_WRITE_ACTIONS
+    return tool in DRAFTING_MAIL_TOOLS and action in MAIL_WRITE_ACTIONS
 
 
 def _verb(action: str | None) -> str:
@@ -924,7 +929,7 @@ def check_mail_write(
         return None
     if a.mail_write == "allow":
         return None
-    verb = _verb(action if tool == "google_mail" else None)
+    verb = _verb(action if tool in DRAFTING_MAIL_TOOLS else None)
     if a.mail_write != "intent":
         return refusal_text(a.kind, verb)
     sc = intent_scope(a.job_text)
@@ -938,9 +943,29 @@ def check_mail_write(
         recipients is not None
         and _self_recipients_ok(recipients, own_addresses, job_addresses(a.job_text))
         and tool != "mcp_mail"
-        and (tool != "google_mail" or action in ("create_draft", "send"))
+        and (tool not in DRAFTING_MAIL_TOOLS or action in ("create_draft", "send"))
     )
     return None if ok else refusal_text_self(a.kind, verb)
+
+
+def check_notify_others(what: str) -> str | None:
+    """``None`` to proceed, else the refusal for a calendar change that emails
+    other people — Outlook sends invitations, updates, cancellations and
+    replies to the organizer itself, the moment the event changes.
+
+    Stricter than :func:`check_mail_write`: an automated turn needs an explicit
+    allow (a human-approved action, a literal flow tool step) — a job's text
+    asking for an email is not a request to invite anyone. *what* names the
+    effect ("invitations to the attendees").
+    """
+    a = current()
+    if a.mode == "human" or a.mail_write == "allow":
+        return None
+    return (
+        f"{MAIL_REFUSAL_TAG} Not done: this change would email {what}, and this turn "
+        f"was started by {_label(a.kind)}, not by the user. Nothing was changed. Don't "
+        "retry or work around this — tell the user what you would do and let them ask for it."
+    )
 
 
 def job_addresses(text: str) -> set[str]:

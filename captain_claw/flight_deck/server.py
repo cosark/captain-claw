@@ -1345,6 +1345,7 @@ from captain_claw.flight_deck.code_routes import router as code_router
 from captain_claw.flight_deck.queue_planner import router as queue_router
 from captain_claw.flight_deck.google_oauth_routes import router as google_oauth_router
 from captain_claw.flight_deck.gmail_send_routes import router as gmail_send_router
+from captain_claw.flight_deck.microsoft_oauth_routes import router as microsoft_oauth_router
 from captain_claw.flight_deck.codex_oauth_routes import router as codex_oauth_router
 from captain_claw.flight_deck.antigravity_routes import router as antigravity_router
 from captain_claw.flight_deck.games_routes import router as games_router
@@ -1405,6 +1406,7 @@ app.include_router(code_router)
 app.include_router(queue_router)
 app.include_router(google_oauth_router)
 app.include_router(gmail_send_router)
+app.include_router(microsoft_oauth_router)
 app.include_router(codex_oauth_router)
 app.include_router(antigravity_router)
 app.include_router(games_router)
@@ -8355,6 +8357,7 @@ OLD_MAN_TOOLS = [
     "scripts", "playbooks", "personality", "datastore", "insights",
     "cron", "summarize_files", "direct_api",
     "google_drive", "google_calendar", "google_mail",
+    "microsoft_onedrive", "microsoft_calendar", "microsoft_mail",
     "flight_deck",
 ]
 
