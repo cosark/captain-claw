@@ -10,6 +10,7 @@ from typing import Any
 
 from captain_claw.agent_chunked_processing_mixin import AgentChunkedProcessingMixin
 from captain_claw.agent_completion_mixin import AgentCompletionMixin
+from captain_claw.agent_context_governor_mixin import AgentContextGovernorMixin
 from captain_claw.agent_context_mixin import AgentContextMixin
 from captain_claw.agent_file_ops_mixin import AgentFileOpsMixin
 from captain_claw.agent_guard_mixin import AgentGuardMixin
@@ -103,6 +104,7 @@ class Agent(
     AgentCompletionMixin,
     AgentFileOpsMixin,
     AgentContextMixin,
+    AgentContextGovernorMixin,
     AgentGuardMixin,
     AgentModelMixin,
     AgentPipelineMixin,

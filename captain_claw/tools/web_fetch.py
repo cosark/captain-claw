@@ -119,6 +119,31 @@ def _page_char_limit(requested: Any, configured: int, agent: Any = None) -> int:
     return min(limit, ceiling) if ceiling else limit
 
 
+def _governed_page_output(url: str, status_code: int, mode: str, raw_len: int,
+                          content: str, requested: Any, agent: Any) -> str:
+    """A governed web_fetch result: the page saved in full (the run's shared
+    sources/ when there is one, so teammates reuse it; else privately when it is
+    too big to keep inline), returned as head + pointer."""
+    from captain_claw import context_spill as _spill
+
+    cap = _spill.inline_cap_chars(agent)
+    try:
+        if requested is not None and int(requested) < cap:
+            cap = max(4_000, int(requested))
+    except (TypeError, ValueError):
+        pass
+    page = (f"[URL: {url}]\n[Status: {status_code}]\n[Mode: {mode}]\n"
+            f"[Size: {raw_len} chars]\n\n{content}")
+    shared = _spill.run_sources_dir() is not None and _spill.shareable_page(content, status_code)
+    pointer = None
+    if content.strip() and (shared or len(page) > cap):
+        pointer = _spill.save_source(agent, "web_fetch", url, content, shared=shared,
+                                     status=status_code)
+    if not pointer:
+        return page if len(page) <= cap else page[:cap] + "\n... [truncated]"
+    return _spill.spill_view("web_fetch", url, page, pointer, cap)
+
+
 _MAX_CHARS_HELP = (
     "Optional — leave it out: the page comes back whole up to the configured limit "
     "(typically 200000 chars). A smaller value is ignored; pass one only to get MORE."
@@ -472,10 +497,24 @@ class WebFetchTool(Tool):
                 return ToolResult(success=False, error=gdrive_block)
 
         body_truncated = False
+        # In-turn context governor: a page the run already fetched comes back
+        # as its saved copy's pointer + a short preview, and a new page is
+        # fetched whole, saved to the run's sources/, and returned as head +
+        # pointer (context_spill).
+        from captain_claw import context_spill as _spill
+
+        _agent = kwargs.get("_agent")
+        governed = (not member) and _spill.governor_enabled()
+        if governed:
+            found = _spill.find_fetched(url)
+            if found:
+                return ToolResult(success=True, content=_spill.dedupe_view(url, found, _agent))
         try:
             cfg = get_config()
             configured_max = int(getattr(cfg.tools.web_fetch, "max_chars", 200000))
-            effective_max_chars = _page_char_limit(max_chars, configured_max, kwargs.get("_agent"))
+            effective_max_chars = _page_char_limit(max_chars, configured_max, _agent)
+            if governed:
+                effective_max_chars = _spill.SPILL_SOURCE_MAX
 
             if deep_fetch:
                 log.info("Fetching URL (deep_fetch mode)", url=url)
@@ -506,6 +545,11 @@ class WebFetchTool(Tool):
                 mode = "text"
 
             content = _extract_readable_text(raw_html, base_url=url)
+
+            if governed:
+                return ToolResult(success=True, content=_governed_page_output(
+                    url, status_code, mode, len(raw_html), content[:_spill.SPILL_SOURCE_MAX],
+                    max_chars, _agent))
 
             # R10: in a corpus run, save the FULL text and return a head + pointer.
             saved = None if member else _save_source_to_corpus(url, content)
@@ -717,7 +761,7 @@ def _looks_thin(content: str, status: int, min_chars: int, raw_html_len: int) ->
 
 
 class _Outcome:
-    __slots__ = ("url", "ok", "mode", "status", "content", "error", "needs_deep")
+    __slots__ = ("url", "ok", "mode", "status", "content", "error", "needs_deep", "salvaged")
 
     def __init__(self, url: str):
         self.url = url
@@ -727,6 +771,7 @@ class _Outcome:
         self.content = ""
         self.error = ""
         self.needs_deep = False
+        self.salvaged = False
 
 
 class WebFetchBatchTool(Tool):
@@ -819,6 +864,22 @@ class WebFetchBatchTool(Tool):
                 blocked.add(u)
         fetchable = [u for u in targets if u not in blocked]
 
+        # Governed: URLs the run already fetched come back as their saved
+        # copy (pointer + short preview); only the rest are fetched.
+        from captain_claw import context_spill as _spill
+        from captain_claw import speaker as _speaker
+
+        governed = _spill.governor_enabled() and _speaker.principal_for(_agent) is None
+        saved_hits: dict[str, dict] = {}
+        if governed:
+            for u in fetchable:
+                found = _spill.find_fetched(u)
+                if found:
+                    saved_hits[u] = found
+                    outcomes[u].ok = True
+                    outcomes[u].mode = "saved"
+            fetchable = [u for u in fetchable if u not in saved_hits]
+
         # ── Phase 1: fast HTTP (skipped when deep is forced) ──
         if not force_deep:
             fast_sem = asyncio.Semaphore(fast_conc)
@@ -863,8 +924,65 @@ class WebFetchBatchTool(Tool):
             if not oc.ok and oc.content:
                 oc.ok = True
                 oc.mode = "fast"
+                oc.salvaged = True
 
+        if governed:
+            return self._aggregate_governed(targets, outcomes, saved_hits, overflow,
+                                            deep_unavailable, max_chars, _agent)
         return self._aggregate(targets, outcomes, per_url_cap, total_cap, overflow, deep_unavailable)
+
+    def _aggregate_governed(self, targets, outcomes, saved_hits, overflow, deep_unavailable,
+                            requested, agent) -> ToolResult:
+        """Governed batch output: every page saved in full (the run's shared
+        sources/ when there is one), each shown as its share of one inline
+        result — head + pointer — so the batch never floods the context."""
+        from captain_claw import context_spill as _spill
+
+        ok = [u for u in targets if outcomes[u].ok and (outcomes[u].content or u in saved_hits)]
+        cap = _spill.inline_cap_chars(agent)
+        try:
+            if requested is not None and int(requested) * max(1, len(ok)) < cap:
+                cap = int(requested) * max(1, len(ok))
+        except (TypeError, ValueError):
+            pass
+        per_url = max(2_000, cap // max(1, len(ok)))
+        run_dir = _spill.run_sources_dir() is not None
+        sections: list[str] = []
+        for u in targets:
+            oc = outcomes[u]
+            if u in saved_hits:
+                sections.append(_spill.dedupe_view(u, saved_hits[u], agent)[: per_url + 600])
+                continue
+            if not (oc.ok and oc.content):
+                sections.append(f"[URL: {u}]\n[Status: {oc.status}]\n[FAILED: {oc.error or 'no content'}]")
+                continue
+            page = f"[URL: {u}]\n[Status: {oc.status}]\n[Mode: {oc.mode}]\n\n{oc.content}"
+            # A thin page kept only because the browser couldn't render it is
+            # never the run's copy.
+            shared = run_dir and not oc.salvaged and _spill.shareable_page(oc.content, oc.status)
+            pointer = None
+            if shared or len(page) > per_url:
+                pointer = _spill.save_source(agent, "web_fetch", u, oc.content, shared=shared,
+                                             status=oc.status or None)
+            if pointer:
+                sections.append(_spill.spill_view("web_fetch", u, page, pointer, per_url))
+            else:
+                sections.append(page if len(page) <= per_url else page[:per_url] + "\n... [truncated]")
+        ok_count = len(ok)
+        header = (f"Fetched {ok_count}/{len(targets)} URLs "
+                  f"({len(saved_hits)} already saved in this run, "
+                  f"{len(targets) - ok_count} failed). Each page's full text is saved; "
+                  "read a pointer with `read` (offset/limit) or `grep` for more than its preview.")
+        notes: list[str] = []
+        if deep_unavailable:
+            notes.append("Some URLs needed a headless browser, which isn't available here; "
+                         "their fast-HTTP text is shown.")
+        if overflow:
+            notes.append(f"{len(overflow)} URL(s) exceeded the per-call cap and were NOT fetched. "
+                         f"Call web_fetch_batch again with: {overflow}")
+        out = header + ("\n" + "\n".join(f"- {n}" for n in notes) if notes else "")
+        out += "\n\n" + "\n\n---\n\n".join(sections)
+        return ToolResult(success=True, content=out)
 
     async def _deep_phase(self, deep_urls: list[str], outcomes: dict, deep_conc: int) -> bool:
         """Render the thin URLs in ONE shared browser, isolated per-URL context.

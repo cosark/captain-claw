@@ -85,6 +85,12 @@ class ContextConfig(BaseModel):
     # Cap (chars) on a single tool result kept in the session and sent to the
     # model; 0 = no cap. Off by default: the tier's window decides.
     tool_result_max_chars: int = 0
+    # In-turn context governor for long single-turn workers: real-token budget
+    # (replayed reasoning counted, calibrated against provider-reported input),
+    # reasoning echoed only on the last steps, cut-once-and-hold packing, big
+    # tool results spilled to files, page de-duplication. Env CLAW_CTX_GOVERNOR
+    # overrides; Vatra turns it on for its workers.
+    turn_governor: bool = False
     # What replaces folded messages on compaction: "digest" — exchanges a
     # person started, grouped by conversation topic, with handles to the full
     # text (no LLM call) — or "model", the agent's model summarising them.

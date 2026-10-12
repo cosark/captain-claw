@@ -575,6 +575,11 @@ class AgentSessionMixin:
         trigger: str = "manual",
     ) -> tuple[bool, dict[str, Any]]:
         """Compact session by summarizing older messages and keeping recent context."""
+        # Compaction rewrites session.messages: the governor's cut point (a
+        # session index) no longer means anything.
+        _reset = getattr(self, "_reset_turn_window", None)
+        if callable(_reset):
+            _reset()
         if not self.session:
             return False, {"reason": "no_session"}
 
