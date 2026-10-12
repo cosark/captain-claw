@@ -151,6 +151,12 @@ _MAX_TEXT_FALLBACK_BYTES = 256 * 1024
 # 120-180s per HTTP attempt would otherwise fire first). A run's own
 # dispatch_timeout raises it further.
 _DECOMPOSE_TIMEOUT = 1800  # seconds for the Lead LLM call (floor)
+# The Lead (and the R12 brief before it) may use the planning tier's whole output
+# limit, up to 64k tokens. A thinking model spends most of its budget reasoning
+# before the JSON starts: a 27B local model at the old 16k cap reasoned ~14.7k
+# tokens and was cut 6.7k chars into the plan. A tier with no output limit set
+# keeps the 8k default (a hosted model rejects max_tokens above its own maximum).
+_LEAD_OUTPUT_CAP = 65_536
 
 
 def _decompose_timeout(dispatch_timeout: Any = None) -> float:
@@ -676,7 +682,7 @@ async def _llm_decompose(intent: str, archetypes: list[dict], reliability: dict,
         user_prompt += constraints_block
     # The plan now carries shared_context + per-piece briefs + depends_on, so it can
     # be long — a tight cap truncates the JSON and the whole route fails. Give it room.
-    prov, mt = _provider_call(creds, temperature=0.2, default_max=8192, cap=16384,
+    prov, mt = _provider_call(creds, temperature=0.2, default_max=8192, cap=_LEAD_OUTPUT_CAP,
                               request_timeout=request_timeout)
     resp = await prov.complete(messages=[
         Message(role="system", content=system_prompt),
@@ -694,9 +700,10 @@ async def _llm_decompose(intent: str, archetypes: list[dict], reliability: dict,
                     chars=len(content), truncated=truncated, tail=content[-200:])
         if truncated:
             raise HTTPException(502, (
-                "The Lead's plan was cut off at the output-token cap before the JSON "
-                "finished. Try fewer max agents, a simpler task, or a planning tier with a "
-                "higher output limit."))
+                f"The Lead's plan was cut off at its {mt}-token output limit before the JSON "
+                f"finished (only {len(content)} chars of plan came back — a thinking model "
+                "spends most of that budget reasoning). Raise the planning tier's output "
+                "limit in the Library, or try fewer max agents or a simpler task."))
         raise HTTPException(502, f"The Lead returned invalid JSON: {e}")
     plan = _normalize_plan(raw, arch_by_id, max_agents)
     if not plan["subtasks"]:
@@ -4827,8 +4834,8 @@ async def route_vatra(body: VatraStartRequest, user: dict = Depends(get_current_
     if not brief and quality.intent_brief:
         try:
             _brief_limit = _decompose_timeout(body.dispatch_timeout)
-            prov, mt = _provider_call(creds, temperature=0.2, default_max=1500, cap=4096,
-                                      request_timeout=_brief_limit)
+            prov, mt = _provider_call(creds, temperature=0.2, default_max=1500,
+                                      cap=_LEAD_OUTPUT_CAP, request_timeout=_brief_limit)
             from captain_claw.llm import Message
             # Bounded as a whole: the provider's own retries must not multiply it.
             bresp = await asyncio.wait_for(prov.complete(
