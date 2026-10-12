@@ -870,7 +870,10 @@ async def _spawn_worker(request: Request, user: dict, *, name: str, description:
     # in-process orchestrator latched it off for its workers for the same reason).
     # Its iteration bumps go with it, so the worker gets a large budget of its own.
     _worker_keys = {str(e.get("key")) for e in _worker_env}
-    for _k, _v in (("CLAW_NO_SCALE", "1"), ("CLAW_MAX_ITERATIONS", str(_WORKER_MAX_ITERATIONS))):
+    # The in-turn context governor keeps that one long turn inside the tier's
+    # window (real tokens, reasoning echo, cut-and-hold, spill, page dedupe).
+    for _k, _v in (("CLAW_NO_SCALE", "1"), ("CLAW_MAX_ITERATIONS", str(_WORKER_MAX_ITERATIONS)),
+                   ("CLAW_CTX_GOVERNOR", "1")):
         if _k not in _worker_keys:
             _worker_env = _worker_env + [{"key": _k, "value": _v}]
     base = dict(
@@ -999,6 +1002,9 @@ def _capture_generated(slug: str, exclude: set[str], dest_dir: Path,
         return files, ""
     for p in sorted(ws.rglob("*")):
         if not p.is_file() or p.name in exclude:
+            continue
+        # The context governor's private spill copies are not deliverables.
+        if ".context" in p.relative_to(ws).parts:
             continue
         out_name = p.name if p.name not in seen else f"{agent_role}__{p.name}"
         seen.add(out_name)

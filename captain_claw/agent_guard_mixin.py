@@ -452,6 +452,12 @@ class AgentGuardMixin:
             _ctx = getattr(self, "last_context_window", {}) or {}
             _ctx_tokens = int(_ctx.get("prompt_tokens", 0) or 0)
             _ctx_budget = int(_ctx.get("context_budget_tokens", 0) or 0)
+            if _ctx.get("governor"):
+                # Governed: what the server is expected to receive — every
+                # part counted (schemas, echoed reasoning), times the ratio
+                # calibrated from what it reported on earlier calls.
+                _est = int(_ctx.get("estimated_input_tokens", 0) or 0) or _ctx_tokens
+                _ctx_tokens = int(_est * float(_ctx.get("ctx_ratio", 1.0) or 1.0))
             if _ctx_tokens:
                 _llm_status += f" · {_ctx_tokens:,} ctx tokens"
                 if _ctx_budget:
@@ -602,13 +608,21 @@ class AgentGuardMixin:
                     _cached = int(usage.get("cache_read_input_tokens", 0) or 0)
                     _created = int(usage.get("cache_creation_input_tokens", 0) or 0)
                     # LiteLLM's Anthropic usage already folds cache reads and
-                    # writes into prompt_tokens; elsewhere prompt_tokens is
-                    # the uncached part.
-                    if provider_name == "anthropic" and _prompt >= _cached + _created:
+                    # writes into prompt_tokens, and so does its Gemini usage
+                    # (promptTokenCount includes cached content); elsewhere
+                    # prompt_tokens is the uncached part.
+                    if provider_name in ("anthropic", "gemini") and _prompt >= _cached + _created:
                         window["provider_input_tokens"] = _prompt
                     else:
                         window["provider_input_tokens"] = _prompt + _cached + _created
                     window["provider_cached_tokens"] = _cached
+                    # Governed: calibrate the budget from what the server
+                    # actually received.
+                    if window.get("governor") and hasattr(self, "_observe_ctx_calibration"):
+                        self._observe_ctx_calibration(
+                            int(window.get("estimated_input_tokens", 0) or 0),
+                            int(window.get("provider_input_tokens", 0) or 0),
+                        )
 
             loop = asyncio.get_event_loop()
             loop.create_task(self.session_manager.record_llm_usage(

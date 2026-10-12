@@ -125,6 +125,7 @@ async def test_workers_spawn_without_the_scale_loop(spawn_capture):
     env = _env(spawn_capture["cfg"])
     assert env["CLAW_NO_SCALE"] == "1"
     assert env["CLAW_MAX_ITERATIONS"] == str(vr._WORKER_MAX_ITERATIONS)
+    assert env["CLAW_CTX_GOVERNOR"] == "1"          # the in-turn context governor
     assert vr._WORKER_MAX_ITERATIONS >= 200
 
 

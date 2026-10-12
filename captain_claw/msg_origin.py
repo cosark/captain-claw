@@ -22,6 +22,7 @@ MONITOR_ONLY_TOOL_NAMES = frozenset({
     "memory_select",
     "memory_semantic_select",
     "memory_deep_select",
+    "context_governor",
 })
 
 # Hidden from the model's prompt but still replayed to the user as monitor

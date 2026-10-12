@@ -14,12 +14,15 @@ import re
 from typing import Any
 
 from captain_claw.config import get_config
+from captain_claw.context_spill import SPILL_TOOLS as _SPILL_TOOLS
+from captain_claw.context_spill import governor_enabled as _governor_enabled
 from captain_claw.gmail_compose import is_repeat_refusal
 from captain_claw.llm import Message, ToolCall
 from captain_claw.logging import get_logger
 
 
 log = get_logger(__name__)
+
 
 
 class AgentToolLoopMixin:
@@ -1048,6 +1051,17 @@ class AgentToolLoopMixin:
                 if _sig_key:
                     _sig_key = os.path.abspath(_sig_key)
                 _dup_sig = f"{tc.name}|path={_sig_key}"
+                # Governed: paging through a spilled source (or the read
+                # tool's own "continue with offset=" hint) is not a repeat —
+                # a different start line is a different page. The limit is
+                # left out, so nudging it can't dodge the guard.
+                if _tool_lower == "read" and _governor_enabled():
+                    try:
+                        _page = int(arguments.get("offset") or 1)
+                    except (TypeError, ValueError):
+                        _page = 1
+                    if _page > 1:
+                        _dup_sig += f"|offset={_page}"
             elif _tool_lower in _URL_TOOLS and isinstance(arguments, dict):
                 _sig_key = str(arguments.get("url", "")).strip()
                 _dup_sig = f"{tc.name}|url={_sig_key}"
@@ -1293,6 +1307,8 @@ class AgentToolLoopMixin:
                     result.success
                     and _tool_lower in _CONTENT_TOOLS
                     and hasattr(self, "_chunked_reduce_tool_result")
+                    # Governed: the spill below keeps the full text on disk.
+                    and not (_tool_lower in _SPILL_TOOLS and _governor_enabled())
                 ):
                     # The turn's own request — not the latest user-role row,
                     # which can be a corrective or a fleet notice.
@@ -1320,6 +1336,16 @@ class AgentToolLoopMixin:
                                 tool=tc.name,
                                 error=str(_chunk_err),
                             )
+
+                # Governed: a big content-tool result goes to a file in full and
+                # the model keeps its head plus a pointer (context_spill).
+                if result.success and _tool_lower in _SPILL_TOOLS:
+                    from captain_claw.context_spill import spill_tool_result
+
+                    _result_content = spill_tool_result(
+                        self, _tool_lower, arguments if isinstance(arguments, dict) else None,
+                        _result_content,
+                    )
 
                 # Optional per-agent cap on one tool result (off by default),
                 # before the hints below are appended so they always survive.

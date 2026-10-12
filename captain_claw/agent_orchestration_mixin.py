@@ -32,6 +32,20 @@ log = get_logger(__name__)
 _STUCK_WARMUP_SCALE = 40
 
 
+# Context-overflow wordings that carry no parseable numbers (Anthropic, Gemini,
+# llama.cpp, Moonshot, newer OpenAI) — the governor still re-cuts and tightens.
+_CONTEXT_OVERFLOW_HINTS = (
+    "context_length_exceeded", "context length", "context window", "maximum context",
+    "prompt is too long", "input is too long", "too many tokens", "exceeds the context",
+    "exceed context", "exceeds context", "input token count", "n_ctx",
+)
+
+
+def _looks_like_context_overflow(message: str) -> bool:
+    """Whether a lowercased provider error reads like a context overflow."""
+    return any(hint in message for hint in _CONTEXT_OVERFLOW_HINTS)
+
+
 def _stuck_warmup(base_iterations: int, soft_iterations: int) -> int:
     """First iteration at which a run of stagnant iterations counts as stuck."""
     return max(2, min(base_iterations, soft_iterations, _STUCK_WARMUP_SCALE) // 2)
@@ -931,6 +945,8 @@ class AgentOrchestrationMixin:
         # The background context notes are frozen per turn the same way.
         self._turn_system_prompt = None
         self._turn_context_notes = None
+        # The in-turn context governor's cut point belongs to one turn.
+        self._reset_turn_window()
         # Reset per-turn coverage-gate valve counters (no-net-progress
         # streak, best missing seen, total blocks, turn key).
         self._coverage_gate_streak: int = 0
@@ -1823,6 +1839,12 @@ class AgentOrchestrationMixin:
 
             # ── LLM call ──────────────────────────────────────────
             self._set_runtime_status("thinking")
+            # The gate feedback rides after the build: the governed budget
+            # leaves room for it.
+            self._pending_feedback_tokens = (
+                self._count_tokens(completion_feedback)
+                if completion_feedback and not _continuing_answer else 0
+            )
             messages = self._build_messages(
                 tool_messages_from_index=turn_start_idx,
                 query=effective_user_input,
@@ -1973,6 +1995,26 @@ class AgentOrchestrationMixin:
                         intent_matched=list(_intent_tools & {td["name"] for td in tool_defs}),
                     )
             self._note_tool_schema_tokens(tool_defs)
+            # Governed: never send past the real window. The budget already
+            # holds the calibrated ratio; this catches a first call before any
+            # calibration, or a ratio that jumped — one forced re-cut.
+            if self._governor_on():
+                _win = getattr(self, "last_context_window", {}) or {}
+                _real_budget = int(_win.get("context_budget_tokens", 0) or 0)
+                _real_est = int(_win.get("estimated_input_tokens", 0) or 0) * self._ctx_ratio()
+                if _real_budget and _real_est > self._PRESEND_LIMIT * _real_budget:
+                    log.warning("Request over the real window; re-cutting before send",
+                                estimated_real=int(_real_est), budget=_real_budget)
+                    self._turn_force_recut = True
+                    messages = self._build_messages(
+                        tool_messages_from_index=turn_start_idx,
+                        query=effective_user_input,
+                        planning_pipeline=planning_pipeline,
+                        list_task_plan=list_task_plan,
+                    )
+                    if completion_feedback and not _continuing_answer:
+                        messages.append(Message(role="user", content=completion_feedback))
+                    self._note_tool_schema_tokens(tool_defs)
             log.debug(
                 "Tool definitions available",
                 count=len(
@@ -2004,6 +2046,7 @@ class AgentOrchestrationMixin:
             )
             # ── LLM call with retry for transient errors ───────────
             _max_llm_retries = 4
+            _overflows_seen = 0
             response = None  # type: ignore[assignment]
             for _llm_attempt in range(_max_llm_retries + 1):
                 try:
@@ -2035,6 +2078,37 @@ class AgentOrchestrationMixin:
                         if "timeout" in _lower or "timed out" in _lower or "overloaded" in _lower:
                             _is_transient = True
 
+                    # Governed: the request outgrew the server's window (the
+                    # output-budget heal couldn't fix it) — learn the window,
+                    # re-cut the turn's chain, and retry instead of ending it.
+                    if self._governor_on() and _llm_attempt < _max_llm_retries:
+                        from captain_claw.llm import _context_overflow
+
+                        _lower_err = error_str.lower()
+                        _overflow = _context_overflow(_lower_err)
+                        if _overflow is not None or _looks_like_context_overflow(_lower_err):
+                            _overflows_seen += 1
+                            if _overflow is not None:
+                                self._learn_ctx_window(
+                                    _overflow.capacity, requested=_overflow.requested,
+                                    prompt_tokens=_overflow.prompt_tokens,
+                                    prompt_floor=_overflow.prompt_floor)
+                            if _overflow is None or _overflows_seen > 1:
+                                # No numbers, or the re-cut wasn't enough: the
+                                # count runs low — tighten before retrying.
+                                self._bump_ctx_calibration()
+                            self._turn_force_recut = True
+                            messages = self._build_messages(
+                                tool_messages_from_index=turn_start_idx,
+                                query=effective_user_input,
+                                planning_pipeline=planning_pipeline,
+                                list_task_plan=list_task_plan,
+                            )
+                            if completion_feedback and not _continuing_answer:
+                                messages.append(Message(role="user", content=completion_feedback))
+                            self._note_tool_schema_tokens(tool_defs)
+                            continue
+
                     # Orphaned tool_result → rebuild messages and retry once.
                     if (
                         isinstance(e, LLMAPIError)
@@ -2053,6 +2127,7 @@ class AgentOrchestrationMixin:
                             await self.compact_session(force=True, trigger="orphan_fix")
                         except Exception:
                             pass
+                        self._reset_turn_window()
                         turn_start_idx = self._turn_start_after_compaction(
                             turn_user_msg, turn_start_idx,
                         )
@@ -2065,6 +2140,7 @@ class AgentOrchestrationMixin:
                         )
                         if completion_feedback and not _continuing_answer:
                             messages.append(Message(role="user", content=completion_feedback))
+                        self._note_tool_schema_tokens(tool_defs)
                         continue
 
                     if _is_transient and _llm_attempt < _max_llm_retries:

@@ -48,6 +48,10 @@ PLACEHOLDER_RE = re.compile(
     r"|use read tool to view"
     r"|\.\.\. shell command truncated"
     r"|Written \d+ chars \(\d+ lines\) to\b"
+    # The in-turn context governor's pointers (context_spill): a spilled
+    # result's preview line, and a de-duplicated page's notice.
+    r"|[a-z_]+ .{1,600}? · \d+ chars · full text saved to\b"
+    r"|already fetched in this run\b"
     r")",
     re.IGNORECASE,
 )
@@ -68,7 +72,8 @@ def is_placeholder_content(text: str | None) -> bool:
     """True when *text* IS a tool acknowledgement/compaction marker, not file text."""
     if not text:
         return False
-    return bool(PLACEHOLDER_RE.match(text[:200]))
+    # The first line: a governed pointer line names a URL that can run long.
+    return bool(PLACEHOLDER_RE.match(text[:200]) or PLACEHOLDER_RE.match(text[:800].split("\n", 1)[0]))
 
 
 def is_empty_content(content: str | None) -> bool:

@@ -33,6 +33,27 @@ def _truncate_markdown(markdown: str, max_chars: int) -> str:
     return markdown[:keep] + suffix
 
 
+_DEFAULT_EXTRACT_CHARS = 120_000
+
+
+def _extract_char_limit(max_chars: Any, *, tool_loop: bool = False) -> int:
+    """Characters an extract keeps: the model's max_chars when given; else, for a
+    call through the agent's tool loop under the in-turn context governor, the
+    whole document (the loop's spill decides what stays inline and saves the
+    rest to a file); else 120k. Callers outside the loop (google_drive,
+    microsoft_onedrive) have no spill behind them and keep the 120k default."""
+    if max_chars is not None:
+        try:
+            return max(1, int(max_chars))
+        except (TypeError, ValueError):
+            pass
+    from captain_claw import context_spill
+
+    if tool_loop and context_spill.governor_enabled():
+        return context_spill.SPILL_SOURCE_MAX
+    return _DEFAULT_EXTRACT_CHARS
+
+
 def _require_existing_file(
     path: str,
     runtime_base_path: str | Path | None = None,
@@ -441,7 +462,7 @@ class PdfExtractTool(Tool):
     async def execute(
         self,
         path: str,
-        max_chars: int = 120000,
+        max_chars: int | None = None,
         max_pages: int = 100,
         **kwargs: Any,
     ) -> ToolResult:
@@ -467,7 +488,7 @@ class PdfExtractTool(Tool):
                 return ToolResult(success=False, error=pdf_error)
             assert content is not None
             return ToolResult(success=True, content=_with_pack_header(
-                file_path, _truncate_markdown(content, max(1, int(max_chars)))))
+                file_path, _truncate_markdown(content, _extract_char_limit(max_chars, tool_loop="_agent" in kwargs))))
         except Exception as e:
             log.error("PDF extraction failed", path=path, error=str(e))
             return ToolResult(success=False, error=_pack_error(path, e))
@@ -487,7 +508,7 @@ class DocxExtractTool(Tool):
         "required": ["path"],
     }
 
-    async def execute(self, path: str, max_chars: int = 120000, **kwargs: Any) -> ToolResult:
+    async def execute(self, path: str, max_chars: int | None = None, **kwargs: Any) -> ToolResult:
         """Execute DOCX extraction."""
         _runtime_base = kwargs.get("_runtime_base_path")
         file_path, error = await _resolve_readable_file(path, runtime_base_path=_runtime_base)
@@ -503,7 +524,7 @@ class DocxExtractTool(Tool):
         try:
             content = await asyncio.to_thread(_extract_docx_markdown, file_path)
             return ToolResult(success=True, content=_with_pack_header(
-                file_path, _truncate_markdown(content, max(1, int(max_chars)))))
+                file_path, _truncate_markdown(content, _extract_char_limit(max_chars, tool_loop="_agent" in kwargs))))
         except KeyError:
             return ToolResult(success=False, error="Invalid DOCX: missing word/document.xml")
         except zipfile.BadZipFile:
@@ -531,7 +552,7 @@ class XlsxExtractTool(Tool):
     async def execute(
         self,
         path: str,
-        max_chars: int = 120000,
+        max_chars: int | None = None,
         max_rows: int = 200,
         **kwargs: Any,
     ) -> ToolResult:
@@ -554,7 +575,7 @@ class XlsxExtractTool(Tool):
                 max(1, int(max_rows)),
             )
             return ToolResult(success=True, content=_with_pack_header(
-                file_path, _truncate_markdown(content, max(1, int(max_chars)))))
+                file_path, _truncate_markdown(content, _extract_char_limit(max_chars, tool_loop="_agent" in kwargs))))
         except KeyError as e:
             return ToolResult(success=False, error=f"Invalid XLSX: missing required part ({e})")
         except zipfile.BadZipFile:
@@ -582,7 +603,7 @@ class PptxExtractTool(Tool):
     async def execute(
         self,
         path: str,
-        max_chars: int = 120000,
+        max_chars: int | None = None,
         max_slides: int = 200,
         **kwargs: Any,
     ) -> ToolResult:
@@ -605,7 +626,7 @@ class PptxExtractTool(Tool):
                 max(1, int(max_slides)),
             )
             return ToolResult(success=True, content=_with_pack_header(
-                file_path, _truncate_markdown(content, max(1, int(max_chars)))))
+                file_path, _truncate_markdown(content, _extract_char_limit(max_chars, tool_loop="_agent" in kwargs))))
         except zipfile.BadZipFile:
             return ToolResult(success=False, error="Invalid PPTX: file is not a valid ZIP package")
         except Exception as e:

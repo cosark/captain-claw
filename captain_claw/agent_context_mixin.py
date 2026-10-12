@@ -31,6 +31,10 @@ _SPEAKER_PATH_PLACEHOLDER = "(not available in shared chats)"
 
 # Lead lines of the background-notes block: in front of the turn's user
 # message, or on its own when the request has no user message to carry it.
+# What an older chain step's replayed reasoning becomes under the in-turn
+# context governor (agent_context_governor_mixin): constant, so the request
+# prefix doesn't move, and never empty.
+_REASONING_OMITTED = "[earlier reasoning omitted]"
 _BACKGROUND_NOTES_LEAD = (
     "background for the user message below; reference only, "
     "do not repeat or quote it in your reply"
@@ -4389,8 +4393,26 @@ class AgentContextMixin:
         _tool_schema_tokens = int(_tool_schema_tokens or 0)
         history_budget = max(0, context_budget - system_tokens - _tool_schema_tokens)
         _replays_reasoning = self._replays_reasoning()
+        # In-turn context governor (long single-turn workers): budget in REAL
+        # tokens — a window learned from an overflow, the calibrated
+        # real/estimated ratio, and the gate feedback appended after this
+        # build — see agent_context_governor_mixin.
+        _governed = tool_messages_from_index is not None and self._governor_on()
+        _ctx_ratio = 1.0
+        _reserve = 0
+        if _governed:
+            _learned = self._learned_window()
+            if 0 < _learned < context_budget:
+                context_budget = _learned
+            _ctx_ratio = self._ctx_ratio()
+            _reserve = int(getattr(self, "_pending_feedback_tokens", 0) or 0)
+            history_budget = max(
+                0, int(context_budget / _ctx_ratio) - system_tokens - _tool_schema_tokens - _reserve)
 
         candidate_messages: list[dict[str, Any]] = []
+        # Session index of each candidate (None for the notes built here) —
+        # the governor's cut point is kept by session index across calls.
+        candidate_sidx: list[int | None] = []
         skipped_historical_tools: list[dict[str, Any]] = []
         filter_historical_tools = tool_messages_from_index is not None
         # Collect tool_call_ids that were filtered so we can strip the
@@ -4562,6 +4584,7 @@ class AgentContextMixin:
                 ):
                     first_turn_pos = len(candidate_messages)
                 candidate_messages.append(msg)
+                candidate_sidx.append(idx)
         if turn_anchor_pos is None:
             turn_anchor_pos = latest_user_pos
 
@@ -4666,17 +4689,23 @@ class AgentContextMixin:
             }
             if turn_anchor_pos is not None:
                 candidate_messages.insert(turn_anchor_pos, background_msg)
+                candidate_sidx.insert(turn_anchor_pos, None)
                 background_pos = turn_anchor_pos
                 turn_anchor_pos += 1
+                if first_turn_pos is not None and first_turn_pos >= background_pos:
+                    first_turn_pos += 1
             elif first_turn_pos is not None:
                 # No user message to ride on (the turn's own was folded into
                 # a compaction summary): open the turn with the block rather
                 # than trailing it after the tool chain.
                 candidate_messages.insert(first_turn_pos, background_msg)
+                candidate_sidx.insert(first_turn_pos, None)
                 background_pos = first_turn_pos
+                first_turn_pos += 1
             else:
                 background_pos = len(candidate_messages)
                 candidate_messages.append(background_msg)
+                candidate_sidx.append(None)
         if turn_anchor_pos is not None:
             must_include.add(turn_anchor_pos)
         # Planning goes after the (often long) list note, so the
@@ -4688,6 +4717,7 @@ class AgentContextMixin:
                     "content": text,
                     "_live_notes": [(kind, text)],
                 })
+                candidate_sidx.append(None)
         if scale_note:
             # The scale progress note is critical during incremental
             # processing — it prevents the LLM from re-globbing or
@@ -4698,6 +4728,7 @@ class AgentContextMixin:
                 "content": scale_note,
                 "_live_notes": [("scale_progress", scale_note)],
             })
+            candidate_sidx.append(None)
         btw_pos: int | None = None
         if _btw_note:
             btw_pos = len(candidate_messages)
@@ -4707,6 +4738,63 @@ class AgentContextMixin:
                 "content": _btw_note,
                 "token_count": self._count_tokens(_btw_note),
             })
+            candidate_sidx.append(None)
+
+        # The turn's chain: everything after its opener (or its first message
+        # when the opener was compacted away).
+        _chain_start: int | None = None
+        if turn_anchor_pos is not None and filter_historical_tools:
+            _chain_start = turn_anchor_pos + 1
+        elif first_turn_pos is not None:
+            _chain_start = first_turn_pos
+        # Governed: replayed reasoning is counted (it is sent — a thinking
+        # model's replayed chain was the largest uncounted part of the request)
+        # and bounded. Steps from the held echo floor on carry their full
+        # reasoning; older ones carry a constant short marker (never an empty
+        # field, which thinking servers that demand reasoning on every step
+        # reject). The floor moves only at a cut, or when the echoed reasoning
+        # outgrows its share — in blocks, never one step per call, so earlier
+        # messages stay byte-identical between calls.
+        _echo_pos: set[int] = set()
+        _marker_pos: set[int] = set()
+        if _governed and not _replays_reasoning:
+            _steps = [
+                _pos for _pos in range(len(candidate_messages))
+                if str(candidate_messages[_pos].get("role", "")).strip().lower() == "assistant"
+                and candidate_messages[_pos].get("reasoning_content")
+            ]
+            _chain_steps = [_pos for _pos in _steps if _chain_start is not None and _pos >= _chain_start]
+
+            def _echoed_from(efloor: int | None) -> list[int]:
+                return [_pos for _pos in _chain_steps
+                        if efloor is None or (candidate_sidx[_pos] is not None and candidate_sidx[_pos] >= efloor)]
+
+            _efloor = self._echo_floor()
+            _echoed = _echoed_from(_efloor)
+            _echo_tokens = sum(self._ensure_reasoning_token_count(candidate_messages[_pos]) for _pos in _echoed)
+            if (len(_echoed) > self._REASONING_ECHO_STEPS
+                    and _echo_tokens > self._REASONING_ECHO_SHARE * history_budget):
+                _keep = _echoed[-self._REASONING_ECHO_STEPS:]
+                _efloor = candidate_sidx[_keep[0]]
+                _win = getattr(self, "_turn_window", None)
+                if not isinstance(_win, dict):
+                    _win = {"floor": None, "prior": None}
+                _win["echo_floor"] = _efloor
+                self._turn_window = _win
+                _echoed = _keep
+                self._emit_governor_event("reasoning_folded", kept_steps=len(_keep),
+                                          echo_tokens_before=_echo_tokens)
+            _echo_pos = set(_echoed)
+            _marker_pos = set(_steps) - _echo_pos
+        _marker_tokens = self._count_tokens(_REASONING_OMITTED) if _governed else 0
+
+        def _cost(pos: int) -> int:
+            tokens = self._wire_token_count(candidate_messages[pos])
+            if pos in _echo_pos:
+                tokens += self._ensure_reasoning_token_count(candidate_messages[pos])
+            elif pos in _marker_pos:
+                tokens += _marker_tokens
+            return tokens
 
         # Must-includes first, then the background block (fitted next to
         # them above), then everything else newest-first — the notes keep
@@ -4714,7 +4802,7 @@ class AgentContextMixin:
         selected: set[int] = set()
         used_tokens = 0
         for pos in sorted(must_include):
-            used_tokens += self._wire_token_count(candidate_messages[pos])
+            used_tokens += _cost(pos)
             selected.add(pos)
         dropped_messages = 0
         if background_pos is not None:
@@ -4744,15 +4832,34 @@ class AgentContextMixin:
                 used_tokens += block_tokens
             else:
                 dropped_messages += 1
-        for pos in range(len(candidate_messages) - 1, -1, -1):
-            if pos in selected or pos == background_pos:
-                continue
-            msg_tokens = self._wire_token_count(candidate_messages[pos])
-            if used_tokens + msg_tokens <= history_budget:
-                selected.add(pos)
-                used_tokens += msg_tokens
-            else:
-                dropped_messages += 1
+        if _governed and _chain_start is not None:
+            _cuts_before = int(getattr(self, "_turn_window_cuts", 0) or 0)
+            used_tokens, _gov_dropped = self._governed_fill(
+                candidate_messages, candidate_sidx, _chain_start, selected, used_tokens,
+                history_budget, background_pos, _cost,
+            )
+            dropped_messages += _gov_dropped
+            if (not _replays_reasoning
+                    and int(getattr(self, "_turn_window_cuts", 0) or 0) != _cuts_before):
+                # The cut moved the echo floor: apply it on this call already,
+                # so the call after the cut doesn't change earlier steps again.
+                _new_echo = set(_echoed_from(self._echo_floor()))
+                for _pos in _echo_pos - _new_echo:
+                    if _pos in selected:
+                        used_tokens -= (self._ensure_reasoning_token_count(candidate_messages[_pos])
+                                        - _marker_tokens)
+                _marker_pos = (_marker_pos | _echo_pos) - _new_echo
+                _echo_pos = _new_echo
+        else:
+            for pos in range(len(candidate_messages) - 1, -1, -1):
+                if pos in selected or pos == background_pos:
+                    continue
+                msg_tokens = _cost(pos)
+                if used_tokens + msg_tokens <= history_budget:
+                    selected.add(pos)
+                    used_tokens += msg_tokens
+                else:
+                    dropped_messages += 1
 
         selected_messages: list[dict[str, Any]] = []
         live_parts: list[tuple[str, str]] = []
@@ -4763,6 +4870,8 @@ class AgentContextMixin:
             if "_live_notes" in msg:
                 live_parts.extend(msg["_live_notes"])
                 continue
+            if pos in _marker_pos:
+                msg = {**msg, "reasoning_content": _REASONING_OMITTED}
             if (
                 pos == turn_anchor_pos
                 and background_pos is not None
@@ -4847,7 +4956,12 @@ class AgentContextMixin:
             else:
                 current = turn_anchor_pos is not None and pos > turn_anchor_pos
                 sections["current_chain" if current else "prior_history"] += tokens
-                reasoning = self._ensure_reasoning_token_count(msg)
+                if _governed and not _replays_reasoning:
+                    reasoning = (self._ensure_reasoning_token_count(msg) if pos in _echo_pos
+                                 else _marker_tokens if pos in _marker_pos else 0)
+                    sections["current_chain" if current else "prior_history"] += reasoning
+                else:
+                    reasoning = self._ensure_reasoning_token_count(msg)
                 if reasoning > 0:
                     if current:
                         reasoning_current += reasoning
@@ -4859,7 +4973,8 @@ class AgentContextMixin:
         sections["env_note"] = int(getattr(self, "_turn_env_tokens", 0) or 0) if env_note else 0
         sections["reasoning_prior"] = reasoning_prior
         sections["reasoning_current"] = reasoning_current
-        prompt_tokens = system_tokens + used_tokens
+        # Governed: the gate feedback appended after this build is sent too.
+        prompt_tokens = system_tokens + used_tokens + (_reserve if _governed else 0)
         self.last_context_window = {
             "context_budget_tokens": context_budget,
             "system_tokens": system_tokens,
@@ -4879,7 +4994,11 @@ class AgentContextMixin:
             "reasoning_tokens": reasoning_prior + reasoning_current,
             # Replayed reasoning is inside history_tokens / prompt_tokens when
             # the provider carries it (and then weighs on the budget).
-            "reasoning_in_budget": 1 if _replays_reasoning else 0,
+            "reasoning_in_budget": 1 if (_replays_reasoning or _governed) else 0,
+            "governor": 1 if _governed else 0,
+            "ctx_ratio": _ctx_ratio,
+            "reasoning_echo_steps": len(_echo_pos),
+            "reasoning_marked_steps": len(_marker_pos),
             "tool_schema_tokens_budgeted": _tool_schema_tokens,
             # The recall decision, and whether its card made it into the block.
             "topic_recall": (
