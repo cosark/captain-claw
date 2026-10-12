@@ -57,20 +57,72 @@ def _save_source_to_corpus(url: str, content: str) -> str | None:
         return None
 
 
-_CORPUS_HEAD_CHARS = 8000  # how much of a corpus-saved page to inline as a preview
+_CORPUS_HEAD_CHARS = 50000  # how much of a corpus-saved page to inline as a preview
 
 
 def _corpus_output(url: str, status_code: int, mode: str, raw_len: int,
-                   content: str, saved: str) -> str:
+                   content: str, saved: str, head_chars: int = _CORPUS_HEAD_CHARS) -> str:
     """Build the head+pointer response for a corpus-saved fetch."""
-    head = content[:_CORPUS_HEAD_CHARS]
+    head_chars = max(1, min(_CORPUS_HEAD_CHARS, int(head_chars)))
+    head = content[:head_chars]
     out = (f"[URL: {url}]\n[Status: {status_code}]\n[Mode: {mode}]\n"
            f"[Size: {raw_len} chars · {len(content)} text chars]\n"
            f"[Full text saved to {saved} — search it with the `researchmap` tool "
            f"or read the file for anything past the preview below]\n\n{head}")
-    if len(content) > _CORPUS_HEAD_CHARS:
+    if len(content) > head_chars:
         out += f"\n\n... [preview only — the full {len(content)} chars are in {saved}]"
     return out
+
+
+# ── Page size ────────────────────────────────────────────────────────
+# The configured max_chars is a FLOOR for what the model asked: models habitually
+# pass max_chars=4000-6000 "to save context", which on a large-context model just
+# throws the page away (and the duplicate-call guard then blocks a re-fetch). A
+# smaller request is ignored, a larger one honoured. Whatever the number, one page
+# stays within a share of THIS agent's context budget, so a small local window is
+# never handed a page it would then drop from its history whole.
+_PAGE_CONTEXT_SHARE = 0.35  # of context.max_tokens (≈4 chars per token)
+_MIN_PAGE_CEILING = 20_000
+
+
+def _context_char_ceiling(agent: Any = None) -> int:
+    """Most characters one fetch result may carry for this agent (0 = unknown).
+
+    Sized on the window the agent really has: ``context.max_tokens``, cut to its
+    provider's ``num_ctx`` when that is smaller — a local Ollama model is clamped
+    to what the box can hold, and the context builder budgets to that clamp
+    (agent_context_mixin), so a page sized on the configured budget would be
+    dropped from the history whole.
+    """
+    try:
+        tokens = int(get_config().context.max_tokens or 0)
+    except Exception:  # noqa: BLE001 — never let sizing break a fetch
+        return 0
+    provider_ctx = getattr(getattr(agent, "provider", None), "num_ctx", 0)
+    if isinstance(provider_ctx, int) and not isinstance(provider_ctx, bool) \
+            and 0 < provider_ctx < tokens:
+        tokens = provider_ctx
+    if tokens <= 0:
+        return 0
+    return max(_MIN_PAGE_CEILING, int(tokens * 4 * _PAGE_CONTEXT_SHARE))
+
+
+def _page_char_limit(requested: Any, configured: int, agent: Any = None) -> int:
+    """Characters to keep from one fetched page (see the note above)."""
+    limit = max(1, int(configured))
+    if requested is not None:
+        try:
+            limit = max(limit, int(requested))
+        except (TypeError, ValueError):
+            pass
+    ceiling = _context_char_ceiling(agent)
+    return min(limit, ceiling) if ceiling else limit
+
+
+_MAX_CHARS_HELP = (
+    "Optional — leave it out: the page comes back whole up to the configured limit "
+    "(typically 200000 chars). A smaller value is ignored; pass one only to get MORE."
+)
 
 # ── Optional Playwright dependency ───────────────────────────────────
 
@@ -360,7 +412,7 @@ class WebFetchTool(Tool):
             },
             "max_chars": {
                 "type": "number",
-                "description": "Maximum characters to return (default from config, typically 100000)",
+                "description": _MAX_CHARS_HELP,
             },
             "deep_fetch": {
                 "type": "boolean",
@@ -422,9 +474,8 @@ class WebFetchTool(Tool):
         body_truncated = False
         try:
             cfg = get_config()
-            configured_max = int(getattr(cfg.tools.web_fetch, "max_chars", 100000))
-            effective_max_chars = configured_max if max_chars is None else int(max_chars)
-            effective_max_chars = max(1, effective_max_chars)
+            configured_max = int(getattr(cfg.tools.web_fetch, "max_chars", 200000))
+            effective_max_chars = _page_char_limit(max_chars, configured_max, kwargs.get("_agent"))
 
             if deep_fetch:
                 log.info("Fetching URL (deep_fetch mode)", url=url)
@@ -461,7 +512,8 @@ class WebFetchTool(Tool):
             if saved:
                 return ToolResult(
                     success=True,
-                    content=_corpus_output(url, status_code, mode, len(raw_html), content, saved),
+                    content=_corpus_output(url, status_code, mode, len(raw_html), content, saved,
+                                           head_chars=effective_max_chars),
                 )
 
             if len(content) > effective_max_chars:
@@ -539,7 +591,7 @@ class WebGetTool(Tool):
             },
             "max_chars": {
                 "type": "number",
-                "description": "Maximum characters of raw HTML to return (default from config, typically 100000)",
+                "description": _MAX_CHARS_HELP,
             },
         },
         "required": ["url"],
@@ -582,9 +634,8 @@ class WebGetTool(Tool):
                 mode="html" if raw_allowed else "text (first call)",
             )
             cfg = get_config()
-            configured_max = int(getattr(cfg.tools.web_fetch, "max_chars", 100000))
-            effective_max_chars = configured_max if max_chars is None else int(max_chars)
-            effective_max_chars = max(1, effective_max_chars)
+            configured_max = int(getattr(cfg.tools.web_fetch, "max_chars", 200000))
+            effective_max_chars = _page_char_limit(max_chars, configured_max, kwargs.get("_agent"))
 
             response = await self.client.get(url)
             response.raise_for_status()
@@ -700,7 +751,10 @@ class WebFetchBatchTool(Tool):
             },
             "max_chars": {
                 "type": "number",
-                "description": "Optional per-URL character cap (overrides config default)",
+                "description": (
+                    "Optional — leave it out: each page comes back whole up to the configured "
+                    "per-URL limit. A smaller value is ignored; pass one only to get MORE."
+                ),
             },
             "deep_fetch": {
                 "type": "boolean",
@@ -740,8 +794,13 @@ class WebFetchBatchTool(Tool):
         overflow = clean[max_urls:]
         targets = clean[:max_urls]
 
-        per_url_cap = max(1, int(max_chars) if max_chars is not None else int(getattr(cfg, "batch_per_url_max_chars", 25000)))
-        total_cap = max(1, int(getattr(cfg, "batch_total_max_chars", 150000)))
+        _agent = kwargs.get("_agent")
+        per_url_cap = _page_char_limit(
+            max_chars, int(getattr(cfg, "batch_per_url_max_chars", 100000)), _agent)
+        total_cap = max(1, int(getattr(cfg, "batch_total_max_chars", 400000)))
+        _ceiling = _context_char_ceiling(_agent)
+        if _ceiling:
+            total_cap = min(total_cap, _ceiling)  # the whole batch is ONE tool result
         min_useful = int(getattr(cfg, "batch_min_useful_chars", 500))
         fast_conc = max(1, int(getattr(cfg, "batch_fast_concurrency", 8)))
         deep_conc = max(1, int(getattr(cfg, "batch_deep_concurrency", 3)))

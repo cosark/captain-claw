@@ -26,6 +26,16 @@ from captain_claw.logging import get_logger
 
 log = get_logger(__name__)
 
+# The stuck detector's warm-up (no stuck verdict before iteration N/2) is sized on
+# the agent's default budget, not a raised one: a worker given 300 iterations for
+# real progress must still be stopped ~iteration 26 when it is going nowhere.
+_STUCK_WARMUP_SCALE = 40
+
+
+def _stuck_warmup(base_iterations: int, soft_iterations: int) -> int:
+    """First iteration at which a run of stagnant iterations counts as stuck."""
+    return max(2, min(base_iterations, soft_iterations, _STUCK_WARMUP_SCALE) // 2)
+
 
 # Phrases signalling the model emitted its REASONING / decision *about*
 # answering instead of the answer itself — a "preamble" it should continue
@@ -1770,7 +1780,7 @@ class AgentOrchestrationMixin:
                     stagnant_iterations += 1
                     if (
                         stagnant_iterations >= max_stagnant_iterations
-                        and iteration >= max(2, min(base_turn_iterations, soft_turn_iterations) // 2)
+                        and iteration >= _stuck_warmup(base_turn_iterations, soft_turn_iterations)
                     ):
                         self._emit_tool_output(
                             "completion_gate",

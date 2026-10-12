@@ -347,7 +347,7 @@ class AgentReasoningMixin:
         self,
         source_urls: list[str],
         turn_usage: dict[str, int],
-        max_chars_per_source: int = 4500,
+        max_chars_per_source: int | None = None,
         pipeline_label: str = "source_report_pipeline",
     ) -> dict[str, Any]:
         """Prefetch all source URLs via web_fetch for source-report tasks."""
@@ -359,6 +359,18 @@ class AgentReasoningMixin:
         fetched = 0
         failed = 0
         total = len(source_urls)
+        # Every prefetched source lands in the session before the main loop starts,
+        # so they share ONE page's worth of this agent's context (web_fetch's
+        # ceiling) rather than each taking a full page — a few long sources would
+        # otherwise push the first ones out of the history whole. An explicit
+        # max_chars_per_source wins.
+        from captain_claw.tools.web_fetch import _context_char_ceiling
+
+        if max_chars_per_source:
+            per_source = max(1, int(max_chars_per_source))
+        else:
+            _ceiling = _context_char_ceiling(self) or 200_000
+            per_source = max(4500, _ceiling // max(1, total))
         self._emit_tool_output(
             pipeline_label,
             {"step": "prefetch_start", "sources": total},
@@ -368,8 +380,11 @@ class AgentReasoningMixin:
             args = {
                 "url": url,
                 "extract_mode": "text",
-                "max_chars": max_chars_per_source,
             }
+            # web_fetch returns the page at its own size (a smaller max_chars is
+            # ignored there); the share is applied to the text below.
+            if max_chars_per_source:
+                args["max_chars"] = max_chars_per_source
             try:
                 result = await self._execute_tool_with_guard(
                     name="web_fetch",
@@ -377,7 +392,11 @@ class AgentReasoningMixin:
                     interaction_label=f"source_report_prefetch_{idx}",
                     turn_usage=turn_usage,
                 )
-                output = result.content if result.success else f"Error: {result.error}"
+                output = (result.content or "") if result.success else f"Error: {result.error}"
+                if result.success and len(output) > per_source:
+                    output = (output[:per_source]
+                              + f"\n... [truncated to {per_source} chars — {total} prefetched "
+                              "sources share the context]")
             except Exception as e:
                 result = None
                 output = f"Error: {str(e)}"

@@ -233,14 +233,14 @@ class ReadToolConfig(BaseModel):
 class WebFetchToolConfig(BaseModel):
     """Web fetch tool configuration."""
 
-    max_chars: int = 100000
+    max_chars: int = 200000  # a floor for model-passed max_chars, see tools/web_fetch.py
 
     # ── web_fetch_batch (parallel multi-URL fetch with fast→deep self-correction) ──
     batch_max_urls: int = 10          # URLs processed per call; extras returned to the agent
     batch_fast_concurrency: int = 8   # parallel plain-HTTP fetches
     batch_deep_concurrency: int = 3   # parallel headless-browser contexts (memory-bound)
-    batch_per_url_max_chars: int = 25000   # per-URL cap in batch mode
-    batch_total_max_chars: int = 150000    # aggregate output cap across all URLs
+    batch_per_url_max_chars: int = 100000  # per-URL cap in batch mode
+    batch_total_max_chars: int = 400000    # aggregate output cap across all URLs
     batch_min_useful_chars: int = 500      # below this ⇒ retry the URL in deep mode
     batch_fast_timeout: float = 15.0       # seconds, plain-HTTP phase per URL
 

@@ -2259,17 +2259,22 @@ class _UsageRecordingProvider:
         return getattr(self._inner, name)
 
 
-def _provider_call(creds: dict, *, temperature: float, default_max: int, cap: int) -> tuple:
+def _provider_call(creds: dict, *, temperature: float, default_max: int, cap: int,
+                   request_timeout: float | None = None) -> tuple:
     """Build (create_provider, max_tokens) from merge creds — honoring the tier's
     output_ctx so a long synthesis isn't truncated by a hardcoded cap. Pops the
     non-provider `output_ctx` key before constructing the provider. When called
     inside a run (``_run_sid`` set), the provider is wrapped so its token spend is
-    counted toward the run's cost."""
+    counted toward the run's cost. ``request_timeout`` (seconds) replaces the
+    provider's own per-request timeout for this call — for a long planning call
+    that an outer ``asyncio.wait_for`` already bounds."""
     from captain_claw.llm import create_provider
     c = {k: v for k, v in creds.items() if k != "output_ctx"}
     out = int(creds.get("output_ctx") or 0)
     max_tokens = min(max(out or default_max, default_max), cap)
     prov = create_provider(temperature=temperature, max_tokens=max_tokens, **c)
+    if request_timeout:
+        prov.request_timeout = float(request_timeout)
     if _run_sid.get():
         prov = _UsageRecordingProvider(prov)
     return prov, max_tokens
