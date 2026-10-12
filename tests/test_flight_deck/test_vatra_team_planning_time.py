@@ -216,3 +216,57 @@ def test_infer_complete_body_accepts_a_bounded_timeout():
     assert InferCompleteBody(timeout=1800).timeout == 1800
     with pytest.raises(ValidationError):
         InferCompleteBody(timeout=99_999)
+
+
+# ── the Lead's output budget ─────────────────────────────────────────
+
+
+class _FakeLead:
+    """A provider double: records max_tokens, answers with a fixed body."""
+
+    def __init__(self, content, finish_reason="stop"):
+        self.content, self.finish_reason = content, finish_reason
+        self.created: dict = {}
+        self.completed: dict = {}
+
+    def factory(self, **kw):
+        self.created = kw
+        return self
+
+    async def complete(self, messages=None, **kw):
+        self.completed = kw
+        return SimpleNamespace(content=self.content, finish_reason=self.finish_reason,
+                               usage={}, model="bonsai-2")
+
+
+_ARCH = [{"id": "analyst", "role": "Analyst", "description": "numbers", "tier": "reason"}]
+_PLAN = ('{"domain": "research", "rationale": "r", "shared_context": "c", "subtasks": '
+         '[{"id": "s1", "title": "t", "owner_archetype_id": "analyst", "brief": "b"}]}')
+
+
+@pytest.mark.parametrize("output_ctx,expected", [(49_152, 49_152), (200_000, 65_536), (0, 8192)])
+async def test_lead_gets_the_tiers_output_limit(monkeypatch, output_ctx, expected):
+    import captain_claw.llm as llm
+
+    fake = _FakeLead(_PLAN)
+    monkeypatch.setattr(llm, "create_provider", fake.factory)
+    creds = {"provider": "openai", "model": "bonsai-2", "output_ctx": output_ctx}
+    plan = await vr._llm_decompose("task", _ARCH, {}, creds, 3)
+    assert plan["subtasks"]
+    assert fake.created["max_tokens"] == expected
+    assert fake.completed["max_tokens"] == expected
+
+
+async def test_a_cut_off_plan_names_the_limit_and_the_reason(monkeypatch):
+    from fastapi import HTTPException
+
+    import captain_claw.llm as llm
+
+    fake = _FakeLead('{"subtasks": [{"id": "s1", "brief": "ITDA margin, R&D', finish_reason="length")
+    monkeypatch.setattr(llm, "create_provider", fake.factory)
+    creds = {"provider": "openai", "model": "bonsai-2", "output_ctx": 49_152}
+    with pytest.raises(HTTPException) as exc:
+        await vr._llm_decompose("task", _ARCH, {}, creds, 3)
+    assert exc.value.status_code == 502
+    assert "49152-token output limit" in exc.value.detail
+    assert "thinking model" in exc.value.detail
