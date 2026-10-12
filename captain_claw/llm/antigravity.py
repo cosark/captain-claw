@@ -199,10 +199,11 @@ class AntigravityCLIProvider(LLMProvider):
         estimated = self._estimate_request_tokens(messages, max_tokens)
         if self.rate_limiter:
             await self.rate_limiter.acquire(estimated)
+        timeout = max(self.timeout, int(self.request_timeout or 0))
         raw = await run_cli(
             ["--agent", AGENT_NAME, "--model", self.model, "--disable-slash-commands",
-             "--output-format", "json", "--print-timeout", f"{self.timeout}s"],
-            prompt=prompt, timeout=self.timeout + 10,
+             "--output-format", "json", "--print-timeout", f"{timeout}s"],
+            prompt=prompt, timeout=timeout + 10,
         )
         try:
             data = json.loads(raw)

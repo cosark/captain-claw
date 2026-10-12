@@ -133,6 +133,10 @@ _WORKER_EXTRACT_SEARCH_TOOLS = (
     "summarize_files",
 )
 
+# Per-message tool-call budget for every Vatra worker (agent default 40). Generous:
+# the dispatch is uncapped too, and the user stops a run that goes astray.
+_WORKER_MAX_ITERATIONS = 300
+
 # Default reporter archetype (a strong general writer); overridable via config.
 _DEFAULT_REPORTER = "editor-writer"
 # Inline this many chars of the slices into the reporter prompt; the full set is
@@ -140,10 +144,13 @@ _DEFAULT_REPORTER = "editor-writer"
 _SLICES_INLINE_CHARS = 12_000
 _MAX_TEXT_FALLBACK_BYTES = 256 * 1024
 # The Lead's plan is the single heaviest planning call (a full decomposition +
-# shared contract, up to a large token cap). Generous so a slow LOCAL model can
-# finish it — cloud models return in a few seconds regardless. A run's own
-# dispatch_timeout raises it: a slow composer on a long task can need more.
-_DECOMPOSE_TIMEOUT = 300  # seconds for the Lead LLM call (floor)
+# shared contract, up to a large token cap). Team creation is allowed to take its
+# time — 30 minutes, so a slow LOCAL model or a big team plan finishes instead of
+# being cut at 5 minutes; cloud models return in seconds regardless. The same
+# limit is handed to the provider as the call's own request timeout (its default
+# 120-180s per HTTP attempt would otherwise fire first). A run's own
+# dispatch_timeout raises it further.
+_DECOMPOSE_TIMEOUT = 1800  # seconds for the Lead LLM call (floor)
 
 
 def _decompose_timeout(dispatch_timeout: Any = None) -> float:
@@ -618,7 +625,8 @@ async def _llm_decompose(intent: str, archetypes: list[dict], reliability: dict,
                          shared_datastore: bool = False,
                          state_manifest: str = "",
                          prior_knowledge: str = "",
-                         constraints_block: str = "") -> dict:
+                         constraints_block: str = "",
+                         request_timeout: float | None = None) -> dict:
     """Ask the Lead to split the task into complementary, owner-assigned subtasks.
 
     Returns a normalized plan. On any LLM/parse failure raises — the caller turns
@@ -668,7 +676,8 @@ async def _llm_decompose(intent: str, archetypes: list[dict], reliability: dict,
         user_prompt += constraints_block
     # The plan now carries shared_context + per-piece briefs + depends_on, so it can
     # be long — a tight cap truncates the JSON and the whole route fails. Give it room.
-    prov, mt = _provider_call(creds, temperature=0.2, default_max=8192, cap=16384)
+    prov, mt = _provider_call(creds, temperature=0.2, default_max=8192, cap=16384,
+                              request_timeout=request_timeout)
     resp = await prov.complete(messages=[
         Message(role="system", content=system_prompt),
         Message(role="user", content=user_prompt),
@@ -742,7 +751,8 @@ async def _build_plan(db, user_id: str, intent: str, max_agents: int, creds: dic
     plan = await asyncio.wait_for(
         _llm_decompose(intent, archetypes, reliability, creds, cap, force_ids=forced or None,
                        shared_datastore=shared_datastore, state_manifest=state_manifest,
-                       prior_knowledge=prior_knowledge, constraints_block=constraints_block),
+                       prior_knowledge=prior_knowledge, constraints_block=constraints_block,
+                       request_timeout=timeout),
         timeout)
     subtasks = plan["subtasks"]
     # Guarantee every fixed-team archetype actually got a piece — if the Lead missed
@@ -846,6 +856,16 @@ async def _spawn_worker(request: Request, user: dict, *, name: str, description:
     # name-based classifier (which would mis-rank a hosted DeepSeek as frontier).
     if lt.get("weak") and not any(str(e.get("key")) == "CLAW_MODEL_WEAK" for e in _worker_env):
         _worker_env = _worker_env + [{"key": "CLAW_MODEL_WEAK", "value": "1"}]
+    # No scale micro-loop in Vatra: the Lead already frames each worker's piece, the
+    # worker's context and prompt cache hold its sources, and the loop's own costs —
+    # an extra list-extraction call per turn, 2-3 item takeovers, results hidden from
+    # the main model, in-place context rewrites, gate loops — buy nothing there (the
+    # in-process orchestrator latched it off for its workers for the same reason).
+    # Its iteration bumps go with it, so the worker gets a large budget of its own.
+    _worker_keys = {str(e.get("key")) for e in _worker_env}
+    for _k, _v in (("CLAW_NO_SCALE", "1"), ("CLAW_MAX_ITERATIONS", str(_WORKER_MAX_ITERATIONS))):
+        if _k not in _worker_keys:
+            _worker_env = _worker_env + [{"key": _k, "value": _v}]
     base = dict(
         name=name, description=description,
         cognitive_mode=cognitive_mode or "neutra", tools=worker_tools,
@@ -4806,11 +4826,14 @@ async def route_vatra(body: VatraStartRequest, user: dict = Depends(get_current_
     brief = research_brief.parse_brief(body.brief) if body.brief.strip() else ""
     if not brief and quality.intent_brief:
         try:
-            prov, mt = _provider_call(creds, temperature=0.2, default_max=1500, cap=4096)
+            _brief_limit = _decompose_timeout(body.dispatch_timeout)
+            prov, mt = _provider_call(creds, temperature=0.2, default_max=1500, cap=4096,
+                                      request_timeout=_brief_limit)
             from captain_claw.llm import Message
-            bresp = await prov.complete(
+            # Bounded as a whole: the provider's own retries must not multiply it.
+            bresp = await asyncio.wait_for(prov.complete(
                 [Message(role="user", content=research_brief.derive_brief_prompt(intent))],
-                temperature=0.2, max_tokens=mt)
+                temperature=0.2, max_tokens=mt), _brief_limit)
             brief = research_brief.parse_brief(bresp.content or "")
         except Exception as e:  # noqa: BLE001 — brief is best-effort; fall back to raw intent
             log.warning("Vatra intent-brief derivation failed; planning on raw intent", error=str(e))

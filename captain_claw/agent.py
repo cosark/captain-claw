@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -87,6 +88,16 @@ def _mrav_flag_state(path: Path | None = None) -> bool | None:
     return state
 
 
+
+def _env_max_iterations(default: int) -> int:
+    """Per-message tool-call budget: ``CLAW_MAX_ITERATIONS`` when it is a positive
+    integer, else *default*."""
+    try:
+        value = int(str(os.environ.get("CLAW_MAX_ITERATIONS", "")).strip() or 0)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
 class Agent(
     AgentOrchestrationMixin,
     AgentCompletionMixin,
@@ -149,7 +160,9 @@ class Agent(
         self.session_manager = get_session_manager()
         self.session: Session | None = None
         self._initialized = False
-        self.max_iterations = 40  # Max tool calls per message
+        # Max tool calls per message. CLAW_MAX_ITERATIONS lets a spawner raise it — Vatra
+        # workers run with the scale loop off, so its iteration bumps no longer apply.
+        self.max_iterations = _env_max_iterations(40)
         self.last_usage: dict[str, int] = self._empty_usage()
         self.total_usage: dict[str, int] = self._empty_usage()
         self.last_context_window: dict[str, int | float] = {}

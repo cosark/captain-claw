@@ -166,6 +166,11 @@ class LLMProvider(ABC):
     """Abstract base class for LLM providers."""
 
     rate_limiter: TokenRateLimiter | None = None
+    # Per-call override of the provider's own request timeout (seconds). None keeps
+    # each provider's default (LiteLLM/Gemini 180s, Ollama 120s per attempt). Set by
+    # a caller that bounds a long single call itself — e.g. the Vatra Lead's team
+    # plan, which may take up to 30 minutes on a slow model.
+    request_timeout: float | None = None
 
     @abstractmethod
     async def complete(
@@ -2582,6 +2587,7 @@ class ClaudeCLIProvider(LLMProvider):
         return result
 
     async def _spawn_and_read(self, argv: list[str], prompt: str) -> str:
+        _cli_timeout = max(self.timeout, self.request_timeout or 0)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
@@ -2598,7 +2604,7 @@ class ClaudeCLIProvider(LLMProvider):
             )
         try:
             out, err = await asyncio.wait_for(
-                proc.communicate(prompt.encode("utf-8")), timeout=self.timeout
+                proc.communicate(prompt.encode("utf-8")), timeout=_cli_timeout
             )
         except asyncio.TimeoutError:
             try:
@@ -2606,7 +2612,7 @@ class ClaudeCLIProvider(LLMProvider):
                 await proc.wait()
             except ProcessLookupError:
                 pass
-            raise LLMAPIError(f"claude CLI timed out after {self.timeout:.0f}s")
+            raise LLMAPIError(f"claude CLI timed out after {_cli_timeout:.0f}s")
         text = (out or b"").decode("utf-8", "replace")
         if proc.returncode not in (0, None) and not text.strip():
             detail = (err or b"").decode("utf-8", "replace")[:500]
@@ -2891,7 +2897,8 @@ class OllamaProvider(LLMProvider):
         last_exc: Exception | None = None
         for attempt in range(1, max_retries + 2):
             try:
-                response = await self.client.post(url, json=body, headers=headers)
+                _post_kw = {"timeout": self.request_timeout} if self.request_timeout else {}
+                response = await self.client.post(url, json=body, headers=headers, **_post_kw)
                 if not response.is_success:
                     # Model doesn't support thinking → retry once without it
                     # (auto-detection is a heuristic; this is the safety net).
@@ -3218,7 +3225,7 @@ class LiteLLMProvider(LLMProvider):
             "model": self.model,
             "messages": _convert_messages_for_openai_style(messages),
             "stream": stream,
-            "timeout": 180,
+            "timeout": self.request_timeout or 180,
         }
         # OpenAI reasoning models (gpt-5+, gpt-6, o-series) reject max_tokens.
         token_key = (
@@ -3539,7 +3546,7 @@ class LiteLLMProvider(LLMProvider):
                 from litellm import completion as sync_completion
                 import asyncio as _asyncio
                 loop = _asyncio.get_event_loop()
-                _gemini_timeout = 180  # seconds
+                _gemini_timeout = self.request_timeout or 180  # seconds
                 try:
                     response = await _asyncio.wait_for(
                         loop.run_in_executor(
@@ -4677,9 +4684,9 @@ class LiteRTProvider(LLMProvider):
             "LITERT_HF_FILE",
             os.path.basename(self.model_path) or "gemma-4-E4B-it.litertlm",
         )
-        timeout_s = float(
+        timeout_s = max(float(
             os.getenv("LITERT_CLI_TIMEOUT_SECONDS", "300") or 300
-        )
+        ), float(self.request_timeout or 0))
 
         cmd = [
             cli_bin,
@@ -5037,12 +5044,20 @@ class BrowserProvider(LLMProvider):
         }
         if response_schema:
             body["response_schema"] = response_schema
+        _post_kw: dict[str, Any] = {}
+        if self.request_timeout:
+            # A long single call (the Vatra Lead's plan): the broker waits that long
+            # for the browser worker, and the HTTP read outlasts the broker.
+            body["timeout"] = float(self.request_timeout)
+            _post_kw["timeout"] = httpx.Timeout(
+                connect=10.0, read=float(self.request_timeout) + 30.0, write=30.0, pool=30.0)
 
         try:
             response = await self.client.post(
                 f"{self.base_url}/fd/infer/complete",
                 json=body,
                 headers=flight_deck_headers(),
+                **_post_kw,
             )
         except httpx.HTTPError as exc:
             raise LLMAPIError(f"Browser inference broker unreachable: {exc}")

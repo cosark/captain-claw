@@ -3945,6 +3945,8 @@ class InferCompleteBody(BaseModel):
     temperature: float = 0.2
     session_key: str = ""
     owner_id: str = ""  # optional explicit owner (in-process callers)
+    # Optional job timeout (seconds) for a long single call; None = broker default.
+    timeout: float | None = Field(default=None, ge=1.0, le=3600.0)
 
 
 @app.post("/fd/infer/complete")
@@ -3985,6 +3987,7 @@ async def infer_complete(body: InferCompleteBody, request: Request):
             max_tokens=body.max_tokens,
             temperature=body.temperature,
             session_key=body.session_key,
+            timeout=body.timeout,
         )
     except NoWorkerError:
         raise HTTPException(

@@ -23,4 +23,4 @@ def test_error_without_text_falls_back_to_type_name():
 
 
 def test_decompose_timeout_is_generous_for_local_models():
-    assert v._DECOMPOSE_TIMEOUT >= 300
+    assert v._DECOMPOSE_TIMEOUT >= 1800  # team creation may take 30 minutes
