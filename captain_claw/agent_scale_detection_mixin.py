@@ -783,8 +783,12 @@ class AgentScaleDetectionMixin:
         errors = micro_result.get("errors", [])
 
         status_word = "stopped by user" if sp_cancelled else "complete"
+        # Failed items are marked done so the loop moves on — they are not
+        # "processed" (16 of 16 with 6 unread spreadsheets read as success).
+        failed_map = (scale_progress or {}).get("failed_items") or {}
+        sp_ok = max(0, sp_completed - len(failed_map)) if failed_map else sp_completed
         summary_lines = [
-            f"Scale processing {status_word}: {sp_completed} of {sp_total} items processed.",
+            f"Scale processing {status_word}: {sp_ok} of {sp_total} items processed.",
         ]
 
         out_strategy = (
@@ -825,7 +829,19 @@ class AgentScaleDetectionMixin:
             else:
                 summary_lines.append("Output: single file")
 
-        if sp_failed > 0:
+        if failed_map:
+            shown = list(failed_map.items())[:30]
+            summary_lines.append(
+                f"NOT processed — {len(failed_map)} item(s) failed and were NOT read. "
+                "Open each one another way before you finish (the matching "
+                "pdf_extract / xlsx_extract / docx_extract / pptx_extract, read, "
+                "or a script), and use its content:"
+            )
+            for item, err in shown:
+                summary_lines.append(f"  - {item}: {err}")
+            if len(failed_map) > len(shown):
+                summary_lines.append(f"  - … (+{len(failed_map) - len(shown)} more)")
+        elif sp_failed > 0:
             summary_lines.append(f"Failed: {sp_failed} items")
             for err in errors[:5]:
                 summary_lines.append(f"  - {err.get('item', '?')}: {err.get('error', '?')}")

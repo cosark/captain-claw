@@ -13,6 +13,7 @@ import asyncio
 import os
 import re
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from captain_claw.config import get_config
@@ -897,6 +898,74 @@ class AgentScaleLoopMixin:
         # Default: plain file read
         return "read", {"path": item}
 
+    # Read-only local-file extractors the micro-loop may register on demand.
+    _ON_DEMAND_EXTRACTORS: dict[str, str] = {
+        "pdf_extract": "PdfExtractTool",
+        "docx_extract": "DocxExtractTool",
+        "xlsx_extract": "XlsxExtractTool",
+        "pptx_extract": "PptxExtractTool",
+    }
+
+    def _ensure_scale_extractor(self, tool_name: str | None) -> bool:
+        """Make sure the document extractor an item needs is registered.
+
+        An agent whose tool list lacks it (an archetype with ``pdf_extract`` but
+        no ``xlsx_extract``) used to fail every such file with "Tool not found"
+        and move on. These four only read a local file, so the loop registers
+        the missing one; the call still runs through the registry's policy
+        chain like any other. Returns whether the tool is available.
+        """
+        tools = getattr(self, "tools", None)
+        if tools is None or not tool_name:
+            return False
+        if tools.has_tool(tool_name):
+            return True
+        cls_name = self._ON_DEMAND_EXTRACTORS.get(tool_name)
+        if not cls_name:
+            return False
+        try:
+            from captain_claw.tools import document_extract
+
+            tools.register(getattr(document_extract, cls_name)())
+        except Exception as e:
+            log.warning("Scale micro-loop could not register extractor",
+                        tool=tool_name, error=str(e))
+            return False
+        log.info("Scale micro-loop registered missing extractor", tool=tool_name)
+        return True
+
+    def _resolve_scale_file_item(self, item: str) -> str:
+        """A file member the list extractor cut short (``…ebitda- u`` for
+        ``…ebitda- ukupna lista.xlsx``), resolved to the one file in the same
+        folder whose name it begins; any other item comes back unchanged."""
+        s = str(item or "").strip()
+        if not s or "://" in s or s.lower().startswith("vfs:"):
+            return item
+        base = getattr(self, "workspace_base_path", None)
+        if not base:
+            tools = getattr(self, "tools", None)
+            base = getattr(tools, "runtime_base_path", None) if tools else None
+        try:
+            raw = Path(s).expanduser()
+            target = raw if raw.is_absolute() else Path(base or ".") / raw
+            if target.exists():
+                return item
+            prefix = target.name.casefold()
+            if len(prefix) < 8 or not target.parent.is_dir():
+                return item
+            matches = [
+                c for c in target.parent.iterdir()
+                if c.is_file() and c.name.casefold().startswith(prefix)
+            ]
+        except Exception:
+            return item
+        if len(matches) != 1:
+            return item
+        name = matches[0].name
+        resolved = str(matches[0]) if raw.is_absolute() else os.path.join(os.path.dirname(s), name)
+        log.info("Scale micro-loop resolved a shortened file name", item=s, file=name)
+        return resolved
+
     # ------------------------------------------------------------------
     # Google Drive file map for scale extraction
     # ------------------------------------------------------------------
@@ -1609,9 +1678,35 @@ class AgentScaleLoopMixin:
                 ev.clear()
 
         _cancelled = False
+        # Items whose extract / LLM / write failed, item → error. They are marked
+        # done (the loop moves on), so this is what keeps them from reading as
+        # covered: the summary names every one and the completion gate holds
+        # finalization until a later tool call opened them some other way.
+        # `failed_items_at` stamps each with the session length at the time, so the
+        # gate only weighs failures of the turn it is judging.
+        _failed_items: dict[str, str] = sp.setdefault("failed_items", {})
+        _failed_at: dict[str, int] = sp.setdefault("failed_items_at", {})
+        _last_item: str | None = None
+        _failed_mark = 0
+
+        def _settle_last_item() -> None:
+            nonlocal _failed_mark
+            if _last_item is not None:
+                if failed > _failed_mark:
+                    _failed_items[_last_item] = str(
+                        (errors[-1] if errors else {}).get("error", "") or "failed")[:300]
+                    _failed_at[_last_item] = len(self.session.messages) if self.session else 0
+                else:
+                    _failed_items.pop(_last_item, None)
+                    _failed_at.pop(_last_item, None)
+            _failed_mark = failed
+
         for idx, item in enumerate(remaining):
+            _settle_last_item()
+            _last_item = item
             # ── Cancellation check (between items) ────────────
             if _check_cancel():
+                _last_item = None
                 log.info("Scale micro-loop cancelled by user", processed=processed)
                 _cancelled = True
                 _consume_cancel()
@@ -1702,7 +1797,12 @@ class AgentScaleLoopMixin:
 
             else:
                 # Standard mode: single-tool extraction (read, web_fetch, pdf_extract, etc.)
-                tool_name, tool_args = self._detect_item_extractor(item)
+                tool_name, tool_args = self._detect_item_extractor(
+                    self._resolve_scale_file_item(item))
+                # The agent's tool list may lack the extractor this file needs
+                # (an archetype with pdf_extract but no xlsx_extract skipped every
+                # spreadsheet as "Tool not found") — register it on demand.
+                self._ensure_scale_extractor(tool_name)
 
                 # ── Google Drive file override ──
                 # When the detected tool would try a local-file operation
@@ -2369,6 +2469,8 @@ class AgentScaleLoopMixin:
                 prompt_tokens=_item_prompt_tokens,
                 response_tokens=_response_tokens,
             )
+
+        _settle_last_item()
 
         # ── Loop-level summary ────────────────────────────────────
         _loop_total_sec = round(_time.monotonic() - _loop_start, 2)

@@ -541,7 +541,16 @@ class ShellTool(Tool):
                 success=False,
                 error=f"Command blocked: {reason}",
             )
-        
+
+        # Vatra workers: no web page dumped into the context, no writes into VFS
+        # storage outside the run's folder (no-op for every other agent).
+        from captain_claw.tools.shell_worker_guard import worker_shell_refusal
+
+        refusal = worker_shell_refusal(command, kwargs.get("_runtime_base_path"))
+        if refusal:
+            log.warning("Blocked worker shell command", command=command[:300], reason=refusal[:160])
+            return ToolResult(success=False, error=f"Command blocked: {refusal}")
+
         # Use config timeout if not provided; auto-shorten for trivial
         # commands so a stalled ``ls`` or ``mkdir`` won't block for 120 s.
         if timeout is None:
