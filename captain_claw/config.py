@@ -352,6 +352,15 @@ class GoogleMailToolConfig(BaseModel):
     repeat_check_days: int = Field(default=14, ge=0)
 
 
+class MicrosoftMailToolConfig(BaseModel):
+    """Outlook (microsoft_mail) tool. It drafts only — no send settings."""
+
+    # create_draft refuses an email already in Drafts, or in Sent Items in the
+    # last N days, to the same recipient with the same subject — unless the
+    # call passes allow_repeat. 0 turns the Sent Items check off.
+    repeat_check_days: int = Field(default=14, ge=0)
+
+
 class TypesenseToolConfig(BaseModel):
     """Typesense tool configuration."""
 
@@ -561,6 +570,9 @@ class ToolsConfig(BaseModel):
         "google_drive",
         "google_calendar",
         "google_mail",
+        "microsoft_onedrive",
+        "microsoft_calendar",
+        "microsoft_mail",
         "todo",
         "contacts",
         "scripts",
@@ -587,6 +599,7 @@ class ToolsConfig(BaseModel):
     image_vision: ImageVisionToolConfig = Field(default_factory=ImageVisionToolConfig)
     send_mail: SendMailToolConfig = Field(default_factory=SendMailToolConfig)
     google_mail: GoogleMailToolConfig = Field(default_factory=GoogleMailToolConfig)
+    microsoft_mail: MicrosoftMailToolConfig = Field(default_factory=MicrosoftMailToolConfig)
     typesense: TypesenseToolConfig = Field(default_factory=TypesenseToolConfig)
     edit: EditToolConfig = Field(default_factory=EditToolConfig)
     write: WriteGuardConfig = Field(default_factory=WriteGuardConfig)
@@ -600,13 +613,14 @@ class ToolsConfig(BaseModel):
     plugin_dirs: list[str] = ["skills/tools"]
 
     # These tools are always available — re-inject if removed by user.
-    # Google tools are always registered but the tool registry hides
-    # them from agents until Google OAuth is actually connected, so
-    # there's no harm in having them permanently enabled.
+    # Google and Microsoft tools are always registered but the tool registry
+    # hides them from agents until that account is actually connected (in
+    # Flight Deck), so there's no harm in having them permanently enabled.
     _ALWAYS_ENABLED: frozenset[str] = frozenset({
         "read", "write", "edit", "personality", "botport", "playbooks",
         "browser", "datastore", "direct_api", "cron",
         "google_drive", "google_calendar", "google_mail",
+        "microsoft_onedrive", "microsoft_calendar", "microsoft_mail",
         "whatsapp_send_file", "intentions", "video_vision", "cv", "topics",
         "history", "vfs",
         # Deep memory is reached through Flight Deck, which owns the Typesense

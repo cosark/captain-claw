@@ -25,8 +25,12 @@ PROVIDER_KEYS_SETTING = "fd:provider-keys"
 # enforces its caps and rewrites the agents' copies. ``fd:shared-agent-*`` (a
 # member's per-agent "Let this agent use my Google during my chats" opt-in) is
 # written only through PUT /fd/shared-agents/google, which checks membership and
-# stamps the agent's current owner.
-_SERVER_OWNED_PREFIXES = ("google_oauth:", "fd:tenant-profile", "fd:shared-agent-")
+# stamps the agent's current owner. ``microsoft_oauth:*`` is the Microsoft twin
+# of ``google_oauth:*`` (written only by /fd/microsoft/callback, a refresh and
+# /fd/microsoft/logout).
+_SERVER_OWNED_PREFIXES = (
+    "google_oauth:", "microsoft_oauth:", "fd:tenant-profile", "fd:shared-agent-",
+)
 
 
 def _server_owned(key: str) -> bool:

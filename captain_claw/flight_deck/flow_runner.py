@@ -389,7 +389,7 @@ def _flow_automation(
             name = str(step.get("tool") or "").strip()
             if name == "send_mail":
                 mode = "allow"
-            elif name == "google_mail":
+            elif name in ("google_mail", "microsoft_mail"):
                 raw_args = step.get("args") if isinstance(step.get("args"), dict) else {}
                 action = raw_args.get("action")
                 if (isinstance(action, str) and "{{" not in action

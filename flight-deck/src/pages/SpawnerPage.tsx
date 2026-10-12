@@ -101,6 +101,7 @@ const ALL_TOOLS = [
   'image_gen', 'image_ocr', 'image_vision',
   'pocket_tts', 'send_mail',
   'google_drive', 'google_calendar', 'google_mail',
+  'microsoft_onedrive', 'microsoft_calendar', 'microsoft_mail',
   'todo', 'contacts', 'scripts', 'apis', 'playbooks',
   'typesense', 'datastore', 'personality', 'insights',
   'screen_capture', 'desktop_action', 'direct_api',

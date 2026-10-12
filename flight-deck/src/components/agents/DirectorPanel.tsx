@@ -742,6 +742,8 @@ function ConnectionRow({ conn }: { conn: ConnectionStatus }) {
       <div className="mt-0.5 flex-shrink-0">
         {conn.kind === 'google' ? (
           <Cloud className="h-3.5 w-3.5 text-blue-400/70" />
+        ) : conn.kind === 'microsoft' ? (
+          <Cloud className="h-3.5 w-3.5 text-sky-400/70" />
         ) : (
           <Plug className="h-3.5 w-3.5 text-violet-400/70" />
         )}

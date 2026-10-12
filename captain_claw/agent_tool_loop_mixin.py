@@ -67,6 +67,9 @@ class AgentToolLoopMixin:
         if name == "google_drive":
             action = str(arguments.get("action", "")).strip()
             return f"Google Drive: {action}" if action else "Google Drive"
+        if name == "microsoft_onedrive":
+            action = str(arguments.get("action", "")).strip()
+            return f"OneDrive: {action}" if action else "OneDrive"
         # ── Memory & context ────────────────────────────────
         if name == "memory_select":
             query = str(arguments.get("query", "")).strip()
@@ -259,7 +262,7 @@ class AgentToolLoopMixin:
         return False
 
     def _turn_has_mail_write(self, turn_start_idx: int) -> bool:
-        """Whether a google_mail draft / send went through this turn, or was
+        """Whether a google_mail / microsoft_mail draft / send went through this turn, or was
         refused because that email already exists (a repeat) — either way the
         user's email is taken care of and must not be made again."""
         if not self.session:
@@ -267,7 +270,7 @@ class AgentToolLoopMixin:
         for msg in self.session.messages[turn_start_idx:]:
             if msg.get("role") != "tool":
                 continue
-            if str(msg.get("tool_name", "")).strip().lower() != "google_mail":
+            if str(msg.get("tool_name", "")).strip().lower() not in ("google_mail", "microsoft_mail"):
                 continue
             args = msg.get("tool_arguments") or {}
             if str(args.get("action", "")).strip().lower() not in (
@@ -1012,6 +1015,11 @@ class AgentToolLoopMixin:
                     "sheet_update", "sheet_append", "sheet_clear",
                     "doc_replace_text", "doc_append_text", "doc_insert_text",
                 },
+                "microsoft_mail": {"create_draft", "update_draft"},
+                "microsoft_calendar": {
+                    "create_event", "update_event", "delete_event", "respond_event",
+                },
+                "microsoft_onedrive": {"upload", "create", "create_folder", "update"},
             }
             _tool_lower = str(tc.name or "").strip().lower()
             _call_action = (
@@ -1024,6 +1032,7 @@ class AgentToolLoopMixin:
             _STATEFUL_TOOLS = {
                 "typesense", "todo", "contacts", "scripts", "apis", "send_mail",
                 "browser", "google_drive", "google_calendar", "google_mail",
+                "microsoft_onedrive", "microsoft_calendar", "microsoft_mail",
                 "datastore",
             }
             # During scale-progress tasks, give extra headroom so the LLM
@@ -1422,6 +1431,7 @@ class AgentToolLoopMixin:
                         # action tools whose output is not "data to embed".
                         _DATA_FETCH_TOOLS = frozenset({
                             "google_drive", "google_mail", "google_calendar",
+                            "microsoft_onedrive", "microsoft_mail", "microsoft_calendar",
                             "read_file", "scrape", "scrape_url",
                             "web_fetch", "fetch_url", "read", "curl",
                         })

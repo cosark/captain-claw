@@ -471,6 +471,7 @@ class ToolRegistry:
                 tools = [
                     t for t in tools
                     if not self._tool_metadata.get(t.name, {}).get("requires_google")
+                    and not self._tool_metadata.get(t.name, {}).get("requires_microsoft")
                 ]
         except Exception:
             pass
@@ -495,6 +496,20 @@ class ToolRegistry:
                 tools = filtered
         except Exception:
             # Never let the gating check break tool listing.
+            pass
+
+        # Same for Microsoft: shown only while the owner's Microsoft account is
+        # connected in Flight Deck (refreshed per turn by
+        # ``MicrosoftOAuthManager.is_connected()``).
+        try:
+            from captain_claw.microsoft_oauth_manager import is_microsoft_connected_cached
+
+            if not is_microsoft_connected_cached():
+                tools = [
+                    t for t in tools
+                    if not self._tool_metadata.get(t.name, {}).get("requires_microsoft")
+                ]
+        except Exception:
             pass
 
         # Same idea for deep memory. Under Flight Deck the tool always shows:
