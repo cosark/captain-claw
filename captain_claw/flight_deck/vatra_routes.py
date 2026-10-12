@@ -71,6 +71,7 @@ from captain_claw.flight_deck.basna_routes import (
     _resolve_owner,
     _round_filename_rule,
     _RUN_USAGE,
+    _run_extend_unbounded,
     _run_gate,
     _run_sid,
     _run_workers,
@@ -118,6 +119,20 @@ router = APIRouter(prefix="/fd/vatra", tags=["vatra"])
 
 # A Vatra worker, like a Basna worker, must never be able to start another run.
 _WORKER_MARKER = "CLAW_VATRA_WORKER"
+
+# Every Vatra worker gets the full reading kit on top of its archetype's tools: a
+# run's attached files and downloaded reports arrive as PDFs / spreadsheets / Word /
+# slides / images, and a worker missing the matching extractor fell back to shell +
+# python (openpyxl, pdftotext, a compiled Vision OCR) or — inside the scale loop —
+# skipped the file outright ("Tool not found: xlsx_extract" on all six spreadsheets).
+_WORKER_EXTRACT_SEARCH_TOOLS = (
+    "read", "glob", "grep",
+    "web_search", "web_fetch",
+    "pdf_extract", "docx_extract", "xlsx_extract", "pptx_extract",
+    "image_ocr", "image_vision",
+    "summarize_files",
+)
+
 # Default reporter archetype (a strong general writer); overridable via config.
 _DEFAULT_REPORTER = "editor-writer"
 # Inline this many chars of the slices into the reporter prompt; the full set is
@@ -817,6 +832,7 @@ async def _spawn_worker(request: Request, user: dict, *, name: str, description:
             max_context = int(mt.get("input_ctx") or 0) or 8192
 
     worker_tools = [t for t in (tools or AgentConfig().tools) if t != "basna"]
+    worker_tools += [t for t in _WORKER_EXTRACT_SEARCH_TOOLS if t not in worker_tools]
     # Every Vatra worker (specialists AND reporter) runs on a caller-chosen tier
     # that is often a fast/weak model, so default the tool-loop's malformed /
     # cut-off / guard-refused corrective retries on (Increment 2). Don't clobber
@@ -1313,7 +1329,17 @@ async def plan_vatra_group0(body: ExecuteRequest, request: Request, user: dict, 
     Horizon Planner to draft a per-agent coordination plan, persists it into
     ``route['group0_plan']``, then EITHER pauses at the approval gate (``gate=True``,
     interactive UI) OR chains straight into ``execute_vatra`` (``gate=False``, headless
-    agent/continuation paths — auto-approve, no human pause). Resume never enters here."""
+    agent/continuation paths — auto-approve, no human pause). Resume never enters here.
+    The planner's dispatch is uncapped like the run's (see :func:`execute_vatra`)."""
+    _unbounded = _run_extend_unbounded.set(True)
+    try:
+        return await _plan_vatra_group0_inner(body, request, user, gate=gate)
+    finally:
+        _run_extend_unbounded.reset(_unbounded)
+
+
+async def _plan_vatra_group0_inner(body: ExecuteRequest, request: Request, user: dict, *,
+                                   gate: bool = True) -> dict:
     db = get_db()
     sess = await db.get_basna_session(body.session_id, user["id"])
     if not sess:
@@ -1429,13 +1455,21 @@ async def execute_vatra(body: ExecuteRequest, request: Request, user: dict) -> d
     as status='error' (continuable/resumable) instead of leaving the session stuck on
     'running' forever — the failure mode where a fire-and-forget task crashes and its
     exception is dropped on GC, so the UI spins with no error and no agent running.
-    HTTPException (request-path 4xx/5xx) and CancelledError propagate unchanged."""
+    HTTPException (request-path 4xx/5xx) and CancelledError propagate unchanged.
+
+    Every worker dispatch of the run is uncapped (`_run_extend_unbounded`): a worker
+    still connected keeps getting time until it finishes, the user Stops the run or
+    Skips the agent. Reset on the way out so a caller that awaited this inline (a
+    flow, a continuation) doesn't inherit it for its own dispatches."""
+    _unbounded = _run_extend_unbounded.set(True)
     try:
         return await _execute_vatra_inner(body, request, user)
     except (HTTPException, asyncio.CancelledError):
         raise
     except Exception as exc:  # noqa: BLE001 — a crash must never leave the run 'running'
         return await _persist_run_crash(body, user, exc)
+    finally:
+        _run_extend_unbounded.reset(_unbounded)
 
 
 async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dict) -> dict:
@@ -4982,6 +5016,7 @@ async def _replan_group0(sid: str, request: Request, user: dict, *, new_groups: 
     phasing, folds the answers into the prompt, regenerates the whole coordination plan,
     and lands back at the approval gate. Any failure re-emits the existing gate so the
     user is never stranded."""
+    _run_extend_unbounded.set(True)  # own task: the planner's dispatch is uncapped too
     db = get_db()
     try:
         sess = await db.get_basna_session(sid, user["id"])

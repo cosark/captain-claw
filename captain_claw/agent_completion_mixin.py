@@ -515,6 +515,9 @@ class AgentCompletionMixin:
                     )
                     _skip_coverage = True
 
+                # The full member list, kept for the report: a bypass empties
+                # `members` below, which made a bypassed gate log covered=0.
+                _all_members = [str(m) for m in members]
                 if _skip_coverage:
                     members = []  # prevent downstream evaluation
 
@@ -527,7 +530,7 @@ class AgentCompletionMixin:
 
                 if _skip_coverage:
                     # Bypass already logged; treat all members as covered.
-                    covered_members = list(members)
+                    covered_members = list(_all_members)
                     missing_members: list[str] = []
                 elif _sp_all_done:
                     covered_members = [str(m) for m in members]
@@ -552,13 +555,26 @@ class AgentCompletionMixin:
                                 still_missing.append(m)
                         missing_members = still_missing
 
+                # Scale-loop items that failed (marked done so the loop moved on)
+                # and that no later tool call opened: still missing, whatever the
+                # bypasses above concluded — six unread spreadsheets must not pass
+                # as covered. The stuck-loop valve below still bounds the blocks.
+                _unread_failed = self._unread_failed_scale_items(turn_start_idx)
+                if _unread_failed:
+                    _unread_set = set(_unread_failed)
+                    covered_members = [m for m in covered_members if m not in _unread_set]
+                    missing_members = list(missing_members) + [
+                        m for m in _unread_failed if m not in set(missing_members)]
+
                 self._emit_tool_output(
                     "completion_gate",
                     {
                         "step": "list_member_coverage",
                         "covered": len(covered_members),
                         "missing": len(missing_members),
-                        "members": len(members),
+                        "members": len(_all_members),
+                        "bypassed": _skip_coverage,
+                        "unread_failed": len(_unread_failed),
                         "scale_progress_total": _sp_total,
                         "scale_progress_done": _sp_completed,
                     },
@@ -566,7 +582,9 @@ class AgentCompletionMixin:
                         "step=list_member_coverage\n"
                         f"covered={len(covered_members)}\n"
                         f"missing={len(missing_members)}\n"
-                        f"members={len(members)}\n"
+                        f"members={len(_all_members)}\n"
+                        f"bypassed={_skip_coverage}\n"
+                        f"unread_failed={len(_unread_failed)}\n"
                         f"scale_progress_total={_sp_total}\n"
                         f"scale_progress_done={_sp_completed}"
                     ),
@@ -641,6 +659,14 @@ class AgentCompletionMixin:
                             strategy=str(list_task_plan.get("strategy", "direct")).strip().lower(),
                             per_member_action=str(list_task_plan.get("per_member_action", "")).strip(),
                         )
+                        if _unread_failed:
+                            completion_feedback += (
+                                "\nThese inputs failed in the scale loop and were never read: "
+                                + ", ".join(_unread_failed[:8])
+                                + (f", … (+{len(_unread_failed) - 8} more)" if len(_unread_failed) > 8 else "")
+                                + ". Open each with its extractor (pdf_extract / xlsx_extract / "
+                                "docx_extract / pptx_extract) or read, use the content, then finish."
+                            )
                         self._emit_tool_output(
                             "task_contract",
                             {
@@ -983,3 +1009,49 @@ class AgentCompletionMixin:
 
         self._playbook_hint_shown = True
         return response + self._PLAYBOOK_HINT
+
+    # Tools whose output only LISTS file names — a listing after the failure is
+    # not an opening of the file.
+    _LISTING_TOOLS = frozenset({"glob", "vfs"})
+
+    def _unread_failed_scale_items(self, turn_start_idx: int) -> list[str]:
+        """Scale-loop items that failed during this turn and that no successful
+        tool call since has opened.
+
+        The loop marks a failed item done so it can move on; on its own that let
+        unread files pass the coverage gate. An item counts as opened once a
+        non-error tool call AFTER its failure names the file in its arguments
+        (the extractor, a ``read``, a shell script) or its output (a script that
+        printed it) — a plain listing (glob, vfs) doesn't count.
+        """
+        sp = getattr(self, "_scale_progress", None)
+        failed_at: dict = (sp or {}).get("failed_items_at") or {}
+        failed = [(item, int(failed_at.get(item, turn_start_idx)))
+                  for item in ((sp or {}).get("failed_items") or {})]
+        failed = [(item, at) for item, at in failed if at >= turn_start_idx]
+        if not failed or not self.session:
+            return []
+        from captain_claw.msg_origin import is_model_hidden_tool
+
+        messages = self.session.messages
+        blobs: list[tuple[int, str]] = []
+        for idx in range(min(at for _, at in failed), len(messages)):
+            msg = messages[idx]
+            if msg.get("role") != "tool" or is_model_hidden_tool(msg):
+                continue
+            if str(msg.get("tool_name", "")).strip().lower() in self._LISTING_TOOLS:
+                continue
+            content = str(msg.get("content", "")).strip()
+            if content.lower().startswith("error:"):
+                continue
+            try:
+                args = json.dumps(msg.get("tool_arguments") or {}, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                args = str(msg.get("tool_arguments") or "")
+            blobs.append((idx, f"{args}\n{content[:20000]}".casefold()))
+        unread: list[str] = []
+        for item, at in failed:
+            name = str(item).rstrip("/\\").rsplit("/", 1)[-1].strip().casefold()
+            if not name or not any(idx >= at and name in blob for idx, blob in blobs):
+                unread.append(item)
+        return unread

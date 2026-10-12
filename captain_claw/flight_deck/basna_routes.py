@@ -17,6 +17,7 @@ import asyncio
 import contextvars
 import json
 import mimetypes
+import re
 import shutil
 import time
 import types
@@ -115,15 +116,29 @@ _EXTEND_CAP_X = 3.0         # ceiling multiplier over the configured budget
 
 
 def _extend_deadline(now: float, hard_deadline: float | None,
-                     last_activity: float) -> float | None:
+                     last_activity: float, *, unbounded: bool = False) -> float | None:
     """The extended deadline for a still-active agent at its budget wall, or
     ``None`` when no extension is warranted (idle past the activity window, or
-    the hard ceiling reached — a hung agent still times out)."""
+    the hard ceiling reached — a hung agent still times out).
+
+    ``unbounded`` (Vatra runs): no ceiling and no activity requirement — a worker
+    that is still connected always gets another slice. The user ends it with the
+    run's Stop (which kills the workers) or the agent's Skip."""
+    if unbounded:
+        return now + _EXTEND_SLICE_S
     if hard_deadline is None or now >= hard_deadline:
         return None
     if now - last_activity > _EXTEND_ACTIVITY_S:
         return None
     return min(now + _EXTEND_SLICE_S, hard_deadline)
+
+
+# Per-run switch for the unbounded extension above — a contextvar so every
+# dispatch of the run obeys it without call-site threading (same pattern as
+# `_run_gate`). Vatra sets it at its execute / Group 0 entry; every other caller
+# (Basna, Code, flows, plans) keeps the bounded min(3× budget, 3600s) ceiling.
+_run_extend_unbounded: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "basna_run_extend_unbounded", default=False)
 
 
 def _safe_name(name: str) -> str:
@@ -2438,21 +2453,43 @@ async def _score_runs(results: list[dict], agg: dict, merge_kind: str, *, judge_
     return scores
 
 
+# A leading `cd <dir> &&` / `cd <dir>;` (quoted dir allowed) — repeated chains too.
+_CD_PREFIX_RE = re.compile(r"""^\s*cd\s+(?:"[^"]*"|'[^']*'|\S+)\s*(?:&&|;)\s*""")
+
+
+def _shell_command_summary(command) -> str:
+    """The part of a shell command worth showing: the leading `cd <dir> &&` chain
+    dropped (agents prefix nearly every command with their absolute workspace path,
+    which alone filled the old 40-char cut so the log read like a bare `cd`), and
+    newlines folded so a heredoc can't break the one-line log."""
+    s = str(command or "")
+    while True:
+        m = _CD_PREFIX_RE.match(s)
+        if not m or not s[m.end():].strip():
+            break
+        s = s[m.end():]
+    return " ⏎ ".join(line.strip() for line in s.strip().splitlines() if line.strip())
+
+
 def _summarize_tool_args(args) -> str:
     """Concise one-line summary of a tool call's arguments for the action log.
 
-    Identifier-shaped values (path/file/url/pattern/name) keep enough characters
-    to survive intact — a 40-char cut turned ``vfs:vatra-<sid8>/eppo-authenticity-pack.md``
+    Identifier-shaped values (path/file/url/pattern/name/folder/item) keep enough
+    characters to survive intact — a 40-char cut turned ``vfs:vatra-<sid8>/eppo-authenticity-pack.md``
     into ``…/eppo-authenticity-pac`` in the action feed and made it look like the
-    write tool had truncated the filename. Other values stay short.
+    write tool had truncated the filename. A shell ``command`` shows what it runs
+    (see :func:`_shell_command_summary`). Other values stay short.
     """
-    _WIDE = ("path", "file", "url", "pattern", "name")
+    _WIDE = ("path", "file", "url", "pattern", "name", "folder", "item")
     if isinstance(args, dict) and args:
         parts = []
-        for k, v in list(args.items())[:2]:
+        for k, v in list(args.items())[:4]:
+            if k == "command":
+                parts.append(f"{k}={_shell_command_summary(v)[:200]}")
+                continue
             cap = 200 if k in _WIDE else 40
             parts.append(f"{k}={str(v)[:cap]}")
-        return ", ".join(parts)[:260]
+        return ", ".join(parts)[:320]
     if args:
         return str(args)[:260]
     return ""
@@ -2513,9 +2550,13 @@ async def _send_chat_and_collect(
     in the agent's system prompt (same path the UI uses), not just the message.
     `automation` (the automated-turn marker: kind / job_text / mail_write) rides
     on the chat frame when given, so the agent knows no user typed this turn.
+    Inside a run that set `_run_extend_unbounded` (Vatra), `timeout` is only the
+    first wall: the turn keeps getting time for as long as the agent stays
+    connected, so it ends when the agent finishes or the user stops it.
     """
     import websockets
     uri = f"ws://localhost:{port}/ws" + (f"?token={token}" if token else "")
+    unbounded = _run_extend_unbounded.get()
     # State persists across reconnects: the task is sent exactly once, and a
     # dropped long-poll socket resumes listening rather than restarting the turn.
     answer = ""
@@ -2633,13 +2674,19 @@ async def _send_chat_and_collect(
     # (initial connect), and the long-poll socket may drop mid-turn. We send the
     # task only on the first connection; reconnects just re-attach and listen, so
     # we never re-trigger the agent's busy guard or discard collected work.
-    for attempt in range(10):
+    # `failures` counts consecutive failed connections; an unbounded (Vatra) turn
+    # resets it on every successful re-attach, so a long turn with the odd dropped
+    # socket keeps listening, while a stopped agent still fails out in ~30s.
+    failures = 0
+    while failures < 10:
         try:
             async with websockets.connect(
                 uri, max_size=8 * 1024 * 1024, open_timeout=10,
                 ping_interval=20, ping_timeout=30,
             ) as ws:
                 await asyncio.wait_for(ws.recv(), timeout=15)  # welcome
+                if unbounded:
+                    failures = 0
                 if not sent:
                     # Drain any pre-existing session replay BEFORE sending our task,
                     # so committed history (e.g. a prior turn's reply on a REUSED
@@ -2692,15 +2739,28 @@ async def _send_chat_and_collect(
                         # ceiling. This stops a document-heavy worker from being
                         # cut mid-final-synthesis at exactly the configured
                         # budget with all its work still in context (the Vatra
-                        # deep-researcher failure mode).
-                        ext = _extend_deadline(now, hard_deadline, last_activity)
+                        # deep-researcher failure mode). An unbounded (Vatra) run
+                        # has no ceiling: the agent keeps going until it finishes
+                        # or the user stops the run / skips the agent.
+                        ext = _extend_deadline(now, hard_deadline, last_activity,
+                                               unbounded=unbounded)
                         if ext is not None:
                             deadline = ext
                             base = started_at if started_at is not None else now
-                            _record("dispatch_extend",
-                                    f"time budget reached but the agent is still working — "
-                                    f"extended to {int(deadline - base)}s "
-                                    f"(cap {int((hard_deadline or deadline) - base)}s)")
+                            if unbounded:
+                                quiet = int(now - last_activity)
+                                state = ("the agent is still working"
+                                         if quiet <= _EXTEND_ACTIVITY_S else
+                                         f"the agent has been quiet for {quiet}s but is still connected")
+                                _record("dispatch_extend",
+                                        f"time budget reached and {state} — extended to "
+                                        f"{int(deadline - base)}s (no cap: Stop the run or "
+                                        f"Skip the agent to end it)")
+                            else:
+                                _record("dispatch_extend",
+                                        f"time budget reached but the agent is still working — "
+                                        f"extended to {int(deadline - base)}s "
+                                        f"(cap {int((hard_deadline or deadline) - base)}s)")
                             continue
                         if error_sink is not None:
                             error_sink["timed_out"] = True
@@ -2722,13 +2782,15 @@ async def _send_chat_and_collect(
             # spent, stop; otherwise reconnect and resume listening — without
             # re-sending the task.
             last_err = e
+            failures += 1
             if sent and answer.strip():
                 return answer.strip(), actions
-            if deadline is not None and asyncio.get_event_loop().time() >= deadline:
+            if (not unbounded and deadline is not None
+                    and asyncio.get_event_loop().time() >= deadline):
                 if error_sink is not None:
                     error_sink["timed_out"] = True
                 return answer.strip(), actions
-            await asyncio.sleep(0.5 * (attempt + 1))
+            await asyncio.sleep(0.5 * failures)
     if sent and (answer.strip() or actions):
         return answer.strip(), actions
     # Genuinely unreachable and nothing collected — surface it as a dispatch error
