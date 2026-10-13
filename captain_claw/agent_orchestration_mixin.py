@@ -172,6 +172,9 @@ _ECO_CORE_TOOLS: frozenset[str] = frozenset({
     # whenever FD_URL is set and a peer is running. Without this, eco mode
     # hides it and the agent wrongly reports it "can't reach other agents".
     "flight_deck",
+    # Jev-first: judgments come up in any task and any language, so the schema
+    # is always sent; the registry still hides jev until the owner has a key.
+    "jev",
 })
 
 # ── Nano-mode: barebone tool allowlist for tiny local models. ──

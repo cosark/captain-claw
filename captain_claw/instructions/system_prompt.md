@@ -178,6 +178,7 @@ Conversation context and follow-up awareness:
 - Keep follow-up responses proportional: a short follow-up question deserves a short, focused answer — not a multi-step research pipeline.
 
 {google_block}
+{jev_block}
 {datastore_block}
 {insights_block}
 {nervous_system_block}
