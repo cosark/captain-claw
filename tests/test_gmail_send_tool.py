@@ -1053,6 +1053,16 @@ def test_section_files_carry_the_no_repeat_rule(name):
     for needle in ("in:sent", "list_drafts", "send_draft", "update_draft", "get_thread",
                    "Different recipients" if name.startswith("micro") else "different recipients"):
         assert needle in text, (name, needle)
+    # The repeat check is for drafts; a send the user asked for is the first
+    # call (send checks repeats itself), and only its answer proves it went.
+    assert "before create_draft/send/send_draft" not in text
+    assert "before `create_draft`, `send` or `send_draft`" not in text
+    for needle in ("first step", "Email sent.", "Message ID", "never write \"Sent\""
+                   if name.startswith("micro") else "Never write \"Sent\""):
+        assert needle in text, (name, needle)
+    # send_draft checks no repeats itself: the Sent check before it stays.
+    assert "send_draft doesn't check repeats" in text or "`send_draft` does not check" in text
+    assert "or send_draft for an existing draft) in this response" not in text
 
 
 def test_roster_one_liners_carry_the_no_repeat_rule():
@@ -1061,6 +1071,9 @@ def test_roster_one_liners_carry_the_no_repeat_rule():
     for descs in (acm._TOOL_PROMPT_DESCRIPTIONS, acm._TOOL_PROMPT_DESCRIPTIONS_MICRO):
         line = descs["google_mail"]
         assert "in:sent" in line and "list_drafts" in line and "repeat" in line, line
+        assert "first" in line and "Message ID" in line and "Email sent." in line, line
+        # Only send blocks repeats itself; send_draft keeps the Sent check.
+        assert "send first" in line and "send_draft doesn't" in line, line
 
 
 def test_tool_description_is_the_members_copy_of_the_rule():
@@ -1071,6 +1084,19 @@ def test_tool_description_is_the_members_copy_of_the_rule():
         assert needle in d, needle
     assert "retry now — do not reference past failures" not in d
     assert "never redo one that succeeded" in d
+    # Send-first: the explicit send request is answered with the call, and
+    # only "Email sent." with a Message ID means the email went.
+    assert "NO REPEATS: before create_draft," in d
+    assert "before create_draft / send / send_draft" not in d
+    assert d.index("SENDING:") < d.index("NO REPEATS")
+    for needle in ("as your first step", "don't search first", "'Email sent.' with a Message ID",
+                   "Never write 'Sent' or a Message ID yourself"):
+        assert needle in d, needle
+    # send_draft has no repeat check of its own: Sent is checked before it.
+    assert "send_draft does NOT check for repeats, so first search query='in:sent" in d
+    # Sending exists now: a draft is no longer only "sent manually".
+    assert "user reviews in Gmail and sends manually" not in d
+    assert "send it later with send_draft" in d
     params = GoogleMailTool.parameters["properties"]
     assert params["allow_repeat"]["type"] == "boolean"
     assert "update_draft" in params["action"]["enum"]
@@ -1119,3 +1145,26 @@ def test_turn_has_mail_write(messages, expected):
     prior = [_tool_msg("create_draft", "Draft created.")]  # an earlier turn's
     turn = _Turn(prior + messages)
     assert AgentToolLoopMixin._turn_has_mail_write(turn, len(prior)) is expected
+
+
+_SENT_MATCH = {"kind": "sent", "subject": "10:30", "to": "ana@x.co", "date": "12 Oct",
+               "message_id": "m-0"}
+_DRAFT_MATCH = {"kind": "draft", "subject": "10:30", "to": "ana@x.co", "draft_id": "r-1"}
+_THREAD_DRAFT_MATCH = {"kind": "draft", "subject": "Re: 10:30", "to": "ana@x.co",
+                       "message_id": "m-7"}
+
+
+def _refusal(match: dict, lead: str = "Not sent") -> str:
+    return "Error: " + gmail_compose.repeat_refusal([match], lead=lead)
+
+
+def test_only_a_sent_match_is_a_sent_repeat():
+    assert gmail_compose.is_sent_repeat_refusal(_refusal(_SENT_MATCH))
+    assert gmail_compose.is_sent_repeat_refusal(_refusal(_SENT_MATCH, lead="Duplicate: not sent"))
+    # A draft match (listed first, so it wins over a sent copy too).
+    for match in (_DRAFT_MATCH, _THREAD_DRAFT_MATCH):
+        text = _refusal(match)
+        assert gmail_compose.is_repeat_refusal(text)
+        assert not gmail_compose.is_sent_repeat_refusal(text)
+    assert not gmail_compose.is_sent_repeat_refusal(
+        "Error: " + gmail_compose.repeat_refusal([_DRAFT_MATCH, _SENT_MATCH], lead="Not sent"))

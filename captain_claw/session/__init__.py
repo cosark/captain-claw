@@ -111,6 +111,19 @@ class Session:
         except Exception:
             pass
         self.messages.append(msg)
+        # The IDs a tool result, a person's message or a lane note shows, kept
+        # past compaction for the made-up ID check — for every writer, not
+        # only the agent's own.
+        try:
+            from captain_claw import fabrication_guard
+
+            if isinstance(self.metadata, dict):
+                ledger = fabrication_guard.ledger_with(
+                    self.metadata.get(fabrication_guard.ID_LEDGER_KEY), msg)
+                if ledger is not None:
+                    self.metadata[fabrication_guard.ID_LEDGER_KEY] = ledger
+        except Exception:
+            pass
         self.updated_at = _utcnow_iso()
         return message_id
 

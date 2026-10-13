@@ -39,6 +39,13 @@ def _previous_summary(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
+def _turned_down(msg: dict[str, Any]) -> bool:
+    """A reply a gate turned down, or the corrective sent back about it."""
+    from captain_claw import msg_origin
+
+    return msg_origin.origin_of(msg) in ("rejected", "corrective")
+
+
 class AgentSessionMixin:
     """Session token accounting, compaction, and runtime flag sync."""
     def _count_tokens(self, text: str) -> int:
@@ -230,8 +237,11 @@ class AgentSessionMixin:
 
         lines: list[str] = []
         consumed = 0
-        # Debug echoes would fill the excerpt budget with retrieval dumps.
-        messages = [msg for msg in messages if not is_model_hidden_tool(msg)]
+        # Debug echoes would fill the excerpt budget with retrieval dumps; a
+        # reply a gate turned down and its corrective (which quotes made-up
+        # IDs back) are no part of the conversation to carry on.
+        messages = [msg for msg in messages
+                    if not is_model_hidden_tool(msg) and not _turned_down(msg)]
         for idx, msg in enumerate(messages, start=1):
             role = self._compact_role(str(msg.get("role", "")))
             tool_name = str(msg.get("tool_name", "")).strip()
@@ -254,7 +264,7 @@ class AgentSessionMixin:
         if not messages:
             return "No prior messages available for summary."
         highlights: list[str] = []
-        for msg in messages[-8:]:
+        for msg in [msg for msg in messages if not _turned_down(msg)][-8:]:
             role = self._compact_role(str(msg.get("role", "")))
             content = re.sub(r"\s+", " ", str(msg.get("content", "")).strip())
             if not content:
@@ -333,6 +343,12 @@ class AgentSessionMixin:
             flat = " ".join(str(text or "").split())
             return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
 
+        def _reply_clip(text: str | None, limit: int) -> str:
+            # No double quote inside: the made-up ID check cuts a quoted reply
+            # out of the summary up to its closing quote (fabrication_guard.
+            # without_digest_replies) — the model's words, not what it was given.
+            return _clip(str(text or "").replace('"', "'"), limit)
+
         lines = [
             "Digest of the earlier part of this conversation (folded by compaction; "
             "`topics get <id>` and the history search have the full text):",
@@ -351,14 +367,14 @@ class AgentSessionMixin:
                 if group[-1]["ask"]:
                     lines.append(f"  last asked: \"{_clip(group[-1]['ask'], 160)}\"")
                 if group[-1]["reply"]:
-                    lines.append(f"  last reply: \"{_clip(group[-1]['reply'], 200)}\"")
+                    lines.append(f"  last reply: \"{_reply_clip(group[-1]['reply'], 200)}\"")
             if len(groups) > _DIGEST_TOPICS:
                 lines.append(f"- … and {len(groups) - _DIGEST_TOPICS} more topic(s)")
         if loose:
             lines.append("Other exchanges:")
             for ex in loose[-_DIGEST_LOOSE:]:
                 ask = _clip(ex["ask"], 120) if ex["ask"] else "(reply)"
-                reply = f" → \"{_clip(ex['reply'], 140)}\"" if ex["reply"] else ""
+                reply = f" → \"{_reply_clip(ex['reply'], 140)}\"" if ex["reply"] else ""
                 lines.append(f"- {ex['ts'][:10]} \"{ask}\"{reply}")
             if len(loose) > _DIGEST_LOOSE:
                 lines.append(f"- … and {len(loose) - _DIGEST_LOOSE} earlier exchange(s)")
@@ -645,6 +661,17 @@ class AgentSessionMixin:
 
         old_messages = messages[:-keep_count]
         recent_messages = messages[-keep_count:]
+        # What the folded messages showed stays known to the made-up ID check
+        # (a message some writer added past the session's ledger included).
+        try:
+            from captain_claw import fabrication_guard
+
+            _ledger = fabrication_guard.ledger_with_all(
+                self.session.metadata.get(fabrication_guard.ID_LEDGER_KEY), old_messages)
+            if _ledger is not None:
+                self.session.metadata[fabrication_guard.ID_LEDGER_KEY] = _ledger
+        except Exception:
+            pass
 
         # Freeze the raw messages we're about to drop into append-only history
         # memory so they remain verbatim-searchable after compaction — the

@@ -207,6 +207,19 @@ def origin_of(msg: Any) -> str:
     return classify_legacy(msg)
 
 
+def is_lane_note(msg: Any) -> bool:
+    """An automation lane's result kept in the chat (web/chat_handler.
+    flush_automation_results): an assistant ``system_note`` without a tool
+    name — compaction summaries carry one. Its tool calls ran in the lane's
+    own session, not in this one."""
+    return (
+        isinstance(msg, dict)
+        and str(msg.get("role", "")).strip().lower() == "assistant"
+        and origin_of(msg) == "system_note"
+        and not _tool_name(msg)
+    )
+
+
 def is_human_input(msg: Any) -> bool:
     """A message a person typed (or sent through a chat surface)."""
     return (

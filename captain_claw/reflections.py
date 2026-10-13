@@ -14,12 +14,14 @@ caching -> prompt block with ``_esc()``.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from captain_claw import msg_origin
 from captain_claw.logging import get_logger
 
 if TYPE_CHECKING:
@@ -400,6 +402,58 @@ def reflection_to_prompt_block(r: Reflection | None) -> str:
 # ── LLM-based reflection generation ──────────────────────────────────
 
 
+def _tool_call_label(call: Any) -> str:
+    """A stored tool call as its name and, when it has one, its ``action``
+    argument ("google_mail send")."""
+    if not isinstance(call, dict):
+        return "tool"
+    fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+    name = str(call.get("name") or fn.get("name") or "tool").strip()
+    args: Any = call.get("arguments", fn.get("arguments"))
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (TypeError, ValueError):
+            args = {}
+    action = str(args.get("action") or "").strip() if isinstance(args, dict) else ""
+    return f"{name} {action}".strip()
+
+
+# How the transcript labels what isn't the model's own reply: an automation
+# lane's result (its tool calls ran in that lane's session) and a compaction
+# summary. Read as "[assistant]" lines with no call marker, both looked like
+# claims made without a call.
+_LANE_NOTE_LABEL = "automation result — another run; its tool calls ran there"
+_SUMMARY_LABEL = "summary"
+
+
+def _reflection_transcript(messages: list[dict[str, Any]]) -> str:
+    """Recent messages as the reflection reads them: ``[role] content``, and
+    each tool call an assistant step made as ``[assistant → google_mail send]``.
+    Without the calls, a reply that only CLAIMS an action ("**Sent** to Ana")
+    reads exactly like one that did it — and a reflection written from such a
+    turn taught the model to keep announcing actions it never took. A reply a
+    check turned down is marked as rejected; a lane's result and a compaction
+    summary carry their own labels."""
+    lines: list[str] = []
+    for m in messages:
+        role = m.get("role", "unknown")
+        content = str(m.get("content", ""))[:500]
+        calls = (m.get("tool_calls") or []) if role == "assistant" else []
+        if content.strip() or not calls:
+            if msg_origin.is_lane_note(m):
+                label = _LANE_NOTE_LABEL
+            elif role == "assistant" and str(m.get("tool_name") or "") == "compaction_summary":
+                label = _SUMMARY_LABEL
+            elif m.get("origin") == "rejected":
+                label = f"{role} (rejected)"
+            else:
+                label = role
+            lines.append(f"[{label}] {content}")
+        lines.extend(f"[assistant → {_tool_call_label(call)}]" for call in calls)
+    return "\n".join(lines)
+
+
 async def generate_reflection(agent: Agent) -> Reflection:
     """Generate a new self-reflection using the LLM.
 
@@ -421,12 +475,7 @@ async def generate_reflection(agent: Agent) -> Reflection:
         # PR D: members' private data never feeds shared reflections.
         from captain_claw import member_privacy
         messages = member_privacy.learnable(agent.session.messages)[-20:]  # Last 20 messages
-        lines: list[str] = []
-        for m in messages:
-            role = m.get("role", "unknown")
-            content = str(m.get("content", ""))[:500]
-            lines.append(f"[{role}] {content}")
-        recent_messages_text = "\n".join(lines)
+        recent_messages_text = _reflection_transcript(messages)
         topics.append("recent conversation messages")
 
     # 3. Gather memory facts.
