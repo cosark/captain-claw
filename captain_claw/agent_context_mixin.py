@@ -51,6 +51,12 @@ _FLEET_NOTICE_RE = re.compile(
 _LIVE_NOTE_ORDER = ("planning_context", "list_task_memory", "scale_progress", "context_pressure")
 # Block markers quoted inside a note body (e.g. a snippet of an earlier prompt).
 _NESTED_BLOCK_MARKER_RE = re.compile(r"\[((?:END )?INTERNAL CONTEXT)", re.IGNORECASE)
+# The header an automation lane's result carries in the main chat
+# (web/chat_handler.flush_automation_results).
+_LANE_NOTE_RE = re.compile(r"^\[(?P<label>[^\[\]\n]*?) — from the (?P<lane>[^\[\]\n]*?) lane\]\n?")
+# At most this share of the history budget goes to the lane notes in front of
+# the turn's message (newest first).
+_LANE_NOTES_SHARE = 0.25
 
 
 def _is_being_body() -> bool:
@@ -99,7 +105,7 @@ _TOOL_PROMPT_DESCRIPTIONS: dict[str, str] = {
     "clipboard": "Read or write the system clipboard. Supports text, images, and files.",
     "google_drive": "Google Drive/Docs/Sheets/Slides — list (folder_id), search, read (returns content inline: Docs/Sheets/Slides exported, PDF/DOCX/XLSX/PPTX extracted), info (metadata), download (saves a local copy and returns its path — for scripts/extract tools), upload (local file → Drive), create, update. Takes a file/folder ID or a full Drive/Docs URL — never web_fetch/browser/curl a Google URL. Edit an existing Google Sheet/Doc IN PLACE — sheet_read/sheet_update/sheet_append/sheet_clear, doc_read/doc_replace_text/doc_append_text/doc_insert_text — never upload a modified copy.",
     "google_calendar": "Google Calendar — list_events, search_events, get_event, create_event, update_event, delete_event, list_calendars.",
-    "google_mail": "Gmail — list_messages, search, read_message, get_thread, list_labels; create_draft / update_draft / list_drafts — write only when the user asked for that email (a draft is then the default; reading or summarizing mail never implies replying); send / send_draft ONLY when the user explicitly asked and sending is enabled; check list_drafts + search in:sent first — never repeat an email already drafted/sent.",
+    "google_mail": "Gmail — list_messages, search, read_message, get_thread, list_labels; create_draft / update_draft / list_drafts — write only when the user asked for that email (a draft is then the default; reading or summarizing mail never implies replying; before create_draft check list_drafts + search in:sent — never repeat an email already drafted/sent); send / send_draft ONLY when the user explicitly asked and sending is enabled — then call send first, in that response (it blocks repeats itself; send_draft doesn't — check in:sent before it), and quote its Message ID: only 'Email sent.' means it went.",
     "microsoft_onedrive": "OneDrive — list, search, read (content inline: PDF/DOCX/XLSX/PPTX extracted), info, download (local copy), upload, create, create_folder, update (same file id); file ID, path or OneDrive/SharePoint share URL — never web_fetch a OneDrive link.",
     "microsoft_calendar": "Outlook Calendar — list_events, search_events, get_event, create_event, update_event, delete_event, respond_event, list_calendars; changes that email attendees need notify_attendees=true (only when the user asked).",
     "microsoft_mail": "Outlook mail — list_messages, search, read_message, get_thread, list_folders, get_attachment; create_draft / update_draft / list_drafts only when the user asked for that email; never sends (drafts wait in Outlook); no repeat drafts.",
@@ -158,7 +164,7 @@ _TOOL_PROMPT_DESCRIPTIONS_MICRO: dict[str, str] = {
     "clipboard": "read/write system clipboard",
     "google_drive": "Drive/Docs/Sheets/Slides: list, search, read (content inline), info, download (local copy), upload, create, update; file ID or Drive URL; edit Sheets/Docs IN PLACE: sheet_read/sheet_update/sheet_append/sheet_clear, doc_read/doc_replace_text/doc_append_text/doc_insert_text",
     "google_calendar": "Calendar events: list/search/get/create/update/delete, list_calendars",
-    "google_mail": "Gmail: list/search/read/thread, labels; drafts only when the user asked (then default); send only if user asked + enabled; check list_drafts + in:sent first, no repeats",
+    "google_mail": "Gmail: list/search/read/thread, labels; drafts only when the user asked (then default; check list_drafts + in:sent first, no repeats); send/send_draft only if user asked + enabled — call send first (it blocks repeats; send_draft doesn't: check in:sent first), quote its Message ID; only 'Email sent.' means sent",
     "microsoft_onedrive": "OneDrive: list, search, read (content inline), info, download, upload, create, create_folder, update",
     "microsoft_calendar": "Outlook Calendar: list/search/get/create/update/delete/respond events; notify_attendees=true only when asked",
     "microsoft_mail": "Outlook mail: list/search/read/thread, folders, attachments; drafts only when asked; never sends; no repeats",
@@ -3807,6 +3813,84 @@ class AgentContextMixin:
         return merged
 
     @staticmethod
+    def _lane_note_as_user(msg: dict[str, Any]) -> dict[str, Any]:
+        """A lane note as the model sees it: a user-role note saying whose
+        result it is. As an assistant message it read as the model's own
+        reply — folded into the reply before it, it taught the model to write
+        "[… — from the AUTO lane]" blocks itself, and a thinking-mode server
+        wants reasoning on every assistant message, which a note has none of."""
+        content = str(msg.get("content", "") or "")
+        match = _LANE_NOTE_RE.match(content)
+        lane, label, body = "automation", "", content
+        if match:
+            lane, label, body = match.group("lane"), match.group("label"), content[match.end():]
+        lead = (
+            f"[Note from the {lane} lane — "
+            + (f"{label}: " if label else "")
+            + "another run's result, not your reply]"
+        )
+        converted = {
+            key: value for key, value in msg.items()
+            if key not in ("reasoning_content", "system_hint", "token_count", "_tc_counted",
+                           "_rc_counted", "reasoning_token_count")
+        }
+        converted["role"] = "user"
+        converted["content"] = f"{lead}\n{body.strip()}"
+        return converted
+
+    @staticmethod
+    def _with_lane_notes(
+        notes: list[tuple[int, dict[str, Any]]], user_msg: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Lane notes (from :meth:`_lane_note_as_user`) as one user message, or
+        in front of *user_msg* — the same text every time, so the cached
+        prefix holds across turns."""
+        text = "\n\n".join(str(note.get("content", "")) for _, note in notes)
+        if user_msg is None:
+            return {**notes[0][1], "content": text}
+        merged = {
+            key: value for key, value in user_msg.items()
+            if key not in ("token_count", "_tc_counted")
+        }
+        merged["content"] = f"{text}\n\n{user_msg.get('content', '')}"
+        return merged
+
+    def _fit_turn_lane_notes(
+        self, notes: list[tuple[int, dict[str, Any]]], history_budget: int, used_tokens: int,
+        turn_key: Any,
+    ) -> tuple[str, int]:
+        """The lane notes in front of the turn's message that fit, and their
+        tokens: newest first, within what the must-includes and the context
+        block left and at most :data:`_LANE_NOTES_SHARE` of the history
+        budget; the ones left out are counted in one line. Chosen once per
+        turn, so the turn's message never changes under the prompt cache."""
+        key = (turn_key, tuple(idx for idx, _ in notes))
+        cached = getattr(self, "_turn_lane_fit", None)
+        if isinstance(cached, tuple) and len(cached) == 3 and cached[0] == key:
+            return cached[1], cached[2]
+        budget = max(0, min(int(history_budget * _LANE_NOTES_SHARE), history_budget - used_tokens))
+        kept: list[str] = []
+        spent = 0
+        for _, note in reversed(notes):
+            text = str(note.get("content", ""))
+            cost = self._count_tokens(text)
+            if spent + cost > budget:
+                break
+            kept.append(text)
+            spent += cost
+        left_out = len(notes) - len(kept)
+        parts = list(reversed(kept))
+        if left_out:
+            parts.insert(0, (
+                f"[{left_out} {'older ' if kept else ''}lane note{'s' if left_out != 1 else ''} "
+                "left out — other runs' results, not your reply]"
+            ))
+        text = "\n\n".join(parts)
+        tokens = self._count_tokens(text) if text else 0
+        self._turn_lane_fit = (key, text, tokens)
+        return text, tokens
+
+    @staticmethod
     def _wrap_internal_context(notes: list[tuple[str, str]], lead: str) -> str:
         """One delimited block of internal context notes.
 
@@ -4429,6 +4513,8 @@ class AgentContextMixin:
         mergeable_assistant_pos: int | None = None
         # First candidate of the current turn (for a block with no anchor).
         first_turn_pos: int | None = None
+        # Lane notes (as user notes) waiting for the next kept message.
+        pending_lane_notes: list[tuple[int, dict[str, Any]]] = []
         empty_assistant_skipped = 0
         historical_assistant_merged = 0
         model_hidden_skipped = 0
@@ -4475,6 +4561,12 @@ class AgentContextMixin:
                     continue
                 if idx in hidden_idx:
                     synthetic_suppressed += 1
+                    continue
+                # Another run's result is never sent as the model's own reply
+                # (nor folded into one): it goes as a user-role note, held for
+                # the front of the next user message (see below).
+                if msg_origin.is_lane_note(msg):
+                    pending_lane_notes.append((idx, self._lane_note_as_user(msg)))
                     continue
                 if (
                     filter_historical_tools
@@ -4549,6 +4641,27 @@ class AgentContextMixin:
                             empty_assistant_skipped += 1
                             continue
                 role = str(msg.get("role", "")).strip().lower()
+                # Held lane notes open the next user message: on their own they
+                # would put two or three user turns in a row, which chat
+                # templates that require alternation (Mistral / Gemma under
+                # llama.cpp, vLLM, mlx) refuse. Before any other message they
+                # go as one user message of their own.
+                if pending_lane_notes:
+                    if role == "user":
+                        # Merged below, once the turn's opener is known: its
+                        # notes are fitted to the budget on their own.
+                        msg = {**msg, "_lane_notes": pending_lane_notes}
+                    else:
+                        if (
+                            first_turn_pos is None
+                            and filter_historical_tools
+                            and pending_lane_notes[0][0] >= tool_messages_from_index
+                        ):
+                            first_turn_pos = len(candidate_messages)
+                        candidate_messages.append(self._with_lane_notes(pending_lane_notes))
+                        candidate_sidx.append(pending_lane_notes[0][0])
+                        mergeable_assistant_pos = None
+                    pending_lane_notes = []
                 # An earlier turn's tool steps, with their calls stripped,
                 # read as a run of assistant messages that each announce work
                 # and stop ("Let me check that:"). Weak models copy that
@@ -4585,8 +4698,35 @@ class AgentContextMixin:
                     first_turn_pos = len(candidate_messages)
                 candidate_messages.append(msg)
                 candidate_sidx.append(idx)
+            if pending_lane_notes:
+                # Nothing after the notes: they go last, never as the turn's
+                # message (latest_user_pos stays on the real one).
+                if (
+                    first_turn_pos is None
+                    and filter_historical_tools
+                    and pending_lane_notes[0][0] >= tool_messages_from_index
+                ):
+                    first_turn_pos = len(candidate_messages)
+                candidate_messages.append(self._with_lane_notes(pending_lane_notes))
+                candidate_sidx.append(pending_lane_notes[0][0])
         if turn_anchor_pos is None:
             turn_anchor_pos = latest_user_pos
+        # Lane notes that arrived before a user message open it. The turn's
+        # own opener is always sent, so its notes are not merged into it here:
+        # they are fitted to the budget after the must-includes (see below),
+        # newest first — a night of cron digests must not push out the
+        # memory notes or run past the window.
+        turn_lane_notes: list[tuple[int, dict[str, Any]]] = []
+        for _pos, _cand in enumerate(candidate_messages):
+            if "_lane_notes" not in _cand:
+                continue
+            _notes = _cand["_lane_notes"]
+            _plain = {key: value for key, value in _cand.items() if key != "_lane_notes"}
+            if _pos == turn_anchor_pos:
+                turn_lane_notes = _notes
+                candidate_messages[_pos] = _plain
+            else:
+                candidate_messages[_pos] = self._with_lane_notes(_notes, _plain)
 
         # ── Context notes ────────────────────────────────────────────
         # Background notes (memory, insights, todos, workspace map, …) go in
@@ -4841,6 +4981,12 @@ class AgentContextMixin:
                 used_tokens += block_tokens
             else:
                 dropped_messages += 1
+        lane_text, lane_tokens = "", 0
+        if turn_lane_notes:
+            lane_text, lane_tokens = self._fit_turn_lane_notes(
+                turn_lane_notes, history_budget, used_tokens, _bg_key,
+            )
+            used_tokens += lane_tokens
         if _governed and _chain_start is not None:
             _cuts_before = int(getattr(self, "_turn_window_cuts", 0) or 0)
             used_tokens, _gov_dropped = self._governed_fill(
@@ -4892,6 +5038,10 @@ class AgentContextMixin:
                 block = selected_messages.pop()
                 msg = dict(msg)
                 msg["content"] = f"{block['content']}\n\n{msg.get('content', '')}"
+            if pos == turn_anchor_pos and lane_text:
+                # The lane notes that fitted open the turn's message.
+                msg = dict(msg)
+                msg["content"] = f"{lane_text}\n\n{msg.get('content', '')}"
             if pos == turn_anchor_pos and selected_messages:
                 # The prior turns' history ends here and is sent unchanged by
                 # the next turn: a cache breakpoint for providers that take one.
@@ -4957,7 +5107,7 @@ class AgentContextMixin:
             if pos == background_pos:
                 sections["context_block"] += tokens
             elif pos == turn_anchor_pos:
-                sections["turn_message"] += tokens
+                sections["turn_message"] += tokens + lane_tokens
             elif pos == btw_pos:
                 sections["btw"] += tokens
             elif "_live_notes" in msg:

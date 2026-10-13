@@ -1478,7 +1478,7 @@ class SemanticMemoryIndex:
             return []
 
         from captain_claw import member_privacy
-        from captain_claw.msg_origin import is_model_hidden_tool
+        from captain_claw.msg_origin import is_model_hidden_tool, is_turned_down
 
         documents: list[_Document] = []
         for sid, name, raw_messages, updated_at in rows:
@@ -1496,6 +1496,8 @@ class SemanticMemoryIndex:
                     continue             # PR D: members' private data is never indexed
                 if is_model_hidden_tool(msg):
                     continue             # debug echoes would feed memory dumps back in
+                if is_turned_down(msg):
+                    continue             # a false reply a gate turned down, its corrective
                 role = str(msg.get("role", "")).strip().lower() or "unknown"
                 content = re.sub(r"\s+", " ", str(msg.get("content", "")).strip())
                 if not content:
@@ -1522,7 +1524,7 @@ class SemanticMemoryIndex:
     def _format_messages_as_text(messages: list[dict[str, Any]]) -> str:
         """Render a list of session messages as ``[role] content`` lines."""
         from captain_claw import member_privacy
-        from captain_claw.msg_origin import is_model_hidden_tool
+        from captain_claw.msg_origin import is_model_hidden_tool, is_turned_down
 
         lines: list[str] = []
         for msg in messages:
@@ -1530,8 +1532,8 @@ class SemanticMemoryIndex:
                 continue
             if member_privacy.is_private(msg):
                 continue                 # PR D: never archived or indexed
-            if is_model_hidden_tool(msg):
-                continue                 # debug echoes are not memory
+            if is_model_hidden_tool(msg) or is_turned_down(msg):
+                continue                 # debug echoes, turned-down replies are not memory
             role = str(msg.get("role", "")).strip().lower() or "unknown"
             content = re.sub(r"\s+", " ", str(msg.get("content", "")).strip())
             if not content:

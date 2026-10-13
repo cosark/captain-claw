@@ -377,6 +377,173 @@ def test_compaction_summary_and_hints_are_not_lost_when_merging():
     ]
 
 
+_LANE_NOTE = "[Autonomous Work — from the AUTO lane]\nNudge: Marko is waiting for your reply."
+
+
+def test_a_lane_note_is_a_user_note_not_folded_into_the_reply():
+    # An automation lane's result is kept in the chat as an assistant
+    # system_note. Folded into the reply before it, the model read it as its
+    # own words and started writing "[… — from the AUTO lane]" blocks itself.
+    agent = _agent()
+    s = agent.session
+    s.add_message("user", "q1")
+    s.add_message("assistant", "Let me check:", tool_calls=[_call("c1")], reasoning_content="think-1")
+    s.add_message("tool", "r1", tool_call_id="c1", tool_name="dummy")
+    s.add_message("assistant", "Answer one.", reasoning_content="think-2")
+    s.add_message("assistant", _LANE_NOTE, origin="system_note", origin_detail="automation_result")
+    s.add_message("assistant", "[Plan step — from the B lane]\nDone: invoice filed.",
+                  origin="system_note", origin_detail="automation_result")
+    turn_start = len(s.messages)
+    s.add_message("user", "q2")
+
+    messages = agent._build_messages(tool_messages_from_index=turn_start, query="q2")
+
+    # The notes open the next user message: roles still alternate (two or
+    # three user turns in a row break strict chat templates).
+    roles = [m.role for m in messages]
+    assert roles == ["system", "user", "assistant", "user"]
+    # The model's own reply keeps its text and reasoning, and nothing else.
+    reply = messages[2]
+    assert reply.content == "Let me check:\n\nAnswer one."
+    assert reply.reasoning_content == "think-2"
+    turn = messages[3]
+    notes = (
+        "[Note from the AUTO lane — Autonomous Work: another run's result, not your reply]\n"
+        "Nudge: Marko is waiting for your reply.\n\n"
+        "[Note from the B lane — Plan step: another run's result, not your reply]\n"
+        "Done: invoice filed.\n\n"
+    )
+    # The notes, then the turn's context block, then the question.
+    assert turn.content.startswith(notes + "[INTERNAL CONTEXT")
+    assert turn.content.endswith("[END INTERNAL CONTEXT]\n\nq2")
+    assert not turn.reasoning_content
+    assert "— from the AUTO lane]" not in "\n".join(m.content for m in messages)
+    # The stored note is not rewritten.
+    assert s.messages[4]["content"] == _LANE_NOTE and s.messages[4]["role"] == "assistant"
+
+
+def test_a_lane_note_in_earlier_history_opens_the_next_user_message():
+    agent = _agent()
+    s = agent.session
+    s.add_message("user", "q1")
+    s.add_message("assistant", "Answer one.")
+    s.add_message("assistant", _LANE_NOTE, origin="system_note", origin_detail="automation_result")
+    s.add_message("user", "q2")
+    s.add_message("assistant", "Answer two.")
+    turn_start = len(s.messages)
+    s.add_message("user", "q3")
+
+    first = agent._build_messages(tool_messages_from_index=turn_start, query="q3")
+
+    assert [m.role for m in first] == ["system", "user", "assistant", "user", "assistant", "user"]
+    assert first[3].content == (
+        "[Note from the AUTO lane — Autonomous Work: another run's result, not your reply]\n"
+        "Nudge: Marko is waiting for your reply.\n\nq2"
+    )
+    assert first[-1].content.endswith("q3")
+    # The next turn sends the earlier opener (and all before it) unchanged:
+    # the cached prefix holds.
+    s.add_message("assistant", "Answer three.")
+    next_start = len(s.messages)
+    s.add_message("user", "q4")
+    again = agent._build_messages(tool_messages_from_index=next_start, query="q4")
+    assert [(m.role, m.content) for m in again[1:5]] == [(m.role, m.content) for m in first[1:5]]
+
+
+def test_a_lane_note_never_becomes_the_turn_message():
+    agent = _agent()
+    s = agent.session
+    s.add_message("user", "q1")
+    s.add_message("assistant", "Answer one.")
+    s.add_message("assistant", _LANE_NOTE, origin="system_note", origin_detail="automation_result")
+
+    messages = agent._build_messages(query="q1")
+
+    # Without a turn start, the background block rides on the last real user
+    # message — never on the note that followed it.
+    assert [m.role for m in messages] == ["system", "user", "assistant", "user"]
+    assert messages[1].content.endswith("q1")
+    assert messages[3].content.startswith("[Note from the AUTO lane")
+
+
+def test_lane_notes_before_the_turn_are_fitted_to_the_budget():
+    # A night of cron digests right before the user's message: the turn's
+    # message is always sent, so notes merged into it would be forced past
+    # the budget and push out the memory notes.
+    old_cfg = get_config().model_copy(deep=True)
+    cfg = old_cfg.model_copy(deep=True)
+    cfg.context.max_tokens = 2000
+    set_config(cfg)
+    try:
+        agent = _agent()
+        agent._build_system_prompt = lambda: "sys"
+        agent._build_todo_context_note = lambda: "Pending todos: water the plants"
+        s = agent.session
+        s.add_message("user", "q1")
+        s.add_message("assistant", "Answer one.")
+        for n in range(12):
+            s.add_message("assistant", f"[Digest {n} — from the AUTO lane]\nnote-{n} " + "word " * 300,
+                          origin="system_note", origin_detail="automation_result")
+        turn_start = len(s.messages)
+        s.add_message("user", "q2")
+
+        messages = agent._build_messages(tool_messages_from_index=turn_start, query="q2")
+
+        window = agent.last_context_window
+        assert window["over_budget"] == 0
+        assert window["todo_note_used"] == 1
+        assert [m.role for m in messages] == ["system", "user", "assistant", "user"]
+        opener = messages[-1]
+        assert opener.content.endswith("q2") and "water the plants" in opener.content
+        # The newest note is sent; the older ones are counted, not sent.
+        assert "note-11 " in opener.content and "note-10 " not in opener.content
+        assert opener.content.startswith("[11 older lane notes left out")
+        # The same choice on the next call of the turn: the cached prefix holds.
+        again = agent._build_messages(tool_messages_from_index=turn_start, query="q2")
+        assert again[-1].content == opener.content
+    finally:
+        set_config(old_cfg)
+
+
+def test_compaction_summary_stays_an_assistant_message():
+    agent = _agent()
+    s = agent.session
+    s.messages.append({"role": "assistant", "content": "Conversation summary: q0 answered.",
+                       "tool_name": "compaction_summary", "origin": "system_note"})
+    turn_start = len(s.messages)
+    s.add_message("user", "next")
+
+    messages = agent._build_messages(tool_messages_from_index=turn_start, query="next")
+
+    assert [m.role for m in messages] == ["system", "assistant", "user"]
+    assert messages[1].content == "Conversation summary: q0 answered."
+
+
+def test_an_earlier_false_mail_claim_is_not_replayed():
+    from captain_claw import fabrication_guard
+
+    corrective = fabrication_guard.mail_corrective()
+    agent = _agent()
+    s = agent.session
+    s.add_message("user", "send the reply to Ana")
+    s.add_message("assistant", "**Sent** to Ana — ID `1a2b3c4d`.", origin="rejected",
+                  origin_detail="false_mail_send")
+    s.add_message("user", corrective, origin="corrective", origin_detail="false_mail_send")
+    s.add_message("assistant", "", tool_calls=[_call("c1")])
+    s.add_message("tool", "Email sent.\n  Message ID: m-1", tool_call_id="c1", tool_name="dummy")
+    s.add_message("assistant", "Email sent to Ana — Message ID m-1.")
+    turn_start = len(s.messages)
+    s.add_message("user", "thanks")
+
+    messages = agent._build_messages(tool_messages_from_index=turn_start, query="thanks")
+
+    joined = "\n".join(m.content for m in messages)
+    assert "1a2b3c4d" not in joined
+    assert "Your reply says an email was sent" not in joined
+    assert [m.role for m in messages] == ["system", "user", "assistant", "user"]
+    assert messages[2].content == "Email sent to Ana — Message ID m-1."
+
+
 def test_current_turn_assistant_messages_are_not_merged():
     agent = _agent()
     s = agent.session

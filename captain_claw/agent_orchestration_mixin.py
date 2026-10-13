@@ -17,7 +17,7 @@ from captain_claw.agent_stuck import (
     MSG_RETRIES_EXHAUSTED,
     MSG_STUCK,
 )
-from captain_claw import mail_authority, msg_origin
+from captain_claw import fabrication_guard, mail_authority, msg_origin
 from captain_claw.config import get_config
 from captain_claw.exceptions import GuardBlockedError, LLMAPIError, LLMError
 from captain_claw.llm import Message, is_reasoning_backfill_placeholder
@@ -25,6 +25,8 @@ from captain_claw.logging import get_logger
 
 
 log = get_logger(__name__)
+
+MAX_FABRICATION_RETRIES = fabrication_guard.MAX_FABRICATION_RETRIES
 
 # The stuck detector's warm-up (no stuck verdict before iteration N/2) is sized on
 # the agent's default budget, not a raised one: a worker given 300 iterations for
@@ -784,6 +786,154 @@ class AgentOrchestrationMixin:
             )
         ), has_tools
 
+    # ── Made-up tool work (decided in fabrication_guard) ─────────────
+
+    def _outside_texts(self) -> list[str]:
+        """Where an ID the model quotes may have come from besides its own
+        words: every tool result, person's or automation's message, lane note
+        and compaction summary in the session; the request this turn last
+        sent (the system prompt, context notes, recalled memory ride in it);
+        and the session's ID ledger (IDs from results compaction has dropped).
+        Never the model's replies, reasoning or tool-call arguments (nor a
+        tool's answer naming them back, nor a summary quoting a reply), a
+        rejected reply, or a corrective — it quotes the made-up ID back."""
+        texts: list[str] = []
+        correctives: list[str] = []
+        for msg in self.session.messages if self.session else []:
+            if fabrication_guard.is_outside_message(msg):
+                texts.append(fabrication_guard.outside_text(msg))
+            elif msg_origin.origin_of(msg) == "corrective":
+                correctives.append(str(msg.get("content") or ""))
+        for request_msg in getattr(self, "_turn_request_messages", None) or ():
+            # Tool results are read from the session above, echoes cut.
+            if getattr(request_msg, "role", "") in ("assistant", "tool"):
+                continue
+            content = str(getattr(request_msg, "content", "") or "")
+            for corrective in correctives:
+                if corrective:
+                    content = content.replace(corrective, " ")
+            if fabrication_guard.SUMMARY_HEAD in content:
+                content = fabrication_guard.without_digest_replies(content)
+            texts.append(content)
+        texts.append(fabrication_guard.ledger_text(self._id_ledger()))
+        return texts
+
+    def _id_ledger(self) -> Any:
+        metadata = getattr(self.session, "metadata", None) if self.session else None
+        return metadata.get(fabrication_guard.ID_LEDGER_KEY) if isinstance(metadata, dict) else None
+
+    def _turn_made_no_tool_call(self, turn_start_idx: int) -> bool:
+        """No tool ran or was attempted in this turn: no call stored (a
+        refused or failed one included), no tool result (monitor rows
+        aside), none cut off mid-arguments."""
+        if getattr(self, "_malformed_retry_count", 0):
+            return False
+        for msg in (self.session.messages if self.session else [])[turn_start_idx:]:
+            if msg.get("tool_calls") or (
+                    msg.get("role") == "tool" and not msg_origin.is_monitor_only(msg)):
+                return False
+        return True
+
+    @staticmethod
+    def _claims_send(text: str, user_input: str, offered: frozenset[str]) -> bool:
+        """Text written next to tool calls reads as a send claim: it is held
+        until the calls answer and judged then (:meth:`_settle_held_claim`),
+        when they are stored and count as this turn's mail."""
+        return bool(text and offered & fabrication_guard.MAIL_TOOLS
+                    and fabrication_guard.claims_mail_sent(text, user_input, True))
+
+    def _judge_reply(
+        self, raw: str, text: str, turn_start_idx: int, user_input: str,
+        offered: frozenset[str], *, held: bool = False,
+    ) -> fabrication_guard.Verdict:
+        """Every check on a reply about to ship (see
+        :func:`fabrication_guard.judge_reply`): *raw* as the model wrote it,
+        *text* as it would ship, *offered* the tools this turn offers. *held*:
+        text written next to tool calls — only its mail claim is judged."""
+        if held and not self._claims_send(text, user_input, offered):
+            return fabrication_guard.Verdict()   # no send claimed: nothing to hold
+        messages = self.session.messages if self.session else []
+        turn = getattr(self, "_turn_origin", None)
+        facts = fabrication_guard.TurnFacts(
+            request=user_input,
+            turn_steps=fabrication_guard.tool_steps(messages[turn_start_idx:]),
+            session_steps=fabrication_guard.tool_steps(messages),
+            sent_ids=fabrication_guard.ledger_sent_ids(self._id_ledger()),
+            relayed=tuple(str(msg.get("content") or "") for msg in messages
+                          if fabrication_guard.is_relay_message(msg)),
+            recent_mail=any(
+                (_tc.get("name") or (_tc.get("function") or {}).get("name", ""))
+                in fabrication_guard.MAIL_TOOLS
+                for _m in messages[-40:]
+                for _tc in (_m.get("tool_calls") or [])
+            ),
+            mail_tools=offered & fabrication_guard.MAIL_TOOLS,
+            # A turn offered no tool is not judged for IDs or lookups.
+            known=tuple(self._outside_texts()) if offered and not held else None,
+            # A delegated result carries another agent's lookups.
+            no_tool_call=(
+                bool(offered) and not held
+                and not (isinstance(turn, tuple) and turn and turn[0] == "delegated_result")
+                and self._turn_made_no_tool_call(turn_start_idx)
+            ),
+            tools=offered,
+        )
+        return fabrication_guard.judge_reply(raw, text, facts)
+
+    def _reject_fabrication(self, text: str, verdict: fabrication_guard.Verdict) -> None:
+        """Store a false reply as rejected (later turns never replay it as an
+        example) and the corrective after it; uses one retry."""
+        self._fabrication_retry_count += 1
+        detail = verdict.origin_detail
+        self._add_session_message(
+            role="assistant", content=text, origin="rejected", origin_detail=detail,
+        )
+        self._add_session_message(
+            role="user", content=verdict.corrective, origin="corrective", origin_detail=detail,
+        )
+
+    def _log_fabrication(self, verdict: fabrication_guard.Verdict, text: str, **extra: Any) -> None:
+        log.warning(
+            "fabricated_reply",
+            attempt=min(self._fabrication_retry_count + 1, MAX_FABRICATION_RETRIES),
+            max_retries=MAX_FABRICATION_RETRIES,
+            kinds=",".join(verdict.kinds),
+            backstop=self._fabrication_retry_count >= MAX_FABRICATION_RETRIES,
+            refused=bool(verdict.refused),
+            narrated=list(verdict.narrated),
+            made_up_ids=list(verdict.fabricated),
+            preview=text[:160],
+            **extra,
+        )
+
+    def _settle_held_claim(
+        self, text: str, turn_start_idx: int, user_input: str, offered: frozenset[str],
+    ) -> bool:
+        """A send claim written next to tool calls, judged now that they have
+        answered: True when it stands (a send among them went out); otherwise
+        it is stored as rejected with the corrective (while retries last) and
+        never shown."""
+        verdict = self._judge_reply(text, text, turn_start_idx, user_input, offered, held=True)
+        if not verdict.false:
+            return True
+        self._log_fabrication(verdict, text, with_tool_calls=True)
+        if self._fabrication_retry_count < MAX_FABRICATION_RETRIES:
+            self._reject_fabrication(text, verdict)
+        return False
+
+    def _with_fabrication_backstop(
+        self, text: str, turn_start_idx: int, user_input: str, offered: frozenset[str],
+    ) -> str:
+        """*text* as shipped without a retry (a salvage, a fallback answer):
+        what the gate would turn down gets the backstop lines it would add."""
+        if fabrication_guard.has_backstop(text):
+            return text
+        verdict = self._judge_reply(text, text, turn_start_idx, user_input, offered)
+        if not verdict.false or not verdict.backstop:
+            return text
+        self._log_fabrication(verdict, text, shipped_without_retry=True)
+        return str(text).rstrip() + "\n\n" + verdict.backstop
+
     # ------------------------------------------------------------------
     # complete() — main entry point
     # ------------------------------------------------------------------
@@ -926,6 +1076,12 @@ class AgentOrchestrationMixin:
         # stall ("Let me…", "I'll fetch…").  Capped by MAX_STALL_RETRIES
         # so a genuinely-stuck turn still terminates.
         self._stall_retry_count: int = 0
+        # Reset per-turn counter of replies turned down as made-up tool work
+        # (a false send, a made-up ID, a narrated lookup): one budget for all,
+        # MAX_FABRICATION_RETRIES, apart from the stall one — see the gate
+        # below. The request last sent is what the ID check reads as given.
+        self._fabrication_retry_count: int = 0
+        self._turn_request_messages: list[Message] | None = None
         # Reset per-turn malformed / cut-off tool-call retry counter. Bumped
         # each time a truncated-JSON, length-truncated, or guard-refused tool
         # call is turned into a forced corrective re-issue. Off (0) unless the
@@ -1068,6 +1224,7 @@ class AgentOrchestrationMixin:
 
         def finish(text: str, success: bool = True) -> str:
             self._emit_thinking("", phase="done")
+            self._turn_request_messages = None   # held for the made-up ID check only
             if planning_pipeline is not None:
                 self._finalize_pipeline(planning_pipeline, success=success)
             self._finalize_turn_usage(turn_usage)
@@ -1076,6 +1233,14 @@ class AgentOrchestrationMixin:
             if success:
                 self._record_timing_event("last_assistant_at")
             return text
+
+        def _backstopped(text: Any) -> Any:
+            """A reply shipped without the gate's retry (a salvage, a fallback
+            answer): what the gate would turn down in it (a false send, a
+            made-up ID, a narrated lookup) gets the backstop lines."""
+            if not isinstance(text, str) or not text.strip():
+                return text
+            return self._with_fabrication_backstop(text, turn_start_idx, user_input, _offered_tools)
 
         async def _salvage_partial_result(reason: str) -> str:
             """Try to produce a useful partial result when the agent gets
@@ -1088,7 +1253,13 @@ class AgentOrchestrationMixin:
                summarise what it has gathered so far.
             3. Falls back to the last short assistant text (>20 chars).
             4. Returns empty string if nothing useful is available.
+
+            A reply a gate turned down is never salvaged, and what is shipped
+            still reporting tool work nobody did gets the gate's backstop lines.
             """
+            return _backstopped(await _salvage_raw(reason))
+
+        async def _salvage_raw(reason: str) -> str:
             if not self.session:
                 return ""
             # 0. An answer cut off mid-continuation: its joined parts.
@@ -1099,7 +1270,7 @@ class AgentOrchestrationMixin:
             # 1. Look for a substantial assistant response (likely a real answer).
             last_short_assistant = ""
             for _msg in reversed(turn_msgs):
-                if _msg.get("role") == "assistant":
+                if _msg.get("role") == "assistant" and _msg.get("origin") != "rejected":
                     _c = str(_msg.get("content", "")).strip()
                     if _c and len(_c) > 100:
                         return _c
@@ -1683,6 +1854,10 @@ class AgentOrchestrationMixin:
         # Nudge at most once per turn when raw planning/contract JSON leaks as
         # the final response (weak models echo the contract instead of answering).
         _plan_leak_nudged = False
+        # The tools this iteration offers (the made-up tool work gate reads
+        # them); kept for the salvage paths, which run before the next
+        # iteration's tool list is built.
+        _offered_tools: frozenset[str] = frozenset()
 
         for iteration in range(hard_turn_iterations):
             _continuing_answer, _continue_answer_next = _continue_answer_next, False
@@ -1999,6 +2174,9 @@ class AgentOrchestrationMixin:
                         intent_matched=list(_intent_tools & {td["name"] for td in tool_defs}),
                     )
             self._note_tool_schema_tokens(tool_defs)
+            _offered_tools = frozenset(
+                str(td.get("name", "")).strip().lower() for td in (tool_defs or [])
+            ) - {""}
             # Governed: never send past the real window. The budget already
             # holds the calibrated ratio; this catches a first call before any
             # calibration, or a ratio that jumped — one forced re-cut.
@@ -2053,6 +2231,9 @@ class AgentOrchestrationMixin:
             _overflows_seen = 0
             response = None  # type: ignore[assignment]
             for _llm_attempt in range(_max_llm_retries + 1):
+                # What the model is given in this call (the made-up ID check
+                # reads it as known).
+                self._turn_request_messages = messages
                 try:
                     response = await self._complete_with_guards(
                         messages=messages,
@@ -2168,7 +2349,7 @@ class AgentOrchestrationMixin:
                             error=error_str,
                             parts=len(_answer_parts),
                         )
-                        final = _join_cut_off(_answer_parts)
+                        final = _backstopped(_join_cut_off(_answer_parts))
                         self._update_clarification_state(
                             user_input=user_input,
                             effective_user_input=effective_user_input,
@@ -2187,7 +2368,7 @@ class AgentOrchestrationMixin:
                             turn_usage=turn_usage,
                         )
                         finalized, final_text, finish_success = await attempt_finalize(
-                            output_text=final,
+                            output_text=_backstopped(final),
                             iteration=iteration,
                             finish_success=False,
                         )
@@ -2232,14 +2413,20 @@ class AgentOrchestrationMixin:
                 log.info("Tool calls detected", count=len(response.tool_calls), calls=response.tool_calls)
                 # Capture intermediate text emitted alongside tool calls.
                 _tc_text = str(response.content or "").strip()
-                if _tc_text:
+                # A send claimed next to other calls ("**Sent** to Roger.
+                # Adding the blocker." + a calendar call) is judged once the
+                # calls have answered; until then it is not narrated, folded
+                # into the answer or stored with the calls.
+                _held_claim = (_tc_text if self._claims_send(_tc_text, user_input, _offered_tools)
+                               else "")
+                if _tc_text and not _held_claim:
                     _intermediate_texts.append(_tc_text)
                     if self._emit_narration(_tc_text, iteration):
                         _narration_streamed = True
                 _tools_executed_count += len(response.tool_calls)
                 self._add_session_message(
                     role="assistant",
-                    content=str(response.content or ""),
+                    content="" if _held_claim else str(response.content or ""),
                     tool_calls=self._serialize_tool_calls_for_session(response.tool_calls),
                 )
                 _tool_results = await self._handle_tool_calls(
@@ -2249,6 +2436,11 @@ class AgentOrchestrationMixin:
                     task_policy=active_task_tool_policy,
                     abort_event=turn_abort_event,
                 )
+                if _held_claim and self._settle_held_claim(
+                        _held_claim, turn_start_idx, user_input, _offered_tools):
+                    _intermediate_texts.append(_held_claim)
+                    if self._emit_narration(_held_claim, iteration):
+                        _narration_streamed = True
 
                 # ── Write-loop detection ───────────────────────────
                 # If the agent keeps rewriting the same file(s), it's
@@ -2558,7 +2750,7 @@ class AgentOrchestrationMixin:
                         turn_usage=turn_usage,
                     )
                     finalized, final_text, finish_success = await attempt_finalize(
-                        output_text=final,
+                        output_text=_backstopped(final),
                         iteration=iteration,
                         finish_success=True,
                     )
@@ -2577,14 +2769,17 @@ class AgentOrchestrationMixin:
                     content_preview=str(response.content or "")[:300],
                 )
                 _emb_text = str(response.content or "").strip()
-                if _emb_text:
+                # Judged after the calls, like explicit ones (see above).
+                _held_claim = (_emb_text if self._claims_send(_emb_text, user_input, _offered_tools)
+                               else "")
+                if _emb_text and not _held_claim:
                     _intermediate_texts.append(_emb_text)
                     if self._emit_narration(_emb_text, iteration):
                         _narration_streamed = True
                 _tools_executed_count += len(embedded_calls)
                 self._add_session_message(
                     role="assistant",
-                    content=str(response.content or ""),
+                    content="" if _held_claim else str(response.content or ""),
                     tool_calls=self._serialize_tool_calls_for_session(embedded_calls),
                 )
                 _emb_tool_results = await self._handle_tool_calls(
@@ -2594,6 +2789,11 @@ class AgentOrchestrationMixin:
                     task_policy=active_task_tool_policy,
                     abort_event=turn_abort_event,
                 )
+                if _held_claim and self._settle_held_claim(
+                        _held_claim, turn_start_idx, user_input, _offered_tools):
+                    _intermediate_texts.append(_held_claim)
+                    if self._emit_narration(_held_claim, iteration):
+                        _narration_streamed = True
 
                 # Free iteration for successful glob (embedded path).
                 if _emb_tool_results and any(
@@ -2754,7 +2954,7 @@ class AgentOrchestrationMixin:
                         turn_usage=turn_usage,
                     )
                     finalized, final_text, finish_success = await attempt_finalize(
-                        output_text=final,
+                        output_text=_backstopped(final),
                         iteration=iteration,
                         finish_success=True,
                     )
@@ -2772,7 +2972,7 @@ class AgentOrchestrationMixin:
                 # loop endlessly on spurious embedded tool matches.
                 if is_worker and str(response.content or "").strip():
                     finalized, final_text, finish_success = await attempt_finalize(
-                        output_text=response.content,
+                        output_text=_backstopped(response.content),
                         iteration=iteration,
                         finish_success=True,
                     )
@@ -2786,6 +2986,10 @@ class AgentOrchestrationMixin:
             if command:
                 _tools_executed_count += 1
                 _inline_text = str(response.content or "").strip()
+                # A send claim around the command is never shown (the command
+                # is no mail send).
+                if self._claims_send(_inline_text, user_input, _offered_tools):
+                    _inline_text = ""
                 if _inline_text:
                     _intermediate_texts.append(_inline_text)
                     if self._emit_narration(_inline_text, iteration):
@@ -2815,7 +3019,7 @@ class AgentOrchestrationMixin:
                     if original_text:
                         log.info("Inline command rejected as non-command, using original response text")
                         finalized, final_text, finish_success = await attempt_finalize(
-                            output_text=original_text,
+                            output_text=_backstopped(original_text),
                             iteration=iteration,
                             finish_success=True,
                         )
@@ -2844,7 +3048,7 @@ class AgentOrchestrationMixin:
                         turn_usage=turn_usage,
                     )
                     finalized, final_text, finish_success = await attempt_finalize(
-                        output_text=final,
+                        output_text=_backstopped(final),
                         iteration=iteration,
                         finish_success=True,
                     )
@@ -2866,7 +3070,7 @@ class AgentOrchestrationMixin:
                         turn_usage=turn_usage,
                     )
                     finalized, final_text, finish_success = await attempt_finalize(
-                        output_text=response.content,
+                        output_text=_backstopped(response.content),
                         iteration=iteration,
                         finish_success=True,
                     )
@@ -2880,7 +3084,7 @@ class AgentOrchestrationMixin:
                         turn_usage=turn_usage,
                     )
                     finalized, final_text, finish_success = await attempt_finalize(
-                        output_text=final,
+                        output_text=_backstopped(final),
                         iteration=iteration,
                         finish_success=False,
                     )
@@ -2947,7 +3151,51 @@ class AgentOrchestrationMixin:
             if _answer_parts and not response.tool_calls:
                 response.content = _join_cut_off(_answer_parts + [str(response.content or "")])
                 _answer_parts = []
+            # The reply as the model wrote it: a made-up ID inside a forged
+            # lane note (cut just below) still shows the reply is made up.
+            _raw_reply = str(response.content or "")
+            # A lane note the model wrote into its reply is not another run's
+            # result: cut it before anything reads, stores or ships the reply.
+            if not response.tool_calls and response.content:
+                _without_lane_note = fabrication_guard.strip_forged_lane_notes(
+                    _raw_reply, user_input,
+                    [str(_m.get("content") or "") for _m in (
+                        self.session.messages if self.session else [])
+                     if msg_origin.is_lane_note(_m)],
+                )
+                if _without_lane_note != _raw_reply:
+                    log.warning("Model-written lane note cut from the reply",
+                                preview=_raw_reply[:160])
+                    response.content = _without_lane_note
             _stall_resp_text = str(response.content or "")
+            # ── Made-up tool work gate ────────────────────────────
+            # The reply says an email went out, but none did this turn; quotes
+            # a mail / calendar / drive ID no tool returned (read on the raw
+            # reply); or, in a turn that made no tool call, narrates lookups
+            # ("Searching for the thread…", "Checked the calendar —"). A weak
+            # model answers "**Sent** to …" — often with an invented ID —
+            # instead of calling the tool. Runs before the deliverable
+            # exemption below: a long false reply is still false. One budget
+            # for every kind, apart from the stall one; the false reply is
+            # stored as rejected so later turns never replay it as an example.
+            # The corrective only asks for a true reply — never a send — and
+            # no tool_choice is forced.
+            _fab_verdict = fabrication_guard.Verdict()
+            if not response.tool_calls:
+                _fab_verdict = self._judge_reply(
+                    _raw_reply, _stall_resp_text, turn_start_idx, user_input, _offered_tools,
+                )
+            if _fab_verdict.false:
+                self._log_fabrication(_fab_verdict, _stall_resp_text)
+                if self._fabrication_retry_count < MAX_FABRICATION_RETRIES:
+                    # The reply as written: the corrective may name an ID the
+                    # lane-note cut took out.
+                    self._reject_fabrication(_raw_reply, _fab_verdict)
+                    continue
+                # Budget spent, still false: the user is told plainly.
+                if _fab_verdict.backstop:
+                    _stall_resp_text = _stall_resp_text.rstrip() + "\n\n" + _fab_verdict.backstop
+                    response.content = _stall_resp_text
             # False-action-claim gate: the reply claims it delegated/sent to a
             # peer, but no flight_deck/consult_peer tool was called THIS TURN —
             # i.e. the model is lying. Force a corrective retry instead of
@@ -2961,10 +3209,20 @@ class AgentOrchestrationMixin:
                 str(k).split("|", 1)[0] in ("flight_deck", "consult_peer")
                 for k in getattr(self, "_turn_tool_call_counts", {})
             )
+            # Lines that report an email are the gate's above: the delegation
+            # corrective would point the model at flight_deck. When the
+            # request itself asks for a hand-off, a line is the email's only
+            # if it names mail itself ("Poslao sam mail Ani", not "Poslao sam
+            # zadatak Researcheru").
+            _handoff_asked = _claims_delegation(user_input)
             _false_claim = (
                 not response.tool_calls
                 and not _delegated_this_turn
-                and _claims_delegation(_stall_resp_text)
+                and _claims_delegation("\n".join(
+                    _line for _i, _line in enumerate(_stall_resp_text.split("\n"))
+                    if _i not in _fab_verdict.claim_lines or (
+                        _handoff_asked and not fabrication_guard.claims_mail_sent(_line))
+                ))
             )
             # False web-research claim: the reply says it searched/fetched the
             # web, but no web tool ran THIS turn — i.e. the model fabricated the
@@ -2992,8 +3250,12 @@ class AgentOrchestrationMixin:
             _turn_produced_deliverable = False
             if self.session:
                 for _m in self.session.messages[turn_start_idx:]:
+                    # A reply a gate turned down (a false mail-send claim, a
+                    # cut-off part) is not completed work: "I'll send it now."
+                    # after one is still a stall.
                     if (
                         _m.get("role") == "assistant"
+                        and _m.get("origin") != "rejected"
                         and len(str(_m.get("content", "")).strip()) > 200
                     ):
                         _turn_produced_deliverable = True

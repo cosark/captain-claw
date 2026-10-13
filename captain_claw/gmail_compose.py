@@ -727,3 +727,16 @@ def is_repeat_refusal(text: str) -> bool:
     """Whether a tool / Flight Deck error is a :func:`repeat_refusal` — the email
     already existed, so nothing failed."""
     return REPEAT_MARK in (text or "")
+
+
+# What :func:`describe_repeat` (and microsoft_mail's refusal) writes for an
+# email found in Sent; a draft match reads "Draft ID …" / "a draft in this thread".
+_SENT_REPEAT_MARK = REPEAT_MARK + "the email sent on "
+
+
+def is_sent_repeat_refusal(text: str) -> bool:
+    """Whether a repeat refusal names an email already SENT — the one repeat
+    that means the email went out. A refusal that names a draft means it is
+    still waiting in Drafts (drafts are listed first, so a draft match wins
+    even when a sent copy exists too)."""
+    return _SENT_REPEAT_MARK in (text or "")

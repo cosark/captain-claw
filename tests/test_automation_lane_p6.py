@@ -547,6 +547,51 @@ def test_the_digest_carries_the_earlier_summary_and_the_last_reply(tmp_path, mon
     mgr._conn.close()
 
 
+def test_the_digest_quotes_replies_the_made_up_id_check_can_cut(tmp_path, monkeypatch):
+    # fabrication_guard cuts a quoted reply up to its closing quote: a reply
+    # with a double quote inside is written with single ones.
+    from captain_claw import fabrication_guard
+
+    agent, mgr = _digest_agent(tmp_path, monkeypatch)
+    s = agent.session
+    s.add_message("user", "which thread?", origin="human")
+    s.add_message("assistant", 'Ana said "fine" — thread 18c2e9f8a7b6c5d4.', origin="model")
+    digest = agent._digest_for_compaction(s.messages)
+    assert '→ "Ana said \'fine\' — thread 18c2e9f8a7b6c5d4."' in digest
+    carried = "Before that: " + " ".join(digest.splitlines()[1:])
+    assert "18c2e9f8a7b6c5d4" not in fabrication_guard.without_digest_replies(carried)
+    mgr._conn.close()
+
+
+async def test_compaction_takes_the_folded_messages_into_the_id_ledger(tmp_path, monkeypatch):
+    # A message some writer appended past Session.add_message still leaves
+    # its IDs known once compaction folds it.
+    from captain_claw.config import set_config
+    from captain_claw.fabrication_guard import ID_LEDGER_KEY
+
+    agent, mgr = _digest_agent(tmp_path, monkeypatch)
+    agent.session_manager = _SessionManager()
+    old = get_config().model_copy(deep=True)
+    cfg = old.model_copy(deep=True)
+    cfg.context.max_tokens = 60
+    set_config(cfg)
+    try:
+        agent.session.messages.append({
+            "role": "tool", "tool_name": "google_calendar", "tool_call_id": "c1", "origin": "tool",
+            "tool_arguments": {"action": "get_event"},
+            "content": "Event: Acme sync\n  ID: q3vb81kd4m5n6p7r8s9t0u1v2a"})
+        for n in range(12):
+            agent.session.add_message("user", f"question {n} " + "word " * 6, origin="human")
+            agent.session.add_message("assistant", f"answer {n} " + "word " * 6, origin="model")
+        assert ID_LEDGER_KEY not in agent.session.metadata
+        compacted, _stats = await agent.compact_session(force=True, trigger="auto")
+        assert compacted
+        assert agent.session.metadata[ID_LEDGER_KEY]["ids"] == ["q3vb81kd4m5n6p7r8s9t0u1v2a"]
+    finally:
+        set_config(old)
+        mgr._conn.close()
+
+
 def test_a_slice_nobody_typed_in_goes_to_the_model(tmp_path, monkeypatch):
     agent, mgr = _digest_agent(tmp_path, monkeypatch)
     s = agent.session

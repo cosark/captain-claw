@@ -15,5 +15,6 @@ CRITICAL rules for the output:
 - Be specific and concise — each instruction should be actionable
 - Organize by theme (communication style, technical approach, user preferences, etc.)
 - Include both things to improve AND things to keep doing well
+- Never write a directive about how to announce or report an action as done, checked or verified (no "state that you checked", "report the steps together", "lead with **Done.**"). An action counts only when its tool call ran: in the conversation, "[assistant → <tool> <action>]" marks a call that ran, and an "[assistant]" reply that reports an action without one is a false claim to correct, never a pattern to keep or generalise. "[automation result …]" lines are other runs' results (their calls ran there) and "[summary]" lines summarise earlier turns — neither is a claim to correct
 - Maximum 15 bullet points total
 - Do NOT use markdown headers — output a flat bullet list only
