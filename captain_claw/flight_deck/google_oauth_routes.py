@@ -1155,7 +1155,9 @@ async def google_agent_status(request: Request) -> dict[str, Any]:
     No network, no tokens, no scopes. On a shared-agent member's turn it answers
     for the MEMBER: ``enabled`` is their opt-in for this agent, ``connected``
     whether they connected their own Google (only looked at when enabled).
-    Otherwise for the agent's owner, always enabled.
+    Otherwise for the agent's owner, always enabled. ``gmail_send_attachments``
+    says this deck's /gmail/send takes files — an agent checks it first, since
+    an older deck would send the email without them.
     """
     _authorize_agent_call(request)
     acting = await speaker_grants.acting_member(request, google=False)
@@ -1164,9 +1166,11 @@ async def google_agent_status(request: Request) -> dict[str, Any]:
         enabled = await speaker_grants.google_opted_in(
             db, acting.user_id, acting.agent_ref, acting.owner)
         connected = enabled and await is_google_connected(acting.user_id)
-        return {"connected": bool(connected), "enabled": bool(enabled)}
+        return {"connected": bool(connected), "enabled": bool(enabled),
+                "gmail_send_attachments": True}
     owner = await _agent_owner(request)
-    return {"connected": bool(await is_google_connected(owner)), "enabled": True}
+    return {"connected": bool(await is_google_connected(owner)), "enabled": True,
+            "gmail_send_attachments": True}
 
 
 @router.get("/credentials")

@@ -32,6 +32,11 @@ A revision goes through update_draft, which edits the existing draft.
 Attachments: read_message / get_thread list each one with a number;
 get_attachment saves one (or all) under ``saved/downloads/<session>/mail-<id>/`` and
 says which tool reads it (pdf_extract, docx_extract, image_vision, read…).
+Outgoing: create_draft / update_draft / send take ``attachments`` — local file
+paths, loaded and checked by :mod:`captain_claw.mail_attachments` before
+anything is created or sent. A message with files goes through Gmail's upload
+endpoint (:func:`gmail_compose.start_upload`); update_draft keeps the draft's
+own files (``remove_attachments`` drops some).
 
 There are still no label / trash / delete actions.
 """
@@ -48,7 +53,7 @@ from typing import Any
 
 import httpx
 
-from captain_claw import gmail_compose, mail_authority
+from captain_claw import gmail_compose, mail_attachments, mail_authority
 from captain_claw.config import get_config
 from captain_claw.logging import get_logger
 from captain_claw.tools.registry import Tool, ToolResult
@@ -199,6 +204,14 @@ class GoogleMailTool(Tool):
         "ATTACHMENTS: read_message lists them numbered; get_attachment (message_id + attachment "
         "number/name, or 'all') saves them and tells you which tool reads each — open an "
         "attachment before answering questions about its contents. "
+        "ATTACHING FILES: create_draft / send / update_draft take attachments=[paths] — files on "
+        "disk as the file tools name them (the path a tool printed, a saved/ path, or "
+        "vfs:<project>/<path>). Up to 25 MB per email (about 18 MB of files); for bigger files "
+        "upload to Drive and put the link in the body. update_draft keeps the draft's own files "
+        "and adds yours (a same-named file replaces the old one); remove_attachments=[names or "
+        "numbers, or 'all'] drops some; with only file changes the body can be left out. "
+        "send_draft sends the draft as it is — add files with update_draft first. A file is "
+        "attached only when the tool's answer lists it under 'Attachments:'. "
         "ROUTING: any user request that refers to an email, message, inbox, thread, "
         "conversation, sender, subject line, or Gmail — including phrases like "
         "'read the one from X', 'open that email', 'show me the Fil Rouge email', "
@@ -244,7 +257,8 @@ class GoogleMailTool(Tool):
         "original conversation in Gmail, with proper In-Reply-To/References headers and a "
         "`Re:` subject."
     )
-    timeout_seconds = 120.0
+    # Uploading an email with 25 MB of files can take a while.
+    timeout_seconds = 300.0
     parameters = {
         "type": "object",
         "properties": {
@@ -319,6 +333,23 @@ class GoogleMailTool(Tool):
                 "description": (
                     "For get_attachment: which attachment — its number from read_message "
                     "('1', '2', …), its name, or 'all'. Optional when the message has one."
+                ),
+            },
+            "attachments": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "For create_draft / send / update_draft: local files to attach — paths "
+                    "as the file tools take them (the path a tool printed, a saved/ path, "
+                    "or vfs:<project>/<path>). At most 20 files, 25 MB per email."
+                ),
+            },
+            "remove_attachments": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "For update_draft: the draft's attachments to drop — names or numbers "
+                    "from read_message on the draft, or 'all'. The rest are kept."
                 ),
             },
             "reply_to_message_id": {
@@ -399,11 +430,12 @@ class GoogleMailTool(Tool):
 
     async def execute(self, action: str, **kwargs: Any) -> ToolResult:
         """Dispatch to the appropriate action handler."""
-        # Where get_attachment saves (the same runtime context the file tools get).
+        # Where get_attachment saves and where attachments are found (the
+        # same runtime context the file tools get).
         runtime = {
             key: kwargs.pop(key, None)
             for key in ("_runtime_base_path", "_saved_base_path", "_session_id",
-                        "_file_registry", "_task_id")
+                        "_file_registry", "_task_id", "_workflow_run_dir")
         }
         kwargs.pop("_abort_event", None)
         if action == "get_attachment":
@@ -449,6 +481,12 @@ class GoogleMailTool(Tool):
                 )
                 return ToolResult(success=False, error=_refusal)
 
+        # Files to attach: every one checked and read before anything is
+        # created or sent — one that can't be attached refuses the call.
+        problem = await self._take_attachments(action, kwargs, runtime)
+        if problem:
+            return ToolResult(success=False, error=problem)
+
         if action in _SEND_ACTIONS:
             from captain_claw.google_oauth_manager import GoogleOAuthManager
             from captain_claw.session import get_session_manager
@@ -491,6 +529,63 @@ class GoogleMailTool(Tool):
         except Exception as exc:
             log.error("Gmail tool error", action=action, error=str(exc))
             return ToolResult(success=False, error=str(exc))
+
+    _NOTHING_DONE = {
+        "send": "Nothing was sent.",
+        "create_draft": "No draft was created.",
+        "update_draft": "Nothing was changed.",
+    }
+
+    async def _take_attachments(
+        self, action: str, kwargs: dict[str, Any], runtime: dict[str, Any],
+    ) -> str:
+        """Replace ``attachments`` / ``remove_attachments`` in *kwargs* with the
+        loaded files (``_attachments``) and the names to drop
+        (``_remove_attachments``); the refusal, or "" when they are usable."""
+        raw = kwargs.pop("attachments", None)
+        raw_remove = kwargs.pop("remove_attachments", None)
+        try:
+            values = mail_attachments.parse_list(raw)
+            remove = mail_attachments.parse_list(raw_remove)
+        except mail_attachments.AttachmentError as exc:
+            return f"{exc} {self._NOTHING_DONE.get(action, '')}".strip()
+        if action == "send_draft" and (values or remove):
+            return (
+                "send_draft sends the draft as it is — it takes no attachments. Add or drop "
+                "files with update_draft (draft_id + attachments / remove_attachments) first, "
+                "then send_draft. Nothing was sent."
+            )
+        if remove and action != "update_draft":
+            return (f"remove_attachments works only with update_draft. "
+                    f"{self._NOTHING_DONE.get(action, '')}").strip()
+        if not values or action not in self._NOTHING_DONE:
+            kwargs["_remove_attachments"] = remove
+            return ""
+        try:
+            kwargs["_attachments"] = await mail_attachments.load(
+                values, runtime,
+                max_total_bytes=mail_attachments.GMAIL_MAX_MESSAGE_BYTES * 3 // 4,
+                limit_label="Gmail takes 25 MB per email, about 18 MB of files once encoded",
+            )
+        except mail_attachments.AttachmentError as exc:
+            return f"{exc} {self._NOTHING_DONE[action]}"
+        kwargs["_remove_attachments"] = remove
+        return ""
+
+    @staticmethod
+    def _too_large(message: bytes, nothing_done: str) -> str:
+        """The refusal when a built message is over Gmail's size limit, else ""."""
+        if len(message) <= mail_attachments.GMAIL_MAX_MESSAGE_BYTES:
+            return ""
+        return (
+            f"This email would be {mail_attachments.human_size(len(message))} once encoded — "
+            "Gmail takes at most 25 MB. Attach fewer or smaller files, or upload big ones to "
+            f"Drive and put the share link in the body. {nothing_done}"
+        )
+
+    @staticmethod
+    def _attachments_line(atts: list[mail_attachments.Attachment]) -> str:
+        return f"\n  Attachments: {mail_attachments.describe(atts)}" if atts else ""
 
     async def _own_addresses(self) -> set[str]:
         """The mailbox's own address (``users/me/profile``); ``set()`` on any error.
@@ -1160,9 +1255,11 @@ class GoogleMailTool(Tool):
         html_body: str = "",
         reply_to_message_id: str = "",
         allow_repeat: Any = False,
+        _attachments: list[mail_attachments.Attachment] | None = None,
         **kwargs: Any,
     ) -> ToolResult:
-        """Save a draft message.
+        """Save a draft message (with *_attachments*, the files
+        :meth:`_take_attachments` loaded).
 
         When ``reply_to_message_id`` is provided, the draft is created
         inside the original message's thread with In-Reply-To /
@@ -1171,6 +1268,7 @@ class GoogleMailTool(Tool):
         Refused (nothing created) when the same email is already drafted or
         sent — unless *allow_repeat*.
         """
+        atts = list(_attachments or [])
         thread_id: str = ""
         in_reply_to: str = ""
         references: str = ""
@@ -1193,7 +1291,7 @@ class GoogleMailTool(Tool):
             if not subject and ctx["subject_default"]:
                 subject = ctx["subject_default"]
 
-        if not reply_to_message_id and not to and not subject and not body:
+        if not reply_to_message_id and not to and not subject and not body and not atts:
             return ToolResult(
                 success=False,
                 error="create_draft requires at least one of: to, subject, body (or reply_to_message_id).",
@@ -1209,22 +1307,36 @@ class GoogleMailTool(Tool):
             if problem:
                 return ToolResult(success=False, error=problem)
 
-        raw = self._build_raw_message(
-            to=to, cc=cc, bcc=bcc, subject=subject,
-            body=body, html_body=html_body,
-            in_reply_to=in_reply_to, references=references,
-        )
-        draft_message: dict[str, Any] = {"raw": raw}
-        if thread_id:
-            draft_message["threadId"] = thread_id
+        if atts:
+            message = gmail_compose.build_message_bytes(
+                to=to, cc=cc, bcc=bcc, subject=subject,
+                body=body, html_body=html_body,
+                in_reply_to=in_reply_to, references=references, attachments=atts,
+            )
+            problem = self._too_large(message, "No draft was created.")
+            if problem:
+                return ToolResult(success=False, error=problem)
+            data = await self._upload_message(
+                token, "POST", "/users/me/drafts",
+                {"message": {"threadId": thread_id} if thread_id else {}}, message,
+            )
+        else:
+            raw = self._build_raw_message(
+                to=to, cc=cc, bcc=bcc, subject=subject,
+                body=body, html_body=html_body,
+                in_reply_to=in_reply_to, references=references,
+            )
+            draft_message: dict[str, Any] = {"raw": raw}
+            if thread_id:
+                draft_message["threadId"] = thread_id
 
-        resp = await self._client.post(
-            f"{_GMAIL_API}/users/me/drafts",
-            headers={**self._auth_headers(token), "Content-Type": "application/json"},
-            json={"message": draft_message},
-        )
-        resp.raise_for_status()
-        data = resp.json()
+            resp = await self._client.post(
+                f"{_GMAIL_API}/users/me/drafts",
+                headers={**self._auth_headers(token), "Content-Type": "application/json"},
+                json={"message": draft_message},
+            )
+            resp.raise_for_status()
+            data = resp.json()
         threaded_note = ""
         if thread_id:
             threaded_note = f"\n  Threaded under: {thread_id} (reply to {reply_to_message_id})"
@@ -1234,8 +1346,19 @@ class GoogleMailTool(Tool):
                 f"Draft created.{threaded_note}\n"
                 f"  Draft ID: {data.get('id', '?')}\n"
                 f"  Message ID: {data.get('message', {}).get('id', '?')}"
+                + self._attachments_line(atts)
             ),
         )
+
+    async def _upload_message(
+        self, token: str, method: str, path: str, metadata: dict[str, Any], message: bytes,
+    ) -> dict[str, Any]:
+        """A message with files through Gmail's upload endpoint (see
+        :func:`gmail_compose.start_upload`); Gmail's JSON answer."""
+        session = await gmail_compose.start_upload(
+            self._client, token, method, path, metadata, len(message),
+        )
+        return await gmail_compose.finish_upload(self._client, token, session, message)
 
     # ------------------------------------------------------------------
     # Action: update_draft
@@ -1252,34 +1375,46 @@ class GoogleMailTool(Tool):
         body: str = "",
         html_body: str = "",
         reply_to_message_id: str = "",
+        _attachments: list[mail_attachments.Attachment] | None = None,
+        _remove_attachments: list[str] | None = None,
         **kwargs: Any,
     ) -> ToolResult:
         """Revise an existing draft in place (``drafts.update``) — so a
         revision never becomes a second draft.
 
-        drafts.update replaces the whole message, so the body is required (the
-        full new text). To / Cc / Bcc / Subject left unset keep the draft's
-        own, and so does a reply draft's threading; ``reply_to_message_id``
-        threads it under that email as create_draft does (its to / subject
-        defaults apply only where the draft has none).
+        drafts.update replaces the whole message, so it is rebuilt from the
+        draft's own raw copy (``format=raw`` — gmail.compose may read it,
+        unlike attachments.get). With a new body (the full new text) the
+        message is built afresh and the draft's files carried over byte for
+        byte; inline images of the old text go with it. With only file
+        changes the draft stays exactly as it was — its text, inline images
+        and files — less *_remove_attachments* and any file a new one of the
+        same name replaces, plus *_attachments*. To / Cc / Bcc / Subject left
+        unset keep the draft's own, and so does a reply draft's threading;
+        ``reply_to_message_id`` threads it under that email as create_draft
+        does (its to / subject defaults apply only where the draft has none).
         """
+        new_atts = list(_attachments or [])
+        remove = list(_remove_attachments or [])
         draft_id = (draft_id or "").strip()
         if not draft_id:
             return ToolResult(
                 success=False,
                 error="update_draft requires draft_id (the Draft ID from create_draft or list_drafts).",
             )
-        if not ((body or "").strip() or (html_body or "").strip()):
+        has_body = bool((body or "").strip() or (html_body or "").strip())
+        if not has_body and not new_atts and not remove:
             return ToolResult(
                 success=False,
                 error=(
                     "update_draft replaces the draft's text — pass the full new body "
                     "(body or html_body). read_message with the draft's Message ID shows "
-                    "the current one. Nothing was changed."
+                    "the current one. (To change only its files, pass attachments / "
+                    "remove_attachments.) Nothing was changed."
                 ),
             )
         try:
-            draft = await self._fetch_draft_metadata(token, draft_id)
+            draft = await self._fetch_draft_metadata(token, draft_id, fmt="raw")
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
                 return ToolResult(
@@ -1291,12 +1426,25 @@ class GoogleMailTool(Tool):
                 )
             raise
         current = draft.get("message", {}) or {}
-        headers = self._header_map(current)
+        raw = str(current.get("raw") or "")
+        if raw:
+            own = mail_attachments.parse_message(
+                base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)))
+            headers = {k.lower(): str(own.get(k) or "") for k in
+                       ("To", "Cc", "Bcc", "Subject", "In-Reply-To", "References")}
+        elif has_body:
+            own, headers = None, self._header_map(current)
+        else:
+            return ToolResult(success=False, error=(
+                f"Gmail didn't return draft {draft_id}'s content, so its text can't be kept — "
+                "pass the full body too. Nothing was changed."
+            ))
         in_reply_to = headers.get("in-reply-to", "")
         references = headers.get("references", "")
         # Only a reply draft is pinned to its thread; a standalone draft's
         # own thread id carries nothing worth keeping.
         thread_id = str(current.get("threadId") or "") if in_reply_to else ""
+        changed = {k: v for k, v in (("To", to), ("Cc", cc), ("Bcc", bcc), ("Subject", subject)) if v}
         to = to or headers.get("to", "")
         cc = cc or headers.get("cc", "")
         bcc = bcc or headers.get("bcc", "")
@@ -1309,28 +1457,77 @@ class GoogleMailTool(Tool):
             thread_id = ctx["thread_id"]
             in_reply_to = ctx["in_reply_to"]
             references = ctx["references"]
+            changed.update({"In-Reply-To": in_reply_to, "References": references})
             if not to and ctx["reply_to_default"]:
-                to = ctx["reply_to_default"]
+                to = changed["To"] = ctx["reply_to_default"]
             if not subject and ctx["subject_default"]:
-                subject = ctx["subject_default"]
+                subject = changed["Subject"] = ctx["subject_default"]
 
-        raw = self._build_raw_message(
-            to=to, cc=cc, bcc=bcc, subject=subject,
-            body=body, html_body=html_body,
-            in_reply_to=in_reply_to, references=references,
-        )
-        message: dict[str, Any] = {"raw": raw}
-        if thread_id:
-            message["threadId"] = thread_id
+        own_files = mail_attachments.message_files(own) if own is not None else []
+        drop, problem = self._files_to_drop(own_files, remove, new_atts)
+        if problem:
+            return ToolResult(success=False, error=problem)
+        dropped_inline = 0
+        if has_body:
+            # New text: a fresh message, the draft's files carried over as they are.
+            message = mail_attachments.parse_message(gmail_compose.build_message_bytes(
+                to=to, cc=cc, bcc=bcc, subject=subject,
+                body=body, html_body=html_body,
+                in_reply_to=in_reply_to, references=references,
+            ))
+            for f in own_files:
+                if f.inline:
+                    dropped_inline += f not in drop
+                    continue
+                if f in drop:
+                    continue
+                if message.get_content_type() != "multipart/mixed":
+                    message.make_mixed()
+                message.attach(f.part)
+        else:
+            # Only files change: the draft stays as it was around them.
+            message = own
+            for f in drop:
+                mail_attachments.detach(f)
+            for name, value in changed.items():
+                del message[name]
+                message[name] = value
+        mail_attachments.add_to(message, new_atts)
+        files_now = mail_attachments.message_files(message)
+        message_bytes = message.as_bytes()
 
-        resp = await self._client.put(
-            f"{_GMAIL_API}/users/me/drafts/{draft_id}",
-            headers={**self._auth_headers(token), "Content-Type": "application/json"},
-            json={"id": draft_id, "message": message},
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        if own_files or new_atts:
+            problem = self._too_large(message_bytes, "Nothing was changed.")
+            if problem:
+                return ToolResult(success=False, error=problem)
+            data = await self._upload_message(
+                token, "PUT", f"/users/me/drafts/{draft_id}",
+                {"id": draft_id, "message": {"threadId": thread_id} if thread_id else {}},
+                message_bytes,
+            )
+        else:
+            message_json: dict[str, Any] = {
+                "raw": base64.urlsafe_b64encode(message_bytes).decode("ascii").rstrip("="),
+            }
+            if thread_id:
+                message_json["threadId"] = thread_id
+
+            resp = await self._client.put(
+                f"{_GMAIL_API}/users/me/drafts/{draft_id}",
+                headers={**self._auth_headers(token), "Content-Type": "application/json"},
+                json={"id": draft_id, "message": message_json},
+            )
+            resp.raise_for_status()
+            data = resp.json()
         threaded_note = f"\n  Threaded under: {thread_id}" if thread_id else ""
+        files_line = ""
+        if files_now:
+            files_line = f"\n  Attachments: {mail_attachments.describe_parts(files_now)}"
+        elif own_files:
+            files_line = "\n  Attachments: none"
+        if dropped_inline:
+            files_line += (f"\n  ({dropped_inline} inline image(s) of the old text were dropped "
+                           "with it — the new text doesn't show them.)")
         return ToolResult(
             success=True,
             content=(
@@ -1339,8 +1536,46 @@ class GoogleMailTool(Tool):
                 f"  Message ID: {data.get('message', {}).get('id', '?')}\n"
                 f"  To: {to or '(no recipient)'}\n"
                 f"  Subject: {subject or '(no subject)'}"
+                + files_line
             ),
         )
+
+    @staticmethod
+    def _files_to_drop(
+        own_files: list[mail_attachments.FilePart],
+        remove: list[str],
+        new_atts: list[mail_attachments.Attachment],
+    ) -> tuple[list[mail_attachments.FilePart], str]:
+        """The draft's files *remove* names (a name, a number from
+        read_message, or 'all' — every file but the text's inline images)
+        plus those a new file of the same name replaces; ``(files, refusal)``."""
+        listing = ", ".join(f"[{n}] {f.name}" for n, f in enumerate(own_files, 1)) or "none"
+        drop: list[mail_attachments.FilePart] = []
+
+        def add(f: mail_attachments.FilePart) -> None:
+            if all(f is not d for d in drop):
+                drop.append(f)
+
+        for item in remove:
+            key = item.strip()
+            if key.lower() == "all":
+                for f in own_files:
+                    if not f.inline:
+                        add(f)
+            elif key.isdigit() and 1 <= int(key) <= len(own_files):
+                add(own_files[int(key) - 1])
+            else:
+                hits = [f for f in own_files if f.name.casefold() == key.casefold()]
+                if not hits:
+                    return [], (f"The draft has no attachment '{key}' (it has: {listing}). "
+                                "Nothing was changed.")
+                for f in hits:
+                    add(f)
+        replaced = {a.filename.casefold() for a in new_atts}
+        for f in own_files:
+            if not f.inline and f.name.casefold() in replaced:
+                add(f)
+        return drop, ""
 
     # ------------------------------------------------------------------
     # Action: list_drafts
@@ -1399,12 +1634,15 @@ class GoogleMailTool(Tool):
         )
         return ToolResult(success=True, content="\n".join(lines))
 
-    async def _fetch_draft_metadata(self, token: str, draft_id: str) -> dict[str, Any]:
-        """A draft with its message headers. (drafts.get takes only
-        ``format`` — no ``metadataHeaders`` — so metadata returns them all.)"""
+    async def _fetch_draft_metadata(
+        self, token: str, draft_id: str, fmt: str = "metadata",
+    ) -> dict[str, Any]:
+        """A draft with its message headers (*fmt* ``full``: and its parts).
+        (drafts.get takes only ``format`` — no ``metadataHeaders`` — so
+        metadata returns them all.)"""
         resp = await self._client.get(
             f"{_GMAIL_API}/users/me/drafts/{draft_id}",
-            params={"format": "metadata"},
+            params={"format": fmt},
             headers=self._auth_headers(token),
         )
         resp.raise_for_status()
@@ -1469,6 +1707,12 @@ class GoogleMailTool(Tool):
         if data.get("bcc"):
             lines.append(f"  Bcc: {data['bcc']}")
         lines.append(f"  Subject: {data.get('subject') or '(no subject)'}")
+        files = data.get("attachments")
+        if isinstance(files, list) and files:
+            lines.append("  Attachments: " + ", ".join(
+                f"{f.get('filename') or '?'} ({mail_attachments.human_size(int(f.get('size') or 0))})"
+                for f in files if isinstance(f, dict)
+            ))
         lines.append(f"  Message ID: {data.get('message_id') or '?'}")
         lines.append(f"  Thread ID: {data.get('thread_id') or '?'}")
         if data.get("daily_limit"):
@@ -1489,10 +1733,12 @@ class GoogleMailTool(Tool):
         html_body: str = "",
         reply_to_message_id: str = "",
         allow_repeat: Any = False,
+        _attachments: list[mail_attachments.Attachment] | None = None,
         **kwargs: Any,
     ) -> ToolResult:
         """Send an email now (standalone). Reply threading, the to / subject
         defaults and the repeat check are exactly create_draft's."""
+        atts = list(_attachments or [])
         thread_id: str = ""
         in_reply_to: str = ""
         references: str = ""
@@ -1527,25 +1773,62 @@ class GoogleMailTool(Tool):
 
         # Put exactly the checked addresses on the wire.
         to, cc, bcc = (gmail_compose.format_recipients(f) for f in (to, cc, bcc))
-        raw = self._build_raw_message(
-            to=to, cc=cc, bcc=bcc, subject=subject,
-            body=body, html_body=html_body,
-            in_reply_to=in_reply_to, references=references,
-        )
-        message: dict[str, Any] = {"raw": raw}
-        if thread_id:
-            message["threadId"] = thread_id
+        if atts:
+            message_bytes = gmail_compose.build_message_bytes(
+                to=to, cc=cc, bcc=bcc, subject=subject,
+                body=body, html_body=html_body,
+                in_reply_to=in_reply_to, references=references, attachments=atts,
+            )
+            problem = self._too_large(message_bytes, "Nothing was sent.")
+            if problem:
+                return ToolResult(success=False, error=problem)
+            try:
+                session = await gmail_compose.start_upload(
+                    self._client, token, "POST", "/users/me/messages/send",
+                    {"threadId": thread_id} if thread_id else {}, len(message_bytes),
+                )
+            except httpx.HTTPStatusError as exc:
+                return ToolResult(success=False, error=(
+                    f"{self._handle_http_error(exc).error} Nothing was sent."))
+            except httpx.HTTPError as exc:
+                return ToolResult(success=False, error=(
+                    f"Could not reach Gmail ({type(exc).__name__}). Nothing was sent."))
+            try:
+                data = await gmail_compose.finish_upload(self._client, token, session, message_bytes)
+            except httpx.HTTPError as exc:
+                maybe = (exc.response.status_code >= 500
+                         if isinstance(exc, httpx.HTTPStatusError)
+                         else not isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)))
+                if not maybe:
+                    return ToolResult(success=False, error=(
+                        f"{self._handle_http_error(exc).error} Nothing was sent."
+                        if isinstance(exc, httpx.HTTPStatusError)
+                        else f"Could not reach Gmail ({type(exc).__name__}). Nothing was sent."))
+                return ToolResult(success=False, error=(
+                    f"Email may or may not have been sent ({type(exc).__name__}) — Gmail didn't "
+                    "confirm it. Do not resend blindly: check the Sent folder "
+                    "(google_mail action=search query='in:sent ...') first."))
+        else:
+            raw = self._build_raw_message(
+                to=to, cc=cc, bcc=bcc, subject=subject,
+                body=body, html_body=html_body,
+                in_reply_to=in_reply_to, references=references,
+            )
+            message: dict[str, Any] = {"raw": raw}
+            if thread_id:
+                message["threadId"] = thread_id
 
-        resp = await self._client.post(
-            f"{_GMAIL_API}/users/me/messages/send",
-            headers={**self._auth_headers(token), "Content-Type": "application/json"},
-            json=message,
-        )
-        resp.raise_for_status()
-        data = resp.json()
+            resp = await self._client.post(
+                f"{_GMAIL_API}/users/me/messages/send",
+                headers={**self._auth_headers(token), "Content-Type": "application/json"},
+                json=message,
+            )
+            resp.raise_for_status()
+            data = resp.json()
         return ToolResult(success=True, content=self._sent_summary({
             "to": to, "cc": cc, "bcc": bcc, "subject": subject,
             "message_id": data.get("id", ""), "thread_id": data.get("threadId", ""),
+            "attachments": [{"filename": a.filename, "size": len(a.data)} for a in atts],
         }))
 
     async def _action_send_draft(
@@ -1563,7 +1846,7 @@ class GoogleMailTool(Tool):
                 error="send_draft requires draft_id (the Draft ID from create_draft or list_drafts).",
             )
         try:
-            draft = await self._fetch_draft_metadata(token, draft_id)
+            draft = await self._fetch_draft_metadata(token, draft_id, fmt="full")
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
                 return ToolResult(
@@ -1575,6 +1858,7 @@ class GoogleMailTool(Tool):
                 )
             raise
         headers = self._header_map(draft.get("message", {}) or {})
+        files = gmail_compose.payload_files((draft.get("message") or {}).get("payload") or {})
         to, cc, bcc = headers.get("to", ""), headers.get("cc", ""), headers.get("bcc", "")
         problem = self._local_send_problem(to, cc, bcc)
         if problem:
@@ -1590,6 +1874,7 @@ class GoogleMailTool(Tool):
         return ToolResult(success=True, content=self._sent_summary({
             "to": to, "cc": cc, "bcc": bcc, "subject": headers.get("subject", ""),
             "message_id": data.get("id", ""), "thread_id": data.get("threadId", ""),
+            "attachments": files,
         }))
 
     async def _send_via_flight_deck(
@@ -1620,6 +1905,10 @@ class GoogleMailTool(Tool):
             if self._flag(kwargs.get("allow_repeat")):
                 # FD runs the repeat check for a composed send; this skips it.
                 payload["allow_repeat"] = True
+            atts = kwargs.get("_attachments") or []
+            if atts:
+                # FD builds the email itself; it re-checks these.
+                payload["attachments"] = mail_attachments.to_wire(atts)
         url = f"{mgr._flight_deck_base()}/fd/google/gmail/send"
         from captain_claw import speaker as _speaker
 
@@ -1630,8 +1919,17 @@ class GoogleMailTool(Tool):
             params = _speaker.grant_params()
         except _speaker.SpeakerGrantMissing:
             return ToolResult(success=False, error=f"Email not sent: {_speaker.NO_GRANT_MESSAGE}")
+        if payload.get("attachments") and not await self._fd_takes_attachments(mgr, headers, params):
+            # An older deck ignores the files and sends the email without them.
+            return ToolResult(success=False, error=(
+                "Email not sent: this Flight Deck can't send files yet (it needs an update and "
+                "a restart). Nothing was sent. To send it now with the files: create_draft with "
+                "the same attachments, then send_draft its Draft ID — or tell the user."
+            ))
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
+            # Files make the request big and FD's upload to Gmail slow.
+            timeout = 240 if payload.get("attachments") else 60
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 resp = await client.post(url, json=payload, headers=headers, params=params)
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             return ToolResult(
@@ -1666,7 +1964,33 @@ class GoogleMailTool(Tool):
                     success=False, error=f"Email may or may not have been sent: {detail}",
                 )
             return ToolResult(success=False, error=f"Email not sent: {detail}")
-        return ToolResult(success=True, content=self._sent_summary(data if isinstance(data, dict) else {}))
+        data = data if isinstance(data, dict) else {}
+        summary = self._sent_summary(data)
+        sent = {a["filename"] for a in payload.get("attachments") or []}
+        listed = {str(f.get("filename")) for f in data.get("attachments") or [] if isinstance(f, dict)}
+        if sent - listed:
+            summary += (
+                "\n  WARNING: Flight Deck did not confirm these files: "
+                f"{', '.join(sorted(sent - listed))} — the email may have gone without "
+                "them. Tell the user; don't resend blindly."
+            )
+        return ToolResult(success=True, content=summary)
+
+    @staticmethod
+    async def _fd_takes_attachments(mgr: Any, headers: dict[str, str], params: dict[str, str]) -> bool:
+        """Does this Flight Deck's send route take files? (Its agent_status
+        says so; an older deck — or no answer — counts as no.)"""
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"{mgr._flight_deck_base()}/fd/google/agent_status",
+                    headers=headers, params=params,
+                )
+            data = resp.json() if resp.status_code == 200 else {}
+        except Exception as exc:  # noqa: BLE001 — unknown counts as no
+            log.info("Flight Deck capability check failed", error=str(exc))
+            return False
+        return isinstance(data, dict) and data.get("gmail_send_attachments") is True
 
     # ------------------------------------------------------------------
     # Raw RFC-822 message builder

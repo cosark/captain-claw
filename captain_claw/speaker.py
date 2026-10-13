@@ -956,7 +956,8 @@ class PathRule:
 
 SPEAKER_PATH_MAP: dict[str, tuple[PathRule, ...]] = {
     "insights": (), "playbooks": (), "topics": (), "web_search": (), "web_fetch": (),
-    "google_mail": (), "google_calendar": (),
+    # google_mail: the files a draft or send attaches (read, like read's /path).
+    "google_mail": (PathRule("/attachments/*", "read_abs"),), "google_calendar": (),
     "google_drive": (PathRule("/local_path", "read_abs"), PathRule("/output_path", "download_dest")),
     "typesense": (PathRule("/file_path", "read_abs"),),
     "read": (PathRule("/path", "read", True),),

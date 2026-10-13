@@ -496,7 +496,7 @@ class TestOwnerPathUnchanged:
             r = await c.get("/fd/google/access_token", headers={"X-Agent-Auth": HELPER_TOK})
             assert r.status_code == 200 and r.json()["access_token"] == "tok-O"
             r = await c.get("/fd/google/agent_status", headers={"X-Agent-Auth": HELPER_TOK})
-            assert r.json() == {"connected": True, "enabled": True}
+            assert r.json() == {"connected": True, "enabled": True, "gmail_send_attachments": True}
 
 
 class TestNoTurn:
@@ -639,7 +639,7 @@ class TestRecordChecks:
             assert r.status_code == 403 and r.json()["detail"] == sg.GOOGLE_OFF_DETAIL
             _no_tokens_in(r)
             r = await _call(c, "GET", "/fd/google/agent_status", grant=tok)
-            assert r.status_code == 200 and r.json() == {"connected": False, "enabled": False}
+            assert r.status_code == 200 and r.json() == {"connected": False, "enabled": False, "gmail_send_attachments": True}
 
     async def test_membership_lost(self, gdeck):
         tok = _mint()
@@ -692,7 +692,7 @@ class TestGoogleAsMember:
             assert r.status_code == 403 and r.json()["detail"] == sg.GOOGLE_OFF_DETAIL
             _no_tokens_in(r)
             r = await _call(c, "GET", "/fd/google/agent_status", grant=tok)
-            assert r.status_code == 200 and r.json() == {"connected": False, "enabled": False}
+            assert r.status_code == 200 and r.json() == {"connected": False, "enabled": False, "gmail_send_attachments": True}
         assert sg.lookup(tok) is not None  # Google off doesn't end the turn
 
     async def test_optin_and_connected(self, gdeck):
@@ -702,7 +702,7 @@ class TestGoogleAsMember:
             r = await _call(c, "GET", "/fd/google/access_token", grant=tok)
             assert r.status_code == 200 and r.json()["access_token"] == "tok-M"
             r = await _call(c, "GET", "/fd/google/agent_status", grant=tok)
-        assert r.json() == {"connected": True, "enabled": True}
+        assert r.json() == {"connected": True, "enabled": True, "gmail_send_attachments": True}
         assert not {"access_token", "scope", "refresh_token"} & set(r.json())
 
     async def test_optin_not_connected(self, gdeck):
@@ -714,14 +714,14 @@ class TestGoogleAsMember:
             assert r.status_code == 404
             _no_tokens_in(r)
             r = await _call(c, "GET", "/fd/google/agent_status", grant=tok)
-        assert r.json() == {"connected": False, "enabled": True}
+        assert r.json() == {"connected": False, "enabled": True, "gmail_send_attachments": True}
 
     async def test_agent_status_owner(self, gdeck):
         await gdeck.db.delete_setting(OWNER, gr._K_TOKENS)
         gr._primary_owner_cache.update(id=OTHER, at=time.time())  # no legacy fallback for O
         async with _agent_client() as c:
             r = await c.get("/fd/google/agent_status", headers={"X-Agent-Auth": HELPER_TOK})
-        assert r.json() == {"connected": False, "enabled": True}
+        assert r.json() == {"connected": False, "enabled": True, "gmail_send_attachments": True}
 
     async def test_credentials_refuses_the_markers(self, gdeck):
         tok = _mint()

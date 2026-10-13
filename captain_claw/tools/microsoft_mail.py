@@ -7,7 +7,10 @@ Microsoft connection (:mod:`captain_claw.microsoft_oauth_manager`):
   Outlook conversation), list_folders, get_attachment (saved under
   ``saved/downloads/<session>/mail-<id>/`` with the tool that reads it).
 * Write: create_draft (new or a reply that stays in its conversation),
-  update_draft, list_drafts. **No sending** — the agent never sends Outlook
+  update_draft, list_drafts — both write actions take ``attachments`` (local
+  files, checked by :mod:`captain_claw.mail_attachments` before the draft is
+  touched; under 3 MB in one request, bigger through a Graph upload session),
+  and update_draft ``remove_attachments``. **No sending** — the agent never sends Outlook
   mail; the user reviews the draft and sends it from Outlook. (Gmail sends go
   through Flight Deck's per-user policy, audit and limits; Outlook has no such
   gate yet, so no send action exists.)
@@ -25,6 +28,7 @@ Scopes: ``Mail.Read`` to read, ``Mail.ReadWrite`` to draft.
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -32,7 +36,7 @@ from urllib.parse import quote
 
 import httpx
 
-from captain_claw import gmail_compose, mail_authority
+from captain_claw import gmail_compose, mail_attachments, mail_authority
 from captain_claw.config import get_config
 from captain_claw.logging import get_logger
 from captain_claw.microsoft_graph import (
@@ -41,6 +45,7 @@ from captain_claw.microsoft_graph import (
     MAIL_WRITE,
     flag,
     graph_error,
+    graph_message,
     graph_token,
     limit,
     odata_string,
@@ -55,6 +60,14 @@ _WRITE_ACTIONS = frozenset({"create_draft", "update_draft"})
 _MAX_BODY_CHARS = 30_000
 _MAX_ATTACHMENT_BYTES = 30 * 1024 * 1024
 _MAX_ATTACHMENTS_PER_CALL = 10
+# Attaching: Graph takes a file "under 3 MB" in one POST (base64 in a request
+# capped near 4 MB) and refuses an upload session for one that small; bigger
+# files go through a session in chunks under 4 MB (a multiple of 320 KiB).
+# Which MB Graph means is undocumented: at 3 MB (decimal) and up a session is
+# tried, and one refused as too small falls back to the POST.
+_SMALL_ATTACHMENT_BYTES = 3_000_000
+_UPLOAD_CHUNK_BYTES = 10 * 320 * 1024
+_SESSION_TOO_SMALL = "ErrorAttachmentSizeShouldNotBeLessThanMinimumSize"
 
 _MSG_SELECT = (
     "id,conversationId,subject,from,toRecipients,ccRecipients,receivedDateTime,"
@@ -153,7 +166,13 @@ class MicrosoftMailTool(Tool):
         "don't retry; pass allow_repeat=true only if the user explicitly wants another copy. "
         "Replies pass reply_to_message_id (reply_all=true for reply-all) so the draft stays in the "
         "conversation. ATTACHMENTS: read_message lists them numbered; get_attachment saves them and "
-        "names the tool that reads each. ROUTING: any request about an Outlook email, inbox, "
+        "names the tool that reads each. ATTACHING FILES: create_draft / update_draft take "
+        "attachments=[paths] — files on disk as the file tools name them (the path a tool printed, "
+        "a saved/ path, or vfs:<project>/<path>), up to 25 MB per email; for bigger files share a "
+        "OneDrive link in the body. update_draft keeps the draft's files and adds yours (a "
+        "same-named file replaces the old one); remove_attachments=[names or numbers, or 'all'] "
+        "drops some; with only file changes the body can be left out. A file is attached only when "
+        "the tool's answer lists it under 'Attachments:'. ROUTING: any request about an Outlook email, inbox, "
         "conversation, sender or subject MUST use microsoft_mail — never filesystem tools. "
         "Actions: list_messages (newest first; folder default Inbox; grouped by conversation), "
         "search (Outlook search: from:, to:, subject:, hasattachments:true, received>=2026-01-01, "
@@ -161,7 +180,8 @@ class MicrosoftMailTool(Tool):
         "get_thread (whole conversation), list_folders, create_draft, update_draft (replace a "
         "draft's body; unset to/cc/bcc/subject keep the draft's own), list_drafts, get_attachment."
     )
-    timeout_seconds = 120.0
+    # Uploading 25 MB of attachments can take a while.
+    timeout_seconds = 300.0
     parameters = {
         "type": "object",
         "properties": {
@@ -223,6 +243,23 @@ class MicrosoftMailTool(Tool):
             },
             "reply_all": {"type": "boolean", "description": "create_draft reply: include everyone (reply all)."},
             "draft_id": {"type": "string", "description": "update_draft: the Draft ID create_draft / list_drafts printed."},
+            "attachments": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "create_draft / update_draft: local files to attach — paths as the file tools "
+                    "take them (the path a tool printed, a saved/ path, or vfs:<project>/<path>). "
+                    "At most 20 files, 25 MB together."
+                ),
+            },
+            "remove_attachments": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "update_draft: the draft's attachments to drop — names or numbers from "
+                    "read_message on the draft, or 'all'."
+                ),
+            },
             "allow_repeat": {
                 "type": "boolean",
                 "description": (
@@ -254,6 +291,7 @@ class MicrosoftMailTool(Tool):
 
     async def execute(self, action: str, **kwargs: Any) -> ToolResult:
         runtime = pop_runtime(kwargs)
+        runtime["_workflow_run_dir"] = kwargs.pop("_workflow_run_dir", None)
         if action == "get_attachment":
             kwargs["_runtime"] = runtime
         handlers = {
@@ -297,6 +335,11 @@ class MicrosoftMailTool(Tool):
                          action=action, kind=mail_authority.current().kind)
                 return ToolResult(success=False, error=refusal)
 
+        # Files to attach: all checked and read before the draft is touched.
+        problem = await self._take_attachments(action, kwargs, runtime)
+        if problem:
+            return ToolResult(success=False, error=problem)
+
         write = action in _WRITE_ACTIONS
         try:
             token, _granted = await graph_token(
@@ -315,6 +358,35 @@ class MicrosoftMailTool(Tool):
         except Exception as exc:
             log.error("Outlook mail tool error", action=action, error=str(exc))
             return ToolResult(success=False, error=str(exc))
+
+    async def _take_attachments(
+        self, action: str, kwargs: dict[str, Any], runtime: dict[str, Any],
+    ) -> str:
+        """Swap ``attachments`` / ``remove_attachments`` in *kwargs* for the
+        loaded files (``_attachments``) and the names to drop
+        (``_remove_attachments``); the refusal, or ""."""
+        nothing = "No draft was created." if action == "create_draft" else "Nothing was changed."
+        raw = kwargs.pop("attachments", None)
+        raw_remove = kwargs.pop("remove_attachments", None)
+        if action not in _WRITE_ACTIONS:
+            return ""
+        try:
+            values = mail_attachments.parse_list(raw)
+            remove = mail_attachments.parse_list(raw_remove)
+        except mail_attachments.AttachmentError as exc:
+            return f"{exc} {nothing}"
+        if remove and action != "update_draft":
+            return f"remove_attachments works only with update_draft. {nothing}"
+        kwargs["_remove_attachments"] = remove
+        if values:
+            try:
+                kwargs["_attachments"] = await mail_attachments.load(
+                    values, runtime, max_total_bytes=mail_attachments.OUTLOOK_MAX_TOTAL_BYTES,
+                    limit_label="attachments are limited to 25 MB per email",
+                )
+            except mail_attachments.AttachmentError as exc:
+                return f"{exc} {nothing}"
+        return ""
 
     # ── HTTP helpers ────────────────────────────────────────────────
 
@@ -649,8 +721,10 @@ class MicrosoftMailTool(Tool):
     async def _action_create_draft(
         self, token: str, to: str = "", cc: str = "", bcc: str = "", subject: str = "",
         body: str = "", html_body: str = "", reply_to_message_id: str = "",
-        reply_all: Any = None, allow_repeat: Any = None, **kwargs: Any,
+        reply_all: Any = None, allow_repeat: Any = None,
+        _attachments: list[mail_attachments.Attachment] | None = None, **kwargs: Any,
     ) -> ToolResult:
+        atts = list(_attachments or [])
         bad = gmail_compose.invalid_recipients(to, cc, bcc)
         if bad:
             return ToolResult(success=False, error=gmail_compose.invalid_recipients_message(bad)
@@ -659,9 +733,9 @@ class MicrosoftMailTool(Tool):
             return await self._reply_draft(
                 token, reply_to_message_id, to=to, cc=cc, bcc=bcc, subject=subject,
                 body=body or gmail_compose.html_to_text(html_body or ""),
-                reply_all=flag(reply_all), allow_repeat=flag(allow_repeat),
+                reply_all=flag(reply_all), allow_repeat=flag(allow_repeat), atts=atts,
             )
-        if not to and not subject and not body and not html_body:
+        if not to and not subject and not body and not html_body and not atts:
             return ToolResult(success=False, error=(
                 "create_draft requires at least one of: to, subject, body (or reply_to_message_id)."
             ))
@@ -683,11 +757,15 @@ class MicrosoftMailTool(Tool):
             message["bccRecipients"] = _recipients(bcc)
         resp = await self._client.post(f"{GRAPH_API}/me/messages", json=message, headers=self._headers(token))
         resp.raise_for_status()
-        return ToolResult(success=True, content=self._draft_saved(resp.json(), "Draft created"))
+        draft = resp.json()
+        return ToolResult(success=True, content=await self._saved_with_files(
+            token, draft, "Draft created", atts,
+        ))
 
     async def _reply_draft(
         self, token: str, original_id: str, *, to: str, cc: str, bcc: str, subject: str,
         body: str, reply_all: bool, allow_repeat: bool,
+        atts: list[mail_attachments.Attachment] | None = None,
     ) -> ToolResult:
         orig = await self._get(token, f"/me/messages/{_seg(original_id)}", {
             "$select": "id,subject,from,replyTo,toRecipients,ccRecipients,conversationId,receivedDateTime,sentDateTime",
@@ -726,8 +804,9 @@ class MicrosoftMailTool(Tool):
             json={"comment": body or "", "message": message}, headers=self._headers(token),
         )
         resp.raise_for_status()
-        return ToolResult(success=True, content=self._draft_saved(
-            resp.json(), f"Reply draft created in conversation {orig.get('conversationId')}",
+        return ToolResult(success=True, content=await self._saved_with_files(
+            token, resp.json(), f"Reply draft created in conversation {orig.get('conversationId')}",
+            list(atts or []),
         ))
 
     @staticmethod
@@ -742,22 +821,35 @@ class MicrosoftMailTool(Tool):
 
     async def _action_update_draft(
         self, token: str, draft_id: str = "", to: str = "", cc: str = "", bcc: str = "",
-        subject: str = "", body: str = "", html_body: str = "", **kwargs: Any,
+        subject: str = "", body: str = "", html_body: str = "",
+        _attachments: list[mail_attachments.Attachment] | None = None,
+        _remove_attachments: list[str] | None = None, **kwargs: Any,
     ) -> ToolResult:
+        """Revise a draft in place: the body (the full new text), any of
+        to / cc / bcc / subject given, and its files — *_attachments* added
+        (one with the name of a file already there replaces it, once the new
+        one is in), *_remove_attachments* dropped. With only file changes the
+        body can be left out."""
+        new_atts = list(_attachments or [])
+        remove = list(_remove_attachments or [])
         draft_id = str(draft_id or "").strip()
         if not draft_id:
             return ToolResult(success=False, error="update_draft requires draft_id (from create_draft or list_drafts).")
-        if not (str(body or "").strip() or str(html_body or "").strip()):
+        has_body = bool(str(body or "").strip() or str(html_body or "").strip())
+        if not has_body and not new_atts and not remove:
             return ToolResult(success=False, error=(
                 "update_draft replaces the draft's text — pass the full new body. read_message "
-                "with the Draft ID shows the current one. Nothing was changed."
+                "with the Draft ID shows the current one. (To change only its files, pass "
+                "attachments / remove_attachments.) Nothing was changed."
             ))
         bad = gmail_compose.invalid_recipients(to, cc, bcc)
         if bad:
             return ToolResult(success=False, error=gmail_compose.invalid_recipients_message(bad)
                               .replace("Nothing was sent.", "Nothing was changed."))
         try:
-            current = await self._get(token, f"/me/messages/{_seg(draft_id)}", {"$select": "id,isDraft"})
+            current = await self._get(token, f"/me/messages/{_seg(draft_id)}", {
+                "$select": "id,isDraft,subject,toRecipients,webLink",
+            })
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
                 return ToolResult(success=False, error=(
@@ -767,10 +859,15 @@ class MicrosoftMailTool(Tool):
             raise
         if not current.get("isDraft"):
             return ToolResult(success=False, error=f"{draft_id} is not a draft (it was sent) — nothing was changed.")
-        patch: dict[str, Any] = {
-            "body": ({"contentType": "html", "content": html_body} if html_body
-                     else {"contentType": "text", "content": body}),
-        }
+        existing = await self._attachments(token, draft_id) if (new_atts or remove) else []
+        drop_ids, problem = self._removal_ids(existing, remove)
+        if problem:
+            return ToolResult(success=False, error=problem)
+
+        patch: dict[str, Any] = {}
+        if has_body:
+            patch["body"] = ({"contentType": "html", "content": html_body} if html_body
+                             else {"contentType": "text", "content": body})
         if subject:
             patch["subject"] = subject
         if to:
@@ -779,13 +876,177 @@ class MicrosoftMailTool(Tool):
             patch["ccRecipients"] = _recipients(cc)
         if bcc:
             patch["bccRecipients"] = _recipients(bcc)
-        resp = await self._client.patch(
-            f"{GRAPH_API}/me/messages/{_seg(draft_id)}", json=patch, headers=self._headers(token),
+        draft = current
+        if patch:
+            resp = await self._client.patch(
+                f"{GRAPH_API}/me/messages/{_seg(draft_id)}", json=patch, headers=self._headers(token),
+            )
+            resp.raise_for_status()
+            draft = resp.json()
+        if not new_atts and not remove:
+            return ToolResult(success=True, content=self._draft_saved(
+                draft, "Draft updated (same draft — no new one was created)",
+            ))
+
+        failed = await self._attach_all(token, draft_id, new_atts)
+        failed_names = {a.filename.casefold() for a, _why in failed}
+        replacing = {a.filename.casefold() for a in new_atts} - failed_names
+        not_removed: list[str] = []
+        for att in existing:
+            name = str(att.get("name") or "")
+            explicit = str(att.get("id")) in drop_ids
+            # An old same-named file goes only once its replacement is in; and
+            # when any new file failed, nothing is removed — the draft never
+            # ends up with neither the old file nor its replacement.
+            if explicit and failed:
+                not_removed.append(f"{name} (kept because a new file failed to attach)")
+                continue
+            if explicit or (not att.get("isInline") and name.casefold() in replacing):
+                try:
+                    resp = await self._client.delete(
+                        f"{GRAPH_API}/me/messages/{_seg(draft_id)}/attachments/{_seg(str(att.get('id')))}",
+                        headers=self._headers(token),
+                    )
+                    resp.raise_for_status()
+                except httpx.HTTPError as exc:
+                    not_removed.append(f"{name} ({self._why(exc)})")
+        now = await self._attachments(token, draft_id)
+        lines = [self._draft_saved(draft, "Draft updated (same draft — no new one was created)")]
+        lines.append(self._files_line(now) or "  Attachments: none")
+        lines += self._failure_lines(draft_id, failed)
+        if not_removed:
+            lines.append(f"  NOT removed (still on the draft): {', '.join(not_removed)}")
+        return ToolResult(success=True, content="\n".join(lines))
+
+    @staticmethod
+    def _removal_ids(existing: list[dict[str, Any]], remove: list[str]) -> tuple[set[str], str]:
+        """The ids of the draft's attachments *remove* names (a name, a number
+        from read_message, or 'all' — every file but the text's inline images,
+        e.g. a signature logo); ``(ids, refusal)``."""
+        ids: set[str] = set()
+        names = [str(a.get("name") or "") for a in existing]
+        listing = ", ".join(f"[{i}] {n}" for i, n in enumerate(names, 1)) or "none"
+        for item in remove:
+            key = item.strip()
+            if key.lower() == "all":
+                ids.update(str(a.get("id")) for a in existing if not a.get("isInline"))
+            elif key.isdigit() and 1 <= int(key) <= len(existing):
+                ids.add(str(existing[int(key) - 1].get("id")))
+            else:
+                hits = {str(a.get("id")) for a, n in zip(existing, names) if n.casefold() == key.casefold()}
+                if not hits:
+                    return set(), (f"The draft has no attachment '{key}' (it has: {listing}). "
+                                   "Nothing was changed.")
+                ids |= hits
+        return ids, ""
+
+    # ── attaching files ─────────────────────────────────────────────
+
+    async def _saved_with_files(
+        self, token: str, draft: dict[str, Any], lead: str,
+        atts: list[mail_attachments.Attachment],
+    ) -> str:
+        """The new draft's summary, after attaching *atts* to it."""
+        text = self._draft_saved(draft, lead)
+        if not atts:
+            return text
+        draft_id = str(draft.get("id") or "")
+        failed = await self._attach_all(token, draft_id, atts)
+        failed_ids = {id(f) for f, _why in failed}
+        added = [a for a in atts if id(a) not in failed_ids]
+        lines = [text]
+        if added:
+            lines.append(f"  Attachments: {mail_attachments.describe(added)}")
+        lines += self._failure_lines(draft_id, failed)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _failure_lines(
+        draft_id: str, failed: list[tuple[mail_attachments.Attachment, str]],
+    ) -> list[str]:
+        if not failed:
+            return []
+        return [
+            "  NOT attached: " + ", ".join(f"{a.filename} ({why})" for a, why in failed)
+            + f". The draft is saved without them — try again with update_draft "
+            f"draft_id={draft_id} attachments=[…], or tell the user.",
+        ]
+
+    @staticmethod
+    def _files_line(atts: list[dict[str, Any]]) -> str:
+        if not atts:
+            return ""
+        return "  Attachments: " + ", ".join(
+            f"{a.get('name') or 'attachment'} ({'inline image, ' if a.get('isInline') else ''}"
+            f"{mail_attachments.human_size(int(a.get('size') or 0))})"
+            for a in atts
         )
+
+    @staticmethod
+    def _why(exc: httpx.HTTPError) -> str:
+        if isinstance(exc, httpx.HTTPStatusError):
+            code, message = graph_message(exc)
+            detail = message or code
+            return f"Outlook HTTP {exc.response.status_code}" + (f": {detail}" if detail else "")
+        return type(exc).__name__
+
+    async def _attach_all(
+        self, token: str, message_id: str, atts: list[mail_attachments.Attachment],
+    ) -> list[tuple[mail_attachments.Attachment, str]]:
+        """Attach each file to the draft; the ones that failed, with why."""
+        failed: list[tuple[mail_attachments.Attachment, str]] = []
+        for att in atts:
+            try:
+                await self._add_attachment(token, message_id, att)
+            except httpx.HTTPError as exc:
+                log.info("Outlook attachment failed", name=att.filename, error=str(exc))
+                failed.append((att, self._why(exc)))
+        return failed
+
+    async def _add_attachment(
+        self, token: str, message_id: str, att: mail_attachments.Attachment,
+    ) -> None:
+        """One file onto a draft: a single POST under 3 MB, else an upload
+        session in chunks. Raises :class:`httpx.HTTPError`."""
+        url = f"{GRAPH_API}/me/messages/{_seg(message_id)}/attachments"
+        size = len(att.data)
+
+        async def _post_whole() -> None:
+            resp = await self._client.post(url, json={
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": att.filename,
+                "contentType": att.mime_type,
+                "contentBytes": base64.b64encode(att.data).decode("ascii"),
+            }, headers=self._headers(token))
+            resp.raise_for_status()
+
+        if size < _SMALL_ATTACHMENT_BYTES:
+            await _post_whole()
+            return
+        resp = await self._client.post(f"{url}/createUploadSession", json={"AttachmentItem": {
+            "attachmentType": "file", "name": att.filename, "size": size,
+            "contentType": att.mime_type,
+        }}, headers=self._headers(token))
+        if resp.status_code == 400 and graph_message(
+            httpx.HTTPStatusError("", request=resp.request, response=resp),
+        )[0] == _SESSION_TOO_SMALL:
+            await _post_whole()
+            return
         resp.raise_for_status()
-        return ToolResult(success=True, content=self._draft_saved(
-            resp.json(), "Draft updated (same draft — no new one was created)",
-        ))
+        upload_url = str((resp.json() or {}).get("uploadUrl") or "")
+        if not upload_url.startswith("https://"):
+            raise httpx.HTTPStatusError(
+                "Outlook did not return an upload session",
+                request=resp.request, response=httpx.Response(502, request=resp.request),
+            )
+        for start in range(0, size, _UPLOAD_CHUNK_BYTES):
+            chunk = att.data[start:start + _UPLOAD_CHUNK_BYTES]
+            # The session URL carries its own credential: no Authorization header.
+            put = await self._client.put(upload_url, content=chunk, headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Range": f"bytes {start}-{start + len(chunk) - 1}/{size}",
+            })
+            put.raise_for_status()
 
     async def _action_list_drafts(
         self, token: str, query: str = "", max_results: Any = None, **kwargs: Any,
