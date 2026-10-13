@@ -307,7 +307,7 @@ class TestAgentSend:
         assert r.status_code == 200, r.text
         assert r.json() == {"ok": True, "message_id": "sent-1", "thread_id": "t-new",
                             "to": "Bob <bob@x.co>", "cc": "", "bcc": "", "subject": "Hello",
-                            "sent_last_24h": 1, "daily_limit": 50}
+                            "attachments": [], "sent_last_24h": 1, "daily_limit": 50}
         (send,) = gmail.sends()
         assert send.url.path.endswith("/users/me/messages/send")
         assert send.headers["Authorization"] == "Bearer alice-access"
@@ -392,7 +392,7 @@ class TestAgentSend:
         assert r.json()["to"] == "Dave <dave@ok.com>" and r.json()["subject"] == "From the draft"
         assert r.json()["message_id"] == "sent-d" and r.json()["thread_id"] == "td"
         (meta,) = [q for q in gmail.requests if q.method == "GET"]
-        assert meta.url.params["format"] == "metadata"
+        assert meta.url.params["format"] == "full"  # its files are listed in the answer
         (send,) = gmail.sends()
         assert send.url.path.endswith("/users/me/drafts/send")
         assert json.loads(send.content) == {"id": "d1"}
@@ -783,10 +783,164 @@ class TestSendHistory:
         sends = c.get("/fd/google/gmail-sends", headers=_bearer(ALICE)).json()["sends"]
         assert [s["subject"] for s in sends] == ["new", "old"]
         assert set(sends[0]) == {"id", "status", "agent", "to", "cc", "bcc", "subject",
-                                 "gmail_message_id", "thread_id", "draft_id", "created_at"}
+                                 "gmail_message_id", "thread_id", "draft_id", "attachments",
+                                 "created_at"}
+        assert sends[0]["attachments"] == []
         assert sends[0]["status"] == "sent"
         assert sends[0]["gmail_message_id"] == "g-new" and sends[0]["to"] == "x@y.co"
         one = c.get("/fd/google/gmail-sends?limit=0", headers=_bearer(ALICE)).json()["sends"]
         assert [s["subject"] for s in one] == ["new"]  # clamped to 1
         bobs = c.get("/fd/google/gmail-sends?limit=500", headers=_bearer(BOB)).json()["sends"]
         assert [s["subject"] for s in bobs] == ["bob's"]
+
+
+# ── attachments ──────────────────────────────────────────────────────
+
+PDF = b"%PDF-1.4 the report"
+
+
+def _file(name="report.pdf", data=PDF, mime="application/pdf"):
+    return {"filename": name, "mime_type": mime, "data": base64.b64encode(data).decode()}
+
+
+@pytest.fixture()
+def upload_gmail(gmail, monkeypatch):
+    """The scripted Gmail plus the resumable upload: opening a session answers
+    its URL (``gmail.start`` overrides the answer), the PUT to it answers
+    ``gmail.upload``."""
+    gmail.start = None
+    gmail.upload = (200, {"id": "sent-f", "threadId": "t-f"})
+    plain = gmail.__class__.__call__
+
+    def handler(request):
+        params = request.url.params
+        if params.get("uploadType") == "resumable" and "upload_id" not in params:
+            gmail.requests.append(request)
+            if gmail.start is not None:
+                return httpx.Response(gmail.start[0], json=gmail.start[1])
+            return httpx.Response(200, headers={"Location": (
+                "https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send"
+                "?uploadType=resumable&upload_id=U1")})
+        if "upload_id" in params:
+            gmail.requests.append(request)
+            if isinstance(gmail.upload, type):
+                raise gmail.upload("boom", request=request)
+            return httpx.Response(gmail.upload[0], json=gmail.upload[1])
+        return plain(gmail, request)
+
+    monkeypatch.setattr(
+        gs.httpx, "AsyncClient",
+        lambda **kw: _RealAsyncClient(transport=httpx.MockTransport(handler), **kw),
+    )
+    return gmail
+
+
+class TestSendAttachments:
+    async def test_files_are_uploaded_audited_and_named_in_the_bell(self, db, agents, upload_gmail):
+        await gr._store_tokens(db, ALICE, _tokens("alice-access"))
+        await _enable(db)
+        r = _client().post("/fd/google/gmail/send", headers=_agent(),
+                           json={**MSG, "attachments": [_file(), _file("data.csv", b"a,b\n", "text/csv")]})
+
+        assert r.status_code == 200, r.text
+        assert r.json()["message_id"] == "sent-f"
+        assert r.json()["attachments"] == [{"filename": "report.pdf", "size": len(PDF)},
+                                           {"filename": "data.csv", "size": 4}]
+        start, put = [q for q in upload_gmail.requests if "uploadType" in q.url.params]
+        assert start.method == "POST" and start.url.path == "/upload/gmail/v1/users/me/messages/send"
+        assert start.headers["Authorization"] == "Bearer alice-access"
+        assert json.loads(start.content) == {}
+        msg = email.message_from_bytes(put.content, policy=email.policy.default)
+        assert msg["To"] == "Bob <bob@x.co>"
+        assert {p.get_filename(): p.get_payload(decode=True) for p in msg.iter_attachments()} == {
+            "report.pdf": PDF, "data.csv": b"a,b\n"}
+        # No JSON raw send for a message with files.
+        assert not [q for q in upload_gmail.requests
+                    if q.url.path == "/gmail/v1/users/me/messages/send"]
+        (row,) = await db.list_gmail_sends(ALICE)
+        assert json.loads(row["attachments"]) == ["report.pdf", "data.csv"]
+        (note,) = await db.list_notifications(ALICE)
+        assert "Attached: report.pdf, data.csv" in note["body"]
+        sends = _client().get("/fd/google/gmail-sends", headers=_bearer(ALICE)).json()["sends"]
+        assert sends[0]["attachments"] == ["report.pdf", "data.csv"]
+
+    async def test_the_duplicate_check_counts_the_files(self, db, agents, upload_gmail):
+        await gr._store_tokens(db, ALICE, _tokens("alice-access"))
+        await _enable(db)
+        c = _client()
+        body = {**MSG, "allow_repeat": True, "attachments": [_file()]}
+        assert c.post("/fd/google/gmail/send", headers=_agent(), json=body).status_code == 200
+        again = c.post("/fd/google/gmail/send", headers=_agent(), json=body)
+        assert again.status_code == 409 and "files" in again.json()["detail"]
+        other = {**body, "attachments": [_file(data=PDF + b" v2")]}
+        assert c.post("/fd/google/gmail/send", headers=_agent(), json=other).status_code == 200
+
+    @pytest.mark.parametrize("attachments, needle", [
+        ("x.pdf", "must be a list"),
+        ([{"filename": "a.pdf", "data": "%%%"}], "not valid base64"),
+        ([_file()] * 21, "Too many attachments"),
+    ])
+    async def test_bad_files_are_a_400(self, db, agents, upload_gmail, attachments, needle):
+        await gr._store_tokens(db, ALICE, _tokens("alice-access"))
+        await _enable(db)
+        r = _client().post("/fd/google/gmail/send", headers=_agent(),
+                           json={**MSG, "attachments": attachments})
+        assert r.status_code == 400 and needle in r.json()["detail"]
+        assert r.json()["detail"].endswith("Nothing was sent.")
+        assert upload_gmail.sends() == [] and await db.list_gmail_sends(ALICE) == []
+
+    async def test_a_draft_send_takes_no_files(self, db, agents, upload_gmail):
+        await gr._store_tokens(db, ALICE, _tokens("alice-access"))
+        await _enable(db)
+        r = _client().post("/fd/google/gmail/send", headers=_agent(),
+                           json={"draft_id": "d1", "attachments": [_file()]})
+        assert r.status_code == 400 and "own files" in r.json()["detail"]
+
+    async def test_over_gmails_limit_is_refused(self, db, agents, upload_gmail, monkeypatch):
+        await gr._store_tokens(db, ALICE, _tokens("alice-access"))
+        await _enable(db)
+        monkeypatch.setattr(gs.mail_attachments, "GMAIL_MAX_MESSAGE_BYTES", 600)
+        r = _client().post("/fd/google/gmail/send", headers=_agent(),
+                           json={**MSG, "attachments": [_file(data=b"x" * 500)]})
+        assert r.status_code == 400 and "at most 25 MB" in r.json()["detail"]
+        assert upload_gmail.sends() == []
+
+    async def test_a_refused_upload_session_sent_nothing(self, db, agents, upload_gmail):
+        await gr._store_tokens(db, ALICE, _tokens("alice-access"))
+        await _enable(db)
+        upload_gmail.start = (500, {"error": {"message": "backend"}})
+        r = _client().post("/fd/google/gmail/send", headers=_agent(),
+                           json={**MSG, "attachments": [_file()]})
+        assert r.status_code == 502 and "was not sent" in r.json()["detail"]
+        assert r.headers.get("X-FD-Gmail-Send-Outcome") is None
+        assert await db.list_gmail_sends(ALICE) == []
+
+    async def test_a_failed_upload_may_have_sent(self, db, agents, upload_gmail):
+        await gr._store_tokens(db, ALICE, _tokens("alice-access"))
+        await _enable(db)
+        upload_gmail.upload = httpx.ReadTimeout
+        r = _client().post("/fd/google/gmail/send", headers=_agent(),
+                           json={**MSG, "attachments": [_file()]})
+        assert r.status_code == 502 and r.headers.get("X-FD-Gmail-Send-Outcome") == "unknown"
+        (row,) = await db.list_gmail_sends(ALICE)
+        assert row["status"] == "unknown" and json.loads(row["attachments"]) == ["report.pdf"]
+
+    async def test_agent_status_says_files_are_taken(self, db, agents, upload_gmail):
+        r = _client().get("/fd/google/agent_status", headers=_agent())
+        assert r.status_code == 200 and r.json()["gmail_send_attachments"] is True
+
+    async def test_a_draft_send_lists_the_drafts_files(self, db, agents, upload_gmail):
+        await gr._store_tokens(db, ALICE, _tokens("alice-access"))
+        await _enable(db)
+        upload_gmail.routes[("GET", "/drafts/d1")] = (200, {"id": "d1", "message": {
+            "id": "m9", "threadId": "td", "payload": {
+                "headers": [{"name": "To", "value": "Dave <dave@ok.com>"},
+                            {"name": "Subject", "value": "From the draft"}],
+                "parts": [{"mimeType": "text/plain", "body": {"size": 2}},
+                          {"mimeType": "application/pdf", "filename": "old.pdf",
+                           "body": {"attachmentId": "A1", "size": 20}}]}}})
+        r = _client().post("/fd/google/gmail/send", headers=_agent(), json={"draft_id": "d1"})
+        assert r.status_code == 200, r.text
+        assert r.json()["attachments"] == [{"filename": "old.pdf", "size": 20}]
+        (row,) = await db.list_gmail_sends(ALICE)
+        assert json.loads(row["attachments"]) == ["old.pdf"]

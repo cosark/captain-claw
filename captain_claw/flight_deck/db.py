@@ -471,7 +471,9 @@ class FlightDeckDB:
                 draft_id         TEXT NOT NULL DEFAULT '',
                 content_hash     TEXT NOT NULL DEFAULT '',
                 status           TEXT NOT NULL DEFAULT 'sent',
-                created_at       TEXT NOT NULL
+                created_at       TEXT NOT NULL,
+                -- JSON list of the attached files' names ('' = none)
+                attachments      TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_gmail_sends_owner
                 ON gmail_sends(owner_id, created_at);
@@ -567,6 +569,7 @@ class FlightDeckDB:
             ("basna_sessions", "analysis", "TEXT NOT NULL DEFAULT '{}'"),
             ("basna_sessions", "title", "TEXT NOT NULL DEFAULT ''"),
             ("gmail_sends", "status", "TEXT NOT NULL DEFAULT 'sent'"),
+            ("gmail_sends", "attachments", "TEXT NOT NULL DEFAULT ''"),
         ]:
             try:
                 await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
@@ -2647,19 +2650,21 @@ class FlightDeckDB:
         self, owner_id: str, agent: str = "", to_addrs: str = "",
         cc_addrs: str = "", bcc_addrs: str = "", subject: str = "",
         gmail_message_id: str = "", thread_id: str = "", draft_id: str = "",
-        content_hash: str = "", status: str = "sent",
+        content_hash: str = "", status: str = "sent", attachments: str = "",
     ) -> str:
         """Record one email Gmail accepted (`status` 'sent') — or may have
-        sent ('unknown') — for `owner_id`; returns its id."""
+        sent ('unknown') — for `owner_id`; returns its id. `attachments` is
+        a JSON list of the attached files' names ('' = none)."""
         assert self._db is not None
         sid = _uuid()
         await self._db.execute(
             "INSERT INTO gmail_sends (id, owner_id, agent, to_addrs, cc_addrs,"
             " bcc_addrs, subject, gmail_message_id, thread_id, draft_id,"
-            " content_hash, status, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " content_hash, status, created_at, attachments)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (sid, owner_id, agent, to_addrs, cc_addrs, bcc_addrs, subject,
-             gmail_message_id, thread_id, draft_id, content_hash, status, _utcnow()),
+             gmail_message_id, thread_id, draft_id, content_hash, status, _utcnow(),
+             attachments),
         )
         await self._db.commit()
         return sid

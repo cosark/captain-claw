@@ -23,6 +23,13 @@ bell. So does a send whose outcome is unknown (Gmail answered 5xx, or never
 answered after the request went out) — as ``status = 'unknown'``, so a blind
 retry is caught as a duplicate and the user is told to check their Sent folder.
 
+A composed send may carry ``attachments`` (the agent read the files; see
+:mod:`captain_claw.mail_attachments`): Flight Deck re-checks them
+(``from_wire``: names, types, base64, count, total), builds the email itself,
+refuses one over Gmail's 25 MB and uploads it through Gmail's upload endpoint.
+The files' names go into the audit row and the bell; their digest into the
+duplicate check's content hash.
+
 The gws Workspace CLI tool is retired (``config.RETIRED_TOOLS``: never
 registered, stripped from every tools list, refused by the shell tool), so
 google_mail → this route is the only tool path to a Gmail send under Flight
@@ -47,7 +54,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from captain_claw import gmail_compose
+from captain_claw import gmail_compose, mail_attachments
 from captain_claw.flight_deck import google_oauth_routes as _google
 from captain_claw.flight_deck import speaker_grants, tenant_profile
 from captain_claw.flight_deck.auth import get_current_user, get_db
@@ -266,10 +273,20 @@ async def gmail_sends_list(
             "gmail_message_id": r["gmail_message_id"],
             "thread_id": r["thread_id"],
             "draft_id": r["draft_id"],
+            "attachments": _names(r.get("attachments")),
             "created_at": r["created_at"],
         }
         for r in rows
     ]}
+
+
+def _names(raw: Any) -> list[str]:
+    """A ``gmail_sends.attachments`` value as a list of names ([] if unreadable)."""
+    try:
+        names = json.loads(raw) if raw else []
+    except (TypeError, ValueError):
+        return []
+    return [str(n) for n in names] if isinstance(names, list) else []
 
 
 # ── agent route ─────────────────────────────────────────────────────
@@ -287,7 +304,8 @@ def _refused(detail: str, reason: str) -> HTTPException:
 async def _read_payload(request: Request) -> dict[str, Any]:
     """The send body: every message field and ``draft_id`` as a string (absent
     = ""), plus ``allow_repeat`` — a boolean (absent = False): the agent's
-    user explicitly asked for another copy, so skip the repeat check."""
+    user explicitly asked for another copy, so skip the repeat check — and
+    ``attachments``: the checked files (absent = none)."""
     try:
         data = await request.json()
     except Exception:
@@ -308,6 +326,16 @@ async def _read_payload(request: Request) -> dict[str, Any]:
     if not isinstance(allow_repeat, bool):
         raise HTTPException(status_code=400, detail="allow_repeat must be true or false")
     out["allow_repeat"] = allow_repeat
+    try:
+        out["attachments"] = mail_attachments.from_wire(
+            data.get("attachments"), max_total_bytes=mail_attachments.GMAIL_MAX_MESSAGE_BYTES,
+        )
+    except mail_attachments.AttachmentError as exc:
+        text = str(exc).rstrip()
+        raise HTTPException(
+            status_code=400,
+            detail=f"{text}{'' if text.endswith('.') else '.'} Nothing was sent.",
+        ) from exc
     return out
 
 
@@ -406,13 +434,13 @@ def _check_gmail_id(value: str, name: str) -> None:
         raise HTTPException(status_code=400, detail=f"{name} is not a valid Gmail id: {value[:80]!r}")
 
 
-async def _draft_headers(client: httpx.AsyncClient, token: str, draft_id: str) -> dict[str, str]:
-    """To / Cc / Bcc / Subject (+ thread) of a draft, before sending it.
-    (drafts.get takes only ``format`` — metadata returns every header.)"""
+async def _draft_headers(client: httpx.AsyncClient, token: str, draft_id: str) -> dict[str, Any]:
+    """To / Cc / Bcc / Subject (+ thread, + ``files``: the names and sizes of
+    the files it carries) of a draft, before sending it."""
     try:
         resp = await client.get(
             f"{gmail_compose.GMAIL_API}/users/me/drafts/{draft_id}",
-            params={"format": "metadata"},
+            params={"format": "full"},
             headers={"Authorization": f"Bearer {token}"},
         )
         resp.raise_for_status()
@@ -435,8 +463,10 @@ async def _draft_headers(client: httpx.AsyncClient, token: str, draft_id: str) -
         name = (h.get("name") or "").lower()
         if name in ("to", "cc", "bcc", "subject"):
             headers[name] = h.get("value", "") or ""
-    headers["thread_id"] = message.get("threadId", "") or ""
-    return headers
+    out: dict[str, Any] = dict(headers)
+    out["thread_id"] = message.get("threadId", "") or ""
+    out["files"] = gmail_compose.payload_files(message.get("payload") or {})
+    return out
 
 
 def _check_recipients(to: str, cc: str, bcc: str, allowlist: list[str]) -> None:
@@ -491,16 +521,18 @@ def _clip(text: str, limit: int) -> str:
 async def _audit_send(
     db: FlightDeckDB, owner: str, *, status: str, agent: str, to: str, cc: str,
     bcc: str, subject: str, message_id: str, thread_id: str, draft_id: str,
-    content_hash: str,
+    content_hash: str, attachments: list[str] | None = None,
 ) -> None:
     """The ``gmail_sends`` row — *status* ``sent``, or ``unknown`` when Gmail
-    never confirmed. A failed insert is logged, never raised: the send (or
-    its error) is what the agent must hear about."""
+    never confirmed; *attachments* the files' names. A failed insert is
+    logged, never raised: the send (or its error) is what the agent must hear
+    about."""
     try:
         await db.add_gmail_send(
             owner, agent=agent, to_addrs=to, cc_addrs=cc, bcc_addrs=bcc,
             subject=subject, gmail_message_id=message_id, thread_id=thread_id,
             draft_id=draft_id, content_hash=content_hash, status=status,
+            attachments=json.dumps(attachments, ensure_ascii=False) if attachments else "",
         )
     except Exception as exc:
         log.error("Gmail send audit insert failed (%s, message %s): %s",
@@ -509,16 +541,17 @@ async def _audit_send(
 
 async def _notify_send(
     db: FlightDeckDB, owner: str, *, status: str, agent: str, to: str,
-    subject: str, message_id: str,
+    subject: str, message_id: str, attachments: list[str] | None = None,
 ) -> None:
     """The owner's bell for a send (*status* ``sent`` / ``unknown``)."""
+    files = f" - Attached: {', '.join(attachments)}" if attachments else ""
     if status == "unknown":
         title = f"{agent} may have sent an email"
         body = (f"Gmail did not confirm it — check your Sent folder. "
-                f"To: {to} - Subject: {subject or '(no subject)'}")
+                f"To: {to} - Subject: {subject or '(no subject)'}{files}")
     else:
         title = f"{agent} sent an email"
-        body = f"To: {to} - Subject: {subject or '(no subject)'}"
+        body = f"To: {to} - Subject: {subject or '(no subject)'}{files}"
     try:
         await db.add_notification(
             owner, "email_sent", _clip(title, 120), _clip(body, 300),
@@ -573,20 +606,29 @@ async def gmail_send(request: Request) -> dict[str, Any]:
     draft_id = payload["draft_id"].strip()
     reply_to = payload["reply_to_message_id"].strip()
     body, html_body = payload["body"], payload["html_body"]
-    async with httpx.AsyncClient(timeout=60) as client:
+    atts: list[mail_attachments.Attachment] = payload["attachments"]
+    names = [a.filename for a in atts]
+    # What the email carries: the files sent with it, or the draft's own.
+    files = [{"filename": a.filename, "size": len(a.data)} for a in atts]
+    message_bytes = b""
+    # Files make Gmail's upload slow.
+    async with httpx.AsyncClient(timeout=180 if atts else 60) as client:
         if draft_id:
-            if any(payload[k].strip() for k in _MESSAGE_FIELDS):
+            if any(payload[k].strip() for k in _MESSAGE_FIELDS) or atts:
                 raise HTTPException(
                     status_code=400,
                     detail=(
                         "Send either draft_id alone or the message fields "
-                        "(to/cc/bcc/subject/body/html_body/reply_to_message_id) — not both."
+                        "(to/cc/bcc/subject/body/html_body/reply_to_message_id/"
+                        "attachments) — not both. A draft is sent with its own files."
                     ),
                 )
             _check_gmail_id(draft_id, "draft_id")
             draft = await _draft_headers(client, token, draft_id)
             to, cc, bcc = draft.get("to", ""), draft.get("cc", ""), draft.get("bcc", "")
             subject, thread_id = draft.get("subject", ""), draft["thread_id"]
+            files = draft["files"]
+            names = [f["filename"] for f in files]
             _check_recipients(to, cc, bcc, policy["allowed_recipients"])
             raw = ""
         else:
@@ -624,16 +666,33 @@ async def gmail_send(request: Request) -> dict[str, Any]:
             try:
                 # Put exactly the checked addresses on the wire.
                 to, cc, bcc = (gmail_compose.format_recipients(f) for f in (to, cc, bcc))
-                raw = gmail_compose.build_raw_message(
-                    to=to, cc=cc, bcc=bcc, subject=subject,
-                    body=body, html_body=html_body,
-                    in_reply_to=in_reply_to, references=references,
-                )
+                if atts:
+                    raw = ""
+                    message_bytes = gmail_compose.build_message_bytes(
+                        to=to, cc=cc, bcc=bcc, subject=subject,
+                        body=body, html_body=html_body,
+                        in_reply_to=in_reply_to, references=references, attachments=atts,
+                    )
+                else:
+                    raw = gmail_compose.build_raw_message(
+                        to=to, cc=cc, bcc=bcc, subject=subject,
+                        body=body, html_body=html_body,
+                        in_reply_to=in_reply_to, references=references,
+                    )
             except ValueError as exc:  # e.g. a line break in the subject
                 raise HTTPException(
                     status_code=400,
                     detail=f"Could not build the email: {exc}. Nothing was sent.",
                 ) from exc
+            if len(message_bytes) > mail_attachments.GMAIL_MAX_MESSAGE_BYTES:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"This email would be {mail_attachments.human_size(len(message_bytes))} "
+                        "once encoded — Gmail takes at most 25 MB. Nothing was sent. Attach "
+                        "fewer or smaller files, or share big ones as a Drive link."
+                    ),
+                )
             if not payload["allow_repeat"]:
                 # The same email already drafted or sent — from any session, a
                 # cron run or the user's own Gmail, not only FD's audit rows.
@@ -667,6 +726,7 @@ async def gmail_send(request: Request) -> dict[str, Any]:
             if not draft_id:  # a draft is one server-side object; Gmail consumes it
                 chash = gmail_compose.content_hash(
                     to, cc, bcc, subject, body, html_body, reply_to=reply_to,
+                    attachments_digest=mail_attachments.digest(atts) if atts else "",
                 )
                 dup = await db.find_gmail_send_by_hash(
                     owner, chash, (now - _DUPLICATE_WINDOW).isoformat(),
@@ -675,8 +735,8 @@ async def gmail_send(request: Request) -> dict[str, Any]:
                     raise HTTPException(
                         status_code=409,
                         detail=(
-                            "Duplicate: this exact email (same recipients, subject and "
-                            f"body) was already attempted at {dup['created_at']} and Gmail "
+                            "Duplicate: this exact email (same recipients, subject, body "
+                            f"and files) was already attempted at {dup['created_at']} and Gmail "
                             "never confirmed it — it may have gone out. Not sent again. "
                             f"{_CHECK_SENT}"
                         ),
@@ -685,8 +745,8 @@ async def gmail_send(request: Request) -> dict[str, Any]:
                     raise HTTPException(
                         status_code=409,
                         detail=(
-                            "Duplicate: this exact email (same recipients, subject and "
-                            f"body) was already sent at {dup['created_at']} (Gmail message "
+                            "Duplicate: this exact email (same recipients, subject, body "
+                            f"and files) was already sent at {dup['created_at']} (Gmail message "
                             f"{dup['gmail_message_id'] or '?'}). Not sent again."
                         ),
                     )
@@ -704,11 +764,27 @@ async def gmail_send(request: Request) -> dict[str, Any]:
                 f"{await tenant_profile.owner_name(db, acting.owner)})"
                 if acting else _agent_label(request)
             )
+            session = ""
+            if atts:
+                # Opening the upload sends nothing: a failure here is "not sent".
+                try:
+                    session = await gmail_compose.start_upload(
+                        client, token, "POST", "/users/me/messages/send",
+                        {"threadId": thread_id} if thread_id else {}, len(message_bytes),
+                    )
+                except httpx.HTTPStatusError as exc:
+                    raise _gmail_error(exc) from exc
+                except httpx.HTTPError as exc:
+                    raise _transport_error(exc) from exc
             try:
-                resp = await client.post(
-                    url, json=send_body, headers={"Authorization": f"Bearer {token}"},
-                )
-                resp.raise_for_status()
+                if session:
+                    sent = await gmail_compose.finish_upload(client, token, session, message_bytes)
+                else:
+                    resp = await client.post(
+                        url, json=send_body, headers={"Authorization": f"Bearer {token}"},
+                    )
+                    resp.raise_for_status()
+                    sent = resp.json()
             except httpx.HTTPError as exc:
                 if isinstance(exc, httpx.HTTPStatusError):
                     err = _gmail_error(
@@ -723,23 +799,22 @@ async def gmail_send(request: Request) -> dict[str, Any]:
                     await _audit_send(
                         db, owner, status="unknown", agent=agent, to=to, cc=cc, bcc=bcc,
                         subject=subject, message_id="", thread_id=thread_id,
-                        draft_id=draft_id, content_hash=chash,
+                        draft_id=draft_id, content_hash=chash, attachments=names,
                     )
                     await _notify_send(db, owner, status="unknown", agent=agent, to=to,
-                                       subject=subject, message_id="")
+                                       subject=subject, message_id="", attachments=names)
                 raise err from exc
-            sent = resp.json()
             message_id = str(sent.get("id") or "")
             sent_thread = str(sent.get("threadId") or thread_id or "")
 
             await _audit_send(
                 db, owner, status="sent", agent=agent, to=to, cc=cc, bcc=bcc,
                 subject=subject, message_id=message_id, thread_id=sent_thread,
-                draft_id=draft_id, content_hash=chash,
+                draft_id=draft_id, content_hash=chash, attachments=names,
             )
 
     await _notify_send(db, owner, status="sent", agent=agent, to=to,
-                       subject=subject, message_id=message_id)
+                       subject=subject, message_id=message_id, attachments=names)
 
     return {
         "ok": True,
@@ -749,6 +824,7 @@ async def gmail_send(request: Request) -> dict[str, Any]:
         "cc": cc,
         "bcc": bcc,
         "subject": subject,
+        "attachments": files,
         "sent_last_24h": used + 1,
         "daily_limit": daily_limit,
     }

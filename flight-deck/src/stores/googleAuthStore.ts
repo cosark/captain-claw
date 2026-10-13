@@ -81,6 +81,7 @@ export interface GmailSendRecord {
   gmail_message_id: string
   thread_id: string
   draft_id: string
+  attachments?: string[]  // the attached files' names
   created_at: string  // ISO 8601, UTC
 }
 

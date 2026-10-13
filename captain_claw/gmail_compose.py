@@ -87,8 +87,30 @@ def build_raw_message(
     html_body: str = "",
     in_reply_to: str = "",
     references: str = "",
+    attachments: list[Any] | None = None,
 ) -> str:
-    """Build a base64url-encoded RFC-822 message for the Gmail API.
+    """Build a base64url-encoded RFC-822 message for the Gmail API — see
+    :func:`build_message_bytes`."""
+    raw_bytes = build_message_bytes(
+        to=to, cc=cc, bcc=bcc, subject=subject, body=body, html_body=html_body,
+        in_reply_to=in_reply_to, references=references, attachments=attachments,
+    )
+    return base64.urlsafe_b64encode(raw_bytes).decode("ascii").rstrip("=")
+
+
+def build_message_bytes(
+    to: str = "",
+    cc: str = "",
+    bcc: str = "",
+    subject: str = "",
+    body: str = "",
+    html_body: str = "",
+    in_reply_to: str = "",
+    references: str = "",
+    attachments: list[Any] | None = None,
+) -> bytes:
+    """Build an RFC-822 message: the text and HTML bodies, plus
+    *attachments* (:class:`mail_attachments.Attachment`) as file parts.
 
     Construct with the SMTP policy from the start so every header
     fold and every line ending is RFC 5322-compliant CRLF. Building
@@ -125,9 +147,92 @@ def build_raw_message(
 
     msg.set_content(plain or " ")
     msg.add_alternative(effective_html, subtype="html")
+    if attachments:
+        from captain_claw import mail_attachments
 
-    raw_bytes = msg.as_bytes()
-    return base64.urlsafe_b64encode(raw_bytes).decode("ascii").rstrip("=")
+        mail_attachments.add_to(msg, attachments)
+
+    return msg.as_bytes()
+
+
+def payload_files(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """The named file parts of a Gmail API message payload (``format=full``),
+    as ``{"filename", "size"}`` — what a draft carries when it is sent."""
+    out: list[dict[str, Any]] = []
+
+    def walk(part: dict[str, Any]) -> None:
+        name = str(part.get("filename") or "").strip()
+        if name:
+            try:
+                size = int((part.get("body") or {}).get("size") or 0)
+            except (TypeError, ValueError):
+                size = 0
+            out.append({"filename": name, "size": size})
+            return
+        for child in part.get("parts") or []:
+            if isinstance(child, dict):
+                walk(child)
+
+    if isinstance(payload, dict):
+        walk(payload)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Messages with attachments: Gmail's upload endpoint
+# ---------------------------------------------------------------------------
+
+GMAIL_UPLOAD_API = "https://gmail.googleapis.com/upload/gmail/v1"
+
+
+async def start_upload(
+    client: httpx.AsyncClient, token: str, method: str, path: str,
+    metadata: dict[str, Any], size: int,
+) -> str:
+    """Open a resumable upload for an RFC-822 message and return its session
+    URL. *method* / *path* are the API call's (``POST /users/me/drafts``,
+    ``PUT /users/me/drafts/<id>``, ``POST /users/me/messages/send``);
+    *metadata* is its JSON resource without ``raw`` (e.g. the ``threadId``).
+
+    Used whenever a message carries attachments: the upload endpoint takes a
+    message up to 35 MB, where the JSON ``raw`` form is meant for small ones.
+    Nothing is created or sent until :func:`finish_upload`.
+    """
+    resp = await client.request(
+        method, f"{GMAIL_UPLOAD_API}{path}",
+        params={"uploadType": "resumable"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Type": "message/rfc822",
+            "X-Upload-Content-Length": str(size),
+        },
+        content=json.dumps(metadata).encode("utf-8"),
+    )
+    resp.raise_for_status()
+    session = resp.headers.get("Location") or ""
+    host = (httpx.URL(session).host if session.startswith("https://") else "") or ""
+    if host != "googleapis.com" and not host.endswith(".googleapis.com"):
+        # The token goes with the upload — only ever to Google.
+        raise httpx.HTTPStatusError(
+            "Gmail did not return an upload session",
+            request=resp.request, response=httpx.Response(502, request=resp.request),
+        )
+    return session
+
+
+async def finish_upload(
+    client: httpx.AsyncClient, token: str, session: str, message: bytes,
+) -> dict[str, Any]:
+    """Upload the message bytes to the *session* :func:`start_upload` opened;
+    Gmail's answer (the draft / the sent message) as JSON."""
+    resp = await client.put(
+        session,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "message/rfc822"},
+        content=message,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
 
 def text_to_html(text: str) -> str:
@@ -408,12 +513,15 @@ def content_hash(
     body: str = "",
     html_body: str = "",
     reply_to: str = "",
+    attachments_digest: str = "",
 ) -> str:
     """sha256 hex of a message's normalized content — the same recipients
     (any order/case/display name), subject (whitespace/case) and body
     (line endings/trailing spaces) hash alike, so a retried send is caught.
     *reply_to* (the Gmail id of the message a reply answers) is part of it: the
-    same short reply to two different emails is two emails, not a retry."""
+    same short reply to two different emails is two emails, not a retry.
+    *attachments_digest* (:func:`mail_attachments.digest`) likewise: the same
+    note with different files is a different email."""
     def _body(text: str) -> str:
         lines = (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
         return "\n".join(line.rstrip() for line in lines).strip()
@@ -428,6 +536,8 @@ def content_hash(
     ]
     if (reply_to or "").strip():
         parts.append("reply:" + reply_to.strip())
+    if attachments_digest:
+        parts.append("files:" + attachments_digest)
     return hashlib.sha256(json.dumps(parts).encode("utf-8")).hexdigest()
 
 

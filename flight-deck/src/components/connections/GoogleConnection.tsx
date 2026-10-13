@@ -795,6 +795,11 @@ function GmailSendSection() {
                       <span className="text-zinc-300 truncate">{s.to}</span>
                     </div>
                     <div className="text-zinc-200 truncate mt-0.5">{s.subject || '(no subject)'}</div>
+                    {!!s.attachments?.length && (
+                      <div className="text-zinc-500 truncate mt-0.5" title={s.attachments.join('\n')}>
+                        Attached: {s.attachments.join(', ')}
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>

@@ -342,7 +342,7 @@ async def test_local_send_draft_posts_drafts_send(monkeypatch, _config):
     assert gmail.json_of("POST", "/drafts/send") == {"id": "d1"}
     assert "To: Bob <bob@x.co>" in res.content and "Subject: Draft subj" in res.content
     assert "Message ID: s5" in res.content
-    assert gmail.requests[0].url.params["format"] == "metadata"
+    assert gmail.requests[0].url.params["format"] == "full"  # its files are listed in the answer
 
 
 @pytest.mark.asyncio
