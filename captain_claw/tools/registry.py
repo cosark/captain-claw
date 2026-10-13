@@ -463,7 +463,8 @@ class ToolRegistry:
 
         # A member recognised by its session key alone (nothing bound): the
         # Google flag below is per principal, and with no principal it would
-        # read the OWNER's — never show a member Google tools on that.
+        # read the OWNER's — never show a member Google tools on that (nor the
+        # owner-only Microsoft / Jev ones).
         try:
             from captain_claw import speaker as _speaker
 
@@ -472,6 +473,7 @@ class ToolRegistry:
                     t for t in tools
                     if not self._tool_metadata.get(t.name, {}).get("requires_google")
                     and not self._tool_metadata.get(t.name, {}).get("requires_microsoft")
+                    and not self._tool_metadata.get(t.name, {}).get("requires_jev")
                 ]
         except Exception:
             pass
@@ -511,6 +513,18 @@ class ToolRegistry:
                 ]
         except Exception:
             pass
+
+        # Jev: under Flight Deck shown only while the owner has a Jev key there
+        # (refreshed per turn by ``jev_client.refresh_connected()``); standalone
+        # only with a configured key. Fails closed — a call couldn't work.
+        try:
+            if any(self._tool_metadata.get(t.name, {}).get("requires_jev") for t in tools):
+                from captain_claw import jev_client
+
+                if not jev_client.jev_usable():
+                    tools = [t for t in tools if not self._tool_metadata.get(t.name, {}).get("requires_jev")]
+        except Exception:
+            tools = [t for t in tools if not self._tool_metadata.get(t.name, {}).get("requires_jev")]
 
         # Same idea for deep memory. Under Flight Deck the tool always shows:
         # FD owns the Typesense connection and can gain one at any moment, and

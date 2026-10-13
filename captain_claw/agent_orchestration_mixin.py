@@ -231,6 +231,9 @@ _ECO_INTENT_PATTERNS: list[tuple[_re.Pattern[str], frozenset[str]]] = [
     # OneDrive / SharePoint
     (_re.compile(r"\bone\s?drive\b|\bsharepoint\b", _re.I),
      frozenset({"microsoft_onedrive"})),
+    # Jev (TypeSafe) — calibrated judgments about text
+    (_re.compile(r"\bjev\b|typesafe", _re.I),
+     frozenset({"jev"})),
     # Data & database
     (_re.compile(r"\bdatastore\b|\bdatabase\b|\btable\b|\bsql\b|\binsert\b|\bquery\b", _re.I),
      frozenset({"datastore", "direct_api"})),
@@ -2071,6 +2074,13 @@ class AgentOrchestrationMixin:
                 try:
                     from captain_claw.microsoft_oauth_manager import MicrosoftOAuthManager
                     await MicrosoftOAuthManager().is_connected()
+                except Exception:
+                    pass
+                # Jev is owner-only too: does the owner have a key in Flight
+                # Deck (rate-limited inside; standalone: a configured key)?
+                try:
+                    from captain_claw import jev_client
+                    await jev_client.refresh_connected()
                 except Exception:
                     pass
 

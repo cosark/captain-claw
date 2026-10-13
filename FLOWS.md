@@ -161,7 +161,34 @@ step id:
 
 - `tool:` — the tool name (**required**).
 - `arg <name>: <value>` — one line per argument.
-- `on` defaults to `origin`. On `fd` the available internal tool is **`face_identify`** (recognizes faces in an image; returns JSON — see [templating](#templating)).
+- `on` defaults to `origin`. On `fd` the internal tools are **`face_identify`** (recognizes faces in an image; returns JSON — see [templating](#templating)) and **`jev`** (below). Both run inside Flight Deck as the run's owner; `jev` runs there whatever `on` says.
+
+#### `jev` — calibrated judgments about text
+
+[Jev](https://docs.typesafe.ai) (TypeSafe AI) doesn't write text: it answers typed questions about a piece of text (or JSON) with probabilities — fast and deterministic enough to branch on. The step uses the **run owner's Jev key** (Connections → Jev; on an auth-off deck, the deck's key) — no agent involved.
+
+```text
+step triage:
+  tool on fd
+  tool: jev
+  arg state: {{trigger.text}}
+  arg questions: [{"name":"urgent","type":"noul","instructions":"Does the sender need an answer today?"},{"name":"topic","type":"choice","instructions":"What is the message mainly about?","options":[{"name":"billing","description":"invoices, payments, refunds"},{"name":"support","description":"something is broken or unclear"},{"name":"other"}]}]
+
+step route:                      # report / escalate / file_it: later steps
+  branch
+  if not {{steps.triage.ok}} -> report
+  if {{steps.triage.values.urgent}} >= 0.7 -> escalate
+  else -> file_it
+```
+
+- `arg state:` — the text the questions are about (a JSON object/array in the text is sent as JSON).
+- `arg questions:` — a **one-line JSON** list (each question has a `name`) or map (name → question). A question is `{"type", "instructions"}` plus:
+  - `noul` (yes/no) — optional `"yes_means"` / `"no_means"`; answers **p(yes)** (0–1).
+  - `choice` — `"options"`: 2–255 names or `{"name","description"}` objects; answers the **chosen option** (+ per-option probabilities and a confidence).
+  - `score` — `"levels"`: 2–10 descriptions, **lowest first**; answers the **expected level** (fractional; `answers.<name>.legend` maps level numbers to your descriptions) and a confidence.
+- `arg model:` — optional (default `jev-latest`).
+
+It returns JSON: `{ok: true, model, answers, values, usage, summary}`, or `{ok: false, error}` (no Jev key, a malformed question, Jev refusing) — the step itself doesn't fail, so branch on `{{steps.<id>.ok}}`. `{{steps.<id>.values.<name>}}` is a question's headline value (p(yes) / the chosen option / the score), `{{steps.<id>.summary}}` a readable account of every answer and `{{steps.<id>.answers.<name>.probabilities}}` the detail. Ask several questions about the same state in one step; keep them literal and specific (Jev reads them literally). Jev is not for math, counting or date arithmetic — use an `agent` step for those.
 
 > ⚠️ A `tool` step **must** have a `tool:` name. For open-ended work (“search”, “research”, “find”, “answer”), use an [agent step](#agent-step) instead — the agent picks its own tools.
 
@@ -459,7 +486,7 @@ The `on` clause says **where** a step runs:
 | Selector | Runs on |
 |---|---|
 | `origin` | the agent that received the triggering message (default for `tool`/`agent`) |
-| `fd` | Flight Deck itself, in-process (for internal tools like `face_identify`) |
+| `fd` | Flight Deck itself, in-process (for the internal tools `face_identify` and `jev`) |
 | `any` | any available pooled agent |
 | `capability:vision` | an agent that has a vision model (default for `vision`) |
 | `name:DeepSeek V4 Flash` | a specific agent by name |
@@ -507,7 +534,7 @@ Anywhere a value is expected, `{{ … }}` pulls from the run context. It’s res
 | `{{steps.<id>.output}}` | that step’s output text |
 | `{{steps.<id>.<field>}}` | a field, when the step returned JSON |
 
-> **Important:** JSON fields attach **flat**. `face_identify` returns `{confident, name, person_id, confidence, count, card}`, so you reference `{{steps.identify.name}}` and `{{steps.identify.confident}}` — **not** `{{steps.identify.output.name}}`. `{{steps.identify.output}}` is the raw JSON string.
+> **Important:** JSON fields attach **flat**. `face_identify` returns `{confident, name, person_id, confidence, count, card}`, so you reference `{{steps.identify.name}}` and `{{steps.identify.confident}}` — **not** `{{steps.identify.output.name}}`. `{{steps.identify.output}}` is the raw JSON string. Nested objects are reached with more dots: a `jev` step's `{{steps.triage.values.urgent}}`.
 
 **System fields:**
 
@@ -1205,7 +1232,8 @@ output -> same
 | `unknown trigger channel '<x>'` | Channels are `any`/`whatsapp`/`web`/`glasses`. |
 | `unknown field '<k>' for <type> step` | Typo’d field name — see the step’s allowed fields above. |
 | `input step: no channel available to prompt the user` | An `input` step ran where there’s no reply channel (e.g. a dry test). Trigger it on a real channel. |
-| `(no FD-internal tool '<x>')` | `on: fd` only exposes `face_identify`. |
+| `(no FD-internal tool '<x>')` | `on: fd` only exposes `face_identify` and `jev`. |
+| `jev` step: `{"ok": false, "error": "Jev isn't connected …"}` | The run's owner has no Jev key — add one in Connections → Jev. Other `ok: false` errors name the bad question (e.g. a choice with one option) or what Jev refused. |
 | AI compile: `generated DSL invalid (…)` | The model produced bad DSL even after one self-repair. The raw DSL is in the editor — fix by hand, or rephrase / pick a stronger model. |
 
 ---

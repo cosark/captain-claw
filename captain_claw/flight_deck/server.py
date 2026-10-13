@@ -1346,6 +1346,7 @@ from captain_claw.flight_deck.queue_planner import router as queue_router
 from captain_claw.flight_deck.google_oauth_routes import router as google_oauth_router
 from captain_claw.flight_deck.gmail_send_routes import router as gmail_send_router
 from captain_claw.flight_deck.microsoft_oauth_routes import router as microsoft_oauth_router
+from captain_claw.flight_deck.jev_routes import router as jev_router
 from captain_claw.flight_deck.codex_oauth_routes import router as codex_oauth_router
 from captain_claw.flight_deck.antigravity_routes import router as antigravity_router
 from captain_claw.flight_deck.games_routes import router as games_router
@@ -1407,6 +1408,7 @@ app.include_router(queue_router)
 app.include_router(google_oauth_router)
 app.include_router(gmail_send_router)
 app.include_router(microsoft_oauth_router)
+app.include_router(jev_router)
 app.include_router(codex_oauth_router)
 app.include_router(antigravity_router)
 app.include_router(games_router)
@@ -4453,8 +4455,10 @@ def _flow_origin_env(payload: dict) -> list:
 
 
 def _fd_internal_tools() -> dict[str, Any]:
-    """FD-side tools the FlowRunner can call directly (no agent), e.g. face_identify."""
-    async def _face_identify(args: dict[str, Any]) -> str:
+    """FD-side tools the FlowRunner can call directly (no agent), e.g.
+    face_identify. Each is ``async fn(args, *, owner_id="") -> str``: the
+    runner passes the run's owner (who the run acts as)."""
+    async def _face_identify(args: dict[str, Any], **_kw: Any) -> str:
         """Recognize faces in an image, in-process in Flight Deck.
 
         ``args.image`` is a filesystem path the FD process can read — use the
@@ -4495,7 +4499,23 @@ def _fd_internal_tools() -> dict[str, Any]:
             return json.dumps({"confident": False, "name": None, "error": str(exc)})
         except Exception as exc:
             return json.dumps({"confident": False, "name": None, "error": f"face_identify failed: {exc}"})
-    return {"face_identify": _face_identify}
+
+    async def _jev(args: dict[str, Any], *, owner_id: str = "") -> str:
+        """Ask Jev (TypeSafe AI) with the run owner's key, in Flight Deck.
+
+        ``args.state`` (text; JSON object / array text is parsed),
+        ``args.questions`` (JSON: a list of questions with a ``name``, or a
+        map), optional ``args.model``. Returns JSON, never raises:
+          {ok: true, model, answers, values, usage, summary} |
+          {ok: false, error}
+        ``{{steps.<id>.values.<question>}}`` is the headline answer (p(yes) /
+        the chosen option / the score).
+        """
+        from captain_claw.flight_deck import jev_routes
+
+        return await jev_routes.flow_tool(args, owner_id=owner_id)
+
+    return {"face_identify": _face_identify, "jev": _jev}
 
 
 async def _flow_whatsapp_send(waid: str, text: str) -> None:
@@ -4783,7 +4803,12 @@ async def _ai_compile_flow(text: str, agent: str = "", current: str = "") -> dic
         "'research', 'look up'.\n"
         "• tool — a SINGLE named, deterministic tool. ONLY use it when you know "
         "the exact tool name; it needs `tool: <name>` and `arg <k>: <v>`. The "
-        "only `on fd` tool is `face_identify`. NEVER emit a `tool` step without "
+        "`on fd` tools are `face_identify` and `jev` (Jev: calibrated yes/no, "
+        "choice and score judgments about text with the user's Jev key — `arg "
+        "state:` the text, `arg questions:` a one-line JSON list like "
+        "[{\"name\":\"urgent\",\"type\":\"noul\",\"instructions\":\"Is this urgent?\"}] "
+        "(choice: \"options\":[...], score: \"levels\":[lowest … highest]); "
+        "branch on {{steps.<id>.values.<name>}}). NEVER emit a `tool` step without "
         "a `tool:` name — use an `agent` step instead.\n"
         "• vision — describe/read an image (`on capability:vision`, `image:`).\n"
         "• input — ask the user something and wait (`prompt:`). The reply is "
@@ -8361,6 +8386,7 @@ OLD_MAN_TOOLS = [
     "cron", "summarize_files", "direct_api",
     "google_drive", "google_calendar", "google_mail",
     "microsoft_onedrive", "microsoft_calendar", "microsoft_mail",
+    "jev",
     "flight_deck",
 ]
 

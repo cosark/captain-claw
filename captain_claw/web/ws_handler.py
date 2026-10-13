@@ -522,6 +522,11 @@ async def handle_ws_message(
                 await MicrosoftOAuthManager().is_connected()
             except Exception:
                 pass
+            try:
+                from captain_claw import jev_client
+                await jev_client.refresh_connected()
+            except Exception:
+                pass
             # The action catalog is the authority for a deterministic invocation,
             # so explicitly allow the named tool past the per-session tool policy
             # (which exists to constrain the LLM mid-turn). The script_tool guard

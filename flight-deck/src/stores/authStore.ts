@@ -55,7 +55,7 @@ export const useAuthStore = create<AuthStore>((set) => ({
  * when the deck runs in simple-chat mode, so they can spawn agents, open config
  * and administer users. Everyone else (the shared kiosk account) stays locked to
  * the chat-only Simple layout, keeping only sign-out, the archetype picker,
- * their own connections (Google, MCP) and their owner profile.
+ * their own connections (Google, Microsoft, MCP, Jev) and their owner profile.
  *
  * Use this instead of reading `simpleChatOnly` directly wherever the lock is
  * enforced, so the admin exemption stays consistent across the app. Reactive:

@@ -73,6 +73,20 @@ class AgentToolLoopMixin:
         if name == "microsoft_onedrive":
             action = str(arguments.get("action", "")).strip()
             return f"OneDrive: {action}" if action else "OneDrive"
+        # ── Jev ──────────────────────────────────────────────
+        if name == "jev":
+            if str(arguments.get("action", "")).strip().lower() == "models":
+                return "Listing Jev models"
+            questions = arguments.get("questions")
+            if isinstance(questions, str):
+                try:
+                    questions = json.loads(questions)
+                except (TypeError, ValueError):
+                    questions = None
+            count = len(questions) if isinstance(questions, (list, dict)) else 0
+            if count:
+                return f"Asking Jev ({count} question{'' if count == 1 else 's'})"
+            return "Asking Jev"
         # ── Memory & context ────────────────────────────────
         if name == "memory_select":
             query = str(arguments.get("query", "")).strip()
