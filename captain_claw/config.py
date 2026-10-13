@@ -367,6 +367,21 @@ class MicrosoftMailToolConfig(BaseModel):
     repeat_check_days: int = Field(default=14, ge=0)
 
 
+class JevToolConfig(BaseModel):
+    """Jev (TypeSafe AI) tool — calibrated judgments about text.
+
+    ``api_key`` is for a STANDALONE agent only (env: ``JEV_API_KEY`` or
+    ``TYPESAFE_API_KEY``). Under Flight Deck it is ignored: the owner's key
+    stays in Flight Deck (Connections → Jev) and the tool asks Flight Deck.
+    Defaults mirror ``jev_client.DEFAULT_BASE_URL`` / ``DEFAULT_MODEL``.
+    """
+
+    api_key: str = ""
+    base_url: str = "https://api.typesafe.ai"
+    model: str = "jev-latest"
+    timeout: float = 30.0
+
+
 class TypesenseToolConfig(BaseModel):
     """Typesense tool configuration."""
 
@@ -579,6 +594,7 @@ class ToolsConfig(BaseModel):
         "microsoft_onedrive",
         "microsoft_calendar",
         "microsoft_mail",
+        "jev",
         "todo",
         "contacts",
         "scripts",
@@ -606,6 +622,7 @@ class ToolsConfig(BaseModel):
     send_mail: SendMailToolConfig = Field(default_factory=SendMailToolConfig)
     google_mail: GoogleMailToolConfig = Field(default_factory=GoogleMailToolConfig)
     microsoft_mail: MicrosoftMailToolConfig = Field(default_factory=MicrosoftMailToolConfig)
+    jev: JevToolConfig = Field(default_factory=JevToolConfig)
     typesense: TypesenseToolConfig = Field(default_factory=TypesenseToolConfig)
     edit: EditToolConfig = Field(default_factory=EditToolConfig)
     write: WriteGuardConfig = Field(default_factory=WriteGuardConfig)
@@ -622,11 +639,14 @@ class ToolsConfig(BaseModel):
     # Google and Microsoft tools are always registered but the tool registry
     # hides them from agents until that account is actually connected (in
     # Flight Deck), so there's no harm in having them permanently enabled.
+    # Jev likewise: hidden until a key is usable (the owner's in Flight Deck,
+    # or tools.jev.api_key / JEV_API_KEY standalone).
     _ALWAYS_ENABLED: frozenset[str] = frozenset({
         "read", "write", "edit", "personality", "botport", "playbooks",
         "browser", "datastore", "direct_api", "cron",
         "google_drive", "google_calendar", "google_mail",
         "microsoft_onedrive", "microsoft_calendar", "microsoft_mail",
+        "jev",
         "whatsapp_send_file", "intentions", "video_vision", "cv", "topics",
         "history", "vfs",
         # Deep memory is reached through Flight Deck, which owns the Typesense
@@ -1755,6 +1775,22 @@ class Config(BaseSettings):
             )
         if env_youcom_key:
             config.tools.web_search.youcom_api_key = env_youcom_key
+
+        # Jev (TypeSafe) API key from env/.env — a standalone agent's own key.
+        # Under Flight Deck the tool never reads it: the owner's key stays in
+        # Flight Deck (Connections → Jev). TYPESAFE_API_KEY is the official
+        # SDKs' name.
+        env_jev_key = str(getattr(env_overlay.tools.jev, "api_key", "")).strip()
+        if not env_jev_key:
+            for _jev_var in ("JEV_API_KEY", "TYPESAFE_API_KEY"):
+                env_jev_key = (
+                    str(os.getenv(_jev_var, "")).strip()
+                    or str(dotenv_values.get(_jev_var, "")).strip()
+                )
+                if env_jev_key:
+                    break
+        if env_jev_key:
+            config.tools.jev.api_key = env_jev_key
 
         # Security-sensitive override: send_mail credentials from env/.env.
         # MAIL_PROVIDER is handled separately: it ALWAYS overrides the config

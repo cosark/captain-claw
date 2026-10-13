@@ -610,7 +610,7 @@ function AgentsColumn({
             <RefreshCw className="h-3.5 w-3.5" />
           </button>
           {onConnections && (
-            <button onClick={onConnections} className={iconBtn} title="Connections — Google, Microsoft and MCP">
+            <button onClick={onConnections} className={iconBtn} title="Connections — Google, Microsoft, MCP and Jev">
               <Plug className="h-3.5 w-3.5" />
             </button>
           )}
@@ -821,7 +821,7 @@ function AgentsColumn({
             <RefreshCw className="h-3.5 w-3.5" />
           </button>
           {onConnections && (
-            <button onClick={onConnections} className={iconBtn} title="Connections — Google, Microsoft and MCP">
+            <button onClick={onConnections} className={iconBtn} title="Connections — Google, Microsoft, MCP and Jev">
               <Plug className="h-3.5 w-3.5" />
             </button>
           )}

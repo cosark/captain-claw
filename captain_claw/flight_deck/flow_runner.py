@@ -652,7 +652,7 @@ class FlowRunner:
         get_agents: Callable[[], list[dict[str, Any]]],
         resolve_auth: Callable[[int], str],
         fd_self_base: str,
-        fd_tools: dict[str, Callable[[dict[str, Any]], Awaitable[str]]] | None = None,
+        fd_tools: dict[str, Callable[..., Awaitable[str]]] | None = None,
         whatsapp_send: Callable[[str, str], Awaitable[Any]] | None = None,
         transfer_file: Callable[[str, int, str], Awaitable[tuple[list[str], list[str]]]] | None = None,
         consult_peer: Callable[..., AsyncIterator[dict[str, Any]]] | None = None,
@@ -668,7 +668,8 @@ class FlowRunner:
         self.get_agents = get_agents
         self.resolve_auth = resolve_auth
         self.fd_self_base = fd_self_base.rstrip("/")
-        self.fd_tools = fd_tools or {}        # FD-internal tools (e.g. face_identify)
+        # FD-internal tools (e.g. face_identify, jev): `await fn(args, owner_id=…)`.
+        self.fd_tools = fd_tools or {}
         self.whatsapp_send = whatsapp_send
         # Uploads a file to a target agent, returning (image_paths, file_paths)
         # ON THE TARGET. Lets the runner verify delivery + use the target's path.
@@ -964,12 +965,13 @@ class FlowRunner:
         args = _render(step.get("args") or {}, ctx)
         selector = str(step.get("on") or "origin")
 
-        # FD-internal tool (e.g. face_identify) — runs in-process, no agent.
+        # FD-internal tool (e.g. face_identify, jev) — runs in-process, no
+        # agent, as the run's owner (jev uses that user's key).
         if selector == "fd" or tool in self.fd_tools:
             fn = self.fd_tools.get(tool)
             if not fn:
                 return f"(no FD-internal tool '{tool}')", "fd"
-            return (await fn(args)), "fd"
+            return (await fn(args, owner_id=root.owner_id)), "fd"
 
         agent, aerr = await self._resolve_step_agent(selector, root, payload)
         if not agent:

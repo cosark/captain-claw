@@ -845,6 +845,37 @@ Gmail through the Gmail API: `list_messages`, `search`, `read_message`, `get_thr
 
 > **Retired: `gws`.** The Google Workspace CLI wrapper (`gws`) is gone. Agents use `google_drive`, `google_calendar` and `google_mail` instead; a `gws` entry left in an old `tools.enabled` list or a stored archetype is dropped when the config loads or the agent is spawned, and a `tools.gws` block in an old `config.yaml` is ignored.
 
+### jev
+
+Fast, calibrated judgments about text with [Jev](https://docs.typesafe.ai) (TypeSafe AI's "System One" model). Jev never writes text: you give it a `state` (the content) and named, typed questions, and each answer comes back with probabilities. One call can ask many questions about the same state.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `action` | string | no | `ask` (default) or `models` (list the models the key can use) |
+| `state` | string | for ask | The content the questions are about: text, or a JSON object/array as text (sent structured). About 30k tokens at most |
+| `state_file` | string | no | Instead of `state`: a text file to use as the state (absolute, or relative to the workspace). Giving both is an error |
+| `questions` | list[object] | for ask | Each `{name, type, instructions, …}` — see below |
+| `model` | string | no | Jev model (default `tools.jev.model`, normally `jev-latest`) |
+
+Question types:
+
+- **`noul`** — yes/no. Answer: p(yes), shown as yes (≥ 0.65), no (≤ 0.35) or uncertain. Optional `yes_means` / `no_means` say what counts as each.
+- **`choice`** — one of 2–255 `options`, each `{name, description}`. Answer: the chosen option, per-option probabilities and a confidence.
+- **`score`** — a level on an ordered rubric of 2–10 `levels` (descriptions, lowest first). Answer: the expected level, the nearest level's text and a confidence.
+
+Good uses: triage and routing, classification, relevance filtering, checking a claim against a source, rating against a rubric. Write literal, specific questions (Jev reads them literally; English works best) and give options and levels real descriptions. Jev is not for math, counting, date arithmetic or writing text.
+
+**Where the key lives.** Under Flight Deck each user adds their own key in **Connections → Jev** (from [console.typesafe.ai/keys](https://console.typesafe.ai/keys)); the key stays in Flight Deck. The agent asks Flight Deck (`/fd/jev/agent/*`), which calls Jev with the agent **owner's** key. Standalone, the agent calls Jev itself with `tools.jev.api_key`, or the `JEV_API_KEY` / `TYPESAFE_API_KEY` environment variable. The tool is hidden from the agent until a key is usable. It is owner-only: a shared agent's members never get it.
+
+```yaml
+tools:
+  jev:
+    api_key: ""                     # standalone only; or JEV_API_KEY / TYPESAFE_API_KEY
+    base_url: "https://api.typesafe.ai"
+    model: "jev-latest"
+    timeout: 30                     # seconds per Jev request (429/529/5xx are retried)
+```
+
 ### todo
 
 Persistent cross-session to-do list. The agent uses this tool to manage tasks that survive across sessions.
@@ -4105,7 +4136,7 @@ Flight Deck serves both the React frontend and the FastAPI backend from a single
 | Datastore browser | View agent datastore tables and rows directly from agent cards |
 | Agent groups & tags | Organize agents into teams and roles with color-coded group badges |
 | Trace timeline | Real-time orchestrator observability — Gantt-style span visualization in the chat panel with duration, token usage, phase breakdown (decompose/execute/task/synthesize), and status tracking |
-| Connections page | Unified external-service authentication: Google OAuth (with per-scope picker and sensitivity tiers), ChatGPT (Codex OAuth), and centrally-managed MCP servers (HTTP + stdio transport, per-agent allowlists, hot-reload over SSE) in a single scrollable, collapsible UI |
+| Connections page | Unified external-service authentication: Google OAuth (with per-scope picker and sensitivity tiers), ChatGPT (Codex OAuth), centrally-managed MCP servers (HTTP + stdio transport, per-agent allowlists, hot-reload over SSE), and each user's Jev (TypeSafe AI) API key with a "Try it" playground, in a single scrollable, collapsible UI |
 | Agent Folders | Admin-gated `fd-data` cleanup (NEW in 0.6.5) — lists each agent subfolder with on-disk size, file counts, last-modified, and desktop presence (**running / on-desktop / orphaned**); view/download workspace files (HTML in a sandboxed iframe, Markdown with GFM tables) and delete a folder (refused while the agent is still running). Path-sandboxed to direct children of `fd-data`; backend `/fd/agentfs` |
 
 ### Connections
@@ -5782,6 +5813,8 @@ workspace/saved/
 | `MAILGUN_DOMAIN` | Mailgun domain |
 | `SENDGRID_API_KEY` | SendGrid API key |
 | `TYPESENSE_API_KEY` | Typesense API key (used by both tool and deep memory) |
+| `JEV_API_KEY` (or `TYPESAFE_API_KEY`) | Jev (TypeSafe AI) API key for the `jev` tool — standalone agents only; under Flight Deck add it in **Connections → Jev** |
+| `FD_JEV_BASE_URL` | Flight Deck: send every user's Jev calls to another Jev-compatible endpoint (a proxy in front of `https://api.typesafe.ai`, or a local stub); default `https://api.typesafe.ai` |
 | `CLAW_BOTPORT_CLIENT__URL` | BotPort WebSocket URL (e.g. `wss://botport.kstevica.com/ws`) |
 | `CLAW_BOTPORT_CLIENT__KEY` | BotPort authentication key |
 | `CLAW_BOTPORT_CLIENT__SECRET` | BotPort authentication secret |

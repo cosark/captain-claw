@@ -109,6 +109,7 @@ _TOOL_PROMPT_DESCRIPTIONS: dict[str, str] = {
     "microsoft_onedrive": "OneDrive — list, search, read (content inline: PDF/DOCX/XLSX/PPTX extracted), info, download (local copy), upload, create, create_folder, update (same file id); file ID, path or OneDrive/SharePoint share URL — never web_fetch a OneDrive link.",
     "microsoft_calendar": "Outlook Calendar — list_events, search_events, get_event, create_event, update_event, delete_event, respond_event, list_calendars; changes that email attendees need notify_attendees=true (only when the user asked).",
     "microsoft_mail": "Outlook mail — list_messages, search, read_message, get_thread, list_folders, get_attachment; create_draft / update_draft / list_drafts only when the user asked for that email (attachments=[file paths], ≤25 MB); never sends (drafts wait in Outlook); no repeat drafts.",
+    "jev": "Jev — fast calibrated judgments about text (never writes text): one call answers several typed questions about the same state (noul yes/no → p(yes); choice → option + probabilities; score → rubric level). For triage, routing, classification, relevance filtering, checking a claim against a source, rubric rating. Literal, specific questions; not for math, counting, dates or writing.",
     "datastore": "Manage persistent relational data tables (create, query, insert, update, delete, import/export)",
     "basna": "Read your past Basna multi-agent sessions like a datastore — list/search sessions and pull the compiled truth, cross-agent analysis, per-agent outputs, and generated files (read-only).",
     "bat": "Bat — the stubborn finisher: start a long-running autonomous run that keeps working a goal across retries and strategy changes until an independent judge says it's genuinely done (survives restarts, reports back when finished); also status/get/list/cancel.",
@@ -168,6 +169,7 @@ _TOOL_PROMPT_DESCRIPTIONS_MICRO: dict[str, str] = {
     "microsoft_onedrive": "OneDrive: list, search, read (content inline), info, download, upload, create, create_folder, update",
     "microsoft_calendar": "Outlook Calendar: list/search/get/create/update/delete/respond events; notify_attendees=true only when asked",
     "microsoft_mail": "Outlook mail: list/search/read/thread, folders, attachments; drafts only when asked; never sends; no repeats",
+    "jev": "calibrated judgments about text: several yes/no (noul), choice or score questions about one state per call; triage/classify/check claims; no math, no writing",
     "datastore": "persistent relational tables",
     "basna": "read past Basna sessions (compiled truth, analysis, agent outputs, files)",
     "bat": "start/inspect a Bat run (stubborn finisher: works a goal until an independent judge says it's done)",
@@ -2313,6 +2315,13 @@ class AgentContextMixin:
             await MicrosoftOAuthManager().is_connected()
         except Exception as _exc:
             log.debug("Microsoft connection priming failed: %s", _exc)
+        # And Jev: whether the owner has a Jev key in Flight Deck (standalone:
+        # whether one is configured).
+        try:
+            from captain_claw import jev_client
+            await jev_client.refresh_connected()
+        except Exception as _exc:
+            log.debug("Jev connection priming failed: %s", _exc)
 
         self._initialized = True
         log.info("Agent initialized", session_id=self.session.id)
@@ -2342,6 +2351,7 @@ class AgentContextMixin:
         "microsoft_onedrive": ["microsoft_onedrive"],
         "microsoft_calendar": ["microsoft_calendar"],
         "microsoft_mail": ["microsoft_mail"],
+        "jev": ["jev"],
         "todo": ["todo"],
         "contacts": ["contacts"],
         "scripts": ["scripts"],
@@ -2376,6 +2386,7 @@ class AgentContextMixin:
             GoogleDriveTool,
             GoogleMailTool,
             ImageGenTool,
+            JevTool,
             MicrosoftCalendarTool,
             MicrosoftMailTool,
             MicrosoftOneDriveTool,
@@ -2491,6 +2502,8 @@ class AgentContextMixin:
                 self.tools.register(MicrosoftCalendarTool(), metadata={"requires_microsoft": True})
             elif tool_name == "microsoft_mail":
                 self.tools.register(MicrosoftMailTool(), metadata={"requires_microsoft": True})
+            elif tool_name == "jev":
+                self.tools.register(JevTool(), metadata={"requires_jev": True})
             elif tool_name == "whatsapp_send_file":
                 self.tools.register(WhatsAppSendFileTool())
             elif tool_name == "intentions":

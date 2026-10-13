@@ -8,9 +8,11 @@ personal access token, and can:
   * ``send_task``    — dispatch a task to one agent (async; returns a task id)
   * ``get_result``   — poll a task for live progress + the final answer
   * ``cancel_task``  — abort an in-flight task
+  * ``jev_ask``      — ask Jev (TypeSafe AI) calibrated questions about a text,
+    with the caller's own Jev key (``jev_routes.ask_for_owner``; no agent)
 
 Everything is owner-scoped: an MCP caller only ever sees and drives their own
-agents. Task execution reuses the same agent ``/ws`` consult mechanism the
+agents and uses only their own connections. Task execution reuses the same agent ``/ws`` consult mechanism the
 peer-consult route uses. PAT management (``/fd/mcp-tokens``) is browser-auth'd
 so users self-serve their tokens from the Flight Deck UI.
 """
@@ -283,6 +285,39 @@ MCP_TOOLS = [
         "description": "Cancel an in-flight task started by send_task (aborts the agent turn).",
         "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"}}, "required": ["task_id"]},
     },
+    {
+        "name": "jev_ask",
+        "description": (
+            "Ask Jev (TypeSafe AI) for fast, calibrated judgments about a piece of text or JSON, "
+            "with your Jev key from Flight Deck → Connections → Jev. Jev does not write text: each "
+            "question is a yes/no (type noul → p(yes)), a choice among named options (→ the chosen "
+            "option, per-option probabilities and a confidence) or a score on an ordered rubric of "
+            "2–10 levels, lowest first (→ the expected level and a confidence). Ask several questions "
+            "about the same state in one call. Good for triage, routing, classification, relevance "
+            "filtering, checking a claim against a source and rubric rating; not for math, counting, "
+            "date arithmetic or writing text. Returns answers, a headline value per question "
+            "(`values`), a readable summary and token usage."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "state": {
+                    "description": "The content the questions are about: text, or a JSON object/array.",
+                },
+                "questions": {
+                    "description": (
+                        "A map of name → question, or a list of questions each with a `name`. A question: "
+                        "{\"type\": \"noul\" | \"choice\" | \"score\", \"instructions\": \"the question, "
+                        "literal and specific\"}, plus for choice `options` (a list of {\"name\", "
+                        "\"description\"} or of names), for score `levels` (descriptions, lowest first), "
+                        "for noul optionally `yes_means` / `no_means`."
+                    ),
+                },
+                "model": {"type": "string", "description": "Jev model (default jev-latest)."},
+            },
+            "required": ["state", "questions"],
+        },
+    },
 ]
 
 
@@ -355,11 +390,24 @@ async def _tool_cancel_task(user: dict, args: dict) -> dict:
     return {"task_id": t.id, "status": t.status if t.status != "running" else "cancelling"}
 
 
+async def _tool_jev_ask(user: dict, args: dict) -> dict:
+    """Jev with the caller's own key (auth off: the deck's). Errors (no key,
+    a malformed question, Jev refusing) come back in-band."""
+    from captain_claw.flight_deck import jev_routes
+
+    model = args.get("model")
+    return await jev_routes.ask_for_owner(
+        str(user.get("id") or ""), args.get("state"), args.get("questions"),
+        str(model).strip() if model else None, source="mcp",
+    )
+
+
 _TOOL_HANDLERS = {
     "list_agents": _tool_list_agents,
     "send_task": _tool_send_task,
     "get_result": _tool_get_result,
     "cancel_task": _tool_cancel_task,
+    "jev_ask": _tool_jev_ask,
 }
 
 

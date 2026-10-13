@@ -27,9 +27,13 @@ PROVIDER_KEYS_SETTING = "fd:provider-keys"
 # written only through PUT /fd/shared-agents/google, which checks membership and
 # stamps the agent's current owner. ``microsoft_oauth:*`` is the Microsoft twin
 # of ``google_oauth:*`` (written only by /fd/microsoft/callback, a refresh and
-# /fd/microsoft/logout).
+# /fd/microsoft/logout). ``jev:*`` is the user's Jev (TypeSafe AI) API key and
+# what Flight Deck knows about it — written only through PUT / DELETE
+# /fd/jev/key (which verify the key and never return it); readable here, any
+# script running as the user would get the raw key.
 _SERVER_OWNED_PREFIXES = (
     "google_oauth:", "microsoft_oauth:", "fd:tenant-profile", "fd:shared-agent-",
+    "jev:",
 )
 
 

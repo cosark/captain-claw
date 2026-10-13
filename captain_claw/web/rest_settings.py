@@ -41,6 +41,7 @@ _SECRET_FIELDS: frozenset[str] = frozenset({
     "tools.send_mail.sendgrid_api_key",
     "tools.send_mail.smtp_password",
     "tools.typesense.api_key",
+    "tools.jev.api_key",
     "tools.pinchtab.token",
     "telegram.bot_token",
     "slack.bot_token",
