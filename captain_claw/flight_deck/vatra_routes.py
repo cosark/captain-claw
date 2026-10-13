@@ -19,6 +19,7 @@ fast-follow once Phase 1 validates.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import re
 import shutil
@@ -230,19 +231,42 @@ def _phase(sid: str, label: str, **extra) -> None:
 # round registers the ROOT run's folder here so EVERY resolution site below
 # (worker env, prompt directives, reporter, ask helpers, agent_wait) lands on the
 # same accumulated data — without threading a project param through each one.
-# Populated at the top of execute_vatra, cleared in its teardown.
+# Populated at the top of execute_vatra; released by _release_run_state when the
+# whole run ends (NOT at the team teardown — the reporter and fact-checker read it).
 _run_vfs_project: dict[str, str] = {}
 
 # Per-run flag: when set, every worker is bound to the run's folder-scoped shared
 # datastore (vfs:<project>/.datastore). Populated at the top of execute_vatra,
-# cleared in teardown — mirrors _run_vfs_project.
+# released with _run_vfs_project.
 _run_shared_datastore: dict[str, bool] = {}
 
 # Per-run deliverable Manifest (Increment 3) and quality flags the agent-facing
 # endpoints (_vatra_env, agent_wait) read back without re-parsing config. Populated
-# in execute_vatra, cleared in teardown alongside _run_vfs_project.
+# in execute_vatra, released with _run_vfs_project (synthesis + the done gate read them).
 _run_manifest: dict[str, Any] = {}
 _run_flags: dict[str, dict] = {}
+
+
+# Which execute_vatra call owns a session's per-run state. A stale coroutine for the
+# same session (Stop/resume raced a run still unwinding, a double approve) must never
+# release a newer run's registrations.
+_run_owner: dict[str, object] = {}
+# The owning call's token, visible inside its run body — the team teardown only
+# releases team-phase state the run still owns.
+_run_token_var: contextvars.ContextVar[object | None] = contextvars.ContextVar(
+    "vatra_run_token", default=None)
+
+
+def _release_run_state(sid: str, token: object) -> None:
+    """Drop the per-run maps the post-team phases (reporter, fact-checker, done gate,
+    agent_wait) read. Called once from execute_vatra's finally, so every exit path
+    (done, blocked, 502, crash, cancel) clears them, and only by the owning call."""
+    if not sid or _run_owner.get(sid) is not token:
+        return
+    _run_owner.pop(sid, None)
+    for m in (_run_vfs_project, _run_shared_datastore, _run_manifest, _run_flags,
+              _run_workers, _wait_ledger, _skip_agents, _owner_activity):
+        m.pop(sid, None)
 
 
 def _vfs_project(sid: str) -> str:
@@ -515,7 +539,8 @@ def _dep_output_block(st: dict, results_by_id: dict, cap: int = _DEP_PUSH_CAP) -
             "work. If you still need something not shown here, search the board first.")
 
 
-def _vatra_env(sid: str, subtask: str, owner: str, depth: int) -> list[dict]:
+def _vatra_env(sid: str, subtask: str, owner: str, depth: int, *,
+               role: str = "worker") -> list[dict]:
     """Run-context env injected into a worker so the `vatra` tool knows where it is."""
     project = _vfs_project(sid)
     env = [
@@ -535,12 +560,15 @@ def _vatra_env(sid: str, subtask: str, owner: str, depth: int) -> list[dict]:
     # against the declared set, and enforce a byte floor on its declared part.
     flags = _run_flags.get(sid) or {}
     manifest = _run_manifest.get(sid)
-    if flags.get("write_guard") and manifest is not None:
+    if flags.get("write_guard") and manifest is not None and role != "factcheck":
         import json as _json
+        # The reporter may only ever land on the deliverable itself — never be
+        # "repaired" onto a teammate's part, never inherit a part's byte floor.
+        _declared = ([manifest.basename()] if role == "reporter"
+                     else manifest.declared_basenames())
         env.append({"key": "CLAW_WRITE_STRICT", "value": "1"})
-        env.append({"key": "CLAW_DECLARED_FILES",
-                    "value": _json.dumps(manifest.declared_basenames())})
-        part = manifest.part_for(subtask) if subtask else None
+        env.append({"key": "CLAW_DECLARED_FILES", "value": _json.dumps(_declared)})
+        part = manifest.part_for(subtask) if (subtask and role == "worker") else None
         if part is not None:
             env.append({"key": "CLAW_MY_ARTIFACT", "value": part.basename()})
             floor = part.min_bytes or manifest.min_bytes or 0
@@ -1189,6 +1217,35 @@ async def _persist_run_crash(body: "ExecuteRequest", user: dict, exc: Exception)
             "subtasks": [], "learned": [], "cost": None}
 
 
+def _track_run_task(session_id: str, task: asyncio.Task) -> None:
+    """Keep a background run task alive AND registered for its session, so Stop
+    (_cancel_basna_run) cancels the coroutine — not only its workers. An
+    unregistered run kept unwinding after Stop, into its reporter, while a
+    resumed run of the same session was already going."""
+    _basna_agent_tasks.add(task)
+    _agent_run_tasks[session_id] = task
+
+    def _done(t: asyncio.Task, _sid: str = session_id) -> None:
+        _bg_task_done(t)
+        if _agent_run_tasks.get(_sid) is t:
+            _agent_run_tasks.pop(_sid, None)
+    task.add_done_callback(_done)
+
+
+def _live_run_task(session_id: str) -> asyncio.Task | None:
+    """The session's registered run task while it is still running (not done, not
+    already being cancelled by Stop/resume)."""
+    t = _agent_run_tasks.get(session_id)
+    if t is None or t.done() or t.cancelling():
+        return None
+    return t
+
+
+# Sessions with a gate action (approve / replan) in flight — reserved before the
+# first await, so two tabs can't both pass the gate check.
+_approving: set[str] = set()
+
+
 def _bg_task_done(task: "asyncio.Task") -> None:
     """Done-callback for fire-and-forget run tasks: drop the retained reference AND
     surface any exception the task swallowed (otherwise it is dropped silently on GC,
@@ -1448,6 +1505,11 @@ async def _plan_vatra_group0_inner(body: ExecuteRequest, request: Request, user:
         _knobs["role_tiers"] = body.role_tiers
     if getattr(body, "dispatch_timeout", None):
         _knobs["dispatch_timeout"] = body.dispatch_timeout
+    # The run's folder must survive the approval gate on its own (an FD restart, a
+    # resume, a continuation) — not ride a leaked in-memory registration.
+    _body_vfs = (getattr(body, "vfs_project", "") or "").strip()
+    if _body_vfs and not cfg.get("vfs_project"):
+        _knobs["vfs_project"] = _body_vfs
     _changed = {k: v for k, v in _knobs.items() if cfg.get(k) != v}
     if _changed:
         cfg.update(_changed)
@@ -1457,9 +1519,10 @@ async def _plan_vatra_group0_inner(body: ExecuteRequest, request: Request, user:
             log.warning("Vatra Group 0 knob persist failed", error=str(e))
 
     _shared_ds = bool(getattr(body, "shared_datastore", False) or cfg.get("shared_datastore"))
-    _vfs_override = (cfg.get("vfs_project") or getattr(body, "vfs_project", "") or "").strip()
-    if _vfs_override:
-        _run_vfs_project[sid] = _vfs_override
+    # The run's folder (persisted in cfg above). Not registered globally here: only
+    # execute_vatra owns — and releases — the session's run state.
+    _plan_folder = ((cfg.get("vfs_project") or getattr(body, "vfs_project", "") or "").strip()
+                    or f"vatra-{sid[:8]}")
 
     session_files = _parse_files(sess)
     input_files = [f for f in session_files if f.get("kind") != "generated"]
@@ -1471,7 +1534,7 @@ async def _plan_vatra_group0_inner(body: ExecuteRequest, request: Request, user:
 
     route = await _ensure_route(db, user["id"], sess, sid, intent=intent,
                                 max_agents=max_agents, creds=_creds(_role_tier("lead", "reason")), cfg=cfg,
-                                shared_datastore=_shared_ds, vfs_project=_vfs_project(sid),
+                                shared_datastore=_shared_ds, vfs_project=_plan_folder,
                                 **_seed_kwargs(body))
     subtasks = route.get("subtasks") or []
     # Re-resolve execution groups from the user's team-plan edits BEFORE the plan is
@@ -1485,6 +1548,7 @@ async def _plan_vatra_group0_inner(body: ExecuteRequest, request: Request, user:
     # Idempotency: a second /execute on an already-gated session re-emits the gate
     # instead of spawning a second planner.
     if (sess.get("status") or "") == "awaiting_plan" and route.get("group0_plan"):
+        await db.update_basna_session(sid, user["id"], status="awaiting_plan")  # undo 'planning'
         _emit_awaiting_plan(sid, route["group0_plan"])
         return {"session_id": sid, "status": "awaiting_plan"}
 
@@ -1523,6 +1587,11 @@ async def execute_vatra(body: ExecuteRequest, request: Request, user: dict) -> d
     Skips the agent. Reset on the way out so a caller that awaited this inline (a
     flow, a continuation) doesn't inherit it for its own dispatches."""
     _unbounded = _run_extend_unbounded.set(True)
+    _sid = str(getattr(body, "session_id", "") or "")
+    _token = object()
+    if _sid:
+        _run_owner[_sid] = _token
+    _token_reset = _run_token_var.set(_token)
     try:
         return await _execute_vatra_inner(body, request, user)
     except (HTTPException, asyncio.CancelledError):
@@ -1530,6 +1599,8 @@ async def execute_vatra(body: ExecuteRequest, request: Request, user: dict) -> d
     except Exception as exc:  # noqa: BLE001 — a crash must never leave the run 'running'
         return await _persist_run_crash(body, user, exc)
     finally:
+        _release_run_state(_sid, _token)
+        _run_token_var.reset(_token_reset)
         _run_extend_unbounded.reset(_unbounded)
 
 
@@ -1708,6 +1779,14 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
     if _deliverable_req is None:
         _deliverable_req = cfg.get("deliverable")
     _manifest = deliverable_manifest.parse(_deliverable_req, subtasks, vfs_project)
+    # Deterministic assembly only stitches parts a caller DECLARED. A derived manifest
+    # makes every subtask a part (research, outline, editor pass) — gluing those is
+    # not the deliverable, so derived runs keep the reporter's rewrite.
+    _manifest_declared = (_manifest is not None and bool(_manifest.parts)
+                          and all(p.owner for p in _manifest.parts))
+    if _manifest is not None and _manifest.parts and not _manifest_declared:
+        _progress(sid, "note", "Deliverable parts have no owners — deterministic assembly "
+                               "skipped; the reporter assembles the pieces")
     # Fall back to deriving when there is no manifest, or when a caller/continuation
     # manifest resolved to zero parts (e.g. its owners are stale after a re-decompose).
     if (_manifest is None or not _manifest.parts) and quality.derive_manifest:
@@ -1874,7 +1953,7 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
     # can pull past its inline slice cap). Free; best-effort.
     vfs_dir: Path | None = None
     if (quality.research_map or quality.git_snapshots or quality.facts_ledger
-            or quality.constraints_contract):
+            or quality.constraints_contract or quality.synthesis_emit == "concat_then_smooth"):
         try:
             from captain_claw.flight_deck.vfs_routes import _user_root
             vfs_dir = _user_root(user["id"]) / vfs_project
@@ -1932,6 +2011,7 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
     generated_files: list[dict] = []
     seen_gen: set[str] = set()
     dest_dir = _session_files_dir(sid)
+    _my_sched: dict | None = None  # this run's published group schedule (if grouped)
 
     try:
         # 2) Spawn one owner per subtask.
@@ -2294,7 +2374,7 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
             # Publish the live schedule so worker briefs + the wait endpoint know
             # who has run, who runs now, and who runs later (fix for a worker
             # burning its wait budget on a later-phase teammate's output).
-            _group_schedule[sid] = {
+            _my_sched = _group_schedule[sid] = {
                 "current": int(first_phase or 0),
                 "done": set(),
                 "owners": [{
@@ -2693,22 +2773,24 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
                 except Exception as e:  # noqa: BLE001
                     log.debug("Vatra checkpoint finalize failed", error=str(e))
     finally:
+        # Team-phase state ends with the team. The run's folder, datastore binding,
+        # manifest and flags stay until execute_vatra releases them: the reporter,
+        # the fact-checker and the done gate below still need them.
         _teardown([sp["slug"] for sp in spawned])
-        _run_workers.pop(sid, None)
-        _run_vfs_project.pop(sid, None)
-        _run_shared_datastore.pop(sid, None)
-        _run_manifest.pop(sid, None)
-        _run_flags.pop(sid, None)
-        _owner_activity.pop(sid, None)
-        _skip_agents.pop(sid, None)
-        _wait_ledger.pop(sid, None)
+        # A run replaced by a newer one on the same session (Stop → Resume while
+        # this one was still unwinding) must not clear the newer run's state.
+        if _run_owner.get(sid) is _run_token_var.get():
+            _run_workers.pop(sid, None)
+            _owner_activity.pop(sid, None)
+            _skip_agents.pop(sid, None)
+            _wait_ledger.pop(sid, None)
+        if _group_schedule.get(sid) is _my_sched:
+            _group_schedule.pop(sid, None)
         # An aborted run may leave a called-forward dispatch in flight — cancel
-        # it so no orphan task outlives its run.
-        _sched_state = _group_schedule.pop(sid, None)
-        if _sched_state:
-            for _t in (_sched_state.get("tasks") or {}).values():
-                if not _t.done():
-                    _t.cancel()
+        # it so no orphan task outlives its run (its own tasks only).
+        for _t in ((_my_sched or {}).get("tasks") or {}).values():
+            if not _t.done():
+                _t.cancel()
 
     usable = [r for r in results if (r.get("ok") or r.get("produced_file"))
               and (r.get("output") or "").strip() and not r.get("blocked")]
@@ -2777,11 +2859,12 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
     # in order (code, not a from-memory LLM rewrite) into the deliverable file, then
     # let the reporter only SMOOTH the seams (guarded against collapse). Assembly seam
     # findings (duplicate/missing chapter, placeholder part) feed the done gate + QA.
-    _manifest_obj = _run_manifest.get(sid)
-    _producer_done = {r["owner"]: bool(r.get("ok") or r.get("produced_file")) for r in results}
+    _manifest_obj = _manifest  # this run's own (the global map belongs to the session's owner)
+    _producer_done = {r["id"]: bool(r.get("ok") or r.get("produced_file")) for r in results}
     _smooth_arg = None
     _assembly_findings: list[dict] = []
     if (quality.synthesis_emit == "concat_then_smooth" and _manifest_obj is not None
+            and _manifest_declared and not cfg.get("parent_session_id")
             and vfs_dir is not None):
         try:
             _asm = deliverable_manifest.assemble(vfs_dir, _manifest_obj, _producer_done)
@@ -2792,8 +2875,12 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
                 (dest_dir / f"{_manifest_obj.basename()}.pre-smooth").write_text(
                     _asm["text"], encoding="utf-8")
                 _abytes = len(_asm["text"].encode("utf-8"))
+                # The session's download copy must not overwrite an uploaded input
+                # of the same name (a "revise my manuscript.md" run).
+                _dl_name = (_manifest_obj.basename() if _manifest_obj.basename() not in input_names
+                            else f"assembly__{_manifest_obj.basename()}")
                 generated_files.append({
-                    "name": _manifest_obj.basename(), "mime": "text/markdown",
+                    "name": _dl_name, "mime": "text/markdown",
                     "size": _abytes, "kind": "generated", "agent": "assembly",
                     "vfs": _manifest_obj.path})
                 _progress(sid, "report",
@@ -2802,9 +2889,62 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
                           f"{deliverable_manifest.count_sections(_asm['text'])} sections)")
                 _smooth_arg = {"file": str(_dfile), "path": _manifest_obj.path,
                                "text": _asm["text"], "findings": _assembly_findings,
-                               "bytes": _abytes}
+                               "bytes": _abytes, "download": _dl_name}
         except OSError as e:  # noqa: BLE001 — assembly is best-effort; reporter falls back
             log.warning("Vatra deterministic assembly failed", error=str(e))
+
+    def _sync_deliverable_file() -> None:
+        """Keep the assembled deliverable file == truth (VFS folder + session files dir,
+        so the listed file downloads). Only when assembly produced the file."""
+        if _smooth_arg is None or _manifest_obj is None or vfs_dir is None:
+            return
+        if not (truth or "").strip() or write_guard.is_placeholder_content(truth):
+            return
+        for _p in (vfs_dir / _manifest_obj.basename(), dest_dir / _smooth_arg["download"]):
+            try:
+                _p.write_text(truth, encoding="utf-8")
+            except OSError as e:  # noqa: BLE001
+                log.warning("Vatra deliverable sync failed", path=str(_p), error=str(e))
+        for _g in generated_files:
+            if _g.get("agent") == "assembly" and _g.get("name") == _smooth_arg["download"]:
+                _g["size"] = len(truth.encode("utf-8"))
+
+    def _structure_kept(new: str, old: str) -> bool:
+        cs = deliverable_manifest.count_sections
+        rx = (_manifest_obj.section_regex if _manifest_obj else "") or ""
+        if cs(new) >= cs(old) and (not rx or cs(new, rx) >= cs(old, rx)):
+            return True
+        # Dropping a DUPLICATED chapter is a fix, not a cut: every chapter number
+        # survives and there are fewer repeats.
+        ch_old, ch_new = deliverable_manifest.chapters_in(old), deliverable_manifest.chapters_in(new)
+        return (bool(ch_old) and set(ch_new) >= set(ch_old)
+                and len(ch_new) - len(set(ch_new)) < len(ch_old) - len(set(ch_old)))
+
+    def _keeps_assembly(new: str, old: str, what: str) -> bool:
+        """An assembled deliverable must not come back shorter from a later revision
+        (a capped revise model can return a cut-off text that still passes its own
+        50% collapse check) — nor shrink step by step: length is measured against
+        the smoothed deliverable too. Rewrite-mode runs are unaffected."""
+        if _smooth_arg is None:
+            return True
+        new, old = new or "", old or ""
+        base = max(len(old), _assembled_len)
+        if len(new) >= 0.9 * base and _structure_kept(new, old):
+            return True
+        _progress(sid, "verify", f"{what}: revision rejected — it would cut the assembled "
+                                 f"deliverable ({len(new)} vs {base} chars)", ok=False)
+        return False
+
+    def _keep_original(res: dict, *, story: bool = False) -> dict:
+        """A rejected revision: report the shipped (original) text's findings, not the
+        rejected text's — otherwise a rejection makes the report look cleaner."""
+        init = res.get("initial_findings") or []
+        out = {**res, "text": truth, "revised": False, "findings": init}
+        if story:
+            out.update(blocking=story_state.blocking_findings(init),
+                       scores=res.get("initial_scores") or res.get("scores"),
+                       **story_state.bucket(init))
+        return out
 
     truth, reporter_files = await _run_reporter(
         request, user, sid, sid8, run_tag, intent, usable, cfg, arch_by_id,
@@ -2823,6 +2963,8 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
         smooth=_smooth_arg,
     )
     generated_files.extend(reporter_files)
+    _assembled_len = len(truth or "") if _smooth_arg is not None else 0  # the cumulative floor
+    _sync_deliverable_file()
     confidence = round(len(usable) / max(1, len(results)), 3)
 
     # 5b) Horizon closer (Lever B, opt-in): adversarially verify the assembled
@@ -2841,7 +2983,7 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
                 question=intent, answer=truth, critic_provider=cp, revise_provider=rp,
                 critics=_hcfg.critics, on_event=_closer_on_event(sid, "Closer", "verify"),
                 triage_findings=quality.critic_triage)  # R3
-            if closed["revised"]:
+            if closed["revised"] and _keeps_assembly(closed["answer"], truth, "Closer"):
                 truth = closed["answer"]
                 _progress(sid, "verify", "Closer revised the deliverable")
             else:
@@ -2918,7 +3060,10 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
                 ledger_rows=_ledger_rows,
                 on_progress=lambda m: _progress(sid, "verify", m))
             if cres["revised"]:
-                truth = cres["text"]
+                if _keeps_assembly(cres["text"], truth, "Consistency check"):
+                    truth = cres["text"]
+                else:
+                    cres = _keep_original(cres)
             cdoc = research_consistency.write_audit(dest_dir, cres, question=intent)
             if cdoc:
                 generated_files.append(cdoc)
@@ -2971,12 +3116,7 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
                 [_Msg(role="user", content=p)], temperature=0.1, max_tokens=mt), 300)
             return r.content or ""
 
-        def _write_back():
-            if _manifest_obj is not None and vfs_dir is not None:
-                try:
-                    (vfs_dir / _manifest_obj.basename()).write_text(truth, encoding="utf-8")
-                except OSError as e:  # noqa: BLE001
-                    log.warning("Vatra QA rewrite failed", error=str(e))
+        _write_back = _sync_deliverable_file
 
         if _run_integrity:
             _progress(sid, "verify", "Story integrity: extracting the state store…")
@@ -2992,8 +3132,11 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
                     max_rounds=quality.validation_max_rounds,
                     on_progress=lambda m: _progress(sid, "verify", m))
                 if ires["revised"]:
-                    truth = ires["text"]
-                    _write_back()
+                    if _keeps_assembly(ires["text"], truth, "Story integrity"):
+                        truth = ires["text"]
+                        _write_back()
+                    else:
+                        ires = _keep_original(ires, story=True)
                 idoc = story_state.write_audit(dest_dir, ires, question=intent)
                 if idoc:
                     generated_files.append(idoc)
@@ -3018,8 +3161,11 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
                     truth, extract_fn=_qa_extract, revise_fn=_qa_revise,
                     on_progress=lambda m: _progress(sid, "verify", m))
                 if canon_res["revised"]:
-                    truth = canon_res["text"]
-                    _write_back()
+                    if _keeps_assembly(canon_res["text"], truth, "Canon check"):
+                        truth = canon_res["text"]
+                        _write_back()
+                    else:
+                        canon_res = _keep_original(canon_res)
                 cdoc = research_canon.write_audit(dest_dir, canon_res, question=intent)
                 if cdoc:
                     generated_files.append(cdoc)
@@ -3040,7 +3186,8 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
                 request, user, sid, sid8, run_tag, intent=intent, deliverable=truth,
                 arch_by_id=arch_by_id, tiers=body.tiers, api_key=body.api_key,
                 env_vars=body.env_vars, dispatch_timeout=body.dispatch_timeout,
-                quality=quality, research_dir=research_dir, facts_block=facts_dump)
+                quality=quality, research_dir=research_dir, facts_block=facts_dump,
+                keep_fn=lambda new, old: _keeps_assembly(new, old, "Fact-check"))
             if cc_doc:
                 generated_files.append(cc_doc)
         except Exception as e:  # noqa: BLE001 — claim check is best-effort
@@ -3081,7 +3228,12 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
                 budget=_budget, est=2 * _retry_est,
                 on_progress=lambda m: _progress(sid, "verify", m))
             if gate["revised"]:
-                truth = gate["text"]
+                if _keeps_assembly(gate["text"], truth, "Blocking gate"):
+                    truth = gate["text"]
+                else:
+                    _left = quality_findings.criticals(findings)
+                    gate = {**gate, "text": truth, "revised": False, "remaining": _left,
+                            "verdict": "critical_findings_remain" if _left else "clean"}
             gate_summary = {"verdict": gate["verdict"], "rounds": gate["rounds"],
                             "remaining": gate["remaining"][:10]}
             _progress(sid, "verify",
@@ -3091,6 +3243,8 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
                       ok=gate["verdict"] == "clean")
         except Exception as e:  # noqa: BLE001 — the gate must never lose a run
             log.warning("Vatra blocking gate failed", error=str(e))
+
+    _sync_deliverable_file()  # claim check / blocking gate may have revised truth
 
     # 6) Persist one run per owner (success backfilled by the learning step below).
     run_ids = await db.add_basna_runs(sid, user["id"], [{
@@ -3112,15 +3266,21 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
             _manifest_obj, truth,
             min_chars_fallback=quality.deliverable_min_chars,
             min_sections_fallback=quality.deliverable_min_sections)
+        # A missing or placeholder part always blocks; the chapter-numbering
+        # heuristics (duplicate / missing chapter) only under a strict gate.
+        _strict_gate = bool(quality.require_deliverable_file or quality.gate_blocks_done)
         _crit = [f for f in _assembly_findings
-                 if f.get("kind") in ("part_missing", "placeholder_part",
-                                      "duplicate_chapter", "missing_chapter")]
+                 if f.get("kind") in ("part_missing", "placeholder_part")
+                 or (_strict_gate and f.get("kind") in ("duplicate_chapter", "missing_chapter"))]
+        _warn = [f for f in _assembly_findings
+                 if f.get("kind") in ("duplicate_chapter", "missing_chapter") and f not in _crit]
         _deliverable_analysis = (deliverable_manifest.to_analysis(_manifest_obj)
                                  if _manifest_obj else {})
         _deliverable_analysis.update({
             "verdict": "ok" if (_dg["ok"] and not _crit) else "failed",
             "reasons": _dg["reasons"], "bytes": _dg["bytes"],
-            "sections": _dg["sections"], "assembly_findings": _crit})
+            "sections": _dg["sections"], "assembly_findings": _crit,
+            "assembly_warnings": _warn})
         if (not _dg["ok"] or _crit) and (quality.require_deliverable_file or _crit):
             _fb_files = {f["name"]: f for f in session_files}
             for g in generated_files:
@@ -3133,6 +3293,9 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
                 analysis={"deliverable": _deliverable_analysis,
                           "quality_verdict": "deliverable_missing"},
                 confidence=confidence, domain=domain)
+        if _warn:
+            _progress(sid, "verify", f"Deliverable gate: {len(_warn)} warning(s) — "
+                                     + "; ".join(f["detail"] for f in _warn)[:300], ok=False)
         _progress(sid, "verify",
                   f"Deliverable gate: {_deliverable_analysis['verdict']} "
                   f"({_dg['bytes']} bytes, {_dg['sections']} sections)",
@@ -3987,6 +4150,8 @@ async def _run_reporter(request: Request, user: dict, sid: str, sid8: str, run_t
     fallback = "\n\n".join(f"## {r['title']} ({r['role']})\n{r['output'].strip()}" for r in usable)
     if asks_block:
         fallback += "\n\n## Answers to cross-agent requests" + asks_block
+    if smooth is not None and (smooth.get("text") or "").strip():
+        fallback = smooth["text"]  # the assembled file IS the deliverable
     if not arch:
         _progress(sid, "report", "No reporter archetype available; using raw assembly", ok=False)
         return fallback, []
@@ -4005,7 +4170,7 @@ async def _run_reporter(request: Request, user: dict, sid: str, sid8: str, run_t
         # CLAW_NO_SCALE: the reporter ASSEMBLES pieces — turn off the list/scale +
         # write-file-enforcement pipeline so it isn't blocked in an infinite rewrite
         # loop (the pieces read as unresolved "list members").
-        extra_env=_vatra_env(sid, "reporter", reporter_id, 0) + [{"key": "CLAW_NO_SCALE", "value": "1"}],
+        extra_env=_vatra_env(sid, "reporter", reporter_id, 0, role="reporter") + [{"key": "CLAW_NO_SCALE", "value": "1"}],
         corpus=corpus,  # R10
     )
     if not sp["ok"]:
@@ -4069,7 +4234,7 @@ async def _run_reporter(request: Request, user: dict, sid: str, sid8: str, run_t
                 prompt += ("\n\n" + _coverage + "\n(For your reference — do not paste this list "
                            "into the deliverable. A teammate's notes file holds the facts behind "
                            "a thin piece.)\n")
-            prompt += _vfs_directive(_vfs_project(sid))
+            prompt += _vfs_directive(project or _vfs_project(sid))
 
         def _on_action(act: dict) -> None:
             detail = act.get("detail", "")
@@ -4175,7 +4340,8 @@ _FACTCHECK_ARCHETYPES = ("fact-checker", "deep-researcher", "market-scanner")
 async def _claim_check(request: Request, user: dict, sid: str, sid8: str, run_tag: str, *,
                        intent: str, deliverable: str, arch_by_id: dict, tiers,
                        api_key, env_vars, dispatch_timeout, quality,
-                       research_dir, facts_block: str = "") -> tuple[str, dict | None, list[dict] | None]:
+                       research_dir, facts_block: str = "",
+                       keep_fn=None) -> tuple[str, dict | None, list[dict] | None]:
     """Spawn a web-tool fact-checker, verify the deliverable's load-bearing claims,
     revise it to fix any verified WRONG and hedge any unconfirmable specific it
     asserted as fact, and write a standalone audit ledger. Returns
@@ -4202,7 +4368,7 @@ async def _claim_check(request: Request, user: dict, sid: str, sid8: str, run_ta
         cognitive_mode=checker.get("cognitive_mode", "phrygian"),  # adversarial lens
         tools=tools, tier=checker.get("tier", "reason"), tiers=tiers,
         api_key=api_key, env_vars=env_vars,
-        extra_env=_vatra_env(sid, "factcheck", checker["id"], 0),
+        extra_env=_vatra_env(sid, "factcheck", checker["id"], 0, role="factcheck"),
         corpus=quality.source_corpus)
     if not sp["ok"]:
         _progress(sid, "verify", f"Fact-checker spawn failed ({sp['message']})", ok=False)
@@ -4254,6 +4420,9 @@ async def _claim_check(request: Request, user: dict, sid: str, sid8: str, run_ta
             collapsed = not revised or (len(deliverable) > 800 and len(revised) < 0.5 * len(deliverable))
             if collapsed:
                 _progress(sid, "verify", "Kept the original (correction pass collapsed)", agent=role, ok=False)
+            elif keep_fn is not None and not keep_fn(revised, deliverable):
+                _progress(sid, "verify", "Kept the original (correction pass would cut the "
+                                         "assembled deliverable)", agent=role, ok=False)
             else:
                 text, revised_applied = revised, True
                 _progress(sid, "verify",
@@ -4995,9 +5164,10 @@ async def execute_vatra_ui(body: VatraExecuteRequest, request: Request,
         horizon=body.horizon or None, max_parallel=body.max_parallel or 0,
         execution_groups=bool(body.execution_groups))
     stub = types.SimpleNamespace(state=types.SimpleNamespace(user_id=user["id"]))
+    if _live_run_task(body.session_id) or body.session_id in _approving:
+        raise HTTPException(409, "this session already has a run in progress")
     t = asyncio.create_task(plan_vatra_group0(exec_req, stub, user, gate=True))
-    _basna_agent_tasks.add(t)
-    t.add_done_callback(_bg_task_done)
+    _track_run_task(body.session_id, t)
     return {"session_id": body.session_id, "status": "planning"}
 
 
@@ -5028,6 +5198,20 @@ class VatraPlanCancelRequest(BaseModel):
 @router.post("/plan/approve")
 async def approve_vatra_plan(body: VatraPlanApproveRequest, request: Request,
                              user: dict = Depends(get_current_user)):
+    """Approve the Group 0 plan and start the run — at most once: the session is
+    reserved before the first await, so a second approve (another tab) can neither
+    start a second team nor overwrite the approved plan."""
+    sid = body.session_id
+    if sid in _approving or _live_run_task(sid):
+        raise HTTPException(409, "this run is already running")
+    _approving.add(sid)
+    try:
+        return await _approve_vatra_plan(body, request, user)
+    finally:
+        _approving.discard(sid)
+
+
+async def _approve_vatra_plan(body: VatraPlanApproveRequest, request: Request, user: dict):
     """Approve the Group 0 coordination plan and start the run. Persists the edited
     plan (if any), then backgrounds execute_vatra with the knobs saved at plan time
     (overridable). Mirrors the Code-mode plan/approve gate."""
@@ -5079,8 +5263,7 @@ async def approve_vatra_plan(body: VatraPlanApproveRequest, request: Request,
                           else float(cfg.get("dispatch_timeout") or 600.0)))
     stub = types.SimpleNamespace(state=types.SimpleNamespace(user_id=user["id"]))
     t = asyncio.create_task(execute_vatra(exec_req, stub, user))
-    _basna_agent_tasks.add(t)
-    t.add_done_callback(_bg_task_done)
+    _track_run_task(body.session_id, t)
     return {"session_id": body.session_id, "status": "running"}
 
 
@@ -5199,15 +5382,21 @@ async def replan_vatra_plan(body: VatraPlanReplanRequest, request: Request,
                 new_groups[str(a["subtask_id"])] = str(a["group"]).strip()
     clarifications = _format_clarifications(
         (body.plan or {}).get("questions") if isinstance(body.plan, dict) else [])
-    # Flip status synchronously so the UI leaves the gate immediately (no poll lag)
-    # instead of waiting for the background task to set it.
-    await db.update_basna_session(body.session_id, user["id"], status="planning")
-    stub = types.SimpleNamespace(state=types.SimpleNamespace(user_id=user["id"]))
-    t = asyncio.create_task(_replan_group0(
-        body.session_id, stub, user, new_groups=new_groups, clarifications=clarifications,
-        tiers=body.tiers, env_vars=body.env_vars, api_key=body.api_key or ""))
-    _basna_agent_tasks.add(t)
-    t.add_done_callback(_bg_task_done)
+    # One gate action at a time (an approve or another replan from a second tab).
+    if body.session_id in _approving or _live_run_task(body.session_id):
+        raise HTTPException(409, "this session already has a run in progress")
+    _approving.add(body.session_id)
+    try:
+        # Flip status synchronously so the UI leaves the gate immediately (no poll lag)
+        # instead of waiting for the background task to set it.
+        await db.update_basna_session(body.session_id, user["id"], status="planning")
+        stub = types.SimpleNamespace(state=types.SimpleNamespace(user_id=user["id"]))
+        t = asyncio.create_task(_replan_group0(
+            body.session_id, stub, user, new_groups=new_groups, clarifications=clarifications,
+            tiers=body.tiers, env_vars=body.env_vars, api_key=body.api_key or ""))
+        _track_run_task(body.session_id, t)
+    finally:
+        _approving.discard(body.session_id)
     return {"session_id": body.session_id, "status": "planning"}
 
 
@@ -5231,7 +5420,9 @@ async def launch_vatra_resume(
         raise HTTPException(404, "session not found")
     if (sess.get("status") or "") == "done" and (sess.get("truth") or "").strip():
         raise HTTPException(400, "session already completed — nothing to resume")
-    if (sess.get("status") or "") == "awaiting_plan":
+    if (sess.get("status") or "") in ("awaiting_plan", "planning", "routed"):
+        # The team never started (the plan was never approved): nothing to resume,
+        # and resuming would run a team on a plan nobody approved.
         raise HTTPException(400, "approve or cancel the plan first — nothing to resume")
     try:
         cfg = json.loads(sess.get("config") or "{}")
@@ -5253,12 +5444,7 @@ async def launch_vatra_resume(
         resume=True)
     stub = types.SimpleNamespace(state=types.SimpleNamespace(user_id=user["id"]))
     t = asyncio.create_task(execute_vatra(exec_req, stub, user))
-    _basna_agent_tasks.add(t)
-    _agent_run_tasks[session_id] = t
-    def _clear(_t: asyncio.Task, _sid: str = session_id) -> None:
-        _basna_agent_tasks.discard(_t)
-        _agent_run_tasks.pop(_sid, None)
-    t.add_done_callback(_clear)
+    _track_run_task(session_id, t)
     return {"session_id": session_id, "status": "running", "resumed": True}
 
 
@@ -5339,8 +5525,7 @@ async def start_vatra(body: VatraStartRequest, request: Request,
     # request.state.user_id) — the real request object isn't safe to use post-response.
     stub = types.SimpleNamespace(state=types.SimpleNamespace(user_id=user["id"]))
     t = asyncio.create_task(plan_vatra_group0(exec_req, stub, user, gate=True))
-    _basna_agent_tasks.add(t)
-    t.add_done_callback(_bg_task_done)
+    _track_run_task(sid, t)
     return {"session_id": sid, "title": title, "status": "planning"}
 
 
@@ -5521,8 +5706,7 @@ async def _continue_run(owner: str, parent_session_id: str, user: dict, *,
     stub = types.SimpleNamespace(state=types.SimpleNamespace(user_id=owner))
     # Headless continuation: draft a Group 0 plan then auto-approve (no human pause).
     t = asyncio.create_task(plan_vatra_group0(exec_req, stub, user, gate=False))
-    _basna_agent_tasks.add(t)
-    t.add_done_callback(_bg_task_done)
+    _track_run_task(sid, t)
     return {"session_id": sid, "title": title, "round": round_no, "kind": kind}
 
 
@@ -5735,12 +5919,5 @@ async def agent_start(body: AgentStartReq):
               "address": body.origin_address}
     t = asyncio.create_task(_run_and_notify(
         user, session_id, title, exec_req, body.source_host, body.source_port, origin))
-    _basna_agent_tasks.add(t)
-    _agent_run_tasks[session_id] = t
-
-    def _on_done(_t: Any, _sid: str = session_id) -> None:
-        _basna_agent_tasks.discard(_t)
-        _agent_run_tasks.pop(_sid, None)
-
-    t.add_done_callback(_on_done)
+    _track_run_task(session_id, t)
     return {"status": "running", "session_id": session_id, "title": title}

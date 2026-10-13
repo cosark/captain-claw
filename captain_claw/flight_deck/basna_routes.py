@@ -811,7 +811,12 @@ async def _cancel_basna_run(session_id: str, owner: str) -> dict:
         if not runs:
             _active_agent_runs.pop(owner, None)
     try:
-        await get_db().update_basna_session(session_id, owner, status="cancelled")
+        # A Vatra session stopped while its Group 0 planner was still drafting never
+        # ran a team: send it back to the team plan ('routed'), not to a resumable
+        # 'cancelled' (Resume would run a team on a plan nobody approved).
+        _prior = ((await get_db().get_basna_session(session_id, owner)) or {}).get("status")
+        _status = "routed" if _prior == "planning" else "cancelled"
+        await get_db().update_basna_session(session_id, owner, status=_status)
     except Exception as exc:
         log.warning("cancel: status update failed", session_id=session_id, error=str(exc))
     log.info("Basna run cancelled", session_id=session_id, stopped_workers=stopped)
