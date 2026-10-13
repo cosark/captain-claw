@@ -1004,6 +1004,8 @@ class AgentToolLoopMixin:
                 "import_file", "create_table", "drop_table", "rename_table",
                 "add_column", "rename_column", "drop_column", "change_column_type",
             }
+            # Vatra team-board reads (see the board-is-live rule below).
+            _VATRA_LIVE_ACTIONS = ("map", "read", "search", "inbox", "wait")
             # Google actions that send or create something the user sees. A
             # byte-identical repeat is a second email / event / file, not a
             # re-read, so these keep the plain limit instead of the stateful
@@ -1478,7 +1480,13 @@ class AgentToolLoopMixin:
                         # Higher threshold: written file must be < 5% of
                         # data (was 10%) and data must be > 1000 chars
                         # (was 500) to reduce false positives.
-                        if _data_in_context > 1000 and written_len < _data_in_context * 0.05:
+                        # A notes append is a short cited block by design (the
+                        # context governor asks for one per source).
+                        _notes_write = bool(arguments.get("append")) or (
+                            self._governor_on() and self._is_notes_path(arguments.get("path"))
+                        )
+                        if (_data_in_context > 1000 and written_len < _data_in_context * 0.05
+                                and not _notes_write):
                             _result_content += (
                                 "\n\nNote: The file you wrote is relatively small "
                                 f"({written_len} chars) compared to data "
@@ -1559,6 +1567,17 @@ class AgentToolLoopMixin:
                     _dc = getattr(self, "_turn_tool_call_counts", {})
                     for _k in [k for k in _dc if k.startswith("datastore|")]:
                         _dc.pop(_k, None)
+
+                # ── The team board is live ──────────────────────
+                # `vatra map/read/search/inbox/wait` answer differently once
+                # work has moved on: after any other successful call the same
+                # board read is not a repeat (back-to-back polling still is).
+                if _tool_lower != "vatra" and result.success:
+                    _dc = getattr(self, "_turn_tool_call_counts", {})
+                    _live = [_sig for _sig in _dc if _sig.startswith("vatra|") and any(
+                        f'"action": "{_act}"' in _sig for _act in _VATRA_LIVE_ACTIONS)]
+                    for _sig in _live:
+                        _dc.pop(_sig, None)
 
                 # ── Dup-counter rollback on failure ──────────────
                 # If the call failed (e.g. wrong path), roll back the

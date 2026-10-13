@@ -91,6 +91,7 @@ from captain_claw.flight_deck import research_rubric
 from captain_claw.flight_deck import story_passes
 from captain_claw.flight_deck import story_state
 from captain_claw.flight_deck import vatra_groups
+from captain_claw.flight_deck import vatra_ledger
 from captain_claw.flight_deck.horizon_worker import HorizonConfig, run_horizon_closer
 from captain_claw.flight_deck.quality_profile import (
     ACTED_CORRECTIVE,
@@ -109,6 +110,7 @@ from captain_claw.flight_deck.quality_profile import (
     output_mode_directive,
     worker_produced_nothing,
 )
+from captain_claw.context_spill import is_governor_notes_path
 from captain_claw.logging import get_logger
 from captain_claw.vfs import is_vfs_path as _vfs_is_path
 from captain_claw.vfs import resolve_under as _vfs_resolve_under
@@ -284,6 +286,26 @@ def _vfs_directive(project: str) -> str:
         "won't sit next to your teammates' and nothing will link up. Every teammate writes "
         f"to the SAME vfs:{project}/ folder, and you read theirs from there too "
         f"(e.g. read vfs:{project}/style.css)."
+    )
+
+
+def _notes_directive(project: str, subtask_id: str, session_id: str = "") -> str:
+    """Ask a worker to keep running notes as it reads. A long turn's older tool
+    results are folded out of its context (the in-turn context governor); the
+    notes are what it writes its part from."""
+    if not project or not subtask_id:
+        return ""
+    from captain_claw.context_spill import notes_path
+
+    path = notes_path(project, subtask_id, session_id)
+    return (
+        "\n\n## Working notes — keep them as you go\n"
+        f"Keep a running notes file at {path}. After each source you read, append one short "
+        "block (`write` with append=true): the source (URL or file), the facts and numbers you "
+        "will use — verbatim — and one line on why it matters. As your turn grows, older tool "
+        "results are folded out of your context (the full text stays on disk); your notes are "
+        "what you write your part from. Notes are scratch — your deliverable still goes to its "
+        "own file."
     )
 
 
@@ -1079,6 +1101,12 @@ def _resolve_deliverable(user_id: str, project: str, candidates: list[str],
         if not cand:
             continue
         path = cand if _vfs_is_path(cand) else f"vfs:{project}/{cand}"
+        # Workers' notes, the run's saved sources and private spill copies are
+        # material, never the deliverable.
+        _rel = path.replace("\\", "/").split("/", 1)[-1] if _vfs_is_path(path) else path
+        if (is_governor_notes_path(path) or _rel.startswith("sources/")
+                or ".context" in _rel.split("/")):
+            continue
         try:
             fp = _vfs_resolve_under(user_id, project, path)
         except Exception:
@@ -1995,6 +2023,7 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
             gx = _gx(subtask)  # grouped mode: tag this owner's events with its phase letter
             def _on_action(act: dict) -> None:
                 _owner_stamp(sid, subtask)  # liveness heartbeat (Increment 5)
+                vatra_ledger.record_action(sid, owner, subtask, label, act)  # `vatra map`
                 detail = act.get("detail", "")
                 if act["tool"] == "narration":
                     _progress(sid, "narration", f"{label}: {detail}", agent=label,
@@ -2081,7 +2110,7 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
             prompt = research_pre + _build_subtask_prompt(
                 role, effective_intent, st, [f["name"] for f in input_files],
                 subtasks, shared_context, team_prep=intro_digest,
-                vfs_project=vfs_project, blocked_inputs=_blocked_inputs)
+                vfs_project=vfs_project, blocked_inputs=_blocked_inputs, session_id=sid)
             prompt += _group_instr_block(st, arch, _group_instructions)
             # Group 0: this owner's slice of the coordination plan — its mandate, what
             # it produces, and which teammates it consumes from. Its *contract*, placed
@@ -2119,7 +2148,7 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
                 on_status=on_status))
             # R2 acted-gate (opt-in): an owner that produced no text and wrote no
             # file wasted its slot — retry once with a corrective on the same agent.
-            if (quality.acted_gate and d.get("ok") and worker_produced_nothing(d)
+            if (quality.acted_gate and d.get("ok") and worker_produced_nothing(d, skip_notes=True)
                     and _budget.can_afford(_retry_est)):
                 _budget.add(_retry_est)
                 _qm_counts["acted"] += 1
@@ -2129,7 +2158,7 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
                     on_action=on_action, fleet_instructions=arch.get("fleet_instructions", ""),
                     agent_name=label, file_paths=doc, image_paths=img, on_usage=on_usage,
                 on_status=on_status))
-                if d2.get("ok") and not worker_produced_nothing(d2):
+                if d2.get("ok") and not worker_produced_nothing(d2, skip_notes=True):
                     d = d2
             # R5 escalate (opt-in): focused-retry an owner that flagged ESCALATE.
             if (quality.worker_escalate and d.get("ok") and escalate_reason(d.get("output"))
@@ -2143,7 +2172,7 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
                     agent_name=label, file_paths=doc, image_paths=img, on_usage=on_usage,
                 on_status=on_status))
                 if d2.get("ok") and not escalate_reason(d2.get("output")) \
-                        and not worker_produced_nothing(d2):
+                        and not worker_produced_nothing(d2, skip_notes=True):
                     d = d2
             mark = "✓" if d["ok"] else "✗"
             extra = "" if d["ok"] else f" — {str(d.get('error', ''))[:160]}"
@@ -2158,8 +2187,10 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
             out = (d.get("output") or "").strip()
             if out:
                 try:
-                    await get_db().add_vatra_board(sid, arch["id"], st["id"], "output",
-                                                   st["title"], out[:_BOARD_CONTENT_CAP])
+                    _row = await get_db().add_vatra_board(sid, arch["id"], st["id"], "output",
+                                                          st["title"], out[:_BOARD_CONTENT_CAP])
+                    vatra_ledger.record_finding(sid, arch["id"], st["id"], label, _row.get("id"),
+                                                st["title"], out, kind="output")
                 except Exception as e:
                     log.debug("Vatra board output write failed", error=str(e))
             # Durable resume checkpoint — written the moment this owner finishes, so a
@@ -2616,9 +2647,11 @@ async def _execute_vatra_inner(body: ExecuteRequest, request: Request, user: dic
                         out2 = (d.get("output") or "").strip()
                         if d["ok"] and out2 and not _is_no_change(out2):
                             try:
-                                await get_db().add_vatra_board(sid, arch["id"], st["id"], "output",
-                                                               f"{st['title']} (revised)",
-                                                               out2[:_BOARD_CONTENT_CAP])
+                                _row = await get_db().add_vatra_board(sid, arch["id"], st["id"], "output",
+                                                                      f"{st['title']} (revised)",
+                                                                      out2[:_BOARD_CONTENT_CAP])
+                                vatra_ledger.record_finding(sid, arch["id"], st["id"], label, _row.get("id"),
+                                                            f"{st['title']} (revised)", out2, kind="output")
                             except Exception as e:
                                 log.debug("Vatra board review-output write failed", error=str(e))
                         return r, d
@@ -3513,7 +3546,8 @@ def _build_intro_prompt(role: str, st: dict, shared_context: str = "", vfs_proje
 def _build_subtask_prompt(role: str, intent: str, st: dict, file_names: list[str],
                           all_subtasks: list[dict], shared_context: str = "",
                           team_prep: str = "", vfs_project: str = "",
-                          blocked_inputs: list[str] | None = None) -> str:
+                          blocked_inputs: list[str] | None = None,
+                          session_id: str = "") -> str:
     """Frame one subtask for its owner — with the team contract everyone must
     follow, awareness of the whole team, and a nudge to delegate cross-slice needs.
 
@@ -3564,7 +3598,8 @@ def _build_subtask_prompt(role: str, intent: str, st: dict, file_names: list[str
         f"Produce only your part, in full — a reporter assembles all parts at the end.\n\n"
         f"## Overall task (for context)\n{intent}\n\n"
         f"## The team and their pieces\n{roster}{contract_block}{prep_block}\n\n"
-        f"## Your part — {st['title']}\n{st['brief']}{files_block}{deps_block}{_vfs_directive(vfs_project)}\n\n"
+        f"## Your part — {st['title']}\n{st['brief']}{files_block}{deps_block}{_vfs_directive(vfs_project)}"
+        f"{_notes_directive(vfs_project, st['id'], session_id)}\n\n"
         f"## Reaching your team — use the `vatra` tool (it is ALWAYS available)\n"
         f"Your teammates' notes and finished pieces stream onto a shared board. Reach it ONLY "
         f"through the `vatra` tool — call it directly. Do NOT run a `shell` command to 'check "
@@ -3573,6 +3608,9 @@ def _build_subtask_prompt(role: str, intent: str, st: dict, file_names: list[str
         f"- `vatra(action=\"search\", query=\"<topic>\")` — to pull a teammate's work when your "
         f"part needs a fact, figure, decision, or section another piece owns. Do this BEFORE "
         f"researching it yourself.\n"
+        f"- `vatra(action=\"map\")` — who is covering what right now, which sources teammates "
+        f"already read, which files exist, what has been found. Check it before you start "
+        f"researching and before you pick a new source.\n"
         f"- `vatra(action=\"read\")` — to skim what teammates shared recently.\n"
         f"- `vatra(action=\"post\", text=\"<finding>\")` — to share a key finding or your draft so "
         f"others can build on it. Post your important results as you produce them.\n"
@@ -4024,6 +4062,13 @@ async def _run_reporter(request: Request, user: dict, sid: str, sid8: str, run_t
             # must match — inlined (it's small and structured), not searched-for.
             if facts_block.strip():
                 prompt += REPORTER_FACTS_DIRECTIVE + facts_block.strip() + "\n"
+            # Run ledger: what each teammate read and wrote, so a thin piece can be
+            # checked against its author's notes file instead of guessed around.
+            _coverage = await vatra_ledger.coverage_appendix(sid)
+            if _coverage:
+                prompt += ("\n\n" + _coverage + "\n(For your reference — do not paste this list "
+                           "into the deliverable. A teammate's notes file holds the facts behind "
+                           "a thin piece.)\n")
             prompt += _vfs_directive(_vfs_project(sid))
 
         def _on_action(act: dict) -> None:
@@ -4321,6 +4366,7 @@ async def _fulfill_ask(request: Request, user: dict, sid: str, sid8: str, run_ta
         out = (d.get("output") or "").strip()
         if out:
             await db.answer_vatra_ask(ask["id"], out, arch["id"])
+            vatra_ledger.record_ask_answer(sid, ask["id"], text, role, owner=arch["id"])
             _progress(sid, "ask", f"Ask #{ask['id']} answered by {role}", agent=role)
             return True
         await db.drop_vatra_ask(ask["id"], note="helper produced no output")
@@ -4517,7 +4563,7 @@ async def agent_wait(body: _VatraWaitReq):
                       f"⛔ {who} tried to wait on {role} — it runs LATER (group {letter}); "
                       "refused instantly", agent=who, ok=False)
             recent = await db.list_vatra_board(
-                body.session_id, limit=12, exclude_owner=body.owner or None)
+                body.session_id, kinds=_BOARD_CONTENT_KINDS, limit=12, exclude_owner=body.owner or None)
             return {"ready": False, "not_scheduled": True,
                     "board": [_board_entry(e) for e in recent],
                     "note": (f"{role} runs in a LATER phase (group {letter}) and has not "
@@ -4539,7 +4585,7 @@ async def agent_wait(body: _VatraWaitReq):
     remaining = _WAIT_TOTAL_BUDGET_S - rec["waited"]
     if rec["attempts"] >= _WAIT_MAX_ATTEMPTS or remaining <= 1:
         recent = await db.list_vatra_board(
-            body.session_id, limit=12, exclude_owner=body.owner or None)
+            body.session_id, kinds=_BOARD_CONTENT_KINDS, limit=12, exclude_owner=body.owner or None)
         _progress(
             body.session_id, "wait",
             f"🛑 {who} stop waiting — budget spent ({int(rec['waited'])}s / "
@@ -4625,7 +4671,7 @@ async def agent_wait(body: _VatraWaitReq):
                 + (f" · {int(left)}s budget left" if can_retry else " · budget spent"),
                 agent=who, ok=False)
             recent = await db.list_vatra_board(
-                body.session_id, limit=12, exclude_owner=body.owner or None)
+                body.session_id, kinds=_BOARD_CONTENT_KINDS, limit=12, exclude_owner=body.owner or None)
             note = (
                 f"Not ready yet. You've waited ~{int(rec['waited'])}s of a ~{_WAIT_TOTAL_BUDGET_S}s "
                 f"budget ({int(left)}s left across {_WAIT_MAX_ATTEMPTS - int(rec['attempts'])} more "
@@ -4645,6 +4691,9 @@ async def agent_wait(body: _VatraWaitReq):
 # ── Shared board: real-time shared memory across the team ────────────
 
 _BOARD_CONTENT_CAP = 30_000  # per-entry content stored on the board
+# What a worker reads from the board by default: teammates' notes, outputs and
+# files. The live narration stream (one row per thought) crowded them out.
+_BOARD_CONTENT_KINDS = ["note", "output", "file"]
 
 
 def _board_post_bg(sid: str, owner: str, subtask: str, kind: str, title: str, content: str) -> None:
@@ -4686,6 +4735,12 @@ class _VatraBoardReadReq(_AgentReq):
     subtask_id: str = ""
     kind: str = ""
     limit: int = 40
+    include_narration: bool = False
+
+
+class _VatraMapReq(_AgentReq):
+    owner: str = ""
+    subtask_id: str = ""
 
 
 class _VatraBoardSearchReq(_AgentReq):
@@ -4715,6 +4770,9 @@ async def agent_board_post(body: _VatraBoardPostReq):
     kind = body.kind if body.kind in ("note", "output") else "note"
     e = await get_db().add_vatra_board(
         body.session_id, body.owner, body.subtask_id, kind, body.title, text[:_BOARD_CONTENT_CAP])
+    rec = (_owner_activity.get(body.session_id) or {}).get(body.subtask_id or "") or {}
+    vatra_ledger.record_finding(body.session_id, body.owner, body.subtask_id, rec.get("role") or body.owner,
+                                e["id"], body.title, text, kind=kind)
     return {"status": "ok", "id": e["id"]}
 
 
@@ -4722,11 +4780,22 @@ async def agent_board_post(body: _VatraBoardPostReq):
 async def agent_board_read(body: _VatraBoardReadReq):
     """Recent board entries from TEAMMATES (the caller's own entries are excluded)."""
     await _board_session(body)
-    kinds = [body.kind] if body.kind else None
+    kinds = [body.kind] if body.kind else (
+        None if body.include_narration else _BOARD_CONTENT_KINDS)
     rows = await get_db().list_vatra_board(
         body.session_id, kinds=kinds, limit=body.limit,
         exclude_subtask=body.subtask_id or None, exclude_owner=body.owner or None)
     return {"entries": [_board_entry(e) for e in rows], "count": len(rows)}
+
+
+@router.post("/agent/map")
+async def agent_map(body: _VatraMapReq):
+    """The run map: who is covering what, sources read, files written, findings —
+    rule-based, from the run ledger (see vatra_ledger)."""
+    await _board_session(body)
+    text = await vatra_ledger.render_map(
+        body.session_id, body.subtask_id or "", _owner_activity.get(body.session_id) or {})
+    return {"map": text}
 
 
 @router.post("/agent/board/search")

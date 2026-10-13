@@ -48,7 +48,7 @@ _FLEET_NOTICE_RE = re.compile(
     r"(?:[^\n]*?Current fleet: (?P<roster>[^\n]*))?"
 )
 # Order of the live task-state notes inside their block.
-_LIVE_NOTE_ORDER = ("planning_context", "list_task_memory", "scale_progress")
+_LIVE_NOTE_ORDER = ("planning_context", "list_task_memory", "scale_progress", "context_pressure")
 # Block markers quoted inside a note body (e.g. a snippet of an earlier prompt).
 _NESTED_BLOCK_MARKER_RE = re.compile(r"\[((?:END )?INTERNAL CONTEXT)", re.IGNORECASE)
 
@@ -4718,6 +4718,15 @@ class AgentContextMixin:
                     "_live_notes": [(kind, text)],
                 })
                 candidate_sidx.append(None)
+        # Governed: the pre-fold notes nudge rides with the live state.
+        _pressure_note = self._context_pressure_note() if _governed else ""
+        if _pressure_note:
+            candidate_messages.append({
+                "role": "user",
+                "content": _pressure_note,
+                "_live_notes": [("context_pressure", _pressure_note)],
+            })
+            candidate_sidx.append(None)
         if scale_note:
             # The scale progress note is critical during incremental
             # processing — it prevents the LLM from re-globbing or
@@ -5015,6 +5024,9 @@ class AgentContextMixin:
             "over_budget": 1 if prompt_tokens > context_budget else 0,
             "utilization": (prompt_tokens / context_budget) if context_budget else 0.0,
         }
+        if _governed and self.session:
+            # What the next call's fold projection measures growth from.
+            self._last_build_msg_count = len(self.session.messages)
         if self.session:
             self.session.metadata["context_window"] = dict(self.last_context_window)
         if dropped_messages:

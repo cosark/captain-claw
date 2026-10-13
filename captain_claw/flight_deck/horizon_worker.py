@@ -166,7 +166,8 @@ async def run_worker_horizon(
             # Tag which rollout produced this action; bound the kept history.
             tagged = {**act, "sample": sample}
             if len(actions) < 400:
-                actions.append(tagged)
+                # The live-only ledger args are not kept (the list is persisted).
+                actions.append({k: v for k, v in tagged.items() if k != "args"})
             if on_action is not None:
                 on_action(tagged)
         return _sink

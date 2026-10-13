@@ -1226,6 +1226,8 @@ def _manifest_body(root: Path, project: str, *, limit: int = 40) -> str:
     collapses the R10 ``sources/`` corpus into a single pointer instead of dumping
     every saved page. Returns "" when there's nothing worth reading.
     """
+    from captain_claw.context_spill import is_governor_notes_path
+
     names: list[str] = []
     n_sources = 0
     for p in sorted(root.rglob("*")):
@@ -1237,6 +1239,8 @@ def _manifest_body(root: Path, project: str, *, limit: int = 40) -> str:
         if parts and parts[0] == "sources":
             n_sources += 1  # R10 corpus — count, don't itemise (searchable via researchmap)
             continue
+        if is_governor_notes_path(p.relative_to(root).as_posix()):
+            continue  # a Vatra worker's scratch notes (in-turn context governor)
         if len(names) < limit:
             names.append(p.relative_to(root).as_posix())
     if not names and not n_sources:
@@ -2574,12 +2578,14 @@ async def _send_chat_and_collect(
     last_activity: float = 0.0
     last_err: Exception | None = None
 
-    def _record(kind: str, detail: str) -> None:
+    def _record(kind: str, detail: str, args: dict | None = None) -> None:
         act = {"tool": kind, "detail": detail}
         actions.append(act)
         if on_action:
             try:
-                on_action(act)
+                # The live callback also gets the exact url/path/query (the Vatra
+                # run ledger keys on them); the stored action list stays small.
+                on_action({**act, "args": args} if args else act)
             except Exception:
                 pass
 
@@ -2600,8 +2606,11 @@ async def _send_chat_and_collect(
                         and m.get("content")):
                     answer = m["content"]
         elif mtype == "monitor" and not msg.get("replay"):
+            from captain_claw.flight_deck.vatra_ledger import ledger_args
+
             _record(str(msg.get("tool_name") or msg.get("tool") or "tool"),
-                    _summarize_tool_args(msg.get("arguments")))
+                    _summarize_tool_args(msg.get("arguments")),
+                    ledger_args(msg.get("arguments"), msg.get("output")))
         elif mtype == "narration" and str(msg.get("text") or "").strip():
             _record("narration", str(msg["text"]).strip()[:280])
         elif mtype == "turn_usage" and not msg.get("replay"):

@@ -1414,6 +1414,15 @@ class AgentSessionMixin:
             # Not worth compacting tiny writes — the overhead of the
             # reference string is comparable to the original content.
             return
+        # In-turn context governor: a short notes write stays readable — the
+        # notes are what the worker keeps once its sources are folded.
+        _is_notes = getattr(self, "_is_notes_path", None)
+        if (
+            callable(_is_notes) and _is_notes(path)
+            and len(content) <= int(getattr(self, "_NOTE_INLINE_CHARS", 0) or 0)
+            and getattr(self, "_governor_on", lambda: False)()
+        ):
+            return
         compact_ref = (
             f"[written to disk: {path}, {lines} lines, {size_kb:.1f}KB"
             f" — use read tool to view]"

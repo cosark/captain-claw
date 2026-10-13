@@ -34,7 +34,11 @@ class VatraTool(Tool):
         "slice; use the board to build ON your teammates' work instead of guessing or duplicating it.\n"
         "'search' — find what teammates have produced by keyword (`query`) — use this FIRST "
         "whenever your piece needs a fact, figure, decision, or section another piece owns.\n"
-        "'read' — recent entries from teammates (optional `kind` = note|output|narration|file).\n"
+        "'map' — the run map: who is covering what right now, which sources teammates already "
+        "read, which files exist, what has been found. Check it before researching and before "
+        "picking a new source.\n"
+        "'read' — recent notes, outputs and files from teammates (optional `kind` = "
+        "note|output|file; `kind=narration` for their live thinking).\n"
         "'post' — share a key finding, decision, or your draft so others can use it (`text`, "
         "optional `title`).\n"
         "'ask' — when you need a teammate to DO new work, post a request (`text`); a helper "
@@ -53,9 +57,10 @@ class VatraTool(Tool):
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["search", "read", "post", "ask", "inbox", "wait"],
+                "enum": ["search", "map", "read", "post", "ask", "inbox", "wait"],
                 "description": (
                     "'search' — keyword search the team board (`query`). "
+                    "'map' — who covers what, sources read, files, findings. "
                     "'read' — recent teammate entries (optional `kind`). "
                     "'post' — share a note to the board (`text`, optional `title`). "
                     "'ask' — request new work from a teammate (`text`). "
@@ -66,7 +71,9 @@ class VatraTool(Tool):
             "query": {"type": "string", "description": "For 'search'/'wait' — keywords to find teammates' work."},
             "text": {"type": "string", "description": "For 'post'/'ask' — the note to share, or what you need."},
             "title": {"type": "string", "description": "For 'post' — optional short label."},
-            "kind": {"type": "string", "description": "For 'read' — filter to note|output|narration|file."},
+            "kind": {"type": "string", "description": (
+                "For 'read' — filter to note|output|file (default: all three) or narration."
+            )},
             "path": {"type": "string", "description": "For 'wait' — a teammate's vfs:<proj>/<file> to block on until it exists."},
             "wait": {"type": "integer", "description": "Seconds to block: 'inbox' 0–30, 'wait' 0–120 (default 120)."},
         },
@@ -143,6 +150,8 @@ class VatraTool(Tool):
         try:
             if action == "search":
                 return await self._search(fd_url, ctx, **kwargs)
+            if action == "map":
+                return await self._map(fd_url, ctx)
             if action == "read":
                 return await self._read(fd_url, ctx, **kwargs)
             if action == "post":
@@ -153,7 +162,8 @@ class VatraTool(Tool):
                 return await self._inbox(fd_url, ctx, **kwargs)
             if action == "wait":
                 return await self._wait(fd_url, ctx, **kwargs)
-            return ToolResult(success=False, error=f"Unknown action '{action}' (use search/read/post/ask/inbox/wait).")
+            return ToolResult(success=False, error=(
+                f"Unknown action '{action}' (use search/map/read/post/ask/inbox/wait)."))
         except Exception as e:
             log.warning("vatra tool error", action=action, error=str(e))
             return ToolResult(success=False, error=f"Vatra board request failed: {e}")
@@ -187,6 +197,16 @@ class VatraTool(Tool):
                 f"No teammate board entries match {q!r} yet. They may not have produced it — "
                 f"do the part you can, or post a note / ask if you need new work."))
         return ToolResult(success=True, content=f"Board matches for {q!r}:\n\n{self._fmt_entries(entries)}")
+
+    async def _map(self, fd_url: str, ctx: dict) -> ToolResult:
+        r = await self._post(fd_url, "/fd/vatra/agent/map", {
+            "session_id": ctx["session_id"], "owner": ctx["owner"],
+            "subtask_id": ctx["subtask_id"],
+        })
+        if isinstance(r, dict) and r.get("_error"):
+            return ToolResult(success=False, error=r["_error"])
+        text = str(r.json().get("map") or "").strip()
+        return ToolResult(success=True, content=text or "The run map is empty — nobody has started yet.")
 
     async def _read(self, fd_url: str, ctx: dict, **kwargs: Any) -> ToolResult:
         r = await self._post(fd_url, "/fd/vatra/agent/board/read", {
