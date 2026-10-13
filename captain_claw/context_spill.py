@@ -139,6 +139,32 @@ def source_file_name(tool: str, key: str) -> str:
     return f"{tool}-{_slug(base, 60)}-{_sha8(str(key))}.md"
 
 
+def notes_path(project: str = "", subtask: str = "", session: str = "") -> str:
+    """A worker's running notes file. In a Vatra run it sits in the run's shared
+    folder as ``vfs:<project>/notes/<sid8>-<subtask>-notes.md`` — the session
+    prefix keeps a continuation round (same folder, same s1/s2 ids) from
+    appending to an earlier round's notes, and the suffix keeps it from sharing a
+    basename with a declared deliverable. Elsewhere ``notes.md``."""
+    project = (project or os.environ.get("CLAW_VFS_PROJECT", "")).strip()
+    subtask = (subtask or os.environ.get("CLAW_VATRA_SUBTASK", "")).strip()
+    session = (session or os.environ.get("CLAW_VATRA_SESSION", "")).strip()
+    if project and subtask:
+        prefix = f"{_slug(session, 8)}-" if session else ""
+        return f"vfs:{project}/notes/{prefix}{_slug(subtask, 60)}-notes.md"
+    return "notes.md"
+
+
+_GOVERNOR_NOTES_RE = re.compile(r"(?:^|/)notes/[^/]+-notes\.md$", re.IGNORECASE)
+
+
+def is_governor_notes_path(path: Any) -> bool:
+    """Whether *path* has the shape :func:`notes_path` gives a Vatra worker
+    (``…/notes/<sid8>-<subtask>-notes.md``) — scratch, never a deliverable. Kept
+    tight on purpose: a real ``notes/`` package or a ``notes.md`` deliverable
+    is not matched."""
+    return bool(_GOVERNOR_NOTES_RE.search(str(path or "").strip().replace("\\", "/")))
+
+
 def run_sources_dir() -> tuple[Path, str] | None:
     """``(directory, vfs pointer prefix)`` of the run's shared ``sources/`` —
     only for a Flight Deck worker bound to a run folder."""

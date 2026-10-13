@@ -21,11 +21,20 @@ With the governor on (see :func:`captain_claw.context_spill.governor_enabled`):
   one cache miss per cut instead of one per call.
 * **Learned window / overflow recovery.** A context-overflow error teaches the
   agent the server's real window and forces a re-cut instead of ending the turn.
+* **Fold (phase 2).** Before a call whose real input would pass ~80% of the
+  window, older tool results are folded — in one batch, oldest and already
+  noted first — into stable stubs (a short head + the file holding the full
+  text), down to ~50%. At ~70% a live note asks the worker to put what it still
+  needs from those results into its notes file first; a notes write or a
+  `vatra post` that cites a source (its URL or file) makes it safe to fold
+  first. The newest step's results — not yet seen by the model — fold only
+  when the request would not fit otherwise.
 """
 
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -45,6 +54,14 @@ class AgentContextGovernorMixin:
     _CALIBRATION_MAX = 2.0
     _CALIBRATION_ALPHA = 0.5
     _CALIBRATION_STEP = 0.05   # the ratio moves the budget only in 5% steps
+    _FOLD_HIGH = 0.80          # fold when the real input would pass 80% of the window …
+    _FOLD_LOW = 0.50           # … down to 50%
+    _NUDGE_AT = 0.70           # ask for notes before the fold comes
+    _FOLD_KEEP_RESULTS = 2     # the newest results are never folded
+    _FOLD_MIN_CHARS = 1_500
+    _FOLD_HEAD_CHARS = 300
+    _FOLD_MIN_GAIN = 0.05      # a fold must free ≥5% of the window, or it waits
+    _NOTE_INLINE_CHARS = 4_000  # a notes write this short stays readable in context
 
     # ── switches ─────────────────────────────────────────────────────
 
@@ -162,6 +179,10 @@ class AgentContextGovernorMixin:
         """Forget the turn's cut point (new turn, or the session was rewritten)."""
         self._turn_window = None
         self._turn_force_recut = False
+        self._fold_nudged = False
+        self._context_nudge_text = ""
+        self._nudge_one_shot = False
+        self._last_build_msg_count = None
 
     def _emit_governor_event(self, step: str, **fields: Any) -> None:
         """One monitor row (hidden from the model) so the run log shows it."""
@@ -340,3 +361,276 @@ class AgentContextGovernorMixin:
     def _echo_floor(self) -> int | None:
         window = getattr(self, "_turn_window", None)
         return window.get("echo_floor") if isinstance(window, dict) else None
+
+    # ── fold (phase 2) ───────────────────────────────────────────────
+
+    def _notes_path(self) -> str:
+        """Where this worker keeps its running notes."""
+        from captain_claw.context_spill import notes_path
+
+        return notes_path()
+
+    def _is_notes_path(self, path: Any) -> bool:
+        """This worker's notes file (outside Vatra: a plain ``notes.md``), or any
+        Vatra notes file of the governed shape."""
+        from captain_claw.context_spill import is_governor_notes_path
+
+        p = str(path or "").strip().replace("\\", "/").lower()
+        if not p:
+            return False
+        own = self._notes_path().lower()
+        return (p == own or is_governor_notes_path(p)
+                or (own == "notes.md" and p.rsplit("/", 1)[-1] == "notes.md"))
+
+    def _is_receipt(self, msg: dict[str, Any]) -> bool:
+        """A successful notes write/edit or `vatra post` — what the sources it
+        cites were written down in, so they fold first. Never folded itself."""
+        if str(msg.get("role", "")) != "tool":
+            return False
+        if str(msg.get("content", "") or "").lstrip().lower().startswith("error"):
+            return False
+        name = str(msg.get("tool_name", "") or "").lower()
+        args = msg.get("tool_arguments") or {}
+        if name in ("write", "edit"):
+            return self._is_notes_path(args.get("path"))
+        return name == "vatra" and str(args.get("action", "")).lower() == "post"
+
+    def _turn_real_projection(self) -> tuple[int, int]:
+        """(projected real input of the next call, real window): the last build's
+        full estimate plus what was appended since, times the ratio."""
+        from captain_claw.context_spill import real_context_budget
+
+        budget = real_context_budget(self)
+        window = getattr(self, "last_context_window", None) or {}
+        last_count = getattr(self, "_last_build_msg_count", None)
+        if (not budget or not isinstance(last_count, int) or not self.session
+                or last_count > len(self.session.messages)):
+            return 0, budget
+        est = int(window.get("estimated_input_tokens", 0) or 0)
+        replays = self._replays_reasoning()
+        added = 0
+        for msg in self.session.messages[last_count:]:
+            added += self._wire_token_count(msg)   # counts reasoning when it is replayed
+            if (not replays and str(msg.get("role", "")) == "assistant"
+                    and msg.get("reasoning_content")):
+                added += self._ensure_reasoning_token_count(msg)
+        return int((est + added) * self._ctx_ratio()), budget
+
+    @staticmethod
+    def _fold_key(tool: str, args: dict[str, Any]) -> str:
+        """What a stub names: the URL / path / query, else a short command."""
+        for field in ("url", "path", "query", "file_id"):
+            value = args.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:300]
+        urls = args.get("urls")
+        if isinstance(urls, list) and urls:
+            return f"batch of {len(urls)} URLs"
+        command = args.get("command")
+        if isinstance(command, str) and command.strip():
+            return " ".join(command.split())[:80]
+        return tool
+
+    def _fold_stub(self, msg: dict[str, Any]) -> str | None:
+        """Stable stub for a folded tool result: tool, key, size, the file with the
+        full text (saved now if the result wasn't spilled already), a short head.
+        None when the full text could not be put on disk — then it isn't folded."""
+        from captain_claw import context_spill
+
+        content = str(msg.get("content", "") or "")
+        tool = str(msg.get("tool_name", "") or "tool")
+        args = msg.get("tool_arguments") or {}
+        key = self._fold_key(tool, args if isinstance(args, dict) else {})
+        first, _, rest = content.partition("\n")
+        found = re.search(re.escape(context_spill.POINTER_MARK) + r"(\S+)", first)
+        if found and context_spill.is_governed_output(content):
+            pointer = found.group(1).rstrip("]).,")
+            body = rest.lstrip("\n")
+        else:
+            # One file per result: two shell outputs, two pages of one file or
+            # two batches must not overwrite each other's saved text.
+            # message_id first — some providers reuse call ids (embedded_0, call_0).
+            uniq = str(msg.get("message_id") or msg.get("tool_call_id") or "")
+            pointer = context_spill.save_source(
+                self, f"folded-{tool}", f"{key}#{uniq}" if uniq else key, content, shared=False)
+            body = content
+        if not pointer:
+            return None
+        head = " ".join(body[: self._FOLD_HEAD_CHARS * 2].split())[: self._FOLD_HEAD_CHARS]
+        return (f"[folded {tool} {key} · {len(content)} chars · {context_spill.POINTER_MARK}"
+                f"{pointer} — read it with `read` (offset/limit) or `grep`]\n{head} …")
+
+    def _nudge_text(self, *, folded: bool) -> str:
+        import os
+
+        in_vatra = bool(os.environ.get("CLAW_VATRA_SESSION", "").strip())
+        share = " or `vatra post` it" if in_vatra else ""
+        final = " Write your final part from your notes." if in_vatra else ""
+        if folded:
+            return ("[Context folded] Some tool results were just folded into short file "
+                    "pointers (the full text stays on disk — `read`/`grep` it if needed). Keep "
+                    f"appending what you use to {self._notes_path()}{share} (one short cited block "
+                    f"per source, numbers verbatim).{final}")
+        return ("[Context is filling up] In a few steps your older tool results will be folded "
+                "into short file pointers (the full text stays on disk — `read`/`grep` it if "
+                f"needed). Before that, append what you still need from them to {self._notes_path()}"
+                f"{share} (one short cited block per source, numbers verbatim).{final}")
+
+    def _maybe_fold_turn_context(self, turn_start_idx: int) -> int:
+        """Fold older tool results of this turn when the next call would pass the
+        high-water mark; return how many were folded."""
+        if not self.session:
+            return 0
+        if getattr(self, "_nudge_one_shot", False):
+            self._nudge_one_shot = False
+            self._context_nudge_text = ""
+        real, budget = self._turn_real_projection()
+        if not real or not budget:
+            return 0
+        was_nudged = bool(getattr(self, "_fold_nudged", False))
+        if real > self._NUDGE_AT * budget and not was_nudged:
+            self._fold_nudged = True
+            self._context_nudge_text = self._nudge_text(folded=False)
+            self._emit_governor_event("nudge", real_tokens=real, budget=budget)
+        if real <= self._FOLD_HIGH * budget:
+            return 0
+        from captain_claw.msg_origin import is_model_hidden_tool
+
+        messages = self.session.messages
+        window = getattr(self, "_turn_window", None) or {}
+        floor = window.get("floor") if isinstance(window, dict) else None
+        start = max(turn_start_idx, floor if isinstance(floor, int) else turn_start_idx)
+
+        def _is_step(i: int) -> bool:
+            return str(messages[i].get("role", "")) == "assistant"
+
+        results = [i for i in range(start, len(messages))
+                   if str(messages[i].get("role", "")) == "tool" and not is_model_hidden_tool(messages[i])]
+        # The newest step's results reach the model with this call: not seen yet.
+        last_step = max((i for i in range(start, len(messages)) if _is_step(i)), default=-1)
+        keep = set(results[-self._FOLD_KEEP_RESULTS:])
+        # A source is noted when a later step's notes write / post cites it
+        # (the notes directive asks for the URL or file in each block).
+        receipt_texts: list[tuple[int, str]] = []
+        for r in results:
+            if self._is_receipt(messages[r]):
+                rargs = messages[r].get("tool_arguments") or {}
+                text = " ".join(str(rargs.get(k) or "") for k in ("content", "text", "new_string", "title"))
+                step = max((j for j in range(start, r) if _is_step(j)), default=-1)
+                receipt_texts.append((step, text.lower()))
+
+        def _noted(i: int) -> bool:
+            args = messages[i].get("tool_arguments") or {}
+            if not isinstance(args, dict) or not receipt_texts:
+                return False
+            keys = [str(args.get(k) or "").strip().lower() for k in ("url", "path", "file_id")]
+            urls = args.get("urls")
+            if isinstance(urls, list):
+                keys += [str(u).strip().lower() for u in urls]
+            keys = [k.rstrip("/") for k in keys if len(k.rstrip("/")) >= 4]
+            # Whole citation only: https://ex.com must not match a note citing
+            # https://ex.com/pricing; a trailing slash or sentence period is fine.
+            return any(step > i and re.search(re.escape(key) + r"/?(?![\w/%?#=&-]|\.\w)", text)
+                       for step, text in receipt_texts for key in keys)
+
+        def _eligible(i: int) -> bool:
+            content = str(messages[i].get("content", "") or "")
+            return (i not in keep and not messages[i].get("_folded")
+                    and not content.startswith("[folded ")
+                    and not self._is_receipt(messages[i])
+                    and len(content) >= self._FOLD_MIN_CHARS)
+
+        seen = sorted((i for i in results if i < last_step and _eligible(i)),
+                      key=lambda i: (not _noted(i), i))   # noted first, then oldest
+        unseen = [i for i in results if i > last_step and _eligible(i)]
+        ratio = self._ctx_ratio()
+        # A fold rewrites history (one cache miss): only when it frees enough —
+        # unless the request would not fit at all.
+        potential = sum(max(0, self._ensure_message_token_count(messages[i]) - 120) for i in seen)
+        if (potential * ratio < self._FOLD_MIN_GAIN * budget
+                and real <= self._PRESEND_LIMIT * budget):
+            seen = []
+        saved = 0
+        folded = 0
+        failed = False
+        newly: list[dict[str, Any]] = []
+
+        def _fold(i: int) -> bool:
+            nonlocal saved, folded, failed
+            msg = messages[i]
+            stub = self._fold_stub(msg)
+            if stub is None:
+                failed = True       # disk trouble: keep the text, leave it to the cut
+                return False
+            before = self._ensure_message_token_count(msg)
+            msg["content"] = stub
+            msg["_folded"] = True
+            saved += max(0, before - self._recount_message_tokens(msg))
+            folded += 1
+            newly.append(msg)
+            return True
+
+        need = (real - self._FOLD_LOW * budget) / ratio
+        for i in seen:
+            if saved >= need or not _fold(i):
+                break
+        seen_folded = folded
+        # Results the model hasn't read are folded only when the request would
+        # not fit otherwise.
+        if not failed:
+            for i in unseen:
+                if real - saved * ratio <= self._PRESEND_LIMIT * budget or not _fold(i):
+                    break
+        if not folded:
+            return 0
+        # A fold of read results already changes earlier messages: move the
+        # reasoning echo floor in the same batch (unread ones sit past the
+        # cached prefix — don't break it for them).
+        steps = [i for i in range(start, len(messages))
+                 if _is_step(i) and messages[i].get("reasoning_content")]
+        if steps and seen_folded:
+            win = getattr(self, "_turn_window", None)
+            if not isinstance(win, dict):
+                win = {"floor": None, "prior": None}
+            win["echo_floor"] = steps[-self._REASONING_ECHO_STEPS:][0]
+            self._turn_window = win
+        self._drop_folded_read_guards(newly)
+        after_real = max(0, real - int(saved * ratio))
+        self._fold_nudged = False
+        # The model never saw the pre-fold note: tell it once, now.
+        self._context_nudge_text = "" if was_nudged else self._nudge_text(folded=True)
+        self._nudge_one_shot = not was_nudged
+        self._fold_count = int(getattr(self, "_fold_count", 0) or 0) + 1
+        log.info("In-turn context fold", folded=folded, saved_tokens=saved,
+                 real_before=real, real_after=after_real, budget=budget)
+        self._emit_governor_event("fold", folded_results=folded, saved_tokens=saved,
+                                  real_before=real, real_after=after_real, budget=budget)
+        return folded
+
+    def _drop_folded_read_guards(self, folded: list[dict[str, Any]]) -> None:
+        """A stub tells the model to `read` the saved copy: the per-turn duplicate
+        guard must not refuse that read as "content has not changed"."""
+        import os
+
+        counts = getattr(self, "_turn_tool_call_counts", None)
+        if not isinstance(counts, dict) or not counts:
+            return
+        from captain_claw import context_spill
+
+        for msg in folded:
+            first = str(msg.get("content", "") or "").partition("\n")[0]
+            found = re.search(re.escape(context_spill.POINTER_MARK) + r"(\S+)", first)
+            paths = [found.group(1).rstrip("]).,")] if found else []
+            args = msg.get("tool_arguments") or {}
+            if isinstance(args, dict) and isinstance(args.get("path"), str):
+                paths.append(args["path"].strip())
+            for path in paths:
+                if not path:
+                    continue
+                base = f"read|path={os.path.abspath(path)}"
+                for sig in [k for k in counts if k == base or k.startswith(base + "|offset=")]:
+                    counts.pop(sig, None)
+
+    def _context_pressure_note(self) -> str:
+        """The pending pre-fold notes nudge (a live note), if any."""
+        return str(getattr(self, "_context_nudge_text", "") or "")

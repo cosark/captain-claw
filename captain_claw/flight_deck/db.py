@@ -304,6 +304,30 @@ class FlightDeckDB:
             CREATE INDEX IF NOT EXISTS idx_vatra_board_session
                 ON vatra_board(session_id);
 
+            -- Vatra run ledger: a rule-based map of who is covering what — each
+            -- owner's current focus, the sources read, the files written, the
+            -- findings posted, the asks answered — built from events Flight Deck
+            -- already sees, and read by workers through `vatra map`. One row per
+            -- (session, kind, key); a repeat bumps `count` and records who.
+            CREATE TABLE IF NOT EXISTS vatra_ledger (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id  TEXT NOT NULL REFERENCES basna_sessions(id) ON DELETE CASCADE,
+                kind        TEXT NOT NULL,              -- focus|source|file|finding|ask_answer
+                key         TEXT NOT NULL,
+                owner       TEXT NOT NULL DEFAULT '',   -- archetype id of the first actor
+                subtask_id  TEXT NOT NULL DEFAULT '',
+                label       TEXT NOT NULL DEFAULT '',   -- the actor's display name
+                detail      TEXT NOT NULL DEFAULT '',
+                pointer     TEXT NOT NULL DEFAULT '',
+                count       INTEGER NOT NULL DEFAULT 1,
+                others      TEXT NOT NULL DEFAULT '',   -- other actors' labels, comma-separated
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL,
+                UNIQUE(session_id, kind, key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_vatra_ledger_session
+                ON vatra_ledger(session_id, kind);
+
             -- Vatra resume checkpoint: one row per owner (subtask) capturing its
             -- finished slice, so a stalled/cancelled run can be resumed — completed
             -- owners are restored from here (no re-run, no re-spend) and only the
@@ -1782,6 +1806,63 @@ class FlightDeckDB:
         sql += " ORDER BY id DESC LIMIT ?"
         params.append(max(1, int(limit)))
         async with self._db.execute(sql, params) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    # ── Vatra run ledger (`vatra map`) ──────────────────────────────
+
+    async def upsert_vatra_ledger(
+        self, session_id: str, kind: str, key: str, *, owner: str = "",
+        subtask_id: str = "", label: str = "", detail: str = "", pointer: str = "",
+        replace: bool = False,
+    ) -> None:
+        """Record one ledger fact. A new key inserts; a repeat bumps ``count`` and
+        adds a different actor to ``others`` — or, with ``replace`` (an owner's
+        current focus), overwrites the row. Atomic: teammates fetching the same
+        page at the same moment both land."""
+        assert self._db is not None
+        now = _utcnow()
+        key = str(key or "")[:500]
+        detail = str(detail or "")[:400]
+        label = str(label or "")[:120]
+        cur = await self._db.execute(
+            "INSERT OR IGNORE INTO vatra_ledger (session_id, kind, key, owner, subtask_id, label,"
+            " detail, pointer, count, others, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, '', ?, ?)",
+            (session_id, kind, key, owner, subtask_id, label, detail, pointer, now, now),
+        )
+        if cur.rowcount == 0 and replace:
+            await self._db.execute(
+                "UPDATE vatra_ledger SET owner = ?, subtask_id = ?, label = ?, detail = ?,"
+                " pointer = ?, updated_at = ? WHERE session_id = ? AND kind = ? AND key = ?",
+                (owner, subtask_id, label, detail, pointer, now, session_id, kind, key),
+            )
+        elif cur.rowcount == 0:
+            other = label.replace(",", " ").strip()   # `others` is comma-separated
+            await self._db.execute(
+                "UPDATE vatra_ledger SET count = count + 1, updated_at = ?,"
+                " pointer = CASE WHEN pointer = '' THEN ? ELSE pointer END,"
+                " others = CASE"
+                "   WHEN ? = '' OR ? = label OR length(others) > 600"
+                "        OR instr(',' || others || ',', ',' || ? || ',') > 0 THEN others"
+                "   WHEN others = '' THEN ?"
+                "   ELSE others || ',' || ? END"
+                " WHERE session_id = ? AND kind = ? AND key = ?",
+                (now, pointer, other, label, other, other, other, session_id, kind, key),
+            )
+        await self._db.commit()
+
+    async def list_vatra_ledger(self, session_id: str, kinds: list[str] | None = None,
+                                limit: int = 500) -> list[dict]:
+        """Ledger rows for a run, newest first."""
+        assert self._db is not None
+        query = "SELECT * FROM vatra_ledger WHERE session_id = ?"
+        params: list = [session_id]
+        if kinds:
+            query += f" AND kind IN ({','.join('?' * len(kinds))})"
+            params.extend(kinds)
+        query += " ORDER BY updated_at DESC, id DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        async with self._db.execute(query, params) as cur:
             return [dict(r) for r in await cur.fetchall()]
 
     # ── Vatra resume checkpoints (per-owner slice, restored on resume) ─

@@ -1839,6 +1839,10 @@ class AgentOrchestrationMixin:
 
             # ── LLM call ──────────────────────────────────────────
             self._set_runtime_status("thinking")
+            # Governed: fold older results before the request outgrows ~80%
+            # of the real window (one batch, then append-only again).
+            if self._governor_on():
+                self._maybe_fold_turn_context(turn_start_idx)
             # The gate feedback rides after the build: the governed budget
             # leaves room for it.
             self._pending_feedback_tokens = (

@@ -409,7 +409,7 @@ ACTED_CORRECTIVE = (
 )
 
 
-def worker_produced_nothing(result: dict | None) -> bool:
+def worker_produced_nothing(result: dict | None, *, skip_notes: bool = False) -> bool:
     """True when a dispatch returned empty text AND made no file-writing tool call.
 
     This is the only case the acted-gate retries: a pure-narration no-op. A worker
@@ -421,9 +421,18 @@ def worker_produced_nothing(result: dict | None) -> bool:
     if (result.get("output") or "").strip():
         return False
     for a in result.get("actions") or []:
-        if str(a.get("tool", "")).lower() in _WRITE_TOOLS:
+        if str(a.get("tool", "")).lower() in _WRITE_TOOLS and not (skip_notes and _is_notes_write(a)):
             return False
     return True
+
+
+def _is_notes_write(action: dict) -> bool:
+    """A write to a Vatra worker's scratch notes (``…/notes/<sid8>-<subtask>-notes.md``,
+    asked for by the in-turn context governor) — not a contribution."""
+    from captain_claw.context_spill import is_governor_notes_path
+
+    m = re.search(r"(?:^|, )path=([^,]+)", str(action.get("detail") or ""))
+    return bool(m) and is_governor_notes_path(m.group(1))
 
 
 # ── R5: worker escalation ─────────────────────────────────────────────
