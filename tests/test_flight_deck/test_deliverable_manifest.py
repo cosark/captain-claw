@@ -212,3 +212,18 @@ def test_gate_reasons():
     assert any("too_few_sections" in x for x in r2["reasons"])
     ok = "# Chapter One\n\n" + "x" * 100 + "\n\n# Chapter Two\n\n" + "y" * 100
     assert dm.gate(m, ok)["ok"] is True
+
+
+def test_part_headings_are_not_chapters_and_two_word_numbers_parse():
+    assert dm.chapters_in("# Part One\n\n## Chapter 1\n\n## Chapter 2\n") == [1, 2]
+    assert dm.chapters_in("## Chapter Twenty One\n## Chapter twenty-two\n## Chapter One Night\n") == [21, 22, 1]
+
+
+def test_continuous_numbering_across_parts_is_not_a_duplicate(tmp_path):
+    m = dm.parse({"path": "book.md", "parts": [
+        {"path": "p1.md", "owner": "s4", "order": 1, "range": "ch1-2"},
+        {"path": "p2.md", "owner": "s5", "order": 2, "range": "ch3-4"},
+    ]}, _SUBTASKS, "proj")
+    _write(tmp_path, "p1.md", "# Part One\n\n## Chapter 1\n\na\n\n## Chapter 2\n\nb\n")
+    _write(tmp_path, "p2.md", "# Part Two\n\n## Chapter 3\n\nc\n\n## Chapter 4\n\nd\n")
+    assert dm.assemble(tmp_path, m)["findings"] == []

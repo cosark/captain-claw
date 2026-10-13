@@ -202,3 +202,16 @@ async def test_start_without_seeds_is_unchanged(monkeypatch):
     assert route["shared_context"] == "Lead conventions."
     cfg = json.loads(db.sessions[res["session_id"]]["config"])
     assert not {"project_id", "project_context", "force_ids"} & set(cfg)
+
+
+async def test_start_persists_vfs_project_for_approve(monkeypatch):
+    db = _DB()
+    cap = _wire(monkeypatch, db)
+    res = await _start(_body(vfs_project="my-folder"), cap)
+    sid = res["session_id"]
+    cfg = json.loads(db.sessions[sid]["config"])
+    assert cfg["vfs_project"] == "my-folder"
+    assert db.sessions[sid]["status"] == "awaiting_plan"
+    # the planner pre-phase never registers the folder globally (it was never
+    # released for a plan that is cancelled or never approved)
+    assert sid not in vr._run_vfs_project

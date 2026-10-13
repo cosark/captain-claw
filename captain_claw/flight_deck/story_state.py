@@ -738,6 +738,7 @@ async def run_validator(text: str, *, extract_fn: CompleteFn,
               "blocking": blocking_findings(findings),
               "scores": score(findings, passes_run=passes_run),
               **bucket(findings)}
+    result["initial_scores"] = result["scores"]
     if revise_fn is None:
         return result
 

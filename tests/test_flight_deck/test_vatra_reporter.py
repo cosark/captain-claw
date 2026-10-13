@@ -168,3 +168,23 @@ async def test_reporter_smooth_collapse_restores_assembly(reporter_env, monkeypa
         dest_dir=reporter_env, seen_gen=set(), smooth=smooth)
     assert truth == pre  # collapse detected → restored
     assert dfile.read_text(encoding="utf-8") == pre
+
+
+@pytest.mark.asyncio
+async def test_smooth_spawn_failure_returns_assembly(tmp_path, monkeypatch):
+    # The smooth-mode reporter can't be spawned: the assembled file is the deliverable,
+    # not the stitched worker replies (mostly "DONE" pointers).
+    monkeypatch.setattr(vr, "_progress", lambda *a, **k: None)
+
+    async def fail_spawn(*a, **k):
+        return {"ok": False, "slug": "", "port": 0, "auth": "", "message": "no port"}
+    monkeypatch.setattr(vr, "_spawn_worker", fail_spawn)
+    usable = [{"title": "P1", "role": "Writer", "output": "DONE — wrote vfs:p/s1.md"}]
+    smooth = {"file": str(tmp_path / "book.md"), "path": "vfs:p/book.md",
+              "text": "# Chapter 1\n\nFull assembled text.", "findings": [], "bytes": 30}
+    truth, files = await vr._run_reporter(
+        None, {"id": "u1"}, "sid", "sid", "t", "intent", usable, {},
+        {"editor-writer": {"id": "editor-writer", "role": "Editor"}},
+        tiers=None, api_key="", env_vars=None, dispatch_timeout=5, input_names=set(),
+        dest_dir=tmp_path, seen_gen=set(), smooth=smooth)
+    assert truth == smooth["text"] and files == []

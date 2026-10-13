@@ -84,16 +84,22 @@ def parse_range(raw: Any) -> tuple[int, int] | None:
 
 
 _SECTION_RE_DEFAULT = r"(?im)^\s{0,3}#{1,3}\s*(?:chapter|part|section)\b"
+# Chapter headings only — a "Part N" heading groups chapters (continuous chapter
+# numbering across parts is normal), so counting it as a chapter invents
+# duplicates. Two-word numbers ("Twenty One") are read whole.
 _CHAPTER_NUM_RE = re.compile(
-    r"(?im)^\s{0,3}#{1,3}\s*(?:chapter|part)\s+([0-9]+|[a-z][a-z\-]*)\b"
+    r"(?im)^\s{0,3}#{1,3}\s*chapter\s+([0-9]+|[a-z]+(?:[ \-][a-z]+)?)\b"
 )
 
 
 def chapters_in(text: str) -> list[int]:
-    """Chapter/part numbers named by markdown headings, in document order."""
+    """Chapter numbers named by markdown chapter headings, in document order."""
     out: list[int] = []
     for m in _CHAPTER_NUM_RE.finditer(text or ""):
-        n = word_to_int(m.group(1))
+        tok = m.group(1).strip().lower()
+        n = word_to_int(tok.replace(" ", "-"))
+        if n is None:  # "Chapter One Night" → "one"
+            n = word_to_int(re.split(r"[ \-]", tok)[0])
         if n is not None:
             out.append(n)
     return out
