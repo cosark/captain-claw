@@ -334,11 +334,14 @@ class _StubMailTool(Tool):
     }
 
     def __init__(self, *, repeat: str = "", refusal: str = "",
-                 search_text: str = "1. To: ana@x.co — 10:30 (12 Oct)  Newest msg: m-0"):
+                 search_text: str = "1. To: ana@x.co — 10:30 (12 Oct)  Newest msg: m-0",
+                 sent: str = "Email sent.\n  To: ana@x.co\n  Subject: 10:30\n  Message ID: m-1\n"
+                             "  Thread ID: t-1"):
         self.actions: list[str] = []
         self.repeat = repeat
         self.refusal = refusal
         self.search_text = search_text
+        self.sent = sent
 
     async def execute(self, action: str = "", **kwargs: Any) -> ToolResult:
         from captain_claw import gmail_compose
@@ -350,8 +353,7 @@ class _StubMailTool(Tool):
             return ToolResult(success=False, error=gmail_compose.repeat_refusal(
                 [self._MATCHES[self.repeat]], lead="Not sent"))
         if action in ("send", "send_draft"):
-            return ToolResult(success=True, content=(
-                "Email sent.\n  To: ana@x.co\n  Subject: 10:30\n  Message ID: m-1\n  Thread ID: t-1"))
+            return ToolResult(success=True, content=self.sent)
         if action == "search":
             return ToolResult(success=True, content=self.search_text)
         if action == "list_drafts":
@@ -1569,3 +1571,152 @@ def test_a_turned_down_reply_and_its_corrective_never_feed_a_summary():
     fallback = agent._fallback_compaction_summary(messages)
     for text in (formatted, fallback):
         assert made_up not in text and "I don't know yet." in text and "did Ana reply?" in text
+
+
+@pytest.mark.asyncio
+async def test_a_true_report_of_an_earlier_send_is_asked_for_its_id_not_retracted(_human_turn):
+    # Turn 2 checks the Sent folder, as the prompts ask, and reports turn 1's
+    # send without its Message ID: the corrective never says nothing was sent.
+    agent, provider, mail = _mail_agent([
+        _send_call(), LLMResponse(content="**Sent** to Ana — Message ID m-1."),
+        _mail_call("search", query="in:sent to:ana@x.co"),
+        LLMResponse(content="Yes — I looked in your Sent folder.\n\nThe email to Ana went out today "
+                            "at 10:31."),
+        LLMResponse(content="Yes — the email to Ana went out today at 10:31 (Message ID m-1)."),
+    ], tool=_StubMailTool(search_text="1. To: ana@x.co — 10:30 — 13 Oct 10:31  Message ID: m-1"))
+    await agent.complete("send Ana a mail that 10:30 works")
+
+    result = await agent.complete("are you sure it went out? check")
+
+    assert mail.actions == ["send", "search"]
+    assert result.startswith("Yes — the email to Ana went out today at 10:31 (Message ID m-1).")
+    assert "no email was sent" not in result and len(provider.calls) == 5
+    corrective = _mail_correctives(agent)
+    assert len(corrective) == 1 and "nothing was sent" not in corrective[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_flight_decks_duplicate_refusal_backs_an_already_sent_reply(_human_turn):
+    refusal = ("Email not sent: Duplicate: this exact email (same recipients, subject and body) "
+               "was already sent at 2026-10-13T09:12 (Gmail message 18f3a1b2c3d4e5f6). Not sent "
+               "again.")
+    reply = "The email to Ana was already sent at 09:12, so there is no second copy."
+    agent, provider, mail = _mail_agent([_send_call(), LLMResponse(content=reply)],
+                                        tool=_StubMailTool(refusal=refusal))
+
+    result = await agent.complete("send Ana the 10:30 confirmation")
+
+    assert mail.actions == ["send"] and result.startswith(reply)
+    assert len(provider.calls) == 2 and _correctives(agent) == []
+
+
+@pytest.mark.asyncio
+async def test_a_peers_send_relayed_in_its_own_words_is_not_questioned(_human_turn):
+    reply = ("Mailer handled it.\n\n**Sent** to Ana — confirming the contract (Message ID "
+             "18f3a1b2c3d4e5f6).")
+    agent, provider, mail = _mail_agent([
+        _call("flight_deck", action="consult", message="email Ana the contract"),
+        LLMResponse(content=reply),
+    ])
+    agent.tools.register(_StubActionTool("flight_deck", (
+        "Response from Mailer:\n\n**Sent** to Ana — confirming the contract. Message ID "
+        "18f3a1b2c3d4e5f6.")))
+
+    result = await agent.complete("ask Mailer to email Ana the contract")
+
+    assert result.startswith(reply) and "no email was sent" not in result
+    assert len(provider.calls) == 2 and _correctives(agent) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_text, reply", [
+    ("Ask the Researcher agent to summarize Ana's email thread about the contract",
+     "**Sent** to Researcher — they'll summarize Ana's thread and report back."),
+    ("ask the Researcher to email Ana the summary",
+     "**Sent** to the Researcher — they'll email Ana the summary."),
+])
+async def test_a_handoff_about_mail_is_not_an_email_send(_human_turn, request_text, reply):
+    agent, provider, mail = _mail_agent([
+        _call("flight_deck", action="delegate", agent_name="Researcher", message="the summary"),
+        LLMResponse(content=reply),
+    ])
+    agent.tools.register(_StubActionTool("flight_deck", "Task delegated to **Researcher**."))
+    _earlier_mail_lookup(agent)
+
+    result = await agent.complete(request_text)
+
+    assert result.startswith(reply) and "no email was sent" not in result
+    assert len(provider.calls) == 2 and _correctives(agent) == []
+    assert not any("delegated/sent the task to a peer" in str(m["content"])
+                   for m in agent.session.messages)
+
+
+@pytest.mark.asyncio
+async def test_a_drafted_letter_is_not_a_send_claim(_human_turn):
+    reply = ("Draft saved in Gmail. It reads:\n\nHi Marko,\n\nI've just sent the signed contract "
+             "over by courier — it should reach you Thursday.\n\nBest,\nK")
+    agent, provider, mail = _mail_agent([
+        _mail_call("create_draft", to="marko@x.co", body="Hi Marko, …"),
+        LLMResponse(content=reply),
+    ])
+
+    result = await agent.complete("Draft a reply to Marko letting him know the signed contract "
+                                  "is on its way by courier")
+
+    assert mail.actions == ["create_draft"] and result.startswith(reply)
+    assert len(provider.calls) == 2 and _correctives(agent) == []
+
+
+@pytest.mark.asyncio
+async def test_proofreading_pasted_text_is_no_narrated_lookup(_human_turn):
+    request = ("Can you proofread this before I send it to Marko?\n\nHi Marko, I wanted to follow "
+               "up on our call last week about the pilot. Could you send over the signed NDA and "
+               "the pricing sheet by Friday, so legal can start the review? Thanks, K")
+    reply = ("Reading through your email now — here are my suggestions:\n\n1. Shorten the "
+             "opening.\n2. Put the ask about the NDA in the first paragraph.")
+    agent, provider, mail = _mail_agent([LLMResponse(content=reply)])
+
+    result = await agent.complete(request)
+
+    assert result.startswith(reply)
+    assert len(provider.calls) == 1 and _correctives(agent) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_text, call, refusal", [
+    ("one line ack to Tom", _mail_call(
+        "get_thread", thread_id="t-1",
+        content="Finding Tom's latest message.\n\n**Sent** — one-line ack to Tom."), ""),
+    ("send Ana the 10:30 confirmation", _send_call(content="**Sent** to Ana — 10:30 confirmed."),
+     "Email not sent: Email sending is off for this agent."),
+])
+async def test_a_send_claim_next_to_a_call_is_judged_once_the_call_is_stored(
+        _human_turn, request_text, call, refusal):
+    # A fresh session, no mail word in the request: only this response's own
+    # call makes the bare "Sent" an email, and it is judged once stored.
+    agent, provider, mail = _mail_agent([call, LLMResponse(content="Not sent yet.")],
+                                        tool=_StubMailTool(refusal=refusal))
+
+    result = await agent.complete(request_text)
+
+    assert result.startswith("Not sent yet.") and "**Sent**" not in result
+    corrective = _mail_correctives(agent)
+    assert len(corrective) == 1 and ("did not go through" in corrective[0]) is bool(refusal)
+
+
+@pytest.mark.asyncio
+async def test_a_follow_up_quoting_the_threads_id_is_no_send(_human_turn):
+    # Gmail gives a new thread its first message's ID: turn 1's Message ID is
+    # also the Thread ID turn 2's false follow-up quotes.
+    agent, provider, mail = _mail_agent([
+        _send_call(), LLMResponse(content="**Sent** to Ana — Message ID 19a0b1c2d3e4f5a6."),
+        LLMResponse(content="**Sent** — threaded on `19a0b1c2d3e4f5a6`, asking Ana for the agenda."),
+        LLMResponse(content="Not sent yet — nothing went out in this turn."),
+    ], tool=_StubMailTool(sent="Email sent.\n  To: ana@x.co\n  Message ID: 19a0b1c2d3e4f5a6\n"
+                               "  Thread ID: 19a0b1c2d3e4f5a6"))
+    await agent.complete("send Ana the 10:30 confirmation")
+
+    result = await agent.complete("now reply in that thread asking Ana for the agenda and send it")
+
+    assert mail.actions == ["send"] and result.startswith("Not sent yet")
+    assert len(_mail_correctives(agent)) == 1

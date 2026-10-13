@@ -39,13 +39,6 @@ def _previous_summary(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
-def _turned_down(msg: dict[str, Any]) -> bool:
-    """A reply a gate turned down, or the corrective sent back about it."""
-    from captain_claw import msg_origin
-
-    return msg_origin.origin_of(msg) in ("rejected", "corrective")
-
-
 class AgentSessionMixin:
     """Session token accounting, compaction, and runtime flag sync."""
     def _count_tokens(self, text: str) -> int:
@@ -233,7 +226,7 @@ class AgentSessionMixin:
         max_item_chars: int = 600,
     ) -> str:
         """Format messages for compaction summarization prompt."""
-        from captain_claw.msg_origin import is_model_hidden_tool
+        from captain_claw.msg_origin import is_model_hidden_tool, is_turned_down
 
         lines: list[str] = []
         consumed = 0
@@ -241,7 +234,7 @@ class AgentSessionMixin:
         # reply a gate turned down and its corrective (which quotes made-up
         # IDs back) are no part of the conversation to carry on.
         messages = [msg for msg in messages
-                    if not is_model_hidden_tool(msg) and not _turned_down(msg)]
+                    if not is_model_hidden_tool(msg) and not is_turned_down(msg)]
         for idx, msg in enumerate(messages, start=1):
             role = self._compact_role(str(msg.get("role", "")))
             tool_name = str(msg.get("tool_name", "")).strip()
@@ -261,10 +254,12 @@ class AgentSessionMixin:
 
     def _fallback_compaction_summary(self, messages: list[dict[str, Any]]) -> str:
         """Fallback summary when LLM-based compaction summarization fails."""
+        from captain_claw.msg_origin import is_turned_down
+
         if not messages:
             return "No prior messages available for summary."
         highlights: list[str] = []
-        for msg in [msg for msg in messages if not _turned_down(msg)][-8:]:
+        for msg in [msg for msg in messages if not is_turned_down(msg)][-8:]:
             role = self._compact_role(str(msg.get("role", "")))
             content = re.sub(r"\s+", " ", str(msg.get("content", "")).strip())
             if not content:

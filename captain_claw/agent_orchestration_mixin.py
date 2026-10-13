@@ -834,6 +834,14 @@ class AgentOrchestrationMixin:
                 return False
         return True
 
+    @staticmethod
+    def _claims_send(text: str, user_input: str, offered: frozenset[str]) -> bool:
+        """Text written next to tool calls reads as a send claim: it is held
+        until the calls answer and judged then (:meth:`_settle_held_claim`),
+        when they are stored and count as this turn's mail."""
+        return bool(text and offered & fabrication_guard.MAIL_TOOLS
+                    and fabrication_guard.claims_mail_sent(text, user_input, True))
+
     def _judge_reply(
         self, raw: str, text: str, turn_start_idx: int, user_input: str,
         offered: frozenset[str], *, held: bool = False,
@@ -842,8 +850,7 @@ class AgentOrchestrationMixin:
         :func:`fabrication_guard.judge_reply`): *raw* as the model wrote it,
         *text* as it would ship, *offered* the tools this turn offers. *held*:
         text written next to tool calls — only its mail claim is judged."""
-        if held and not (offered & fabrication_guard.MAIL_TOOLS
-                         and fabrication_guard.claims_mail_sent(text, user_input, True)):
+        if held and not self._claims_send(text, user_input, offered):
             return fabrication_guard.Verdict()   # no send claimed: nothing to hold
         messages = self.session.messages if self.session else []
         turn = getattr(self, "_turn_origin", None)
@@ -2410,9 +2417,8 @@ class AgentOrchestrationMixin:
                 # Adding the blocker." + a calendar call) is judged once the
                 # calls have answered; until then it is not narrated, folded
                 # into the answer or stored with the calls.
-                _held_claim = _tc_text if _tc_text and self._judge_reply(
-                    _tc_text, _tc_text, turn_start_idx, user_input, _offered_tools, held=True,
-                ).false else ""
+                _held_claim = (_tc_text if self._claims_send(_tc_text, user_input, _offered_tools)
+                               else "")
                 if _tc_text and not _held_claim:
                     _intermediate_texts.append(_tc_text)
                     if self._emit_narration(_tc_text, iteration):
@@ -2764,9 +2770,8 @@ class AgentOrchestrationMixin:
                 )
                 _emb_text = str(response.content or "").strip()
                 # Judged after the calls, like explicit ones (see above).
-                _held_claim = _emb_text if _emb_text and self._judge_reply(
-                    _emb_text, _emb_text, turn_start_idx, user_input, _offered_tools, held=True,
-                ).false else ""
+                _held_claim = (_emb_text if self._claims_send(_emb_text, user_input, _offered_tools)
+                               else "")
                 if _emb_text and not _held_claim:
                     _intermediate_texts.append(_emb_text)
                     if self._emit_narration(_emb_text, iteration):
@@ -2981,11 +2986,9 @@ class AgentOrchestrationMixin:
             if command:
                 _tools_executed_count += 1
                 _inline_text = str(response.content or "").strip()
-                # A false send claim around the command is never shown (the
-                # command is no mail send).
-                if _inline_text and self._judge_reply(
-                        _inline_text, _inline_text, turn_start_idx, user_input, _offered_tools,
-                        held=True).false:
+                # A send claim around the command is never shown (the command
+                # is no mail send).
+                if self._claims_send(_inline_text, user_input, _offered_tools):
                     _inline_text = ""
                 if _inline_text:
                     _intermediate_texts.append(_inline_text)

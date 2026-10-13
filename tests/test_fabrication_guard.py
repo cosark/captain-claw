@@ -217,6 +217,8 @@ def _refusal(match: dict, lead: str = "Not sent") -> str:
 
 
 _SENT = "Email sent.\n  To: ana@x.co\n  Subject: 10:30\n  Message ID: m-1\n  Thread ID: t-1"
+_FD_DUPLICATE = ("Duplicate: this exact email (same recipients, subject and body) was already "
+                 "sent at 2026-10-13T09:12 (Gmail message 18f3a1b2c3d4e5f6). Not sent again.")
 
 
 @pytest.mark.parametrize("steps, expected", [
@@ -233,6 +235,11 @@ _SENT = "Email sent.\n  To: ana@x.co\n  Subject: 10:30\n  Message ID: m-1\n  Thr
         [_THREAD_DRAFT_MATCH], lead="Duplicate: not sent"))], False),
     # Gmail may have delivered it.
     ([_step("send", "Error: Email may or may not have been sent: HTTP 502")], True),
+    # Flight Deck's duplicate check: sent before, or maybe sent.
+    ([_step("send", "Error: Email not sent: " + _FD_DUPLICATE)], True),
+    ([_step("send", "Error: Email not sent: Duplicate: this exact email (same recipients, "
+                    "subject and body) was already attempted at 2026-10-13T09:12 and Gmail never "
+                    "confirmed it — it may have gone out. Not sent again.")], True),
     ([_step("send", "Error: Email not sent: sending is turned off for this agent.")], False),
     ([_step("send", "Error: microsoft_mail doesn't send email.", tool="microsoft_mail")], False),
     # A draft or a look at the mailbox is not a send.
@@ -281,6 +288,9 @@ def test_sent_message_ids_come_only_from_emails_that_went_out() -> None:
              _step("create_draft", "Draft created.\n  Draft ID: r-2\n  Message ID: m-8")]
     # Message IDs only: a thread holds every reply in it.
     assert fg.sent_message_ids(steps) == {"m-1", "m-0"}
+    # Flight Deck's duplicate refusal names the Gmail message that went out.
+    assert fg.sent_message_ids([_step("send", "Error: Email not sent: " + _FD_DUPLICATE)]) == {
+        "18f3a1b2c3d4e5f6"}
 
 
 # ── The mail claim decision ──────────────────────────────────────────
@@ -395,7 +405,7 @@ def test_no_corrective_invites_a_send() -> None:
     every_tool = _TOOLS | {"microsoft_mail", "microsoft_calendar", "google_drive",
                            "microsoft_onedrive"}
     variants = [
-        fg.mail_corrective(),
+        fg.mail_corrective(), fg.mail_corrective(earlier_send=True),
         *(fg.mail_corrective(refused) for refused in (
             _refusal(_DRAFT_MATCH), _refusal(_SENT_MATCH), "Error: Email not sent: sending is off.",
             "Error: Gmail refused: quota. Send it later with allow_repeat=true.", "")),
@@ -438,6 +448,42 @@ def test_a_message_id_a_send_returned_proves_the_claim_after_compaction() -> Non
     assert _judge(reply, _facts("did the reply to Ana go out?")).false
     assert not _judge(reply, _facts("did the reply to Ana go out?",
                                     sent_ids=frozenset({"m-1"}))).false
+
+
+def test_after_a_real_send_the_corrective_never_says_nothing_was_sent() -> None:
+    # The reply may be about that send (after the in:sent check the prompts
+    # ask for): the model is told how to report it, not that it never went.
+    looked = _step("search", "1. To: ana@x.co — 10:30 — 13 Oct 10:31  Message ID: m-1",
+                   query="in:sent to:ana@x.co")
+    for reply in ("Yes — I looked in your Sent folder.\n\nThe email to Ana went out today at 10:31.",
+                  "Yes — the email to Ana was sent."):
+        for facts in (_facts("are you sure it went out? check", earlier=[_EARLIER_SEND],
+                             turn=[looked]),
+                      _facts("did it actually go out?", sent_ids=frozenset({"m-1"})),
+                      _facts("did it go out?", relayed=(_LANE_SENT,))):
+            verdict = _judge(reply, facts)
+            assert verdict.kinds == (fg.MAIL_CLAIM,), reply
+            assert "nothing was sent" not in verdict.corrective.lower()
+            assert 'only with the Message ID its "Email sent." returned' in verdict.corrective
+            assert verdict.backstop == fg.MAIL_BACKSTOP
+    # No real send anywhere: nothing was sent.
+    assert "so nothing was sent" in _judge("Yes — the email to Ana was sent.",
+                                           _facts("did it go out?", turn=[looked])).corrective
+
+
+def test_a_sent_id_quoted_as_the_thread_proves_no_new_send() -> None:
+    # Gmail gives a new thread its first message's ID.
+    send = _step("send", "Email sent.\n  To: ana@x.co\n  Message ID: 19a0b1c2d3e4f5a6\n"
+                         "  Thread ID: 19a0b1c2d3e4f5a6")
+    request = "now reply in that thread asking Ana for the agenda and send it"
+    for reply in ("**Sent** — threaded on `19a0b1c2d3e4f5a6`, asking Ana for the agenda.",
+                  "**Sent** to Ana (thread 19a0b1c2d3e4f5a6).",
+                  "Reply sent — Thread ID: 19a0b1c2d3e4f5a6."):
+        assert _judge(reply, _facts(request, earlier=[send])).false, reply
+    for reply in ("**Sent** to Ana — Message ID 19a0b1c2d3e4f5a6.",
+                  "Sent to Ana in her thread, ID 19a0b1c2d3e4f5a6.",
+                  "**Sent** — Thread `t-1`, Message ID `19a0b1c2d3e4f5a6`."):
+        assert not _judge(reply, _facts("did the email to Ana go out?", earlier=[send])).false, reply
 
 
 @pytest.mark.parametrize("reply", [
@@ -556,6 +602,85 @@ def test_the_claim_lines_are_the_email_lines() -> None:
     verdict = _judge(reply, _facts("pošalji Ani mail i proslijedi istraživanje Researcheru",
                                    turn=[_EARLIER_SEND]))
     assert not verdict.false and verdict.claim_lines == {0, 2, 3}
+
+
+def test_a_peers_send_reported_in_its_own_words_backs_the_claim() -> None:
+    # A peer answers as the prompts teach ("**Sent** to Ana — … Message ID
+    # X"); its own gate let that through.
+    answer = _step("consult", "Response from Mailer:\n\n**Sent** to Ana — confirming the "
+                              "contract. Message ID 18f3a1b2c3d4e5f6.", tool="flight_deck")
+    reply = ("Mailer handled it.\n\n**Sent** to Ana — confirming the contract (Message ID "
+             "18f3a1b2c3d4e5f6).")
+    assert fg.turn_sent_mail([answer])
+    assert not _judge(reply, _facts("ask Mailer to email Ana the contract", turn=[answer])).false
+    # A lane note (or a delegated result) in that shape proves the ID it names.
+    note = f"{_LANE}\n**Sent** to Ana — confirming the contract. Message ID 18f3a1b2c3d4e5f6."
+    assert fg.relayed_sent_ids([note]) == {"18f3a1b2c3d4e5f6"}
+    assert not _judge(reply, _facts("did Mailer's email to Ana go out?", relayed=(note,))).false
+    # No send reported: a plan, a negation, an earlier send, a backstopped reply.
+    for text in ("I'll send it to Ana after lunch.", "**Not sent** — Ana's address bounced.",
+                 "The email to Ana went out yesterday (Message ID 18f3a1b2c3d4e5f6).",
+                 "**Sent** to Ana.\n\n" + fg.MAIL_BACKSTOP):
+        step = _step("consult", "Response from Mailer:\n\n" + text, tool="flight_deck")
+        assert not fg.turn_sent_mail([step]) and not fg.sent_message_ids([step]), text
+
+
+@pytest.mark.parametrize("reply", [
+    "**Sent** to Researcher — they'll summarize Ana's thread and report back.",
+    "Done — sent to the Researcher; the summary of Ana's email comes back to you.",
+    "Poslano Researcheru — javit će sažetak Aninog maila.",
+    "**Sent** to the Researcher — they'll email Ana the summary.",
+])
+def test_a_line_naming_the_agent_handed_the_work_reports_that_handoff(reply: str) -> None:
+    handoff = _step("delegate", "Task delegated to **Researcher**.", tool="flight_deck",
+                    agent_name="Researcher")
+    request = "Ask the Researcher agent to summarize Ana's email thread"
+    verdict = _judge(reply, _facts(request, turn=[handoff]))
+    assert not verdict.false and verdict.claim_lines == frozenset()
+    # Without that hand-off (none, or a failed one) the line is an email claim.
+    failed = _step("delegate", "Error: Agent 'Researcher' is not running.", tool="flight_deck",
+                   agent_name="Researcher")
+    for turn in ([], [failed]):
+        assert _judge(reply, _facts(request, turn=turn)).false
+    # A line about someone else is still one.
+    assert _judge("**Sent** to Ana — confirming 10:30.", _facts(request, turn=[handoff])).false
+
+
+@pytest.mark.parametrize("reply", [
+    "Draft saved in Gmail. It reads:\n\nHi Marko,\n\nI've just sent the signed contract over by "
+    "courier — it should reach you Thursday.\n\nBest,\nK",
+    "Here's a reply you can use:\n\nHi Marko,\n\nI sent the files over — tell me if any are "
+    "missing.\n\nBest,\nKS",
+    "Poštovani,\n\nposlao sam Vam ugovor poštom.\n\nLijep pozdrav",
+])
+def test_a_letter_drafted_for_the_user_holds_no_claim(reply: str) -> None:
+    request = "Draft a reply to Marko's email: the signed contract is on its way"
+    assert not _judge(reply, _facts(request)).false
+    # Outside the letter a send claim is still one, on its own line.
+    verdict = _judge(reply + "\n\n**Sent** to Ana — confirming 10:30.", _facts(request))
+    assert verdict.false and verdict.claim_lines == {reply.count("\n") + 2}
+
+
+def test_a_digest_of_the_users_own_sends_holds_no_claim() -> None:
+    request = "what did I send today?"
+    looked = _step("search", "1. To: ana@x.co — 10:30\n2. To: ivo@x.co — agenda",
+                   query="in:sent newer_than:1d")
+    for reply in (
+        "Today you sent two emails:\n- **Sent** to Ana — 10:30 confirmation\n- **Sent** to Ivo — "
+        "agenda",
+        "Your sent mail today:\n\n1. **Sent** to Ana — 10:30 confirmation\n2. **Sent** to Ivo",
+        "You've sent two:\n**Sent** to Ana — 10:30\n**Sent** to Ivo — agenda",
+        "Poslao si danas dva maila:\n- Poslano Ani — potvrda za 10:30",
+    ):
+        assert not _judge(reply, _facts(request, turn=[looked])).false, reply
+    # The lead must list the user's sends ("you sent me" is the agent's
+    # input) and introduce them.
+    for reply in ("You sent me the draft:\n**Sent** to Ana — confirming 10:30.",
+                  "You sent nothing to Ana, so\n**Sent** to Ana — confirming 10:30."):
+        assert _judge(reply, _facts("send it")).false, reply
+    # Known false positive, kept: an undated report with no such lead.
+    assert _judge("Email to Ana sent at 09:12; email to Ivo sent at 10:40.",
+                  _facts(request, turn=[looked])).false
 
 
 # ── Model-written lane notes ─────────────────────────────────────────
@@ -826,6 +951,60 @@ def test_a_how_to_question_is_not_judged_for_narrated_lookups() -> None:
             request, no_tool_call=True, tools=_TOOLS)).false, request
     assert fg.judge_reply(reply, reply, _facts(
         "any mail from Ana?", no_tool_call=True, tools=_TOOLS)).narrated
+
+
+_PASTED = ("Can you proofread this before I send it to Marko?\n\nHi Marko, I wanted to follow up "
+           "on our call last week about the pilot. Could you send over the signed NDA and the "
+           "pricing sheet by Friday, so legal can start the review? Thanks, K")
+
+
+def test_pasted_content_is_told_from_an_ask() -> None:
+    assert fg.has_pasted_content(_PASTED)
+    assert fg.has_pasted_content("fix the typos:\n```\nHi Ana, thx\n```")
+    assert fg.has_pasted_content("what does she mean?\n> I checked the deck and it's fine")
+    for request in (
+        "check my email for Ana's reply\nand tell me what she said", _PRODUCTION_TURNS[6][0],
+        # An attached file is read with a tool: its lines are no content.
+        "reply to Petra with this doc, ask if ok\n[Attached file: /tmp/x/portfolio.pdf]\n"
+        "(portfolio.pdf: PDF document — open it with pdf_extract.)\n" + "[Attachment note: x] " * 9,
+    ):
+        assert not fg.has_pasted_content(request), request
+
+
+@pytest.mark.parametrize("reply", [
+    "Reading through your email now — here are my suggestions:\n\n1. Shorten the opening.\n2. Put "
+    "the ask in the first paragraph.",
+    "Reviewing your draft:\n\n1. Shorten the opening.",
+    "Let me review the draft you wrote:\n\n1. Shorten the opening — it buries the NDA ask.",
+    "Looking at the document: the ask is buried in the last line.",
+    "Pregledavam tvoj mail — evo ispravki:\n\n1. Skrati uvod.",
+    "Pregledao sam tvoj nacrt — uvod je predug.",
+    "Pročitao sam dokument i evo sažetka: traži NDA do petka.",
+])
+def test_reading_the_pasted_content_is_no_lookup(reply: str) -> None:
+    assert fg.narrated_lookups(reply)
+    assert fg.narrated_lookups(reply, pasted=True) == ()
+    assert not fg.judge_reply(reply, reply, _facts(_PASTED, no_tool_call=True, tools=_TOOLS)).false
+
+
+@pytest.mark.parametrize("reply", [
+    "Checking the thread too.\n\nShe asked for Friday.",
+    "Checking for an existing reply first.\n\nNone.",
+    "Checking your email first.\n\nAna replied Monday.",
+    "Searching your inbox for Ana's reply.\n\nShe replied Monday.",
+    "Reading your inbox now — Ana replied Monday.",
+    "I checked drafts and sent mail — nothing to Marko yet.",
+    "I've read the thread — Marko wants Friday.",
+])
+def test_pasted_content_never_hides_a_search_or_a_look_at_a_store(reply: str) -> None:
+    assert fg.narrated_lookups(reply, pasted=True)
+
+
+def test_the_production_turns_are_caught_with_pasted_content_too() -> None:
+    for _request, raw in _PRODUCTION_TURNS:
+        shipped = fg.strip_forged_lane_notes(raw, _PASTED)
+        verdict = fg.judge_reply(raw, shipped, _facts(_PASTED, no_tool_call=True, tools=_TOOLS))
+        assert {fg.MAIL_CLAIM, fg.NARRATED_LOOKUP} <= set(verdict.kinds), raw
 
 
 # ── Made-up IDs ──────────────────────────────────────────────────────
@@ -1119,6 +1298,33 @@ def test_a_correct_reply_has_no_verdict() -> None:
     reply = "The structure works — lead with the problem, then traction."
     verdict = fg.judge_reply(reply, reply, _facts(known=(_KNOWN,), no_tool_call=True, tools=_TOOLS))
     assert not verdict.false and verdict.corrective == "" and verdict.backstop == ""
+
+
+def test_turned_down_rows_never_reach_semantic_memory(tmp_path) -> None:
+    import json
+    import sqlite3
+
+    from captain_claw.semantic_memory import SemanticMemoryIndex
+
+    messages = [
+        {"role": "user", "content": "send Luka the answers"},
+        {"role": "assistant", "content": "**Sent to Luka** — ID `1a2b3c4d5e6f7a8b`",
+         "origin": "rejected", "origin_detail": "false_mail_send"},
+        {"role": "user", "content": "Your reply quotes `1a2b3c4d5e6f7a8b` — invented.",
+         "origin": "corrective", "origin_detail": "fabricated_id"},
+        {"role": "assistant", "content": "Not sent yet — want me to send it?"},
+    ]
+    db = tmp_path / "sessions.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE sessions (id TEXT, name TEXT, messages TEXT, updated_at TEXT)")
+        conn.execute("INSERT INTO sessions VALUES (?, ?, ?, ?)",
+                     ("s1", "default", json.dumps(messages), "2026-10-13T10:00:00"))
+    idx = SemanticMemoryIndex.__new__(SemanticMemoryIndex)
+    idx.session_db_path = db
+    # What compaction archives, and what the session sync indexes.
+    for text in (SemanticMemoryIndex._format_messages_as_text(messages),
+                 idx._collect_session_documents()[0].text):
+        assert "Not sent yet" in text and "1a2b3c4d5e6f7a8b" not in text
 
 
 def test_monitor_rows_are_no_tool_steps() -> None:

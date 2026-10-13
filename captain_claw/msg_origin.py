@@ -220,6 +220,12 @@ def is_lane_note(msg: Any) -> bool:
     )
 
 
+def is_turned_down(msg: Any) -> bool:
+    """A reply a gate turned down, or the corrective sent back about it: no
+    part of the conversation to carry on, summarize or remember."""
+    return isinstance(msg, dict) and origin_of(msg) in ("rejected", "corrective")
+
+
 def is_human_input(msg: Any) -> bool:
     """A message a person typed (or sent through a chat surface)."""
     return (

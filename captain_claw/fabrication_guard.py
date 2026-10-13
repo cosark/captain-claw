@@ -22,9 +22,11 @@ The corrective only ever asks the model to make its reply true. It never asks
 for a send: whether the user wanted one is theirs to say, and a second copy
 or an email nobody asked for is worse than a false "Sent". A flagged reply
 costs a full-context call, so the claim detector lets ambiguous lines pass: a
-digest of other people's mail, a file, picture or voice note delivered to the
-chat, a calendar invite, a hand-off, the user's own send, a question, a send
-dated before this turn.
+digest of other people's mail or of the user's own sends, a letter drafted for
+the user, a file, picture or voice note delivered to the chat, a calendar
+invite, a hand-off, the user's own send, a question, a send dated before this
+turn. A claim the session's real send may back is told how to prove it, never
+that nothing was sent.
 
 Pure functions over text and the facts the caller gathers: no agent state, no
 I/O. The model-written lane note cut (:func:`strip_forged_lane_notes`) lives
@@ -280,12 +282,20 @@ _USER_SENT_RE = re.compile(
     r"(?:sent|replied|forwarded|e-?mailed)"
     r"|posla(?:o|la)\s+sam|odgovori(?:o|la)\s+sam|proslijedi(?:o|la)\s+sam)\b"
 )
+# A lead line that lists the user's own sends ("Today you sent two emails:",
+# "Your sent mail:", "Poslao si:"): the list or paragraph under it is a digest.
+_YOU_SENT_RE = re.compile(
+    r"(?i)\byou(?:'ve|\s+have)?\s+(?:also\s+)?sent\b(?!\s+(?:me|us)\b)|\byour\s+sent\b"
+    r"|\byou\s+e-?mailed\b|\bposla(?:o|la|li)\s+(?:si|ste)\b(?!\s+(?:mi|nam)\b)"
+)
+_LIST_ITEM_RE = re.compile(r"[ \t]*(?:[-*•]|\d+[.)])\s")
 
 
 @dataclass(frozen=True)
 class _Claim:
     line_index: int
     earlier: bool
+    line_start: int = 0
 
 
 def _line_bounds(text: str, pos: int) -> tuple[int, int]:
@@ -305,6 +315,24 @@ def _is_question(text: str, end: int) -> bool:
     return bool(m and m.group() == "?")
 
 
+def _in_users_digest(text: str, line_start: int) -> bool:
+    """The line at *line_start* hangs from a lead line that lists the user's
+    own sends (see _YOU_SENT_RE): the one above its list (past one blank
+    line), or its paragraph's first line."""
+    above = text[:line_start].split("\n")[:-1]
+    lead = ""
+    if _LIST_ITEM_RE.match(text, line_start):
+        while above and _LIST_ITEM_RE.match(above[-1]):
+            above.pop()
+        if above and not above[-1].strip():
+            above.pop()
+        lead = above[-1] if above else ""
+    else:
+        while above and above[-1].strip():
+            lead = above.pop()
+    return lead.rstrip(" *_").endswith(":") and bool(_YOU_SENT_RE.search(lead))
+
+
 def _find_claims(
     text: str, *, request: str = "", recent_mail: bool = False, strict: bool = False,
 ) -> list[_Claim]:
@@ -315,10 +343,13 @@ def _find_claims(
     reply forms count when the reply or the request is about mail or a mail
     tool ran lately; "I've sent…" / "poslao sam" need mail words. *strict*
     (something else was delivered this turn): only the forms that name the
-    email.
+    email. A letter drafted for the user and a digest of the user's sends
+    hold no claim.
     """
     if not text:
         return []
+    # Blanked, not cut: line numbers stay the reply's.
+    text = _LETTER_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), text)
     patterns: list[re.Pattern[str]] = [_MAIL_NOUN_SENT_RE, _EMAILED_RE]
     if not strict:
         worded = bool(_MAIL_WORDS_RE.search(text) or _MAIL_WORDS_RE.search(request or ""))
@@ -344,7 +375,7 @@ def _find_claims(
                 continue
             if _NOT_MAIL_TARGET_RE.search(text[start:line_end][:120]):
                 continue
-            if _is_question(text, match.end()):
+            if _is_question(text, match.end()) or _in_users_digest(text, line_start):
                 continue
             after = text[match.end():line_end]
             if pattern is _MAIL_NOUN_SENT_RE and _DELIVERY_AFTER_RE.search(
@@ -355,6 +386,7 @@ def _find_claims(
                 line_index=text.count("\n", 0, line_start),
                 earlier=bool(_EARLIER_AFTER_RE.search(after.lstrip())
                              or _EARLIER_BEFORE_RE.search(head)),
+                line_start=line_start,
             ))
     return claims
 
@@ -379,6 +411,13 @@ _QUOTED_ID_RE = re.compile(
 _GMAIL_ID_RE = re.compile(r"[0-9a-f]{16}")
 # Only a Message ID proves one email: a thread holds every reply in it.
 _RESULT_ID_RE = re.compile(r"(?i)\bmessage\s+id:?\s+([A-Za-z0-9][\w-]{2,})")
+# Flight Deck's duplicate refusal: "… was already sent at <time> (Gmail
+# message <id>). Not sent again."
+_FD_DUPLICATE_ID_RE = re.compile(r"\(Gmail message ([A-Za-z0-9][\w-]{2,})\)")
+# An ID quoted as a thread's ("threaded on `X`", "Thread ID: X"): Gmail gives
+# a new thread its first message's ID, so a later reply in it quotes a sent
+# ID without being that send.
+_THREAD_LABEL_RE = re.compile(r"(?i)\bthread(?:ed)?(?:\s+(?:id|on|in))?\b[\s:#`'\"(]*$")
 
 
 def _quoted_ids(text: str) -> list[tuple[str, str]]:
@@ -394,18 +433,23 @@ def _quoted_ids(text: str) -> list[tuple[str, str]]:
     return found
 
 
-def _id_in(token: str, text: str) -> bool:
-    return bool(re.search(rf"(?<![\w-]){re.escape(token)}(?![\w-])", text or ""))
+def _quotes_message_id(token: str, text: str) -> bool:
+    """*token* appears in *text*, at least once not labelled as a thread."""
+    return any(not _THREAD_LABEL_RE.search(text[max(0, m.start() - 20):m.start()])
+               for m in re.finditer(rf"(?<![\w-]){re.escape(token)}(?![\w-])", text or ""))
 
 
 def mail_send_went_out(content: str) -> bool:
     """A google_mail / microsoft_mail send / send_draft answer that means the
     email went out: "Email sent.", an unknown outcome ("may or may not
-    have"), or a refusal naming the SENT email it repeats. A repeat of a
-    DRAFT is not one — that email still waits in Drafts."""
+    have", "may have gone out"), or a refusal naming the SENT email it
+    repeats (the agent's check, or Flight Deck's "already sent at … (Gmail
+    message …)"). A repeat of a DRAFT is not one — that email still waits in
+    Drafts."""
     text = str(content or "").strip()
     return (text.startswith("Email sent.") or is_sent_repeat_refusal(text)
-            or "may or may not have" in text)
+            or "may or may not have" in text or "may have gone out" in text
+            or ("was already sent at" in text and "(Gmail message " in text))
 
 
 def _is_mcp_mail_write(name: str) -> bool:
@@ -450,39 +494,52 @@ def _mail_sends(steps: Iterable[ToolStep]) -> list[ToolStep]:
 # ── Sends another run made ──
 #
 # A peer's answer (flight_deck / consult_peer), a delegated result or a lane
-# note can relay that run's send: "Mailer replied: Email sent. … Message ID X".
-# Its tool calls ran in that run's session, so this one holds no result of
-# them; the relayed "Email sent" is the evidence.
+# note can relay that run's send: "Mailer replied: Email sent. … Message ID X",
+# or that run's final reply ("**Sent** to Ana — Message ID X"), which its own
+# gate let through. Its tool calls ran in that run's session, so this one
+# holds no result of them; the relayed report is the evidence.
 RELAY_TOOLS = frozenset({"flight_deck", "consult_peer"})
 _RELAYED_SEND_RE = re.compile(r"(?i)(?<!\bno\s)(?<!\bnot\s)\be-?mail\s+sent\b")
 _RELAY_ID_SPAN = 600
 
 
+def _relay_starts(text: str) -> list[int]:
+    """Where *text* (another run's) reports a send: after each "Email sent",
+    and at each line that claims one this turn. None when it carries a
+    backstop ("Note: no email was sent…")."""
+    if has_backstop(text):
+        return []
+    starts = {m.end() for m in _RELAYED_SEND_RE.finditer(text)}
+    starts.update(c.line_start for c in _find_claims(text, recent_mail=True) if not c.earlier)
+    return sorted(starts)
+
+
 def relayed_sent_ids(texts: Iterable[str]) -> frozenset[str]:
-    """The Message IDs another run's "Email sent" names in *texts* (what
-    follows each one, up to the next). A text that carries a backstop
-    ("Note: no email was sent…") relays nothing."""
+    """The Message IDs another run's reported send names in *texts* (what
+    follows each report, up to the next)."""
     ids: set[str] = set()
     for text in texts:
         text = str(text or "")
-        if has_backstop(text):
-            continue
-        found = list(_RELAYED_SEND_RE.finditer(text))
-        for i, match in enumerate(found):
-            end = found[i + 1].start() if i + 1 < len(found) else len(text)
-            span = text[match.end(): min(end, match.end() + _RELAY_ID_SPAN)]
+        starts = _relay_starts(text)
+        for i, start in enumerate(starts):
+            end = starts[i + 1] if i + 1 < len(starts) else len(text)
+            span = text[start: min(end, start + _RELAY_ID_SPAN)]
             ids.update(token for token, label in _quoted_ids(span)
                        if label in ("message id", "msg id", "id")
                        or (not label and _GMAIL_ID_RE.fullmatch(token)))
     return frozenset(ids)
 
 
-def _relays_send(step: ToolStep) -> bool:
-    """A peer's answer this run got that relays its "Email sent" (a fleet
-    listing or a spawn answers with no peer's work)."""
+def _is_handoff(step: ToolStep) -> bool:
+    """A peer this run asked or handed work to answered (a fleet listing or
+    a spawn answers with no peer's work)."""
     return (step.name in RELAY_TOOLS and step.ok
-            and step.action not in ("list_agents", "spawn_agent")
-            and not has_backstop(step.content) and bool(_RELAYED_SEND_RE.search(step.content)))
+            and step.action not in ("list_agents", "spawn_agent"))
+
+
+def _relays_send(step: ToolStep) -> bool:
+    """A peer's answer this run got that reports its send."""
+    return _is_handoff(step) and bool(_relay_starts(step.content))
 
 
 def is_relay_message(msg: Mapping[str, Any]) -> bool:
@@ -497,7 +554,7 @@ def turn_sent_mail(steps: Sequence[ToolStep]) -> bool:
     """Whether an email went out in *steps*: a mail send / send_draft that
     answered "Email sent." (or may have), was refused because that email was
     already SENT, went out another mail tool, or a peer this run asked
-    relays its "Email sent"."""
+    reports its send."""
     return (any(mail_send_went_out(s.content) for s in _mail_sends(steps))
             or any(_other_mail_send(s) or _relays_send(s) for s in steps))
 
@@ -515,12 +572,13 @@ def turn_refused_send(steps: Sequence[ToolStep]) -> str:
 
 def sent_message_ids(steps: Iterable[ToolStep]) -> frozenset[str]:
     """The Message IDs of emails that went out: what "Email sent." and a
-    sent-repeat refusal name, and what a peer's relayed "Email sent" names."""
+    sent-repeat refusal name, and what a peer's reported send names."""
     steps = list(steps)
     ids: set[str] = set()
     for step in _mail_sends(steps):
         if step.content.startswith("Email sent.") or is_sent_repeat_refusal(step.content):
             ids.update(_RESULT_ID_RE.findall(step.content))
+        ids.update(_FD_DUPLICATE_ID_RE.findall(step.content))
     ids.update(relayed_sent_ids(s.content for s in steps if _relays_send(s)))
     return frozenset(ids)
 
@@ -945,6 +1003,32 @@ _IN_CONTEXT_RE = re.compile(
     r"|(?:si|ste)\s+(?:zalijepi|podijeli|proslijedi)\w*|tvoj\w*\s+(?:poruk|tekst|pitanj)\w*"
     r"|gore\b|ispod\b)"
 )
+# When the request carries pasted content, reading or reviewing a text
+# ("Reviewing your draft:", "Pročitao sam dokument") is about it: an analysis
+# verb, or a past-tense look at nothing but these, is no lookup. A store
+# (inbox, Sent, calendar, thread) still is, and so are search / check verbs.
+_PASTED_TARGET_RE = re.compile(
+    r"(?i)draft|e-?mail|mail|docs?|documents?|notes?|nacrt\w*|dokument\w*|mejl[a-z]?|bilje[šs]k\w*")
+_READ_VERB_RE = re.compile(
+    r"(?i)^(?:" + _PROGRESS_ANALYSIS + r"|let\s+me\s+(?:read|review|look\s+at))\b")
+_BRACKET_LINE_RE = re.compile(r"(?m)^[ \t]*[\[(][^\n]*[\])][ \t]*$")
+
+
+def has_pasted_content(request: str) -> bool:
+    """*request* carries content to read, not only an ask: a fenced or
+    quoted block, or two lines or more of 200+ characters (attachment lines
+    aside — an attached file is read with a tool)."""
+    text = _BRACKET_LINE_RE.sub("", strip_automated_prefix(request or "")).strip()
+    if "```" in text or _BLOCKQUOTE_RE.search(text):
+        return True
+    return len(text) >= 200 and sum(bool(line.strip()) for line in text.split("\n")) >= 2
+
+
+def _about_pasted(sentence: str) -> bool:
+    targets = [m.group() for m in _LOOKUP_TARGET_RE.finditer(sentence)]
+    return bool(targets) and all(_PASTED_TARGET_RE.fullmatch(t) for t in targets)
+
+
 # A routine, not a step now ("- Checking the inbox daily at 09:00").
 _ROUTINE_RE = re.compile(
     r"(?i)\b(?:daily|hourly|weekly|nightly|every\s+(?:day|morning|evening|night|hour|week"
@@ -1040,7 +1124,7 @@ def _denies_lookup(text: str) -> bool:
         text))
 
 
-def narrated_lookups(reply: str) -> tuple[str, ...]:
+def narrated_lookups(reply: str, pasted: bool = False) -> tuple[str, ...]:
     """The lookups *reply* narrates as done or under way, for a turn that made
     no tool call: progress lines ("Searching for the thread…", "Provjeravam
     inbox."), "Let me find X." followed by what it "found", and past-tense
@@ -1048,9 +1132,10 @@ def narrated_lookups(reply: str) -> tuple[str, ...]:
 
     Not counted: offers ("I can check…", "Want me to look?"), plans ("I'll
     check"), negations ("I haven't checked"), quotes of other people's words,
-    routines ("checking daily"), reading what the user put in the chat, an
-    earlier turn's check, a bare "Let me check." (the stall gate's), a letter
-    drafted for the user, and a retraction.
+    routines ("checking daily"), reading what the user put in the chat (with
+    *pasted*, the request's content: see _PASTED_TARGET_RE), an earlier
+    turn's check, a bare "Let me check." (the stall gate's), a letter drafted
+    for the user, and a retraction.
     """
     text = _LETTER_RE.sub(" ", _own_words(reply))
     if not text.strip() or _denies_lookup(text):
@@ -1066,7 +1151,8 @@ def narrated_lookups(reply: str) -> tuple[str, ...]:
         if _PROGRESS_NOT_RE.match(sentence) or (
                 not _LET_ME_RE.match(sentence) and _GERUND_SUBJECT_RE.match(sentence)):
             continue
-        if _IN_CONTEXT_RE.search(sentence) or _ROUTINE_RE.search(sentence):
+        if _IN_CONTEXT_RE.search(sentence) or _ROUTINE_RE.search(sentence) or (
+                pasted and _READ_VERB_RE.match(sentence) and _about_pasted(sentence)):
             continue
         if _LET_ME_RE.match(sentence):
             # "Let me check." with nothing after it is a stall; narration is
@@ -1090,7 +1176,7 @@ def narrated_lookups(reply: str) -> tuple[str, ...]:
                 continue
             whole = before + sentence
             if (_LOOKUP_EARLIER_RE.search(whole) or not _LOOKUP_TARGET_RE.search(whole)
-                    or _IN_CONTEXT_RE.search(whole)):
+                    or _IN_CONTEXT_RE.search(whole) or (pasted and _about_pasted(whole))):
                 continue
             hits.append(sentence.strip()[:80])
     for pattern in (_CLAIM_VERIFIED_DASH_RE, _CLAIM_RESULT_RE):
@@ -1217,13 +1303,20 @@ def _lookup_quotes(narrated: Sequence[str]) -> str:
     return ", ".join(f'"{_quote(line)}"' for line in narrated[:2])
 
 
-def mail_corrective(refused: str = "") -> str:
+def mail_corrective(refused: str = "", earlier_send: bool = False) -> str:
     """What the model is told about a reply that says an email went out when
-    none did. It asks for a true reply, never for a send."""
+    none did. It asks for a true reply, never for a send. *earlier_send*:
+    the session holds a real send, which the reply may be about — it is not
+    told nothing was sent."""
     if refused:
         return ("Your reply says an email was sent, but the send in this turn did not go "
                 f'through — the tool answered: "{_first_sentence(refused)}" Nothing was sent. '
                 "Rewrite your reply so it is true: say plainly that it was not sent, and why.")
+    if earlier_send:
+        return ("Your reply says an email was sent, but no send ran in this turn. An email sent in "
+                "an earlier turn may be reported only with the Message ID its \"Email sent.\" "
+                "returned; otherwise don't claim a send, a Message ID, a search or a check that "
+                "didn't happen.")
     return ("Your reply says an email was sent, but no send ran in this turn, so nothing was "
             "sent. Rewrite your reply so it is true — don't claim a send, a Message ID, a search "
             "or a check that didn't happen.")
@@ -1253,11 +1346,23 @@ def id_backstop(ids: Sequence[str]) -> str:
     return f"Note: {_id_list(ids)} {_them(ids, 'was', 'were')} not" + _ID_BACKSTOP_TAIL
 
 
-def _mail_claim(reply: str, request: str, facts: TurnFacts) -> tuple[frozenset[int], bool, str]:
+def _name_re(name: Any) -> re.Pattern[str] | None:
+    """An agent's name as a reply writes it: any case, any separator, maybe
+    inflected ("deep_researcher" → "Deep Researcher", "Researcheru")."""
+    words = re.findall(r"[^\W_]+", str(name or ""))
+    if sum(map(len, words)) < 3:
+        return None
+    return re.compile(r"(?i)(?<![^\W_])" + r"[\s_-]*".join(map(re.escape, words)))
+
+
+def _mail_claim(
+    reply: str, request: str, facts: TurnFacts,
+) -> tuple[frozenset[int], bool, str, bool]:
     """(the lines that report an email as sent, whether the report is false,
-    the refusal of this turn's send) — see :func:`judge_reply`."""
+    the refusal of this turn's send, whether the session holds a real send)
+    — see :func:`judge_reply`."""
     if not facts.mail_tools or not reply.strip():
-        return frozenset(), False, ""
+        return frozenset(), False, "", False
     steps = facts.turn_steps
     # Something else was delivered (a file, a picture, a voice note): a bare
     # "Sent" is about that. Recent mail alone makes a bare "Sent" an email
@@ -1265,19 +1370,26 @@ def _mail_claim(reply: str, request: str, facts: TurnFacts) -> tuple[frozenset[i
     strict = any(_delivers_to_chat(s) for s in steps)
     recent = facts.recent_mail and not strict and not any(_acts_elsewhere(s) for s in steps)
     claims = _find_claims(reply, request=request, recent_mail=recent, strict=strict)
+    # A line naming the agent this turn handed work to ("**Sent** to the
+    # Researcher", "Poslano Researcheru") reports that hand-off.
+    agents = [p for p in (_name_re(s.arguments.get("agent_name")) for s in steps if _is_handoff(s))
+              if p]
+    if agents:
+        reply_lines = reply.split("\n")
+        claims = [c for c in claims if not any(p.search(reply_lines[c.line_index]) for p in agents)]
     lines = frozenset(c.line_index for c in claims)
     # A send dated before this turn is history; "I sent your draft to Ted" →
     # "OK, the email to Ted was sent" acknowledges the user's own send.
     claims = [c for c in claims if not c.earlier]
     if not claims or _USER_SENT_RE.search(request) or turn_sent_mail(steps):
-        return lines, False, ""
+        return lines, False, "", False
     # A Message ID an "Email sent." returned (in any turn, or in the run a
     # lane note or a peer's answer relays): the claim is about that email.
     proven = sent_message_ids(facts.session_steps) | facts.sent_ids | relayed_sent_ids(
         facts.relayed)
-    if any(_id_in(token, reply) for token in proven):
-        return lines, False, ""
-    return lines, True, turn_refused_send(steps)
+    if any(_quotes_message_id(token, reply) for token in proven):
+        return lines, False, "", False
+    return lines, True, turn_refused_send(steps), bool(proven)
 
 
 def judge_reply(raw: str, reply: str, facts: TurnFacts) -> Verdict:
@@ -1288,7 +1400,8 @@ def judge_reply(raw: str, reply: str, facts: TurnFacts) -> Verdict:
     note is where made-up IDs sat), the mail and lookup checks *reply*.
 
     False when *reply* says an email went out and none did this turn (nor a
-    peer relayed one), unless it quotes a Message ID an earlier send returned;
+    peer relayed one), unless it quotes a Message ID an earlier send returned
+    (not as a thread's);
     when it narrates lookups in a turn that made no tool call (not on a how-to
     question); when *raw* quotes an ID nothing the model was given held.
 
@@ -1298,9 +1411,9 @@ def judge_reply(raw: str, reply: str, facts: TurnFacts) -> Verdict:
     """
     raw, reply = str(raw or ""), str(reply or "")
     request = strip_automated_prefix(facts.request or "")
-    lines, mail_false, refused = _mail_claim(reply, request, facts)
-    narrated = (narrated_lookups(reply) if facts.no_tool_call and not _HOW_TO_RE.match(request)
-                else ())
+    lines, mail_false, refused, earlier_send = _mail_claim(reply, request, facts)
+    narrated = (narrated_lookups(reply, has_pasted_content(request))
+                if facts.no_tool_call and not _HOW_TO_RE.match(request) else ())
     fabricated = () if facts.known is None else fabricated_ids(raw, facts.known, request)
     kinds = tuple(kind for kind, on in (
         (MAIL_CLAIM, mail_false), (NARRATED_LOOKUP, bool(narrated)),
@@ -1311,7 +1424,7 @@ def judge_reply(raw: str, reply: str, facts: TurnFacts) -> Verdict:
     parts: list[str] = []
     backstop: list[str] = []
     if mail_false:
-        parts.append(mail_corrective(refused))
+        parts.append(mail_corrective(refused, earlier_send))
         backstop.append(MAIL_BACKSTOP_REFUSED if refused else MAIL_BACKSTOP)
     if narrated:
         parts.append(lookup_corrective(narrated, facts.tools) if not parts else
