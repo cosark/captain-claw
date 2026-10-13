@@ -58,6 +58,7 @@ Context awareness:
 - Short follow-ups get short answers, not full research pipelines.
 
 {google_block}
+{jev_block}
 {datastore_block}
 {insights_block}
 {nervous_system_block}

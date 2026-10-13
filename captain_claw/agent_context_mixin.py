@@ -109,7 +109,7 @@ _TOOL_PROMPT_DESCRIPTIONS: dict[str, str] = {
     "microsoft_onedrive": "OneDrive — list, search, read (content inline: PDF/DOCX/XLSX/PPTX extracted), info, download (local copy), upload, create, create_folder, update (same file id); file ID, path or OneDrive/SharePoint share URL — never web_fetch a OneDrive link.",
     "microsoft_calendar": "Outlook Calendar — list_events, search_events, get_event, create_event, update_event, delete_event, respond_event, list_calendars; changes that email attendees need notify_attendees=true (only when the user asked).",
     "microsoft_mail": "Outlook mail — list_messages, search, read_message, get_thread, list_folders, get_attachment; create_draft / update_draft / list_drafts only when the user asked for that email (attachments=[file paths], ≤25 MB); never sends (drafts wait in Outlook); no repeat drafts.",
-    "jev": "Jev — fast calibrated judgments about text (never writes text): one call answers several typed questions about the same state (noul yes/no → p(yes); choice → option + probabilities; score → rubric level). For triage, routing, classification, relevance filtering, checking a claim against a source, rubric rating. Literal, specific questions; not for math, counting, dates or writing.",
+    "jev": "Jev — calibrated judgments about text; use it WHENEVER you'd otherwise judge content yourself (never writes text): one call answers several typed questions about the same state (noul yes/no → p(yes); choice → option + probabilities; score → rubric level). Triage, routing, classification, relevance filtering, claim-vs-source checks, rubric rating, yes/no checks before acting. Literal, specific questions; not for math, counting, dates or writing.",
     "datastore": "Manage persistent relational data tables (create, query, insert, update, delete, import/export)",
     "basna": "Read your past Basna multi-agent sessions like a datastore — list/search sessions and pull the compiled truth, cross-agent analysis, per-agent outputs, and generated files (read-only).",
     "bat": "Bat — the stubborn finisher: start a long-running autonomous run that keeps working a goal across retries and strategy changes until an independent judge says it's genuinely done (survives restarts, reports back when finished); also status/get/list/cancel.",
@@ -169,7 +169,7 @@ _TOOL_PROMPT_DESCRIPTIONS_MICRO: dict[str, str] = {
     "microsoft_onedrive": "OneDrive: list, search, read (content inline), info, download, upload, create, create_folder, update",
     "microsoft_calendar": "Outlook Calendar: list/search/get/create/update/delete/respond events; notify_attendees=true only when asked",
     "microsoft_mail": "Outlook mail: list/search/read/thread, folders, attachments; drafts only when asked; never sends; no repeats",
-    "jev": "calibrated judgments about text: several yes/no (noul), choice or score questions about one state per call; triage/classify/check claims; no math, no writing",
+    "jev": "use WHENEVER you'd judge content yourself: several yes/no (noul), choice or score questions about one state per call; triage/classify/filter/check claims; no math, no writing",
     "datastore": "persistent relational tables",
     "basna": "read past Basna sessions (compiled truth, analysis, agent outputs, files)",
     "bat": "start/inspect a Bat run (stubborn finisher: works a goal until an independent judge says it's done)",
@@ -3318,6 +3318,17 @@ class AgentContextMixin:
         datastore_block = self._build_conditional_section(
             "datastore", "section_datastore.md",
         )
+        # Jev-first policy — only while the tool can actually be used (it is
+        # always registered; the owner's key decides). The prompt is rebuilt
+        # each turn, so it appears the turn after the user connects Jev.
+        jev_block = ""
+        try:
+            from captain_claw.jev_client import jev_usable
+
+            if jev_usable():
+                jev_block = self._build_conditional_section("jev", "section_jev.md")
+        except Exception:
+            jev_block = ""
         insights_block = self._build_insights_block()
         nervous_system_block = self._build_nervous_system_block()
         briefing_block = self._build_briefing_block()
@@ -3358,6 +3369,7 @@ class AgentContextMixin:
             direct_api_block=direct_api_block,
             termux_policy_block=termux_policy_block,
             google_block=google_block,
+            jev_block=jev_block,
             datastore_block=datastore_block,
             insights_block=insights_block,
             nervous_system_block=nervous_system_block,

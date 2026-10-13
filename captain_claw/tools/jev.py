@@ -88,7 +88,9 @@ class JevTool(Tool):
 
     name = "jev"
     description = (
-        "Jev (TypeSafe AI): fast, calibrated JUDGMENTS about text — it never writes text. Give it a "
+        "Jev (TypeSafe AI): fast, calibrated JUDGMENTS about text — it never writes text. Use it "
+        "WHENEVER you would otherwise judge content yourself (is it X? which category? how urgent / "
+        "good / risky? does A support B? same thing? best option? relevant?). Give it a "
         "state (the content: text, or JSON object/array text) and named questions; each comes back "
         "with probabilities. Question types: noul = yes/no → p(yes) (yes_means / no_means sharpen "
         "it); choice = pick one of 2–255 options → the choice, per-option probabilities and a "

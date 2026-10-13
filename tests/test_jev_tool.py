@@ -545,3 +545,91 @@ def test_thinking_label(args, label):
     from captain_claw.agent_tool_loop_mixin import AgentToolLoopMixin
 
     assert AgentToolLoopMixin._tool_thinking_summary("jev", args) == label
+
+
+# ── Jev-first prompt policy ──────────────────────────────────────────
+
+_INSTRUCTIONS = Path(acm.__file__).resolve().parent / "instructions"
+
+
+
+def _prompt_agent(monkeypatch, tmp_path, micro):
+    from captain_claw.agent import Agent
+    from captain_claw.instructions import InstructionLoader
+    from captain_claw.llm import LLMProvider, LLMResponse
+    from captain_claw.session import Session
+
+    class _Provider(LLMProvider):
+        async def complete(self, messages, tools=None, temperature=None, max_tokens=None):
+            return LLMResponse(content="ok")
+
+        async def complete_streaming(self, messages, tools=None, temperature=None, max_tokens=None):
+            if False:
+                yield ""
+
+        def count_tokens(self, text: str) -> int:
+            return len(text.split()) or 1
+
+    # A fresh global registry: the agent's tools are only what the test adds.
+    monkeypatch.setattr("captain_claw.tools.registry._registry", None)
+    agent = Agent(provider=_Provider())
+    agent.session = Session(id="s1", name="jev-first")
+    agent.instructions = InstructionLoader(
+        base_dir=_INSTRUCTIONS, personal_dir=tmp_path, use_micro=micro, use_nano=False,
+    )
+    return agent
+
+
+@pytest.mark.parametrize("micro", [False, True])
+def test_templates_carry_the_jev_block(tmp_path, micro):
+    from captain_claw.instructions import InstructionLoader
+
+    for name in ("system_prompt.md", "micro_system_prompt.md"):
+        assert "{jev_block}" in (_INSTRUCTIONS / name).read_text(encoding="utf-8"), name
+    loader = InstructionLoader(base_dir=_INSTRUCTIONS, personal_dir=tmp_path, use_micro=micro, use_nano=False)
+    assert "<<JEV>>" in loader.render("system_prompt.md", jev_block="<<JEV>>")
+    section = loader.load("section_jev.md")  # micro resolves micro_section_jev.md
+    assert "whenever" in section.lower() and "`jev`" in section
+
+
+@pytest.mark.parametrize("micro", [False, True])
+def test_jev_first_policy_only_while_jev_is_usable(monkeypatch, tmp_path, _config, micro):
+    agent = _prompt_agent(monkeypatch, tmp_path, micro)
+    marker = "use `jev` whenever" if micro else "Jev-first policy"
+
+    # No jev tool registered → no policy.
+    assert marker not in agent._build_system_prompt()
+
+    # Registered (it always is) but no usable key → still no policy: the
+    # prompt never pushes a tool the agent can't see.
+    agent.tools.register(JevTool(), metadata={"requires_jev": True})
+    agent.instructions._cache.clear()
+    prompt = agent._build_system_prompt()
+    assert marker not in prompt and "{jev_block}" not in prompt
+
+    # A usable key → the policy is in the prompt.
+    _config.tools.jev.api_key = "jv-config-key-0001"
+    agent.instructions._cache.clear()
+    prompt = agent._build_system_prompt()
+    assert marker in prompt and "{jev_block}" not in prompt
+
+
+def test_jev_first_policy_follows_the_flight_deck_connection(monkeypatch, tmp_path, _config):
+    _under_fd(monkeypatch)
+    agent = _prompt_agent(monkeypatch, tmp_path, False)
+    agent.tools.register(JevTool(), metadata={"requires_jev": True})
+    assert "Jev-first policy" not in agent._build_system_prompt()
+    jev_client._mark(True)
+    assert "Jev-first policy" in agent._build_system_prompt()
+
+
+def test_eco_mode_always_sends_the_jev_schema():
+    from captain_claw.agent_orchestration_mixin import _ECO_CORE_TOOLS
+
+    assert "jev" in _ECO_CORE_TOOLS
+
+
+def test_the_tool_itself_says_to_prefer_it():
+    assert "WHENEVER you would otherwise judge content yourself" in JevTool.description
+    assert "WHENEVER" in acm._TOOL_PROMPT_DESCRIPTIONS["jev"]
+    assert "WHENEVER" in acm._TOOL_PROMPT_DESCRIPTIONS_MICRO["jev"]
