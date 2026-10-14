@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
-from datetime import datetime, timezone
+from collections.abc import Iterable
+from dataclasses import asdict, is_dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 
@@ -29,6 +33,143 @@ def _with_run_labels(row: dict) -> dict:
     row["judge_success"] = judge
     row["success"] = human if human is not None else judge
     return row
+
+
+# ── Gmail topic auto-replies: the ledger's vocabulary ─────────────────
+#
+# new → matching → [waiting_agent] → writing → checking → approved → sending
+# → sent | unknown; terminal: skipped · held · blocked · failed · dismissed;
+# the owner path is held → approved (approved_by) → sending → sent.
+
+AUTOREPLY_STATES: tuple[str, ...] = (
+    "new", "matching", "waiting_agent", "writing", "checking", "approved",
+    "sending", "sent", "unknown", "skipped", "held", "blocked", "failed", "dismissed",
+)
+# What the caps count: a reply that went out, may have gone out, or is going.
+AUTOREPLY_SEND_STATES: tuple[str, ...] = ("sending", "sent", "unknown")
+# Mid-pipeline states a restart interrupts; nothing was sent from any of them.
+AUTOREPLY_WORK_STATES: tuple[str, ...] = ("matching", "writing", "checking", "approved")
+# Skip reasons the activity list hides unless "Show all".
+AUTOREPLY_QUIET_REASONS: tuple[str, ...] = (
+    "labels", "auto_or_list", "automated_sender", "no_match", "unauthenticated", "burst",
+    "classified_automated",
+)
+AUTOREPLY_RECOVER_ATTEMPTS = 2   # a restart requeues an interrupted row while attempts < this
+AUTOREPLY_HELD_DAYS = 7          # held cards expire (→ dismissed) after this
+AUTOREPLY_TEXT_DAYS = 14         # reply_text is cleared after this
+AUTOREPLY_QUIET_DAYS = 30        # skipped / failed rows are deleted after this
+AUTOREPLY_KEEP_DAYS = 90         # every row is deleted after this
+
+# Ledger columns update_autoreply / cas_autoreply may write, with a clip length
+# (0 = unclipped). id, owner_id, inbound_message_id, state and the timestamps
+# are not here: a state only ever changes through cas_autoreply's to_state.
+_AUTOREPLY_TEXT_COLUMNS: dict[str, int] = {
+    "thread_id": 0, "received_at": 0, "from_addr": 320, "from_domain": 255,
+    "subject": 200, "reason": 200, "detail": 300, "topic_id": 0, "topic_name": 120,
+    "match_judge": 16, "reply_text": 0, "agent_ref": 0, "agent_name": 120,
+    "approved_by": 0, "sent_message_id": 0,
+}
+_AUTOREPLY_JSON_COLUMNS: dict[str, type] = {"findings": list, "judge": dict, "sources_used": list}
+_AUTOREPLY_STATE_TEXT_COLUMNS: dict[str, int] = {
+    "history_id": 0, "google_sub": 0, "account_email": 0, "enabled_at": 0,
+    "own_addresses_at": 0, "last_poll_at": 0, "last_ok_at": 0, "last_error": 300,
+    "classify_day": 0,
+}
+
+
+def _json_default(obj: Any) -> Any:
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return asdict(obj)
+    if isinstance(obj, (set, frozenset)):
+        return sorted(obj)
+    raise TypeError(f"not JSON serializable: {type(obj).__name__}")
+
+
+def _text(value: Any, clip: int = 0) -> str:
+    s = "" if value is None else str(value)
+    return s[:clip] if clip else s
+
+
+def _autoreply_states(states: Iterable[str] | str | None) -> list[str]:
+    """Validated state names; a typo raises rather than silently matching
+    nothing (an under-counted cap would fail open)."""
+    if states is None:
+        return []
+    if isinstance(states, str):
+        states = (states,)
+    out = list(dict.fromkeys(states))
+    bad = [s for s in out if s not in AUTOREPLY_STATES]
+    if bad:
+        raise ValueError(f"unknown auto-reply state(s): {bad}")
+    return out
+
+
+def _autoreply_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    """Coerce whitelisted ledger columns for a write; unknown names raise."""
+    out: dict[str, Any] = {}
+    for key, value in fields.items():
+        if key in _AUTOREPLY_TEXT_COLUMNS:
+            v = _text(value, _AUTOREPLY_TEXT_COLUMNS[key])
+            out[key] = v.strip().lower() if key in ("from_addr", "from_domain") else v
+        elif key in _AUTOREPLY_JSON_COLUMNS:
+            out[key] = value if isinstance(value, str) else json.dumps(
+                value, ensure_ascii=False, default=_json_default)
+        elif key == "confidence":
+            out[key] = None if value is None else float(value)
+        elif key == "attempts":
+            out[key] = int(value)
+        else:
+            raise ValueError(f"gmail_autoreplies column not writable: {key!r}")
+    return out
+
+
+def _autoreply_row(row: Any) -> dict:
+    """A ledger row for readers, with its JSON columns parsed (a corrupt value
+    reads as empty)."""
+    d = dict(row)
+    for col, kind in _AUTOREPLY_JSON_COLUMNS.items():
+        try:
+            val = json.loads(d.get(col) or "")
+        except (ValueError, TypeError):
+            val = None
+        d[col] = val if isinstance(val, kind) else kind()
+    return d
+
+
+def _own_addresses_json(value: Any) -> str:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value or "[]")
+        except ValueError:
+            raise ValueError("own_addresses must be a JSON list") from None
+    if not isinstance(value, (list, tuple, set, frozenset)):
+        raise ValueError("own_addresses must be a list of addresses")
+    addrs = [str(a).strip().lower() for a in value if str(a or "").strip()]
+    return json.dumps(list(dict.fromkeys(addrs)))
+
+
+def _autoreply_state_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in fields.items():
+        if key in _AUTOREPLY_STATE_TEXT_COLUMNS:
+            out[key] = _text(value, _AUTOREPLY_STATE_TEXT_COLUMNS[key])
+        elif key == "own_addresses":
+            out[key] = _own_addresses_json(value)
+        elif key == "classify_count":
+            out[key] = int(value)
+        else:
+            raise ValueError(f"gmail_autoreply_state column not writable: {key!r}")
+    return out
+
+
+def _autoreply_state_row(row: Any) -> dict:
+    d = dict(row)
+    try:
+        addrs = json.loads(d.get("own_addresses") or "[]")
+    except (ValueError, TypeError):
+        addrs = []
+    d["own_addresses"] = [str(a) for a in addrs] if isinstance(addrs, list) else []
+    return d
 
 
 class FlightDeckDB:
@@ -420,6 +561,29 @@ class FlightDeckDB:
             CREATE INDEX IF NOT EXISTS idx_resource_shares_owner
                 ON resource_shares(owner_id, resource_type, resource_id);
 
+            -- Agents that ever had members (a share row is deleted when the
+            -- member is removed; their learnings stay in the agent's commons).
+            CREATE TABLE IF NOT EXISTS agent_share_history (
+                agent_ref        TEXT NOT NULL,
+                owner_id         TEXT NOT NULL,
+                first_shared_at  TEXT NOT NULL,
+                PRIMARY KEY (agent_ref, owner_id)
+            );
+            INSERT OR IGNORE INTO agent_share_history (agent_ref, owner_id, first_shared_at)
+                SELECT resource_id, owner_id, MIN(created_at) FROM resource_shares
+                WHERE resource_type = 'agent' GROUP BY resource_id, owner_id;
+
+            -- The one Flight Deck that runs the auto-reply engine on this
+            -- database (two decks can share one fd-data): pid + host, and a
+            -- heartbeat; a cold claim is taken over.
+            CREATE TABLE IF NOT EXISTS gmail_autoreply_runner (
+                id            INTEGER PRIMARY KEY CHECK (id = 1),
+                pid           INTEGER NOT NULL,
+                host          TEXT NOT NULL,
+                claimed_at    TEXT NOT NULL,
+                heartbeat_at  TEXT NOT NULL
+            );
+
             -- Persisted run costs (Iskra Phase 0, docs/living-beings-plan.md
             -- §10). One row per finished run: the aggregate token usage +
             -- dollar cost that pricing.summarize computed, which previously
@@ -473,10 +637,79 @@ class FlightDeckDB:
                 status           TEXT NOT NULL DEFAULT 'sent',
                 created_at       TEXT NOT NULL,
                 -- JSON list of the attached files' names ('' = none)
-                attachments      TEXT NOT NULL DEFAULT ''
+                attachments      TEXT NOT NULL DEFAULT '',
+                -- who decided the send: 'agent' (POST /gmail/send), 'autoreply'
+                -- (the topic auto-reply engine) or 'autoreply_approved' (the
+                -- owner sent a held auto-reply); limits and listings filter on it
+                origin           TEXT NOT NULL DEFAULT 'agent',
+                topic_id         TEXT NOT NULL DEFAULT '',
+                in_reply_to_message_id TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_gmail_sends_owner
                 ON gmail_sends(owner_id, created_at);
+            -- Gmail topic auto-replies (gmail_autoreply.py). Per-owner poll
+            -- state: a row exists ONLY while the owner has auto-replies on —
+            -- the enabling PUT creates it (the history baseline), turning off
+            -- deletes it, and the engine polls exactly the owners listed here.
+            -- `own_addresses` is a JSON list; `classify_day` / `classify_count`
+            -- are the per-UTC-day classification budget.
+            CREATE TABLE IF NOT EXISTS gmail_autoreply_state (
+                owner_id         TEXT PRIMARY KEY,
+                history_id       TEXT NOT NULL DEFAULT '',
+                google_sub       TEXT NOT NULL DEFAULT '',
+                account_email    TEXT NOT NULL DEFAULT '',
+                enabled_at       TEXT NOT NULL DEFAULT '',
+                own_addresses    TEXT NOT NULL DEFAULT '[]',
+                own_addresses_at TEXT NOT NULL DEFAULT '',
+                last_poll_at     TEXT NOT NULL DEFAULT '',
+                last_ok_at       TEXT NOT NULL DEFAULT '',
+                last_error       TEXT NOT NULL DEFAULT '',
+                classify_day     TEXT NOT NULL DEFAULT '',
+                classify_count   INTEGER NOT NULL DEFAULT 0,
+                updated_at       TEXT NOT NULL
+            );
+            -- The auto-reply ledger: one row per INBOX message the engine
+            -- claimed (INSERT OR IGNORE, before any fetch or LLM call), moved
+            -- through its state machine by compare-and-set only. The inbound
+            -- body is never stored. `findings` (masked hints), `judge` (scores
+            -- and a note) and `sources_used` are JSON.
+            CREATE TABLE IF NOT EXISTS gmail_autoreplies (
+                id                 TEXT PRIMARY KEY,
+                owner_id           TEXT NOT NULL,
+                inbound_message_id TEXT NOT NULL,
+                thread_id          TEXT NOT NULL DEFAULT '',
+                received_at        TEXT NOT NULL DEFAULT '',
+                from_addr          TEXT NOT NULL DEFAULT '',
+                from_domain        TEXT NOT NULL DEFAULT '',
+                subject            TEXT NOT NULL DEFAULT '',
+                state              TEXT NOT NULL DEFAULT 'new',
+                reason             TEXT NOT NULL DEFAULT '',
+                detail             TEXT NOT NULL DEFAULT '',
+                topic_id           TEXT NOT NULL DEFAULT '',
+                topic_name         TEXT NOT NULL DEFAULT '',
+                confidence         REAL,
+                match_judge        TEXT NOT NULL DEFAULT '',
+                reply_text         TEXT NOT NULL DEFAULT '',
+                findings           TEXT NOT NULL DEFAULT '[]',
+                judge              TEXT NOT NULL DEFAULT '{}',
+                sources_used       TEXT NOT NULL DEFAULT '[]',
+                agent_ref          TEXT NOT NULL DEFAULT '',
+                agent_name         TEXT NOT NULL DEFAULT '',
+                attempts           INTEGER NOT NULL DEFAULT 0,
+                approved_by        TEXT NOT NULL DEFAULT '',
+                sent_message_id    TEXT NOT NULL DEFAULT '',
+                created_at         TEXT NOT NULL,
+                updated_at         TEXT NOT NULL,
+                UNIQUE(owner_id, inbound_message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_gmail_autoreplies_owner
+                ON gmail_autoreplies(owner_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_gmail_autoreplies_thread
+                ON gmail_autoreplies(owner_id, thread_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_gmail_autoreplies_sender
+                ON gmail_autoreplies(owner_id, from_addr, created_at);
+            CREATE INDEX IF NOT EXISTS idx_gmail_autoreplies_state
+                ON gmail_autoreplies(owner_id, state);
             CREATE TABLE IF NOT EXISTS personal_access_tokens (
                 id           TEXT PRIMARY KEY,
                 user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -570,6 +803,9 @@ class FlightDeckDB:
             ("basna_sessions", "title", "TEXT NOT NULL DEFAULT ''"),
             ("gmail_sends", "status", "TEXT NOT NULL DEFAULT 'sent'"),
             ("gmail_sends", "attachments", "TEXT NOT NULL DEFAULT ''"),
+            ("gmail_sends", "origin", "TEXT NOT NULL DEFAULT 'agent'"),
+            ("gmail_sends", "topic_id", "TEXT NOT NULL DEFAULT ''"),
+            ("gmail_sends", "in_reply_to_message_id", "TEXT NOT NULL DEFAULT ''"),
         ]:
             try:
                 await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
@@ -2236,6 +2472,12 @@ class FlightDeckDB:
             " DO UPDATE SET permission = excluded.permission",
             (sid, resource_type, resource_id, owner_id, grantee_id, permission, now),
         )
+        if resource_type == "agent":
+            await self._db.execute(
+                "INSERT OR IGNORE INTO agent_share_history (agent_ref, owner_id, first_shared_at)"
+                " VALUES (?, ?, ?)",
+                (resource_id, owner_id, now),
+            )
         await self._db.commit()
         return await self.get_share(resource_type, resource_id, owner_id, grantee_id)
 
@@ -2307,6 +2549,17 @@ class FlightDeckDB:
             (agent_ref, owner_id, user_id),
         ) as cur:
             return await cur.fetchone() is not None
+
+    async def agent_ever_shared(self, agent_ref: str, owner_id: str) -> bool:
+        """Did ``owner_id``'s agent ever have members (current or removed)?"""
+        assert self._db is not None
+        rows = await self._db.execute_fetchall(
+            "SELECT 1 FROM agent_share_history WHERE agent_ref = ? AND owner_id = ?"
+            " UNION ALL SELECT 1 FROM resource_shares WHERE resource_type = 'agent'"
+            " AND resource_id = ? AND owner_id = ? LIMIT 1",
+            (agent_ref, owner_id, agent_ref, owner_id),
+        )
+        return bool(rows)
 
     async def list_agent_members(self, agent_ref: str, owner_id: str) -> list[dict]:
         """Members of one of ``owner_id``'s shared agents."""
@@ -2626,6 +2879,30 @@ class FlightDeckDB:
             row = await cur.fetchone()
             return int(row[0]) if row else 0
 
+    async def count_notifications_since(
+        self, user_id: str, since_iso: str, types: Iterable[str] | str = (), *,
+        ref_type: str = "", ref_id: str = "",
+    ) -> int:
+        """How many bells `user_id` got at/after `since_iso`, read or not —
+        optionally only of `types` and with this `ref_type` / `ref_id`. For
+        per-day bell caps and per-reason dedupe that survive a restart."""
+        assert self._db is not None
+        q = "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND created_at >= ?"
+        args: list = [user_id, since_iso or ""]
+        kinds = [t for t in ([types] if isinstance(types, str) else types) if t]
+        if kinds:
+            q += f" AND type IN ({','.join('?' * len(kinds))})"
+            args.extend(kinds)
+        if ref_type:
+            q += " AND ref_type = ?"
+            args.append(ref_type)
+        if ref_id:
+            q += " AND ref_id = ?"
+            args.append(ref_id)
+        async with self._db.execute(q, tuple(args)) as cur:
+            row = await cur.fetchone()
+            return int(row[0]) if row else 0
+
     async def mark_notification_read(self, notif_id: str, user_id: str) -> bool:
         assert self._db is not None
         async with self._db.execute(
@@ -2651,43 +2928,59 @@ class FlightDeckDB:
         cc_addrs: str = "", bcc_addrs: str = "", subject: str = "",
         gmail_message_id: str = "", thread_id: str = "", draft_id: str = "",
         content_hash: str = "", status: str = "sent", attachments: str = "",
+        origin: str = "agent", topic_id: str = "", in_reply_to_message_id: str = "",
     ) -> str:
         """Record one email Gmail accepted (`status` 'sent') — or may have
         sent ('unknown') — for `owner_id`; returns its id. `attachments` is
-        a JSON list of the attached files' names ('' = none)."""
+        a JSON list of the attached files' names ('' = none). `origin` says
+        who decided the send ('agent' | 'autoreply' | 'autoreply_approved');
+        an auto-reply also records its topic and the inbound message it
+        answered."""
         assert self._db is not None
         sid = _uuid()
         await self._db.execute(
             "INSERT INTO gmail_sends (id, owner_id, agent, to_addrs, cc_addrs,"
             " bcc_addrs, subject, gmail_message_id, thread_id, draft_id,"
-            " content_hash, status, created_at, attachments)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " content_hash, status, created_at, attachments, origin, topic_id,"
+            " in_reply_to_message_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (sid, owner_id, agent, to_addrs, cc_addrs, bcc_addrs, subject,
              gmail_message_id, thread_id, draft_id, content_hash, status, _utcnow(),
-             attachments),
+             attachments, origin, topic_id, in_reply_to_message_id),
         )
         await self._db.commit()
         return sid
 
-    async def count_gmail_sends_since(self, owner_id: str, since_iso: str) -> int:
+    async def count_gmail_sends_since(
+        self, owner_id: str, since_iso: str, origin: str | None = None,
+    ) -> int:
         """How many emails `owner_id` sent (or may have sent) at or after
-        `since_iso` (ISO UTC)."""
+        `since_iso` (ISO UTC). `origin` narrows to one origin ('agent',
+        'autoreply', …); None counts every row (the original behaviour)."""
         assert self._db is not None
-        async with self._db.execute(
-            "SELECT COUNT(*) FROM gmail_sends WHERE owner_id = ? AND created_at >= ?",
-            (owner_id, since_iso),
-        ) as cur:
+        q = "SELECT COUNT(*) FROM gmail_sends WHERE owner_id = ? AND created_at >= ?"
+        args: list = [owner_id, since_iso]
+        if origin is not None:
+            q += " AND origin = ?"
+            args.append(origin)
+        async with self._db.execute(q, tuple(args)) as cur:
             row = await cur.fetchone()
             return int(row[0]) if row else 0
 
-    async def list_gmail_sends(self, owner_id: str, limit: int = 20) -> list[dict]:
-        """`owner_id`'s sends, newest first."""
+    async def list_gmail_sends(
+        self, owner_id: str, limit: int = 20, origin: str | None = None,
+    ) -> list[dict]:
+        """`owner_id`'s sends, newest first — only one `origin`'s when given,
+        else every row."""
         assert self._db is not None
-        rows = await self._db.execute_fetchall(
-            "SELECT * FROM gmail_sends WHERE owner_id = ?"
-            " ORDER BY created_at DESC LIMIT ?",
-            (owner_id, limit),
-        )
+        q = "SELECT * FROM gmail_sends WHERE owner_id = ?"
+        args: list = [owner_id]
+        if origin is not None:
+            q += " AND origin = ?"
+            args.append(origin)
+        q += " ORDER BY created_at DESC LIMIT ?"
+        args.append(limit)
+        rows = await self._db.execute_fetchall(q, tuple(args))
         return [dict(r) for r in rows]
 
     async def find_gmail_send_by_hash(
@@ -2705,6 +2998,441 @@ class FlightDeckDB:
         ) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
+
+    # ── Gmail topic auto-replies: per-owner poll state ────────────────
+
+    async def get_autoreply_state(self, owner_id: str) -> dict | None:
+        """`owner_id`'s poll state (`own_addresses` parsed to a list), or None
+        when auto-replies are off for them."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT * FROM gmail_autoreply_state WHERE owner_id = ?", (owner_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return _autoreply_state_row(row) if row else None
+
+    async def set_autoreply_state(self, owner_id: str, **fields: Any) -> None:
+        """Create `owner_id`'s state row, or merge `fields` into the existing
+        one (columns not named keep their value — the classification budget
+        survives a re-set). Only the enabling PUT should create a row: the
+        engine writes through update_autoreply_state, which never does."""
+        assert self._db is not None
+        cols = _autoreply_state_fields(fields)
+        cols["updated_at"] = _utcnow()
+        await self._db.execute(
+            f"INSERT INTO gmail_autoreply_state (owner_id, {', '.join(cols)})"
+            f" VALUES (?, {', '.join('?' * len(cols))})"
+            " ON CONFLICT(owner_id) DO UPDATE SET "
+            + ", ".join(f"{n} = excluded.{n}" for n in cols),
+            (owner_id, *cols.values()),
+        )
+        await self._db.commit()
+
+    async def update_autoreply_state(
+        self, owner_id: str, *, if_enabled_at: str | None = None, **fields: Any,
+    ) -> bool:
+        """Write `fields` into an EXISTING state row; never creates one, so a
+        tick that outlives a turn-off cannot switch the engine back on. With
+        `if_enabled_at` the write lands only while the row is still that
+        enablement (not deleted and re-created in between). True when a row
+        was updated."""
+        assert self._db is not None
+        cols = _autoreply_state_fields(fields)
+        cols["updated_at"] = _utcnow()
+        q = ("UPDATE gmail_autoreply_state SET "
+             + ", ".join(f"{n} = ?" for n in cols) + " WHERE owner_id = ?")
+        args: list = [*cols.values(), owner_id]
+        if if_enabled_at is not None:
+            q += " AND enabled_at = ?"
+            args.append(if_enabled_at)
+        async with self._db.execute(q, tuple(args)) as cur:
+            await self._db.commit()
+            return (cur.rowcount or 0) == 1
+
+    async def delete_autoreply_state(self, owner_id: str) -> bool:
+        """Drop `owner_id`'s state row (auto-replies off); True if one existed."""
+        assert self._db is not None
+        async with self._db.execute(
+            "DELETE FROM gmail_autoreply_state WHERE owner_id = ?", (owner_id,)
+        ) as cur:
+            await self._db.commit()
+            return (cur.rowcount or 0) > 0
+
+    async def list_autoreply_states(self) -> list[dict]:
+        """Every existing state row — the owners the engine polls."""
+        assert self._db is not None
+        rows = await self._db.execute_fetchall(
+            "SELECT * FROM gmail_autoreply_state ORDER BY enabled_at, owner_id"
+        )
+        return [_autoreply_state_row(r) for r in rows]
+
+    async def incr_classify_budget(self, owner_id: str, day: str, limit: int) -> bool:
+        """Take one classification from `owner_id`'s budget for UTC `day`
+        ('YYYY-MM-DD'): True when it was below `limit` (now counted), False
+        when spent — or when no state row exists (fail closed). One atomic
+        UPDATE; a new day restarts the count at 1."""
+        assert self._db is not None
+        if not day or int(limit) <= 0:
+            return False
+        async with self._db.execute(
+            "UPDATE gmail_autoreply_state SET"
+            " classify_count = CASE WHEN classify_day = ? THEN classify_count + 1 ELSE 1 END,"
+            " classify_day = ?, updated_at = ?"
+            " WHERE owner_id = ? AND (classify_day != ? OR classify_count < ?)",
+            (day, day, _utcnow(), owner_id, day, int(limit)),
+        ) as cur:
+            await self._db.commit()
+            return (cur.rowcount or 0) == 1
+
+    # ── Gmail topic auto-replies: the exactly-once ledger ─────────────
+
+    async def claim_autoreply(
+        self, owner_id: str, inbound_message_id: str, thread_id: str = "", *,
+        state: str = "new", reason: str = "",
+    ) -> str | None:
+        """Claim one inbound message for `owner_id` (INSERT OR IGNORE): its new
+        ledger id ('ar_<hex16>'), or None when it was already claimed — the
+        exactly-once point, taken before any fetch or LLM call. `state` is
+        'new', or 'skipped' with a `reason` (a burst's overflow)."""
+        assert self._db is not None
+        if state not in ("new", "skipped"):
+            raise ValueError(f"a claim starts as 'new' or 'skipped', not {state!r}")
+        if not inbound_message_id:
+            return None
+        rid = "ar_" + _uuid()[:16]
+        now = _utcnow()
+        async with self._db.execute(
+            "INSERT OR IGNORE INTO gmail_autoreplies (id, owner_id, inbound_message_id,"
+            " thread_id, state, reason, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (rid, owner_id, inbound_message_id, _text(thread_id), state,
+             _text(reason, _AUTOREPLY_TEXT_COLUMNS["reason"]), now, now),
+        ) as cur:
+            await self._db.commit()
+            return rid if (cur.rowcount or 0) == 1 else None
+
+    async def cas_autoreply(
+        self, row_id: str, owner_id: str, from_states: Iterable[str] | str,
+        to_state: str, *, inc_attempts: bool = False, **fields: Any,
+    ) -> bool:
+        """Compare-and-set: move `owner_id`'s row `row_id` to `to_state` (also
+        writing the whitelisted `fields`, and `attempts + 1` with
+        `inc_attempts`) ONLY while it is in one of `from_states`. True when
+        this call made the move; False means another writer got there first
+        or the row is not this owner's."""
+        assert self._db is not None
+        froms = _autoreply_states(from_states)
+        (to,) = _autoreply_states((to_state,))
+        if not froms:
+            return False
+        cols = _autoreply_fields(fields)
+        cols["state"] = to
+        cols["updated_at"] = _utcnow()
+        sets = [f"{n} = ?" for n in cols]
+        if inc_attempts and "attempts" not in cols:
+            sets.append("attempts = attempts + 1")
+        async with self._db.execute(
+            f"UPDATE gmail_autoreplies SET {', '.join(sets)}"
+            f" WHERE id = ? AND owner_id = ? AND state IN ({','.join('?' * len(froms))})",
+            (*cols.values(), row_id, owner_id, *froms),
+        ) as cur:
+            await self._db.commit()
+            return (cur.rowcount or 0) == 1
+
+    async def update_autoreply(self, row_id: str, owner_id: str, **fields: Any) -> bool:
+        """Write whitelisted columns of `owner_id`'s row `row_id`, whatever its
+        state (never the state itself — that is cas_autoreply's). Unknown
+        names raise ValueError. True when the row was updated."""
+        assert self._db is not None
+        cols = _autoreply_fields(fields)
+        if not cols:
+            return False
+        cols["updated_at"] = _utcnow()
+        async with self._db.execute(
+            "UPDATE gmail_autoreplies SET " + ", ".join(f"{n} = ?" for n in cols)
+            + " WHERE id = ? AND owner_id = ?",
+            (*cols.values(), row_id, owner_id),
+        ) as cur:
+            await self._db.commit()
+            return (cur.rowcount or 0) == 1
+
+    async def get_autoreply(self, owner_id: str, row_id: str) -> dict | None:
+        """`owner_id`'s ledger row `row_id` (JSON columns parsed), else None."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT * FROM gmail_autoreplies WHERE id = ? AND owner_id = ?",
+            (row_id, owner_id),
+        ) as cur:
+            row = await cur.fetchone()
+            return _autoreply_row(row) if row else None
+
+    async def next_autoreplies(
+        self, owner_id: str, states: Iterable[str] | str, limit: int = 5,
+    ) -> list[dict]:
+        """`owner_id`'s rows in `states`, oldest claim first — the work queue."""
+        assert self._db is not None
+        wanted = _autoreply_states(states)
+        if not wanted:
+            return []
+        rows = await self._db.execute_fetchall(
+            "SELECT * FROM gmail_autoreplies WHERE owner_id = ?"
+            f" AND state IN ({','.join('?' * len(wanted))})"
+            " ORDER BY created_at ASC, rowid ASC LIMIT ?",
+            (owner_id, *wanted, max(1, int(limit))),
+        )
+        return [_autoreply_row(r) for r in rows]
+
+    async def count_autoreplies(
+        self, owner_id: str, since_iso: str, states: Iterable[str] | str | None = None, *,
+        thread_id: str = "", from_addr: str = "", topic_id: str = "",
+        reasons: Iterable[str] = (), arrived_only: bool = False,
+    ) -> int:
+        """How many of `owner_id`'s rows were claimed OR last changed at/after
+        `since_iso` ('' = ever), in `states` (None = any state). So a held
+        reply the owner approved days after it arrived counts from the moment
+        it went out. With `arrived_only`, claimed at/after only (arrivals, for
+        the flood rule). Optional exact filters: `thread_id`, `from_addr`
+        (case-folded), `topic_id`, and `reasons` (any of)."""
+        assert self._db is not None
+        if arrived_only:
+            q = "SELECT COUNT(*) FROM gmail_autoreplies WHERE owner_id = ? AND created_at >= ?"
+            args: list = [owner_id, since_iso or ""]
+        else:
+            q = ("SELECT COUNT(*) FROM gmail_autoreplies WHERE owner_id = ?"
+                 " AND (created_at >= ? OR updated_at >= ?)")
+            args = [owner_id, since_iso or "", since_iso or ""]
+        wanted = _autoreply_states(states)
+        if wanted:
+            q += f" AND state IN ({','.join('?' * len(wanted))})"
+            args.extend(wanted)
+        if thread_id:
+            q += " AND thread_id = ?"
+            args.append(thread_id)
+        if from_addr:
+            q += " AND from_addr = ?"
+            args.append(from_addr.strip().lower())
+        if topic_id:
+            q += " AND topic_id = ?"
+            args.append(topic_id)
+        why = [r for r in ([reasons] if isinstance(reasons, str) else reasons) if r]
+        if why:
+            q += f" AND reason IN ({','.join('?' * len(why))})"
+            args.extend(why)
+        async with self._db.execute(q, tuple(args)) as cur:
+            row = await cur.fetchone()
+            return int(row[0]) if row else 0
+
+    async def list_autoreplies(
+        self, owner_id: str, limit: int = 50, include_quiet: bool = False,
+        quiet_reasons: Iterable[str] = AUTOREPLY_QUIET_REASONS, *,
+        states: Iterable[str] | str | None = None, since_iso: str = "",
+    ) -> list[dict]:
+        """`owner_id`'s ledger rows, newest first (JSON columns parsed). Quiet
+        skips — state 'skipped' with a reason in `quiet_reasons` — are left
+        out unless `include_quiet`. Optional `states` and `since_iso` (claimed
+        at/after) narrow further. `limit` is clamped to 1..500."""
+        assert self._db is not None
+        q = "SELECT * FROM gmail_autoreplies WHERE owner_id = ?"
+        args: list = [owner_id]
+        quiet = list(quiet_reasons or ())
+        if not include_quiet and quiet:
+            q += f" AND NOT (state = 'skipped' AND reason IN ({','.join('?' * len(quiet))}))"
+            args.extend(quiet)
+        wanted = _autoreply_states(states)
+        if wanted:
+            q += f" AND state IN ({','.join('?' * len(wanted))})"
+            args.extend(wanted)
+        if since_iso:
+            q += " AND created_at >= ?"
+            args.append(since_iso)
+        q += " ORDER BY created_at DESC, rowid DESC LIMIT ?"
+        args.append(max(1, min(int(limit), 500)))
+        rows = await self._db.execute_fetchall(q, tuple(args))
+        return [_autoreply_row(r) for r in rows]
+
+    async def autoreply_sent_ids(self, owner_id: str, thread_id: str) -> set[str]:
+        """The Gmail ids of the auto-replies `owner_id`'s ledger sent in
+        `thread_id` — the human-takeover rule's "ours, not the owner's"."""
+        assert self._db is not None
+        if not thread_id:
+            return set()
+        rows = await self._db.execute_fetchall(
+            "SELECT sent_message_id FROM gmail_autoreplies"
+            " WHERE owner_id = ? AND thread_id = ? AND sent_message_id != ''",
+            (owner_id, thread_id),
+        )
+        return {r["sent_message_id"] for r in rows}
+
+    async def autoreply_match_stats(self, owner_id: str, since_iso: str) -> dict:
+        """The drift breaker's sample: rows claimed at/after `since_iso` that
+        were classified (`match_judge` set) and, of those, how many per
+        `topic_id` (set only when the classifier accepted a topic):
+        ``{"classified": n, "matched": {topic_id: n}}``."""
+        assert self._db is not None
+        rows = await self._db.execute_fetchall(
+            "SELECT topic_id, COUNT(*) AS n FROM gmail_autoreplies"
+            " WHERE owner_id = ? AND created_at >= ? AND match_judge != ''"
+            " GROUP BY topic_id",
+            (owner_id, since_iso or ""),
+        )
+        classified = 0
+        matched: dict[str, int] = {}
+        for r in rows:
+            classified += int(r["n"])
+            if r["topic_id"]:
+                matched[r["topic_id"]] = int(r["n"])
+        return {"classified": classified, "matched": matched}
+
+    async def claim_autoreply_runner(self, pid: int, host: str, now_iso: str,
+                                     stale_before_iso: str) -> bool:
+        """Claim (or keep) the right to run the auto-reply engine on this
+        database: ours when no runner is recorded, it is already us, or its
+        heartbeat is older than `stale_before_iso`. A held claim's heartbeat
+        moves to `now_iso`. True when this process is the runner."""
+        assert self._db is not None
+        async with self._db.execute(
+            "UPDATE gmail_autoreply_runner SET heartbeat_at = ? WHERE id = 1 AND pid = ? AND host = ?",
+            (now_iso, pid, host),
+        ) as cur:
+            if (cur.rowcount or 0) == 1:
+                await self._db.commit()
+                return True
+        async with self._db.execute(
+            "INSERT INTO gmail_autoreply_runner (id, pid, host, claimed_at, heartbeat_at)"
+            " VALUES (1, ?, ?, ?, ?)"
+            " ON CONFLICT(id) DO UPDATE SET pid = excluded.pid, host = excluded.host,"
+            " claimed_at = excluded.claimed_at, heartbeat_at = excluded.heartbeat_at"
+            " WHERE gmail_autoreply_runner.heartbeat_at < ?",
+            (pid, host, now_iso, now_iso, stale_before_iso),
+        ) as cur:
+            took = (cur.rowcount or 0) == 1
+        await self._db.commit()
+        return took
+
+    async def release_autoreply_runner(self, pid: int, host: str) -> None:
+        assert self._db is not None
+        await self._db.execute(
+            "DELETE FROM gmail_autoreply_runner WHERE id = 1 AND pid = ? AND host = ?",
+            (pid, host))
+        await self._db.commit()
+
+    async def autoreply_queue_owners(self) -> list[str]:
+        """Owners with rows in `new` or `waiting_agent`."""
+        assert self._db is not None
+        rows = await self._db.execute_fetchall(
+            "SELECT DISTINCT owner_id FROM gmail_autoreplies"
+            " WHERE state IN ('new', 'waiting_agent')")
+        return [str(r[0]) for r in rows]
+
+    async def interrupted_autoreplies(self) -> list[dict]:
+        """Rows, every owner, that :meth:`recover_autoreplies` will fail as
+        'interrupted' (a work state with its recover attempts used up) —
+        read just before it runs, so the engine can release their claims."""
+        assert self._db is not None
+        work = ",".join("?" * len(AUTOREPLY_WORK_STATES))
+        rows = await self._db.execute_fetchall(
+            "SELECT id, owner_id, inbound_message_id FROM gmail_autoreplies"
+            f" WHERE state IN ({work}) AND attempts >= ? AND approved_by = ''",
+            (*AUTOREPLY_WORK_STATES, AUTOREPLY_RECOVER_ATTEMPTS),
+        )
+        return [dict(r) for r in rows]
+
+    async def recover_autoreplies(self) -> list[dict]:
+        """Boot recovery, every owner, once before the loop's first tick:
+
+        - `sending` → `unknown` (reason 'interrupted'): the send may have
+          happened, so it is NEVER retried; the rows are returned so the
+          engine can ring "may have auto-replied — check Sent".
+        - `approved` by the owner (`approved_by` set) → back to `held` (and
+          `approved_by` cleared): the owner clicks Send again.
+        - other `matching` / `writing` / `checking` / `approved` → `new` with
+          `attempts + 1` while attempts < AUTOREPLY_RECOVER_ATTEMPTS, else
+          `failed` (reason 'interrupted'); their unchecked reply_text is cleared.
+        - `new` and `waiting_agent` are left alone.
+        """
+        assert self._db is not None
+        now = _utcnow()
+        sending = await self._db.execute_fetchall(
+            "SELECT id FROM gmail_autoreplies WHERE state = 'sending'"
+        )
+        moved: list[str] = []
+        for r in sending:
+            async with self._db.execute(
+                "UPDATE gmail_autoreplies SET state = 'unknown', reason = 'interrupted',"
+                " updated_at = ? WHERE id = ? AND state = 'sending'",
+                (now, r["id"]),
+            ) as cur:
+                if (cur.rowcount or 0) == 1:
+                    moved.append(r["id"])
+        await self._db.execute(
+            "UPDATE gmail_autoreplies SET state = 'held', approved_by = '', updated_at = ?"
+            " WHERE state = 'approved' AND approved_by != ''",
+            (now,),
+        )
+        work = ",".join("?" * len(AUTOREPLY_WORK_STATES))
+        await self._db.execute(
+            "UPDATE gmail_autoreplies SET state = 'new', attempts = attempts + 1,"
+            f" reply_text = '', updated_at = ? WHERE state IN ({work}) AND attempts < ?",
+            (now, *AUTOREPLY_WORK_STATES, AUTOREPLY_RECOVER_ATTEMPTS),
+        )
+        await self._db.execute(
+            "UPDATE gmail_autoreplies SET state = 'failed', reason = 'interrupted',"
+            " detail = 'interrupted while ' || state, reply_text = '', updated_at = ?"
+            f" WHERE state IN ({work})",
+            (now, *AUTOREPLY_WORK_STATES),
+        )
+        await self._db.commit()
+        if not moved:
+            return []
+        rows = await self._db.execute_fetchall(
+            f"SELECT * FROM gmail_autoreplies WHERE id IN ({','.join('?' * len(moved))})"
+            " ORDER BY created_at",
+            tuple(moved),
+        )
+        return [_autoreply_row(r) for r in rows]
+
+    async def purge_autoreplies(self, now: datetime | str | None = None) -> dict[str, int]:
+        """Retention, every owner (by claim time): held cards older than
+        AUTOREPLY_HELD_DAYS → `dismissed` (reason 'expired'); reply_text
+        cleared after AUTOREPLY_TEXT_DAYS; skipped / failed rows deleted after
+        AUTOREPLY_QUIET_DAYS; every row deleted after AUTOREPLY_KEEP_DAYS.
+        Clearing text leaves updated_at alone, so an old send never re-enters
+        a cap window. `now` (datetime or ISO; naive = UTC) defaults to the
+        current time. Returns ``{"expired", "cleared", "deleted"}`` counts."""
+        assert self._db is not None
+        if isinstance(now, str):
+            now = datetime.fromisoformat(now)
+        now = now or datetime.now(timezone.utc)
+        now = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+
+        def before(days: int) -> str:
+            return (now - timedelta(days=days)).isoformat()
+
+        async with self._db.execute(
+            "UPDATE gmail_autoreplies SET state = 'dismissed', reason = 'expired',"
+            " updated_at = ? WHERE state = 'held' AND created_at < ?",
+            (now.isoformat(), before(AUTOREPLY_HELD_DAYS)),
+        ) as cur:
+            expired = int(cur.rowcount or 0)
+        async with self._db.execute(
+            "UPDATE gmail_autoreplies SET reply_text = ''"
+            " WHERE reply_text != '' AND created_at < ?",
+            (before(AUTOREPLY_TEXT_DAYS),),
+        ) as cur:
+            cleared = int(cur.rowcount or 0)
+        async with self._db.execute(
+            "DELETE FROM gmail_autoreplies WHERE state IN ('skipped', 'failed')"
+            " AND created_at < ?",
+            (before(AUTOREPLY_QUIET_DAYS),),
+        ) as cur:
+            deleted = int(cur.rowcount or 0)
+        async with self._db.execute(
+            "DELETE FROM gmail_autoreplies WHERE created_at < ?",
+            (before(AUTOREPLY_KEEP_DAYS),),
+        ) as cur:
+            deleted += int(cur.rowcount or 0)
+        await self._db.commit()
+        return {"expired": expired, "cleared": cleared, "deleted": deleted}
 
     async def list_shares_for_resource(
         self, resource_type: str, resource_id: str, owner_id: str,

@@ -785,6 +785,12 @@ async def maybe_run_arbiter(
         # Per-thread dedup (J4): every action derived from a Gmail event — track
         # included — carries its thread key, so the thread isn't surfaced again.
         _chosen_ev = _gmail_event(evstore, chosen.get("event_ref"))
+        if _chosen_ev is not None and _chosen_ev.get("status") == "acted":
+            # Handled elsewhere since this pass read it (claimed on the spine
+            # while the ranker ran): no action of our own about it.
+            emit("dropped: handled elsewhere", chosen["title"], routine=True)
+            return {"ran": True, "proposed": 0, "reason": "handled-elsewhere",
+                    "considered": len(actions)}
         _tk = _thread_key(_chosen_ev) if _chosen_ev is not None else ""
         if _tk:
             _payload = {**(_payload or {}), "thread_key": _tk}

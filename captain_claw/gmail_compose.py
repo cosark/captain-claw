@@ -33,6 +33,7 @@ import html as html_module
 import json
 import logging
 import re
+from collections.abc import Mapping
 from email.headerregistry import Address
 from email.message import EmailMessage
 from typing import Any
@@ -72,6 +73,12 @@ SEND_REFUSED_HEADER = "X-FD-Gmail-Send"
 # went out) — the tool then says "may or may not have been sent", not "not sent".
 SEND_OUTCOME_HEADER = "X-FD-Gmail-Send-Outcome"
 
+# The only headers a caller may add on top of the standard ones (the builders'
+# ``extra_headers``): the RFC 3834 auto-reply markers, so other responders
+# don't answer an automated reply and start a loop. Exact names — anything
+# else is refused, so the parameter can never set a recipient or a sender.
+EXTRA_HEADER_NAMES = frozenset({"Auto-Submitted", "X-Auto-Response-Suppress"})
+
 
 # ---------------------------------------------------------------------------
 # Raw RFC-822 message builder
@@ -88,14 +95,38 @@ def build_raw_message(
     in_reply_to: str = "",
     references: str = "",
     attachments: list[Any] | None = None,
+    extra_headers: Mapping[str, str] | None = None,
 ) -> str:
     """Build a base64url-encoded RFC-822 message for the Gmail API — see
     :func:`build_message_bytes`."""
     raw_bytes = build_message_bytes(
         to=to, cc=cc, bcc=bcc, subject=subject, body=body, html_body=html_body,
         in_reply_to=in_reply_to, references=references, attachments=attachments,
+        extra_headers=extra_headers,
     )
     return base64.urlsafe_b64encode(raw_bytes).decode("ascii").rstrip("=")
+
+
+def _extra_header_items(extra_headers: Mapping[str, str] | None) -> list[tuple[str, str]]:
+    """*extra_headers* as ``(name, value)`` pairs, checked before anything is
+    built: only :data:`EXTRA_HEADER_NAMES`, each with a non-empty text value.
+    Raises :class:`ValueError` otherwise. (A line break in a value is the SMTP
+    policy's to refuse — also a ValueError.)"""
+    if extra_headers is None:
+        return []
+    if not isinstance(extra_headers, Mapping):
+        raise ValueError("extra_headers must be a mapping of header name to value")
+    items: list[tuple[str, str]] = []
+    for name, value in extra_headers.items():
+        if name not in EXTRA_HEADER_NAMES:
+            raise ValueError(
+                f"header {str(name)[:60]!r} can't be added — only "
+                f"{', '.join(sorted(EXTRA_HEADER_NAMES))}"
+            )
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"header {name} needs a text value")
+        items.append((name, value))
+    return items
 
 
 def build_message_bytes(
@@ -108,9 +139,14 @@ def build_message_bytes(
     in_reply_to: str = "",
     references: str = "",
     attachments: list[Any] | None = None,
+    extra_headers: Mapping[str, str] | None = None,
 ) -> bytes:
     """Build an RFC-822 message: the text and HTML bodies, plus
     *attachments* (:class:`mail_attachments.Attachment`) as file parts.
+
+    *extra_headers* go on after the standard ones — only the names in
+    :data:`EXTRA_HEADER_NAMES` (anything else raises :class:`ValueError`).
+    Without them the message is exactly what it always was.
 
     Construct with the SMTP policy from the start so every header
     fold and every line ending is RFC 5322-compliant CRLF. Building
@@ -118,6 +154,7 @@ def build_message_bytes(
     serialization time has been observed to produce drafts whose
     body Gmail's web UI fails to render in threaded reply drafts.
     """
+    extra = _extra_header_items(extra_headers)
     msg = EmailMessage(policy=email.policy.SMTP)
     if to:
         msg["To"] = to
@@ -131,6 +168,8 @@ def build_message_bytes(
         msg["In-Reply-To"] = in_reply_to
     if references:
         msg["References"] = references
+    for name, value in extra:
+        msg[name] = value
 
     plain = body or ""
 
@@ -249,6 +288,29 @@ def text_to_html(text: str) -> str:
     return "<div>" + escaped.replace("\n", "<br>") + "</div>"
 
 
+# A tag: name and attributes, quoted values taken whole. The alternatives
+# can't overlap (each starts with a different character), so a failed match
+# gives up at the next bare "<" — linear over any input.
+_TAG_RE = re.compile(r"""<(?:[^<>"']|"[^"]*"|'[^']*')+>""")
+
+
+def _strip_comments(text: str) -> str:
+    """*text* without ``<!-- … -->`` comments (an unclosed one runs to the
+    end, as in a browser), in one linear pass."""
+    out: list[str] = []
+    pos = 0
+    while True:
+        start = text.find("<!--", pos)
+        if start < 0:
+            out.append(text[pos:])
+            return "".join(out)
+        out.append(text[pos:start])
+        end = text.find("-->", start + 4)
+        if end < 0:
+            return "".join(out)
+        pos = end + 3
+
+
 def html_to_text(html_str: str) -> str:
     """Best-effort HTML to plain text conversion."""
     text = html_str
@@ -256,8 +318,10 @@ def html_to_text(html_str: str) -> str:
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"</(p|div|tr|li|h[1-6])>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<(hr)\s*/?>", "\n---\n", text, flags=re.IGNORECASE)
-    # Strip all remaining tags
-    text = re.sub(r"<[^>]+>", "", text)
+    # Strip comments, then every remaining tag — in linear time: a long run
+    # of "<" with no ">" must not rescan to the end from every "<". Quoted
+    # attribute values may hold "<" or ">" (``alt="<3"``).
+    text = _TAG_RE.sub("", _strip_comments(text))
     # Decode HTML entities
     text = html_module.unescape(text)
     # Collapse whitespace

@@ -1,0 +1,117 @@
+{
+  "_fixture": "SYNTHETIC, not a real capture: header names, order and value shapes mirror what Gmail prepends to a received message (Delivered-To, internal Received/X-Received, ARC set, Return-Path, MX Received, Received-SPF, Authentication-Results) above the sender's own headers. Replace with sanitised real captures before shipping.",
+  "id": "19a1c2d3e4f5a6d9",
+  "threadId": "19a1c2d3e4f5a6d9",
+  "labelIds": [
+    "UNREAD",
+    "CATEGORY_PERSONAL",
+    "INBOX"
+  ],
+  "snippet": "Hello, do you deliver to Zagreb, and how long does it take? Thanks, Marko Kovač",
+  "payload": {
+    "partId": "",
+    "mimeType": "text/plain",
+    "filename": "",
+    "headers": [
+      {
+        "name": "Delivered-To",
+        "value": "owner.inbox@gmail.com"
+      },
+      {
+        "name": "Received",
+        "value": "by 2002:a05:7208:3c8a:b0:a7:5e21:1f3c with SMTP id m10csp2178423rbe;\r\n        Tue, 13 Oct 2026 02:14:07 -0700 (PDT)"
+      },
+      {
+        "name": "X-Google-Smtp-Source",
+        "value": "AGHT+IF3kQx9vZr2mWbq7Lp0sYtC8nH1uJdE5aKoVf6gRzXwTyBc4NmPqS2lD"
+      },
+      {
+        "name": "X-Received",
+        "value": "by 2002:a17:907:7d8c:b0:b3c:1a2f:9e01 with SMTP id oz12-20020a1709077d8cb0b3c1a2f9e01mr1834201ejc.12.1791882847123;\r\n        Tue, 13 Oct 2026 02:14:07 -0700 (PDT)"
+      },
+      {
+        "name": "ARC-Seal",
+        "value": "i=1; a=rsa-sha256; t=1791882847; cv=none;\r\n        d=google.com; s=arc-20240605;\r\n        b=Kq3vL8xZ0pR7mYt2WnB5cH9sJd4FgA1eUo6iTzXrVlNyQwEkPbMa2CsDf8Gh0Jk"
+      },
+      {
+        "name": "ARC-Message-Signature",
+        "value": "i=1; a=rsa-sha256; c=relaxed/relaxed; d=google.com; s=arc-20240605;\r\n        h=to:subject:message-id:date:from:mime-version:dkim-signature;\r\n        bh=4Xq9ZtLwR2mK7pYvB0cN5sHdJ8gFa3eUo1iTzXrVlNy=;\r\n        fh=Qw7Lp0sYtC8nH1uJdE5aKoVf6gRzXwTyBc4NmPqS2lD=;\r\n        b=Vb6nM1qP9wE3rT7yU2iO5pA8sD4fG0hJ6kL1zX3cV9bN2mQ7wE5rT8yU1iO4pA==;\r\n        dara=google.com"
+      },
+      {
+        "name": "ARC-Authentication-Results",
+        "value": "i=1; mx.google.com;\r\n       dkim=pass header.i=@mail.smallshop.example header.s=default header.b=Qw3rTy12;\r\n       spf=pass (google.com: domain of marko@smallshop.example designates 203.0.113.40 as permitted sender) smtp.mailfrom=marko@smallshop.example"
+      },
+      {
+        "name": "Return-Path",
+        "value": "<marko@smallshop.example>"
+      },
+      {
+        "name": "Received",
+        "value": "from mx1.smallshop.example (mx1.smallshop.example. [203.0.113.40])\r\n        by mx.google.com with ESMTPS id d75a77b69052e-4b1c2d3e4f5si987654321cf.88.2026.10.13.02.20.41\r\n        for <owner.inbox@gmail.com>\r\n        (version=TLS1_2 cipher=ECDHE-RSA-AES128-GCM-SHA256 bits=128/128);\r\n        Tue, 13 Oct 2026 02:20:41 -0700 (PDT)"
+      },
+      {
+        "name": "Received-SPF",
+        "value": "pass (google.com: domain of marko@smallshop.example designates 203.0.113.40 as permitted sender) client-ip=203.0.113.40;"
+      },
+      {
+        "name": "Authentication-Results",
+        "value": "mx.google.com;\r\n       dkim=pass header.i=@mail.smallshop.example header.s=default header.b=Qw3rTy12;\r\n       spf=pass (google.com: domain of marko@smallshop.example designates 203.0.113.40 as permitted sender) smtp.mailfrom=marko@smallshop.example"
+      },
+      {
+        "name": "DKIM-Signature",
+        "value": "v=1; a=rsa-sha256; c=relaxed/simple; d=mail.smallshop.example;\r\n        s=default; t=1791883240; bh=Zt3vL8xZ0pR7mYt2WnB5cH9sJd4FgA1eUo6iTzXrVlN=;\r\n        h=Date:From:To:Subject:From;\r\n        b=Qw3rTy12L8xZ0pR7mYt2WnB5cH9sJd4FgA1eUo6iTzXrVlNyQwEkPbMa2CsDf8Gh0Jk"
+      },
+      {
+        "name": "Received",
+        "value": "from [192.168.1.20] (unknown [198.51.100.90])\r\n        by mx1.smallshop.example (Postfix) with ESMTPSA id 7E1D2C0A44\r\n        for <owner.inbox@gmail.com>; Tue, 13 Oct 2026 11:20:40 +0200 (CEST)"
+      },
+      {
+        "name": "Message-ID",
+        "value": "<5c2e9a1f-3b7d-4e8a-9f10-2a3b4c5d6e7f@smallshop.example>"
+      },
+      {
+        "name": "Date",
+        "value": "Tue, 13 Oct 2026 11:20:40 +0200"
+      },
+      {
+        "name": "MIME-Version",
+        "value": "1.0"
+      },
+      {
+        "name": "User-Agent",
+        "value": "Mozilla Thunderbird"
+      },
+      {
+        "name": "Content-Language",
+        "value": "en-US"
+      },
+      {
+        "name": "To",
+        "value": "owner.inbox@gmail.com"
+      },
+      {
+        "name": "From",
+        "value": "=?UTF-8?Q?Marko_Kova=C4=8D?= <marko@smallshop.example>"
+      },
+      {
+        "name": "Subject",
+        "value": "Delivery to Zagreb"
+      },
+      {
+        "name": "Content-Type",
+        "value": "text/plain; charset=UTF-8; format=flowed"
+      },
+      {
+        "name": "Content-Transfer-Encoding",
+        "value": "8bit"
+      }
+    ],
+    "body": {
+      "size": 83,
+      "data": "SGVsbG8sCgpkbyB5b3UgZGVsaXZlciB0byBaYWdyZWIsIGFuZCBob3cgbG9uZyBkb2VzIGl0IHRha2U_CgpUaGFua3MsCk1hcmtvIEtvdmHEjQo"
+    }
+  },
+  "sizeEstimate": 8123,
+  "historyId": "4182736",
+  "internalDate": "1791883241000"
+}

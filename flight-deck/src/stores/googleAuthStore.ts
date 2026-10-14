@@ -151,7 +151,7 @@ class HttpError extends Error {
   }
 }
 
-async function fetchJson(url: string, init?: RequestInit): Promise<any> {
+export async function fetchJson(url: string, init?: RequestInit): Promise<any> {
   const doFetch = () => fetch(url, {
     credentials: 'include',
     ...init,
@@ -242,7 +242,7 @@ function _connectError(exc: unknown): string {
 
 // The backend's own words when it gave some (e.g. which recipient entry it
 // couldn't read), else the status line.
-function _gmailSendError(exc: unknown): string {
+export function _gmailSendError(exc: unknown): string {
   if (exc instanceof HttpError) {
     if (exc.status === 401) return 'Your Flight Deck session has expired — sign in again.'
     // None of these routes answers 404 or 405 itself, so either means a deck

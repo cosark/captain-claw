@@ -794,7 +794,7 @@ async def _bat_judge(run: dict, steps: list[dict]) -> dict:
         receipt = ""
         if (run.get("config") or {}).get("email_allowed"):
             try:
-                sends = await db.list_gmail_sends(run["owner_id"], limit=50)
+                sends = await db.list_gmail_sends(run["owner_id"], limit=50, origin="agent")
                 receipt = _email_receipt_block(sends, sid[:8])
             except Exception:
                 receipt = ""

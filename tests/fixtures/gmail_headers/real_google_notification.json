@@ -1,0 +1,116 @@
+{
+ "_fixture": "REAL CAPTURE, sanitised: the header block of a real message received by a Google Workspace inbox via the Gmail API (raw order and folding kept). Owner/vendor addresses, domains and names replaced; Google/AWS relay hosts, ARC/DKIM blobs and ids kept. No body was stored.",
+ "id": "1a138740770f63dc",
+ "threadId": "1a138740770f63dc",
+ "labelIds": [
+  "UNREAD",
+  "CATEGORY_UPDATES",
+  "INBOX"
+ ],
+ "snippet": "",
+ "payload": {
+  "partId": "",
+  "mimeType": "multipart/alternative",
+  "filename": "",
+  "headers": [
+   {
+    "name": "Delivered-To",
+    "value": "owner@workspace.example"
+   },
+   {
+    "name": "Received",
+    "value": "by 2002:a05:7108:5a18:b0:5c1:66cc:f7b2 with SMTP id hd24csp1409096gdb;\r\n        Tue, 13 Oct 2026 20:28:10 -0700 (PDT)"
+   },
+   {
+    "name": "X-Received",
+    "value": "by 2002:a05:6512:3b9a:b0:5bc:e906:aba with SMTP id 2adb3069b0e04-5bce9060ed0mr4143221e87.31.1791948490550;\r\n        Tue, 13 Oct 2026 20:28:10 -0700 (PDT)"
+   },
+   {
+    "name": "ARC-Seal",
+    "value": "i=1; a=rsa-sha256; t=1791948490; cv=none;\r\n        d=google.com; s=arc-20260327;\r\n        b=gyA6jkh9dB6q3CHspA5G4n8ytQEZtJrJN9vPCYTRcfPlrMLNQqYbaTkFsj48tm+SCE\r\n         lk2/QFDH6K9iYz0UY4/pMg2CNofu7UNBueJgDb60vnOxU2v637ZKJJXUjfxH7zKOKDFy\r\n         v9hfjJQhFqduOHqpeqz8BdK50NHeFkmyyW4SiwF80HzgAKUrA1/ahbIFe/eZfiTlu9O/\r\n         3nib9Y4TuVSO6w1InBZ5C/9LMqtjILwbPea451j8/mkZuFtHCEWwBlF4xfJrltNxV24b\r\n         NLOnnsQ3FgLMXU7lXHkJCP+B7Kb4WMCmBJFvRMmZhQ2yAquWIqosvS2SKVV+O5XJ2mnO\r\n         Os2A=="
+   },
+   {
+    "name": "ARC-Message-Signature",
+    "value": "i=1; a=rsa-sha256; c=relaxed/relaxed; d=google.com; s=arc-20260327;\r\n        h=to:from:subject:date:message-id:auto-submitted:reply-to\r\n         :mime-version:dkim-signature;\r\n        bh=+WmN2c4kgrFmHhH2D52plsJN8CbTHG3cYnUvG2QwiF8=;\r\n        fh=m1V6Ur2HcYbdhdSNeoRd/k93SNGFnsWRxeHd5IL2Tr4=;\r\n        b=DyxYRnGFhFVpo3tNkmsfISEi5o14o0rDlUawEx2nJ/78fbmeCi+qi2qCF51JzCNUbz\r\n         DDgjUSV5QSOGej3pFQ1zcIKIP+a4tOE9NSocpHmmpDAm59mJsW/AoVRL/YUWTxaa6QOe\r\n         I7xJJ7SS0VBzf6K8ySUzAK4XPatyTCzAFiCX9W9SWnZF6FfBGotwZYBEIfYq2desymBQ\r\n         e/tntyV6Q437V8wBa6Mj8Izm7qErNRHSGBc7ajW5KHCc1a2K7UNEehKZozAmEHAXW6td\r\n         H5PGMNrR1t8MUCn3RO8qbdR9O3OCZ/gBa6XzLBq+xrt5hepLkD2ffsyqAF3wltC45X2X\r\n         GrXw==;\r\n        dara=google.com"
+   },
+   {
+    "name": "ARC-Authentication-Results",
+    "value": "i=1; mx.google.com;\r\n       dkim=pass header.i=@google.com header.s=20251104 header.b=kl6hsKLs;\r\n       spf=pass (google.com: domain of 3yfboagitalaa2x0396cywus70bs3.u64a2x0396cywus70bs3.u64@calendar-server.bounces.google.com designates 209.85.220.69 as permitted sender) smtp.mailfrom=3yfbOagITAlAA2x0396Cywus70Bs3.u64A2x0396Cywus70Bs3.u64@calendar-server.bounces.google.com;\r\n       dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=google.com;\r\n       dara=neutral header.i=@workspace.example"
+   },
+   {
+    "name": "Return-Path",
+    "value": "<3yfbOagITAlAA2x0396Cywus70Bs3.u64A2x0396Cywus70Bs3.u64@calendar-server.bounces.google.com>"
+   },
+   {
+    "name": "Received",
+    "value": "from mail-sor-f69.google.com (mail-sor-f69.google.com. [209.85.220.69])\r\n        by mx.google.com with SMTPS id 2adb3069b0e04-5bcdde5d9b2sor1993390e87.8.2026.10.13.20.28.10\r\n        for <owner@workspace.example>\r\n        (Google Transport Security);\r\n        Tue, 13 Oct 2026 20:28:10 -0700 (PDT)"
+   },
+   {
+    "name": "Received-SPF",
+    "value": "pass (google.com: domain of 3yfboagitalaa2x0396cywus70bs3.u64a2x0396cywus70bs3.u64@calendar-server.bounces.google.com designates 209.85.220.69 as permitted sender) client-ip=209.85.220.69;"
+   },
+   {
+    "name": "Authentication-Results",
+    "value": "mx.google.com;\r\n       dkim=pass header.i=@google.com header.s=20251104 header.b=kl6hsKLs;\r\n       spf=pass (google.com: domain of 3yfboagitalaa2x0396cywus70bs3.u64a2x0396cywus70bs3.u64@calendar-server.bounces.google.com designates 209.85.220.69 as permitted sender) smtp.mailfrom=3yfbOagITAlAA2x0396Cywus70Bs3.u64A2x0396Cywus70Bs3.u64@calendar-server.bounces.google.com;\r\n       dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=google.com;\r\n       dara=neutral header.i=@workspace.example"
+   },
+   {
+    "name": "DKIM-Signature",
+    "value": "v=1; a=rsa-sha256; c=relaxed/relaxed;\r\n        d=google.com; s=20251104; t=1791948490; x=1792553290; darn=workspace.example;\r\n        h=content-type:to:from:subject:date:message-id:auto-submitted\r\n         :reply-to:mime-version:from:to:cc:subject:date:message-id:reply-to\r\n         :content-type;\r\n        bh=+WmN2c4kgrFmHhH2D52plsJN8CbTHG3cYnUvG2QwiF8=;\r\n        b=kl6hsKLs+k6lWxrnOtH+3f4bmsSvuWrjmn7h0KUl39qpR51am8m3nrUMrDaRCBb46z\r\n         GkH4wbHELHBIYDsAvzPOcXC7GaIVX9Gd5np5gR9rFVHThMCTOU2B5hQ1RYJ+r/OboikP\r\n         FVh91QrMGhFLVTrYuzOQ3qkLNlMCna1LcPvo68KKqD0TXAK7dAMiZd8js0iMtj1Ax/YE\r\n         4q8Rt5iXiTUYp1ST0vaEpkc/RV75RSSBXunlcLLdCYI72WFEPSIf7vMiPgVfS6+sQhbo\r\n         KW4WvLklmw17Fsz2ED0BtSRbDH7uE4sm71a7GAJEz5o5cuRGWCpm6yk9Uzi7j8ANxrXO\r\n         0z3w=="
+   },
+   {
+    "name": "X-Google-DKIM-Signature",
+    "value": "v=1; a=rsa-sha256; c=relaxed/relaxed;\r\n        d=1e100.net; s=20260707; t=1791948490; x=1792553290;\r\n        h=content-type:to:from:subject:date:message-id:auto-submitted\r\n         :reply-to:mime-version:x-gm-message-state:from:to:cc:subject:date\r\n         :message-id:reply-to:content-type;\r\n        bh=+WmN2c4kgrFmHhH2D52plsJN8CbTHG3cYnUvG2QwiF8=;\r\n        b=wCcyqUDMzu7TAijpLYYXigQlsxx01dosJKfkKGaKpu2wtOX9x+eH/3ZWmPmILQ8CZC\r\n         FomkdKghtQqNEKxRbpUN4E4/7LTv63kYuGA7q7Ed3qzHaG4iYqhzkrOPv64lv3OHsF7n\r\n         Y1+qFA0K7nQtvYmoEYWmkmgpFKuTjiW4o3y+e+gybIBhHQ67dDwQZ0AqnyhA1bFiBtd/\r\n         CtuylaeSw2LutHSDYw4JEBAIbxrsa7Pr0isDtQdP1jaYwTGtGrQ1SdhYEnYIuOvEQboc\r\n         J+zx9qas5kbhO9r5rmfikO7bNm115Yv/h7VWuGWlUMCFfKcamappjfixY/5C2abHahI8\r\n         p2Jg=="
+   },
+   {
+    "name": "X-Gm-Message-State",
+    "value": "AFq9FYKypHF/6ta7Eo7PSxrPZMc4uGGjiXiPNgxP7Ux1CW8PRNGkchI+\r\n\tGu6pU8oLXaiNysvc7TdkEM4e5rfCR4orouFQCZYVQKz/81VOlP+fvWsJCQsGXzNaNOp8JIr0uap\r\n\tLDC9Y6tg8ANGnxvABbQw0dsOnNZKUg3CfDGJGbMgHDBHeFbQnUcQcFZto"
+   },
+   {
+    "name": "MIME-Version",
+    "value": "1.0"
+   },
+   {
+    "name": "X-Received",
+    "value": "by 2002:a05:6512:3a82:b0:5b8:f5e6:5b51 with SMTP id\r\n 2adb3069b0e04-5bcde6b3732mr4939662e87.11.1791948489798; Tue, 13 Oct 2026\r\n 20:28:09 -0700 (PDT)"
+   },
+   {
+    "name": "Reply-To",
+    "value": "Owner Name <owner@workspace.example>"
+   },
+   {
+    "name": "Auto-Submitted",
+    "value": "auto-generated"
+   },
+   {
+    "name": "Message-ID",
+    "value": "<calendar-9fb18551-9e0d-422e-96cf-2ef1d7f84b77@google.com>"
+   },
+   {
+    "name": "Date",
+    "value": "Wed, 14 Oct 2026 03:28:09 +0000"
+   },
+   {
+    "name": "Subject",
+    "value": "You have no events scheduled today."
+   },
+   {
+    "name": "From",
+    "value": "Google Calendar <calendar-notification@google.com>"
+   },
+   {
+    "name": "To",
+    "value": "Owner Name <owner@workspace.example>"
+   },
+   {
+    "name": "Content-Type",
+    "value": "multipart/alternative; boundary=\"00000000000030c709065dc485b4\""
+   }
+  ],
+  "body": {
+   "size": 0
+  }
+ },
+ "sizeEstimate": 0,
+ "historyId": "1",
+ "internalDate": "1791948489000"
+}

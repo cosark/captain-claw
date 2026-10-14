@@ -1,0 +1,156 @@
+{
+  "_fixture": "SYNTHETIC, not a real capture: header names, order and value shapes mirror what Gmail prepends to a received message (Delivered-To, internal Received/X-Received, ARC set, Return-Path, MX Received, Received-SPF, Authentication-Results) above the sender's own headers. Replace with sanitised real captures before shipping.",
+  "id": "19a1c2d3e4f5a6f1",
+  "threadId": "19a1c2d3e4f5a6f1",
+  "labelIds": [
+    "UNREAD",
+    "INBOX"
+  ],
+  "snippet": "Hi all, the build server is back up. Ping me with questions. Bob",
+  "payload": {
+    "partId": "",
+    "mimeType": "text/plain",
+    "filename": "",
+    "headers": [
+      {
+        "name": "Delivered-To",
+        "value": "owner.inbox@gmail.com"
+      },
+      {
+        "name": "Received",
+        "value": "by 2002:a05:7208:3c8a:b0:a7:5e21:1f3c with SMTP id m10csp2178423rbe;\r\n        Tue, 13 Oct 2026 02:14:07 -0700 (PDT)"
+      },
+      {
+        "name": "X-Google-Smtp-Source",
+        "value": "AGHT+IF3kQx9vZr2mWbq7Lp0sYtC8nH1uJdE5aKoVf6gRzXwTyBc4NmPqS2lD"
+      },
+      {
+        "name": "X-Received",
+        "value": "by 2002:a17:907:7d8c:b0:b3c:1a2f:9e01 with SMTP id oz12-20020a1709077d8cb0b3c1a2f9e01mr1834201ejc.12.1791882847123;\r\n        Tue, 13 Oct 2026 02:14:07 -0700 (PDT)"
+      },
+      {
+        "name": "ARC-Seal",
+        "value": "i=2; a=rsa-sha256; t=1791882847; cv=pass;\r\n        d=google.com; s=arc-20240605;\r\n        b=Kq3vL8xZ0pR7mYt2WnB5cH9sJd4FgA1eUo6iTzXrVlNyQwEkPbMa2CsDf8Gh0Jk"
+      },
+      {
+        "name": "ARC-Message-Signature",
+        "value": "i=2; a=rsa-sha256; c=relaxed/relaxed; d=google.com; s=arc-20240605;\r\n        h=to:subject:message-id:date:from:mime-version:dkim-signature;\r\n        bh=4Xq9ZtLwR2mK7pYvB0cN5sHdJ8gFa3eUo1iTzXrVlNy=;\r\n        fh=Qw7Lp0sYtC8nH1uJdE5aKoVf6gRzXwTyBc4NmPqS2lD=;\r\n        b=Vb6nM1qP9wE3rT7yU2iO5pA8sD4fG0hJ6kL1zX3cV9bN2mQ7wE5rT8yU1iO4pA==;\r\n        dara=google.com"
+      },
+      {
+        "name": "ARC-Authentication-Results",
+        "value": "i=2; mx.google.com;\r\n       dkim=pass header.i=@lists.example.org header.s=20230601 header.b=Ls7tGr0p;\r\n       arc=pass (i=1 spf=pass spfdomain=builder.example dkim=pass dkdomain=builder.example dmarc=pass fromdomain=builder.example);\r\n       spf=pass (google.com: domain of team-updates+bncBDH4@lists.example.org designates 209.85.220.65 as permitted sender) smtp.mailfrom=team-updates+bncBDH4@lists.example.org;\r\n       dmarc=pass (p=NONE sp=NONE dis=NONE) header.from=lists.example.org"
+      },
+      {
+        "name": "Return-Path",
+        "value": "<team-updates+bncBDH4@lists.example.org>"
+      },
+      {
+        "name": "Received",
+        "value": "from mail-sor-f65.google.com (mail-sor-f65.google.com. [209.85.220.65])\r\n        by mx.google.com with SMTPS id 6a1803df08f44-6f9a8b7c6d5sor445566778d6.11.2026.10.13.02.40.12\r\n        for <owner.inbox@gmail.com>\r\n        (Google Transport Security);\r\n        Tue, 13 Oct 2026 02:40:12 -0700 (PDT)"
+      },
+      {
+        "name": "Received-SPF",
+        "value": "pass (google.com: domain of team-updates+bncBDH4@lists.example.org designates 209.85.220.65 as permitted sender) client-ip=209.85.220.65;"
+      },
+      {
+        "name": "Authentication-Results",
+        "value": "mx.google.com;\r\n       dkim=pass header.i=@lists.example.org header.s=20230601 header.b=Ls7tGr0p;\r\n       arc=pass (i=1 spf=pass spfdomain=builder.example dkim=pass dkdomain=builder.example dmarc=pass fromdomain=builder.example);\r\n       spf=pass (google.com: domain of team-updates+bncBDH4@lists.example.org designates 209.85.220.65 as permitted sender) smtp.mailfrom=team-updates+bncBDH4@lists.example.org;\r\n       dmarc=pass (p=NONE sp=NONE dis=NONE) header.from=lists.example.org"
+      },
+      {
+        "name": "DKIM-Signature",
+        "value": "v=1; a=rsa-sha256; c=relaxed/relaxed;\r\n        d=lists.example.org; s=20230601; t=1791884412; x=1792489212; darn=gmail.com;\r\n        h=list-unsubscribe:list-subscribe:list-archive:list-help:list-post\r\n        :list-id:mailing-list:precedence:reply-to:to:subject:message-id:date\r\n        :from:mime-version:from:to:cc:subject:date:message-id:reply-to;\r\n        bh=Yv2WnB5cH9sJd4FgA1eUo6iTzXrVlNyQwEkPbMa2CsD=;\r\n        b=Ls7tGr0pR7mYt2WnB5cH9sJd4FgA1eUo6iTzXrVlNyQwEkPbMa2CsDf8Gh0Jk2c4Xq9"
+      },
+      {
+        "name": "ARC-Seal",
+        "value": "i=1; a=rsa-sha256; t=1791884411; cv=none;\r\n        d=google.com; s=arc-20240605;\r\n        b=Tz5uV8wX1yZ4aB7cD0eF3gH6iJ9kL2mN5oP8qR1sT4uV7wX0"
+      },
+      {
+        "name": "ARC-Authentication-Results",
+        "value": "i=1; gmr-mx.google.com;\r\n       dkim=pass header.i=@builder.example header.s=s2 header.b=Bb4uLdR1;\r\n       spf=pass (google.com: domain of bob@builder.example designates 192.0.2.77 as permitted sender) smtp.mailfrom=bob@builder.example;\r\n       dmarc=pass (p=NONE sp=NONE dis=NONE) header.from=builder.example"
+      },
+      {
+        "name": "X-Original-Sender",
+        "value": "bob@builder.example"
+      },
+      {
+        "name": "X-Original-Authentication-Results",
+        "value": "gmr-mx.google.com;\r\n       dkim=pass header.i=@builder.example header.s=s2 header.b=Bb4uLdR1;\r\n       dmarc=pass (p=NONE sp=NONE dis=NONE) header.from=builder.example"
+      },
+      {
+        "name": "MIME-Version",
+        "value": "1.0"
+      },
+      {
+        "name": "From",
+        "value": "'Bob Builder' via Team Updates <team-updates@lists.example.org>"
+      },
+      {
+        "name": "Date",
+        "value": "Tue, 13 Oct 2026 11:40:10 +0200"
+      },
+      {
+        "name": "Message-ID",
+        "value": "<CABb0b1c2d3e4f5g6h7i8j9k0l@mail.builder.example>"
+      },
+      {
+        "name": "Subject",
+        "value": "[team-updates] Build server is back"
+      },
+      {
+        "name": "To",
+        "value": "Team Updates <team-updates@lists.example.org>"
+      },
+      {
+        "name": "Reply-To",
+        "value": "Bob Builder <bob@builder.example>"
+      },
+      {
+        "name": "Content-Type",
+        "value": "text/plain; charset=\"UTF-8\""
+      },
+      {
+        "name": "Precedence",
+        "value": "list"
+      },
+      {
+        "name": "Mailing-list",
+        "value": "list team-updates@lists.example.org; contact team-updates+owners@lists.example.org"
+      },
+      {
+        "name": "List-ID",
+        "value": "<team-updates.lists.example.org>"
+      },
+      {
+        "name": "X-Spam-Checked-In-Group",
+        "value": "bob@builder.example"
+      },
+      {
+        "name": "X-Google-Group-Id",
+        "value": "123456789012"
+      },
+      {
+        "name": "List-Post",
+        "value": "<https://groups.google.com/a/lists.example.org/group/team-updates/post>, <mailto:team-updates@lists.example.org>"
+      },
+      {
+        "name": "List-Help",
+        "value": "<https://support.google.com/a/lists.example.org/bin/topic.py?topic=25838>, <mailto:team-updates+help@lists.example.org>"
+      },
+      {
+        "name": "List-Archive",
+        "value": "<https://groups.google.com/a/lists.example.org/group/team-updates/>"
+      },
+      {
+        "name": "List-Unsubscribe",
+        "value": "<mailto:googlegroups-manage+123456789012+unsubscribe@googlegroups.com>,<https://groups.google.com/a/lists.example.org/group/team-updates/subscribe>"
+      }
+    ],
+    "body": {
+      "size": 67,
+      "data": "SGkgYWxsLAoKdGhlIGJ1aWxkIHNlcnZlciBpcyBiYWNrIHVwLiBQaW5nIG1lIHdpdGggcXVlc3Rpb25zLgoKQm9iCg"
+    }
+  },
+  "sizeEstimate": 8123,
+  "historyId": "4182736",
+  "internalDate": "1791884412000"
+}

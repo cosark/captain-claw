@@ -908,6 +908,16 @@ async def lifespan(app: FastAPI):
         app.state.events_stop = _ev_stop
         app.state.events_task = asyncio.create_task(_ev_loop(_ev_stop))
         print("Flight Deck: event spine poll loop started")
+    # ── Gmail topic auto-replies: FD's own History-API poller → ledger →
+    # classifier / writer / guard → send (gmail_autoreply.py). Inert until a
+    # user opts in; FD_GMAIL_AUTOREPLY=off keeps it from starting at all. ──
+    from captain_claw.flight_deck import gmail_autoreply as _gmail_autoreply
+    if not _gmail_autoreply.autoreply_deck_disabled():
+        _ar_stop = asyncio.Event()
+        app.state.autoreply_stop = _ar_stop
+        app.state.autoreply_task = asyncio.create_task(
+            _gmail_autoreply.autoreply_loop(_ar_stop, _fd_db))
+        print("Flight Deck: Gmail topic auto-reply loop started")
     # ── Iskra beings heartbeat (living beings tick/dream on their own clock).
     # Disable with FD_BEINGS_DISABLED=true. Cheap when no being is due. ──
     if os.environ.get("FD_BEINGS_DISABLED", "").lower() not in ("true", "1", "yes"):
@@ -1092,6 +1102,15 @@ async def lifespan(app: FastAPI):
             try:
                 await asyncio.wait_for(app.state.consciousness_task, timeout=5.0)
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
+    # Stop the Gmail topic auto-reply loop. A send it interrupts is never
+    # resent: the next boot records it as "may have auto-replied".
+    if hasattr(app.state, "autoreply_stop"):
+        app.state.autoreply_stop.set()
+        if hasattr(app.state, "autoreply_task"):
+            try:
+                await asyncio.wait_for(app.state.autoreply_task, timeout=5.0)
+            except (TimeoutError, asyncio.CancelledError, Exception):
                 pass
     # Stop the context-pack reconcile loop.
     if hasattr(app.state, "context_packs_stop"):
@@ -1345,6 +1364,7 @@ from captain_claw.flight_deck.code_routes import router as code_router
 from captain_claw.flight_deck.queue_planner import router as queue_router
 from captain_claw.flight_deck.google_oauth_routes import router as google_oauth_router
 from captain_claw.flight_deck.gmail_send_routes import router as gmail_send_router
+from captain_claw.flight_deck.gmail_autoreply_routes import router as gmail_autoreply_router
 from captain_claw.flight_deck.microsoft_oauth_routes import router as microsoft_oauth_router
 from captain_claw.flight_deck.jev_routes import router as jev_router
 from captain_claw.flight_deck.codex_oauth_routes import router as codex_oauth_router
@@ -1407,6 +1427,7 @@ app.include_router(code_router)
 app.include_router(queue_router)
 app.include_router(google_oauth_router)
 app.include_router(gmail_send_router)
+app.include_router(gmail_autoreply_router)
 app.include_router(microsoft_oauth_router)
 app.include_router(jev_router)
 app.include_router(codex_oauth_router)

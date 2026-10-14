@@ -1,0 +1,97 @@
+{
+  "_fixture": "SYNTHETIC, not a real capture: header names, order and value shapes mirror what Gmail prepends to a received message (Delivered-To, internal Received/X-Received, ARC set, Return-Path, MX Received, Received-SPF, Authentication-Results) above the sender's own headers. Replace with sanitised real captures before shipping.",
+  "id": "19a1c2d3e4f5a924",
+  "threadId": "19a1c2d3e4f5a924",
+  "labelIds": [
+    "UNREAD",
+    "CATEGORY_PERSONAL",
+    "INBOX"
+  ],
+  "snippet": "Hi, what are your opening hours this Saturday? Thanks",
+  "payload": {
+    "partId": "",
+    "mimeType": "text/plain",
+    "filename": "",
+    "headers": [
+      {
+        "name": "Delivered-To",
+        "value": "owner.inbox@gmail.com"
+      },
+      {
+        "name": "Received",
+        "value": "by 2002:a05:7208:3c8a:b0:a7:5e21:1f3c with SMTP id m10csp2178423rbe;\r\n        Tue, 13 Oct 2026 02:14:07 -0700 (PDT)"
+      },
+      {
+        "name": "X-Google-Smtp-Source",
+        "value": "AGHT+IF3kQx9vZr2mWbq7Lp0sYtC8nH1uJdE5aKoVf6gRzXwTyBc4NmPqS2lD"
+      },
+      {
+        "name": "X-Received",
+        "value": "by 2002:a17:907:7d8c:b0:b3c:1a2f:9e01 with SMTP id oz12-20020a1709077d8cb0b3c1a2f9e01mr1834201ejc.12.1791882847123;\r\n        Tue, 13 Oct 2026 02:14:07 -0700 (PDT)"
+      },
+      {
+        "name": "ARC-Seal",
+        "value": "i=1; a=rsa-sha256; t=1791882847; cv=none;\r\n        d=google.com; s=arc-20240605;\r\n        b=Kq3vL8xZ0pR7mYt2WnB5cH9sJd4FgA1eUo6iTzXrVlNyQwEkPbMa2CsDf8Gh0Jk"
+      },
+      {
+        "name": "ARC-Message-Signature",
+        "value": "i=1; a=rsa-sha256; c=relaxed/relaxed; d=google.com; s=arc-20240605;\r\n        h=to:subject:message-id:date:from:mime-version:dkim-signature;\r\n        bh=4Xq9ZtLwR2mK7pYvB0cN5sHdJ8gFa3eUo1iTzXrVlNy=;\r\n        fh=Qw7Lp0sYtC8nH1uJdE5aKoVf6gRzXwTyBc4NmPqS2lD=;\r\n        b=Vb6nM1qP9wE3rT7yU2iO5pA8sD4fG0hJ6kL1zX3cV9bN2mQ7wE5rT8yU1iO4pA==;\r\n        dara=google.com"
+      },
+      {
+        "name": "Return-Path",
+        "value": "<bounce-78@attacker.example>"
+      },
+      {
+        "name": "Received",
+        "value": "from mail.attacker.example (mail.attacker.example. [198.51.100.66])\r\n        by mx.google.com with ESMTPS id 5b1f17b1804b1-46e9f8e7d6csi9988776655f9.12.2026.10.13.02.58.03\r\n        for <owner.inbox@gmail.com>\r\n        (version=TLS1_3 cipher=TLS_AES_256_GCM_SHA384 bits=256/256);\r\n        Tue, 13 Oct 2026 02:58:03 -0700 (PDT)"
+      },
+      {
+        "name": "Received-SPF",
+        "value": "pass (google.com: domain of bounce-78@attacker.example designates 198.51.100.66 as permitted sender) client-ip=198.51.100.66;"
+      },
+      {
+        "name": "Authentication-Results",
+        "value": "mail.spoofer.example;\r\n       dkim=pass header.d=example.com header.s=s1;\r\n       dmarc=pass header.from=example.com"
+      },
+      {
+        "name": "Authentication-Results",
+        "value": "mx.google.com;\r\n       dkim=pass header.i=@example.com header.s=s1 header.b=Fake5678;\r\n       dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=example.com"
+      },
+      {
+        "name": "MIME-Version",
+        "value": "1.0"
+      },
+      {
+        "name": "From",
+        "value": "CEO Example <ceo@example.com>"
+      },
+      {
+        "name": "To",
+        "value": "owner.inbox@gmail.com"
+      },
+      {
+        "name": "Subject",
+        "value": "Opening hours"
+      },
+      {
+        "name": "Date",
+        "value": "Tue, 13 Oct 2026 11:58:02 +0200"
+      },
+      {
+        "name": "Message-ID",
+        "value": "<20261013095802.4D5E6F@mail.attacker.example>"
+      },
+      {
+        "name": "Content-Type",
+        "value": "text/plain; charset=utf-8"
+      }
+    ],
+    "body": {
+      "size": 56,
+      "data": "SGksCgp3aGF0IGFyZSB5b3VyIG9wZW5pbmcgaG91cnMgdGhpcyBTYXR1cmRheT8KClRoYW5rcwo"
+    }
+  },
+  "sizeEstimate": 8123,
+  "historyId": "4182736",
+  "internalDate": "1791885483000"
+}
