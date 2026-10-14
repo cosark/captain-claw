@@ -88,6 +88,108 @@ def test_plan_needs_gate_allows_plain_build_research():
     assert not plan_needs_gate("refactor the auth module and add tests", [])[0]
 
 
+def test_plan_needs_gate_offers_organizing_mail():
+    # No email / inbox / gmail word: still offered, as its own grant.
+    assert plan_needs_gate(
+        "Archive the Substack newsletters and label the receipts Receipts",
+        [{"title": "Find the Substack newsletters"}, {"title": "Archive them"},
+         {"title": "Label receipts"}],
+    ) == (True, "organize email")
+    for task in ("Move the invoices in Outlook into the Invoices folder",
+                 "Tag the receipts in my mail with the Receipts category",
+                 "Label all invoices from Stripe as Finance"):
+        assert plan_needs_gate(task, []) == (True, "organize email"), task
+    # In a step title too.
+    assert plan_needs_gate("tidy up after the launch", [{"title": "archive the launch newsletters"}]) \
+        == (True, "organize email")
+    # Files, folders on a drive, tickets: not mail.
+    for task in ("Move the files into the archive folder",
+                 "Archive the old project folders on the drive",
+                 "Categorize the support tickets by severity"):
+        assert not plan_needs_gate(task, [])[0], task
+
+
+def test_plan_needs_gate_organize_plus_email_is_gated_as_both():
+    _, reason = plan_needs_gate("Archive the newsletters in my inbox and email Ana the list", [])
+    assert reason == "send email, organize email"
+    # An email ask the keywords miss still counts as mail when it rides on an
+    # organize-only grant (whose guard would honour it).
+    for task in ("Arhiviraj newslettere i pošalji Ani izvještaj mailom",
+                 "Archive the newsletters and draft a response to Ana"):
+        assert plan_needs_gate(task, []) == (True, "send email, organize email"), task
+
+
+def test_plan_needs_gate_reads_organizing_on_the_whole_plan():
+    # A step that only refers back ("the ones you summarized", "them") names
+    # no mail on its own line: it means what the plan named before it.
+    for task, steps in (
+        ("Compile a digest of the newsletters I received this week",
+         ["Read newsletters", "Archive the ones you summarized"]),
+        ("Compile a digest of the newsletters I received this week",
+         ["Summarize each one", "Archive the ones you summarized"]),
+        ("Clean up", ["Find the Substack newsletters", "Archive them"]),
+        ("Go through this week's newsletters. Archive the ones you summarized.", []),
+        ("Pregledaj newslettere od ovog tjedna", ["Sažmi ih", "Arhiviraj ih"]),
+    ):
+        assert plan_needs_gate(task, [{"title": t} for t in steps]) == (True, "organize email"), task
+    # A step that names its own object isn't read with another, and a step
+    # isn't read past the nearest one that names something.
+    for task, steps in (
+        ("Write a newsletter about our launch", ["Draft the newsletter", "Archive old drafts"]),
+        ("Analyze our newsletter open rates", ["Export the data", "Move the chart into the deck"]),
+        ("Refactor the mail module", ["Find the helpers", "Move them into utils.py"]),
+        ("Read the newsletters", ["Export the stats", "Move them into the deck"]),
+        ("Summarize the newsletters into a report", ["Archive it in Drive"]),
+    ):
+        assert not plan_needs_gate(task, [{"title": t} for t in steps])[0], task
+
+
+def test_the_gate_stays_linear_on_a_long_pronoun_heavy_plan(monkeypatch):
+    # Every sentence refers back: each may reach only a few sentences back,
+    # and readings stop once the job text is full — no quadratic walk.
+    from captain_claw import mail_authority as ma
+    from captain_claw.flight_deck import bat_routes
+
+    calls = {"chars": 0}
+    real = ma.organize_intent
+
+    def counting(text):
+        calls["chars"] += len(text)
+        return real(text)
+
+    monkeypatch.setattr(bat_routes.mail_authority, "organize_intent", counting)
+    sents = ["Read the newsletters"] + ["Then summarize them for me"] * 1500
+    task = ". ".join(sents) + "."
+    plan_needs_gate(task, [])
+    # A few passes over the plan at most — a quadratic walk reads ~1000x it.
+    assert calls["chars"] < 12 * len(task)
+    # Readings never outgrow the job text.
+    assert len(bat_routes._organize_text(task, [])) <= ma.JOB_TEXT_MAX
+    short = "Compile a digest of the newsletters I received this week"
+    assert "organize email" in plan_needs_gate(
+        short, [{"title": "Read newsletters"}, {"title": "Archive the ones you summarized"}])[1]
+
+
+def test_the_gate_and_the_workers_guard_agree_on_organizing():
+    # Gated as "organize email" exactly when the workers' guard reads the text
+    # an organize grant hands them as organizing: an approval is never empty,
+    # and deny's refusal ("its instructions don't ask to organize email") is true.
+    from captain_claw import mail_authority as ma
+    from captain_claw.flight_deck.bat_routes import _organize_text
+
+    for task, steps in (
+        ("Compile a digest of the newsletters I received this week",
+         ["Read newsletters", "Archive the ones you summarized"]),
+        ("Clean up", ["Find the Substack newsletters", "Archive them"]),
+        ("Triage the Stripe notifications", ["Archive the Stripe notifications"]),
+        ("Write a newsletter about our launch", ["Draft the newsletter", "Archive old drafts"]),
+        ("Read the newsletters", ["Export the stats", "Move them into the deck"]),
+    ):
+        steps = [{"title": t} for t in steps]
+        gated = "organize email" in plan_needs_gate(task, steps)[1]
+        assert gated is ma.organize_intent(_organize_text(task, steps)), task
+
+
 def test_build_step_prompt_includes_human_input_when_present():
     p = _build_step_prompt({"task": "t"}, {"step_key": "s", "title": "do it"}, [],
                            human_input="the code is 4242")

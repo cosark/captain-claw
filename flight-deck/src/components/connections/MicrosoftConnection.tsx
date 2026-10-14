@@ -18,8 +18,9 @@ import { useAuthStore } from '../../stores/authStore'
 
 // The Microsoft twin of GoogleConnection: one app registration per deck
 // (admin-managed — POST /fd/microsoft/config is require_admin), one Microsoft
-// account per Flight Deck user. Agents read mail, draft (never send), use the
-// calendar and OneDrive with their owner's account.
+// account per Flight Deck user. Agents read mail, draft (never send), organize
+// mail when asked (archive, move, folders, categories), use the calendar and
+// OneDrive with their owner's account.
 export default function MicrosoftConnection() {
   const {
     status,
@@ -180,7 +181,7 @@ export default function MicrosoftConnection() {
               own app registration
             </span>
           </div>
-          <div className="text-xs text-zinc-500 mt-0.5">Outlook mail (read + drafts), Calendar, OneDrive</div>
+          <div className="text-xs text-zinc-500 mt-0.5">Outlook mail (read, drafts, organize), Calendar, OneDrive</div>
         </div>
         {loading && <Loader2 className="h-4 w-4 animate-spin text-zinc-500" />}
         <ChevronDown className={'h-4 w-4 text-zinc-500 transition-transform ' + (collapsed ? '-rotate-90' : '')} />
@@ -307,8 +308,9 @@ export default function MicrosoftConnection() {
         {connected && (
           <div className="text-[11px] text-zinc-500 leading-snug">
             Agents never send Outlook mail: they save drafts in your Outlook Drafts folder for you to
-            send. Calendar changes that email attendees (invitations, updates, cancellations) happen
-            only when you ask for them.
+            send. They archive, move or categorize mail, or create folders, only when you ask.
+            Calendar changes that email attendees (invitations, updates, cancellations) happen only
+            when you ask for them.
           </div>
         )}
 

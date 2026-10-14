@@ -18,6 +18,11 @@ specifically told to.
   the caller vouches for a human click (``mail_write="allow"``). When that
   text only asks for an email to the user themself ("email me the summary"),
   the write must be one new email to the owner's own address.
+* **Mailbox changes** (archive, move, labels / categories, a new label or
+  folder — :data:`MAILBOX_CHANGE_ACTIONS`) are a separate class, gated the
+  same way in automated turns by :func:`check_mailbox_change`: the job's own
+  text must ask to organize email (:func:`organize_intent`). Neither kind of
+  intent grants the other.
 
 The decision travels in a :class:`contextvars.ContextVar` (never on the
 agent), so concurrent lanes and tasks can't leak authority into each other.
@@ -45,7 +50,10 @@ from dataclasses import dataclass
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# Names shared with Flight Deck (by wire and string, never by import)
+# Names shared with Flight Deck — by wire and string (Flight Deck mirrors these
+# sets as literals), except that Bat's routes import the pure detectors
+# (organize_intent, explicit_mail_intent) and JOB_TEXT_MAX. This module never
+# imports Flight Deck, and no context state crosses that import.
 # ---------------------------------------------------------------------------
 
 AUTOMATION_KINDS = frozenset({
@@ -53,6 +61,14 @@ AUTOMATION_KINDS = frozenset({
     "peer", "peer_relay", "sister", "botport", "fd_worker", "being", "mcp_task", "bat", "unknown",
 })
 MAIL_WRITE_ACTIONS = frozenset({"create_draft", "update_draft", "send", "send_draft"})
+# google_mail / microsoft_mail actions that change the mailbox without writing
+# an email (archive, move, labels / categories, new label / folder). A separate
+# class: email intent never grants them, and they never grant email.
+# Flight Deck mirrors this set by string (action_catalog.py, flow_runner.py).
+MAILBOX_CHANGE_ACTIONS = frozenset({
+    "archive", "move", "add_labels", "remove_labels", "create_label",
+    "create_folder", "add_categories", "remove_categories",
+})
 MAIL_REFUSAL_TAG = "[not-authorized: mail-write]"
 JOB_TEXT_MAX = 4000
 
@@ -272,14 +288,87 @@ _JOB_TO_TAIL_RE = re.compile(
 # "don't send", "never email", "nemoj poslati" …
 # "Remind me (every Friday) to email Ana" — a reminder, not a job that writes.
 _REMIND_TAIL_RE = re.compile(r"\b(?:remind\w*|podsjet\w*)\b[^.!?;\n]{0,60}?\b(?:to|da)\s*$")
+# …also with an intensifier between ("do not under any circumstances send",
+# "under no circumstances whatsoever archive", "never at any point reply").
 _NEG_TAIL_RE = re.compile(
     r"(?:^|[^\w])(?:not|don'?t|do not|never|no|without|nemoj|nemojte|ne|nikad|nikada|bez)"
-    r"(?:\s+\w+)?\s*$"
+    r"(?:\s+(?:under|at|in|on|by|for)\s+(?:any|no)\s+\w+)?(?:\s+\w+)?"
+    r"(?:\s+(?:whatsoever|ever|at all))?\s*$"
 )
 # "Do not, under any circumstances, email Ana" — a negation with an aside
 _NEG_ASIDE_RE = re.compile(
     r"(?:^|[^\w])(?:don'?t|do not|never|nemoj|nemojte|nikad|nikada)\s*,[^.!?;\n]{0,80},\s*$"
 )
+# A coordinated list of mail actions ("don't archive, move or label …",
+# "never draft or send …", "nemoj arhivirati, premjestiti ni označiti …"): a
+# negation or a reminder before its first verb covers every verb in it.
+_LIST_VERB = (
+    r"(?:(?:un|re)?archive|(?:re|un)?label|(?:un)?tag|(?:re)?categori[sz]e|(?:un)?star|move|file"
+    r"|sort|mark|flag|put|add|apply|assign|remove|delete|trash|touch|change|modify|edit|open"
+    r"|read|(?:re)?organi[sz]e|clean|draft|compose|write|prepare|create|make|send|forward"
+    r"|e-?mail|mail|reply|respond|answer"
+    r"|arhivir\w*|premjest\w*|prebac\w*|pomak\w*|makn\w*|oznac\w*|kategoriz\w*|razvrst\w*"
+    r"|sortir\w*|sprem\w*|stav\w*|napis\w*|pisa\w*|pisi\w*|sastav\w*|priprem\w*|posal\w*"
+    r"|posla\w*|salj\w*|slat\w*|odgovor\w*|odgovar\w*|proslijed\w*|bris\w*|obris\w*|dira\w*"
+    r"|otvar\w*|otvori\w*|cita\w*|procita\w*|mijenja\w*|promijen\w*)"
+)
+# A word of a list member's object ("archive emails or move them"): never a
+# coordinator or a word that starts a new instruction — except an "and" /
+# "or" inside the object ("any email from Substack or Medium").
+_LIST_OBJ_WORD = (
+    rf"(?:(?:and|or|i|ili)\s+(?!{_LIST_VERB}\b))?"
+    r"(?!(?:and|or|nor|then|just|instead|but|also|please|only|now|rather"
+    r"|ili|ni|niti|i|pa|onda|samo|nego|vec|ali|te)\b)[\w'@-]+(?:\.[\w'@-]+)*"
+)
+# A member's object is at most this many words ("do not archive any of the
+# emails, move them or label them").
+_LIST_OBJ_MAX = 8
+# A negation is never part of a member's object: a member that runs over one
+# ("read my emails and under no circumstances archive, move or label them")
+# is negated, like one after it.
+_LIST_NEG_WORD_RE = re.compile(
+    r"(?<![\w'])(?:no|not|never|without|don'?t|nemoj\w*|ne|nikad\w*|nikako|niposto|nista|bez)"
+    r"(?![\w'])"
+)
+# The member from a verb to the next one and what joins them: ","  "and"
+# "or"  "/" … (matched at each list verb before it, nearest first).
+_LIST_VERB_RE = re.compile(rf"(?<![\w']){_LIST_VERB}\b")
+_LIST_TAIL_RE = re.compile(
+    rf"(?P<v>{_LIST_VERB})\b(?P<obj>(?:\s+{_LIST_OBJ_WORD}){{0,{_LIST_OBJ_MAX}}})"
+    r"\s*(?P<comma>,)?\s*(?P<conj>(?:and/or|and|or|nor|ili|niti|ni|i)\s+|[/&]\s*)?$"
+)
+_LIST_OR = frozenset({"or", "nor", "and/or", "ili", "ni", "niti"})
+# "don't archive emails, move them or label them" — commas between members
+# with objects make a list only when it ends with "or" / "nor" ("A, B or C").
+_LIST_CLOSE_RE = re.compile(
+    rf"\w+(?:\s+{_LIST_OBJ_WORD}){{0,{_LIST_OBJ_MAX}}}\s*"
+    rf"(?:,\s*{_LIST_VERB}\b(?:\s+{_LIST_OBJ_WORD}){{0,{_LIST_OBJ_MAX}}}\s*)*"
+    rf",?\s*(?:or|nor|ili|niti|ni)\s+{_LIST_VERB}\b"
+)
+# "don't reply, email Ana the report instead" — a contrast, not a list: only
+# in the judged verb's own member (up to the next "," or coordinator, or a
+# "just" / "please" / "only" that starts a new instruction), never "instead
+# of …" / "rather than …" ("don't archive or label emails instead of reading
+# them"), nor in a later clause ("…, just summarize them instead"), and
+# "rather" only as the member's last word (not "the rather old newsletters").
+_LIST_CONTRAST_RE = re.compile(
+    r"\b(?:instead(?!\s+of\b)|rather(?=\s*$)|radije(?!\s+(?:nego|od)\b)"
+    r"|umjesto\s+(?:toga|tog|svega)\b)"
+)
+_LIST_MEMBER_END_RE = re.compile(
+    r"[,;.!?:\n()—–]|\s-\s"
+    r"|\b(?:and|or|nor|but|then|just|only|please|ili|ni|niti|i|pa|te|ali|nego|onda|zatim"
+    r"|samo|molim)\b"
+    # …and a verb with an object of its own ("move my emails summarize them instead")
+    rf"|\b(?:{_LIST_VERB}|summari[sz]e|list|sazmi\w*|izlistaj\w*)\s+(?:them|it|everything|ih|ga|sve)\b"
+)
+_WORD_RE = re.compile(r"[\w'-]+")
+# An HR infinitive ("nemoj arhivirati mailove i premjestiti ih") is never an
+# instruction of its own: it still hangs on the "nemoj" before it.
+_HR_INFINITIVE_RE = re.compile(r"\w+(?:ti|ci)\b")
+# How far back the tail patterns above look (each one is shorter): a long
+# job text stays linear in its verbs.
+_TAIL_WINDOW = 160
 
 _NOT_NAMES = frozenset({
     "The", "A", "An", "This", "That", "These", "Those", "I", "Me", "Us", "User", "Users",
@@ -429,6 +518,51 @@ _AFTER_NAME_OK_RE = re.compile(
 _DETERMINER_TAIL_RE = re.compile(
     r"(?:^|[^\w])(?:the|a|an|this|that|my|your|his|her|their|our|each|every|any|its)\s*$"
 )
+# EN-4 "email" is the noun after a quantifier or a verb that takes mail as
+# its object ("Archive email that is older …", "Summarize email the boss
+# sent", "all email from Ana") …
+_EMAIL_NOUN_TAIL_RE = re.compile(
+    r"(?:^|[^\w'])(?:all|some|these|those|such|other|more|most|both|several"
+    r"|(?:un)?archive|(?:re|un)?label|(?:un)?tag|move|file|sort|(?:un)?star|mark|flag"
+    r"|(?:re)?categori[sz]e|summari[sz]e|read|reread|check|search|scan|review|find|process"
+    r"|handle|open|delete|trash|remove|ignore|skip|list|count|collect|fetch|get|pull|filter"
+    r"|triage|clean|organi[sz]e|monitor|watch|track|analy[sz]e|parse|extract|forward|save"
+    r"|export|print|translate|keep|show|display|block|mute|snooze|prioriti[sz]e|clear|purge"
+    r"|go through)\s+$"
+)
+# … or before a relative clause ("email that came today", "email which is …")
+_EMAIL_RELATIVE_RE = re.compile(
+    r"e-?mail\s+(?:that|which)(?:'s\b|\s+(?:is|are|was|were|has|have|had|came|comes|come|arrived"
+    r"|arrives|arrive|got|gets|landed|lands|mentions?|mentioned|contains?|contained|needs?"
+    r"|needed|looks?|looked|seems?|seemed|matches|matched|includes?|included|refers?|referred"
+    r"|sent|received|bounced|failed|asks?|asked|says|said|i|we|you|they|he|she|isn't|aren't"
+    r"|wasn't|weren't|hasn't|haven't|doesn't|didn't|don't|will|would|should|could|can|might"
+    r"|may|must)\b)"
+)
+# EN-4 in a statement is no instruction: a subject before "email" ("I'll
+# email them myself", "who I should email", "Ana will email them") …
+_EMAIL_SUBJECT_TAIL_RE = re.compile(
+    r"(?:^|[^\w'])(?P<s>i|we|he|she|they|who|someone|somebody|everyone|everybody|nobody|people"
+    r"|[a-z]+)(?:'ll|'d|'ve|'m|'re)?\s+(?P<mod>(?:(?:will|would|should|could|can|must|might|may"
+    r"|shall|usually|always|often|never|also|just|then|still|already|normally|typically"
+    r"|sometimes|generally|ever|need to|needs to|have to|has to|had to|want to|wants to"
+    r"|wanted to|used to|plan to|plans to|going to|gonna|wanna|tried to|try to|forgot to|did|do"
+    r"|does|didn't|don't|doesn't)\s+){0,3})$"
+)
+_EMAIL_SUBJECTS = frozenset({
+    "i", "we", "he", "she", "they", "who", "someone", "somebody", "everyone", "everybody",
+    "nobody", "people",
+})
+# …after a NAME only with a modal ("Ana will email …"; "Please always email" is a request)
+_EMAIL_NAME_MOD_RE = re.compile(
+    r"(?:'ll|'d|will|would|should|could|can|must|might|may|usually|normally|typically|often"
+    r"|sometimes|already|still|needs to|has to|wants to|plans to)\b"
+)
+# … or asked of someone else ("Ana asked me to email her the deck")
+_EMAIL_ASKED_TAIL_RE = re.compile(
+    r"(?:^|[^\w])(?:ask\w*|told|tell\w*|want\w*|expect\w*|need\w*|requir\w*|like|wish\w*|get)"
+    r"\s+(?:me|us|him|her|them)\s+to\s+$"
+)
 # "email me and Ana …", "send me, ana@x.co …" — the user and someone else
 _ALSO_RE = re.compile(r"\s*(?:,|and|&|\+)\s*")
 
@@ -494,9 +628,14 @@ _VENUE_RE = re.compile(
 )
 
 
+_APOSTROPHES = str.maketrans({c: "'" for c in "’‘ʼ′＇`´"})
+
+
 def _normalize(text: str) -> tuple[str, str]:
     """``(cased, low)`` — diacritics folded, whitespace collapsed, same length."""
     s = str(text or "").replace("đ", "dj").replace("Đ", "Dj")
+    # Typographic apostrophes (phones and macOS type "Don’t") read as "'".
+    s = s.translate(_APOSTROPHES)
     s = unicodedata.normalize("NFKD", s)
     s = "".join(c for c in s if not unicodedata.combining(c))
     s = re.sub(r"\s+", lambda m: "\n" if "\n" in m.group(0) else " ", s).strip()
@@ -536,10 +675,95 @@ def _imperative_at(low: str, start: int, *, hr: bool = False, cased: str = "") -
 
 
 def _negated_at(low: str, start: int) -> bool:
-    """A negation ("don't send") or a reminder ("remind me to send") before *start*."""
-    head = low[:start]
-    return bool(_NEG_TAIL_RE.search(head) or _REMIND_TAIL_RE.search(head)
-                or _NEG_ASIDE_RE.search(head))
+    """A negation ("don't send") or a reminder ("remind me to send") before
+    *start* — or before the first verb of a list the verb at *start* is part
+    of ("don't draft, send or reply …", "never archive, move my emails")."""
+    return _negated_here(low, start) or _list_negated(low, start)
+
+
+def _negated_here(low: str, start: int) -> bool:
+    lo = max(0, start - _TAIL_WINDOW)
+    return bool(_NEG_TAIL_RE.search(low, lo, start) or _REMIND_TAIL_RE.search(low, lo, start)
+                or _NEG_ASIDE_RE.search(low, lo, start))
+
+
+def _list_negated(low: str, start: int) -> bool:
+    """Walk back from the verb at *start* over a coordinated list of mail
+    actions to its first verb; True when that one is negated or a reminder.
+
+    A bare verb joins with anything (", ", "and", "/"); one with an object
+    only with "or" / "nor" ("don't archive emails or move them"), in a serial
+    "A, B or C", or before an HR infinitive. After an object, ", " or "and"
+    starts a new instruction ("don't archive anything, label the invoices"),
+    and so does a contrast in the verb's own member right after a negated
+    one ("don't reply, archive them instead").
+
+    Every verb before it that can start its member is judged, nearest
+    first, so an earlier verb whose object runs over the negation ("read my
+    emails and under no circumstances archive, move …") never hides it; a
+    member whose object holds a negation is negated itself."""
+    infinitive = bool(_HR_INFINITIVE_RE.match(low, start))
+    contrast = not infinitive and _member_contrast(low, start)
+    todo, seen = [start], {start}
+    for step in range(8):
+        later = []
+        for pos in todo:
+            for m in _list_members_before(low, pos):
+                conj = (m.group("conj") or "").strip()
+                if not (m.group("comma") or conj):
+                    continue
+                if m.group("obj").strip() and conj not in _LIST_OR and not infinitive and not (
+                        m.group("comma") and not conj and _LIST_CLOSE_RE.match(low, pos)):
+                    continue
+                v = m.start("v")
+                if _LIST_NEG_WORD_RE.search(m.group("obj")) or _negated_here(low, v):
+                    if not (contrast and step == 0 and not conj):
+                        return True
+                elif v not in seen:
+                    seen.add(v)
+                    later.append(v)
+        todo = later
+    return False
+
+
+def _list_members_before(low: str, pos: int) -> Iterator[re.Match]:
+    """Each list member that ends at *pos* (a verb, its object and what joins
+    it to the next verb), the one whose verb is nearest *pos* first."""
+    verbs = list(_LIST_VERB_RE.finditer(low, max(0, pos - _TAIL_WINDOW), pos))
+    for vm in reversed(verbs):
+        m = _LIST_TAIL_RE.match(low, vm.start(), pos)
+        if m:
+            yield m
+
+
+def _member_contrast(low: str, start: int) -> bool:
+    """A contrast word ("instead", "rather", "radije") in the list member of
+    the verb at *start* — from the verb to the next "," or coordinator (an
+    address is one word: its "." ends nothing, "send it to ana@x.co instead")."""
+    vm = _WORD_RE.match(low, start)
+    a = vm.end() if vm else start
+    member = _ADDR_RE.sub(lambda m: "@" * len(m.group(0)), low[a:a + 80])
+    em = _LIST_MEMBER_END_RE.search(member)
+    return bool(_LIST_CONTRAST_RE.search(member, 0, em.start() if em else len(member)))
+
+
+def _email_verb_at(cased: str, low: str, start: int) -> bool:
+    """EN-4: is the "email" at *start* the verb of an instruction — wherever
+    it stands ("When it's ready email it to Ana", "Always email …", "— email
+    the top 5 to …") — and not the noun ("Archive email that is older …") or
+    a statement ("I'll email them myself", "Ana will email them")?"""
+    lo = max(0, start - _TAIL_WINDOW)
+    if (_DETERMINER_TAIL_RE.search(low, lo, start) or _EMAIL_NOUN_TAIL_RE.search(low, lo, start)
+            or _EMAIL_RELATIVE_RE.match(low, start)
+            or _EMAIL_ASKED_TAIL_RE.search(low, lo, start)):
+        return False
+    sm = _EMAIL_SUBJECT_TAIL_RE.search(low, lo, start)
+    if not sm or sm.group("s") == "you":
+        return True  # "You should email the report to Ana" asks the agent
+    if sm.group("s") in _EMAIL_SUBJECTS:
+        return False
+    after_name = low[sm.end("s"):start].lstrip()
+    return not (_EMAIL_NAME_MOD_RE.match(after_name) and _name_at(cased, sm.start("s")) >= 0)
 
 
 def _name_at(cased: str, pos: int) -> int:
@@ -685,7 +909,7 @@ def _scopes(text: str) -> list[str]:
     # EN-1 compose (any)
     for rx in (_EN_COMPOSE_RE, _EN_COMPOSE_FREE_RE):
         for m in rx.finditer(low):
-            if not _imperative_at(low, m.start()):
+            if not _imperative_at(low, m.start()) or _negated_at(low, m.start()):
                 continue
             if rx is _EN_COMPOSE_FREE_RE and _CHANNEL_RE.search(m.group(0)):
                 continue  # "write a WhatsApp reply to Ana"
@@ -698,12 +922,14 @@ def _scopes(text: str) -> list[str]:
         if _imperative_at(low, m.start()) and not _negated_at(low, m.start()):
             out.append(_ANY if _other_addressee(cased, low, m.end(), hr=False) else _SELF)
     for m in _EN_COMPOSE_TO_RE.finditer(low):
-        if _imperative_at(low, m.start()) and _name_at(cased, m.start("n")) >= 0:
+        if (_imperative_at(low, m.start()) and not _negated_at(low, m.start())
+                and _name_at(cased, m.start("n")) >= 0):
             out.append(_ANY)
 
     # EN-2 reply (any)
     for m in _EN_REPLY_RE.finditer(low):
-        if not _imperative_at(low, m.start()) or _other_channel(low, m.end()):
+        if (not _imperative_at(low, m.start()) or _negated_at(low, m.start())
+                or _other_channel(low, m.end())):
             continue
         if _mailobj_at(cased, low, m.end()) or (
             _EN_PRONOUN_OBJ_RE.match(low, m.end()) and _mail_in_sentence(low, m.start())
@@ -745,7 +971,7 @@ def _scopes(text: str) -> list[str]:
 
     # EN-4 email-as-verb
     for m in _EN_EMAIL_VERB_RE.finditer(low):
-        if _negated_at(low, m.start()) or _DETERMINER_TAIL_RE.search(low[:m.start()]):
+        if _negated_at(low, m.start()) or not _email_verb_at(cased, low, m.start()):
             continue
         if m.group("self") and not _also_someone(cased, low, m.end()):
             out.append(_SELF)
@@ -764,7 +990,8 @@ def _scopes(text: str) -> list[str]:
 
     # HR-1 compose — "napiši mi mail" is self unless someone else is named
     for m in _HR_COMPOSE_RE.finditer(low):
-        if not _imperative_at(low, m.start(), hr=True, cased=cased):
+        if (not _imperative_at(low, m.start(), hr=True, cased=cased)
+                or _negated_at(low, m.start())):
             continue
         if m.group("mail") or (
             _reply_noun_ok(cased, low, m.end(), hr=True, verb=m.start())
@@ -797,7 +1024,7 @@ def _scopes(text: str) -> list[str]:
     # HR-3 reply (any)
     for m in _HR_REPLY_RE.finditer(low):
         if (not _imperative_at(low, m.start(), hr=True, cased=cased)
-                or _other_channel(low, m.end())):
+                or _negated_at(low, m.start()) or _other_channel(low, m.end())):
             continue
         if _mailobj_at(cased, low, m.end()) or (
             _HR_PRONOUN_OBJ_RE.match(low, m.end()) and _mail_in_sentence(low, m.start())
@@ -827,11 +1054,24 @@ def narrower_intent(a: str, b: str) -> str:
     job may also reach an address its text names (:func:`check_mail_write`),
     so an agent-written task ("email me at x@evil.co …") can't add one the
     user never wrote.
+
+    Organizing mail (:func:`organize_intent`) needs both texts too. When
+    they don't both ask for an email but both ask to organize, the result is
+    the one without email intent (*a* first), so it never carries email
+    authority; a result that asks to organize when the other text doesn't
+    has its organize verbs blanked.
     """
     sa, sb = intent_scope(a), intent_scope(b)
     if sa == _NONE or sb == _NONE:
+        if organize_intent(a) and organize_intent(b):
+            return a if sa == _NONE else b
         return ""
     out, other = (b, a) if _RANK[sb] < _RANK[sa] else (a, b)
+    if organize_intent(out) and not organize_intent(other):
+        blanked = _without_organize(out)
+        if organize_intent(blanked) or intent_scope(blanked) != intent_scope(out):
+            return ""
+        out = blanked
     return _keep_shared_addresses(out, other) if intent_scope(out) == _SELF else out
 
 
@@ -847,7 +1087,8 @@ def _keep_shared_addresses(text: str, other: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-# Mailbox tools with create_draft / update_draft / send / send_draft actions.
+# Mailbox tools with create_draft / update_draft / send / send_draft actions
+# (and the MAILBOX_CHANGE_ACTIONS).
 DRAFTING_MAIL_TOOLS = frozenset({"google_mail", "microsoft_mail"})
 
 
@@ -966,6 +1207,409 @@ def check_notify_others(what: str) -> str | None:
         f"was started by {_label(a.kind)}, not by the user. Nothing was changed. Don't "
         "retry or work around this — tell the user what you would do and let them ask for it."
     )
+
+
+# ---------------------------------------------------------------------------
+# Mailbox changes (archive / move / labels / categories / new label or folder)
+# ---------------------------------------------------------------------------
+# Not email writes: nothing is sent, so there is no recipient check. An
+# automated turn may change the mailbox only when the job's own text asks to
+# organize email (:func:`organize_intent`) or a human vouched for it
+# ("allow"). Email intent never grants it, and organize intent never grants
+# email (:func:`intent_scope` knows none of these verbs).
+
+# EN verbs. Before ":" or a place noun it is a noun ("Archive folder: …"), and
+# "move on / forward" moves nothing.
+_ORG_EN_RE = re.compile(
+    r"\b(?:(?:un)?archive|(?:re|un)?label|(?:un)?tag|(?:re)?categori[sz]e|(?:un)?star"
+    r"|move(?!\s+(?:on|forward|ahead|along|over|up)\b))\b"
+    r"(?!\s*:|\s+(?:folders?|labels?|categor(?:y|ies)|tags?)\b)"
+)
+# …and verbs that organize only with somewhere to put it ("file / sort … into
+# X", "put / add … to the X folder", "mark … as read").
+_ORG_EN_DEST_RE = re.compile(
+    r"\b(?:(?:file|sort)(?=[^.!?;\n]{0,60}?\b(?:into|in|to|under)\s)"
+    r"|(?:put|add)(?=[^.!?;\n]{0,60}?\b(?:in|into|under|to)\s+(?:[\w'-]+\s+){0,3}?"
+    r"(?:folder|label|categor)\w*)"
+    r"|mark(?=[^.!?;\n]{0,60}?\bas\s+(?:un)?(?:read|important|starred)\b))\b"
+)
+# Creating, applying or removing a label / folder / category ("create a label
+# Invoices", "apply the Clients label to …"); *mod* is the word before the noun
+# ("a Gmail label").
+_ORG_EN_LABEL_RE = re.compile(
+    r"\b(?:create|make|add|set up|apply|assign|remove)\s+(?:(?:a|an|the|new|my|our)\s+){0,2}"
+    r"(?:(?P<mod>[\w'-]+)\s+)?(?:labels?|folders?|categor(?:y|ies)|tags?)\b"
+)
+# The mailbox as a whole ("organize my inbox") — not into a summary or a list.
+_ORG_WHOLE_TAIL = (
+    r"(?!\s+(?:into|in|as)\s+(?:(?:a|an|the|my)\s+)?(?:summary|list|report|digest|overview|table"
+    r"|doc\w*|sazet\w*|pregled\w*|popis\w*|izvjestaj\w*|tablic\w*|dokument\w*)\b)"
+)
+_ORG_EN_WHOLE_RE = re.compile(
+    r"\b(?:organi[sz]e|clean\s+up|tidy\s+up|declutter)\s+(?:(?:my|the|our)\s+)?"
+    r"(?:e-?mails?|mails?|mailbox|inbox|gmail|outlook)\b" + _ORG_WHOLE_TAIL
+)
+_ORG_HR_RE = re.compile(
+    r"\b(?:arhiviraj(?:te)?|arhivirati|premjesti(?:te)?|premjestaj(?:te)?|premjestiti"
+    r"|prebaci(?:te)?|prebacuj(?:te)?|prebaciti|pomakni(?:te)?|makni(?:te)?"
+    r"|kategoriziraj(?:te)?|kategorizirati)\b"
+    # "spremi / stavi … u mapu X" — only with the place it goes
+    r"|\b(?:spremi(?:te)?|stavi(?:te)?)\b(?=[^.!?;\n]{0,60}?\bu\s+(?:[\w'-]+\s+){0,2}?"
+    r"(?:map[aeiu]\b|folder\w*|label\w*|oznak\w*|kategorij\w*|inbox\w*|arhiv\w*))"
+)
+# …and, like EN sort / file / mark, verbs that organize only with somewhere
+# in the mailbox to put it: "razvrstaj / sortiraj … u mape / pod labelu X /
+# po mapama" (not "po hitnosti", "u 8 sati", "u tri skupine"), "označi … kao
+# pročitano / labelom X" (not "označi najvažnije").
+_ORG_HR_BOX = (
+    r"(?:map(?:a|e|i|u|ama)\b|folder\w*|label\w*|oznak\w*|arhiv\w*|inbox\w*|kategorij\w*"
+    r"|sanduc\w*|direktorij\w*|spam\w*)"
+)
+_ORG_HR_DEST_RE = re.compile(
+    r"\b(?:razvrstaj(?:te)?|razvrstavaj(?:te)?|razvrstati|sortiraj(?:te)?|sortirati)\b"
+    r"(?=[^.!?;\n]{0,60}?\b(?:(?:u|pod)\s+(?:[\w'-]+\s+){0,2}?" + _ORG_HR_BOX
+    + r"|po\s+(?:map|folder|label|oznak|kategorij)\w*))"
+    r"|\b(?:oznaci(?:te)?|oznacavaj(?:te)?|oznaciti)\b"
+    r"(?=[^.!?;\n]{0,60}?(?:\bkao\s+(?:ne)?(?:procitan\w*|vazn\w*|spam\w*|zvjezdic\w*)"
+    r"|\b(?:label|oznak|kategorij|zvjezdic|zastavic)\w*))"
+)
+_ORG_HR_LABEL_RE = re.compile(
+    r"\b(?:napravi(?:te)?|kreiraj(?:te)?|stvori(?:te)?|dodaj(?:te)?|ukloni(?:te)?|makni(?:te)?)\s+"
+    r"(?:(?P<mod>[\w'-]+)\s+)?(?:label\w*|oznak\w*|map[aeu]\b|folder\w*|kategorij\w*)"
+)
+_ORG_HR_WHOLE_RE = re.compile(
+    r"\b(?:organiziraj(?:te)?|pospremi(?:te)?|pocisti(?:te)?|sredi(?:te)?)\s+"
+    r"(?:(?:mi|moj|moje|svoj|svoje)\s+)?"
+    r"(?:inbox\w*|e-?mail\w*|mail\w*|mejl\w*|sanduc\w*|post[aeiu]\b)"
+    + _ORG_WHOLE_TAIL
+)
+# (regex, HR verb, kind): "verb" needs mail context and a mail-like object,
+# "label" mail context only, "whole" names the mailbox itself.
+_ORG_VERBS = (
+    (_ORG_EN_RE, False, "verb"), (_ORG_EN_DEST_RE, False, "verb"),
+    (_ORG_EN_LABEL_RE, False, "label"), (_ORG_EN_WHOLE_RE, False, "whole"),
+    (_ORG_HR_RE, True, "verb"), (_ORG_HR_DEST_RE, True, "verb"),
+    (_ORG_HR_LABEL_RE, True, "label"), (_ORG_HR_WHOLE_RE, True, "whole"),
+)
+# "use google_mail to archive …", "via outlook action=move" — naming the tool
+_ORG_TOOL_RE = re.compile(
+    r"\b(?:use|using|call|via|with|through)\s+(?:the\s+)?"
+    r"(?:google_mail|microsoft_mail|gmail|outlook)\b"
+    r"(?:\s+tool)?(?:\s+action)?[\s=:'\",]*(?:to\s+)?"
+    r"(?:(?:un)?archive|label|tag|move|file|sort|star|mark|categori[sz]e|organi[sz]e"
+    r"|create_label|create_folder|add_labels|remove_labels|add_categories|remove_categories)\b"
+)
+# "make sure to archive …", "always label …", "uvijek arhiviraj …" — still a request
+_ORG_ASK_TAIL_RE = re.compile(
+    r"(?:^|[^\w])(?P<w>make sure (?:to|you)|be sure to|remember to|don'?t forget to|always"
+    r"|uvijek|obavezno)\s+$"
+)
+# Mail context anywhere in the sentence ("newsletters", "in Gmail", an address)…
+_ORG_MAIL_RE = re.compile(
+    r"\b(?:e-?mail\w*|mail\w*|mejl\w*|gmail\w*|outlook\w*|inbox\w*|newsletter\w*|sanduc\w*)|"
+    + _ADDR
+)
+# …or, after the verb, a place mail goes or another mail word ("move receipts
+# into the Receipts folder", "arhiviraj poruke od Ane").
+_ORG_PLACE_RE = re.compile(
+    r"\b(?:folder\w*|label\w*|categor\w*|kategorij\w*|oznak\w*|map[aeiu]\b|messages?\b|poruk\w*"
+    r"|threads?\b|spam\b|junk\b|promotions\b)"
+)
+_ORG_FROM_RE = re.compile(r"\b(?:from|od)\s+")
+# What the verb acts on: up to four words before a preposition or the next clause.
+_ORG_OBJ_RE = re.compile(
+    r"(?:\s+(?!(?:from|to|into|in|under|on|as|with|by|for|at|of|than|that|which|who|and|or|then"
+    r"|but|od|u|na|s|sa|iz|za|kao|i|pa|ali)\b)[\w'@.-]*\w){0,4}"
+)
+_ORG_WORD_RE = re.compile(r"[\w'@.-]*\w")
+# Objects that aren't mail ("move the meeting", "archive the project files",
+# "label the chart axes", "pomakni sastanak", "spremi izvještaj u mapu").
+_ORG_NOT_MAIL_RE = re.compile(
+    r"(?:files?|documents?|docs?|attachments?|photos?|pictures?|images?|videos?|notes?|tasks?"
+    r"|todos?|cards?|tickets?|issues?|bugs?|prs?|commits?|branch(?:es)?|releases?|repos?"
+    r"|repositor(?:y|ies)|projects?|meetings?|events?|appointments?|calls?|deadlines?|slides?"
+    r"|sheets?|spreadsheets?|rows?|columns?|cells?|results?|data|charts?|axes|axis|points?"
+    r"|summary|summaries|reports?|expenses?|transactions?|contacts?|code|cursor|pages?|posts?"
+    r"|comments?|datotek\w*|dokument\w*|fajl\w*|privit\w*|slik\w*|fotografij\w*|biljesk\w*"
+    r"|zadat\w*|zadac\w*|sastan\w*|termin\w*|dogadja\w*|izvjestaj\w*|sazet\w*|tablic\w*"
+    r"|projekt\w*|prezentacij\w*)"
+)
+# Where an organize verb puts things that isn't the mailbox: another app
+# ("file them in Notion", "tag @ana in the #support Slack channel", "na
+# Slacku") or the answer itself ("label each in your reply", "move the urgent
+# ones to the top of the summary", "označi važne u sažetku") — even when mail
+# came earlier in the sentence. A mailbox place right after the noun keeps it
+# ("to the Reports folder", "u mapu Izvještaji").
+_ORG_APPS = (
+    r"(?:slack\w*|notion\w*|(?:google\s+)?drive\w*|dropbox\w*|onedrive\w*|sharepoint\w*"
+    r"|quickbooks\w*|xero\w*|zendesk\w*|intercom\w*|hubspot\w*|salesforce\w*|crm\w*|jira\w*"
+    r"|trello\w*|asana\w*|confluence\w*|airtable\w*|excel\b|(?:google\s+)?sheets?\b"
+    r"|spreadsheets?\b|todoist\w*|evernote\w*|obsidian\w*|clickup\w*|basecamp\w*|github\w*"
+    r"|gitlab\w*|whats\s?app\w*|telegram\w*|teams\b|discord\w*|viber\w*|signal\b|messenger\w*"
+    r"|sms\b|linkedin\w*|twitter\w*|calendar\w*|kalendar\w*|wiki\w*)"
+)
+_ORG_APP_WORD_RE = re.compile(_ORG_APPS)
+# What lives in another app, not in the mailbox ("the Slack thread")
+_ORG_APP_THING_RE = re.compile(
+    r"(?:threads?|channels?|messages?|conversations?|chats?|dms?|boards?|workspaces?)"
+)
+_ORG_ANSWER_EN = (
+    r"(?:summary|summaries|digest|recap|briefing|brief|report|reply|response|answer|list"
+    r"|table|overview|output|doc|document|notes|chat)"
+)
+_ORG_ANSWER_HR = (
+    r"(?:sazet\w*|izvjestaj\w*|pregled\w*|popis\w*|tablic\w*|odgovor\w*|dokument\w*"
+    r"|biljesk\w*|list[iu]\b)"
+)
+_ORG_PLACE_WORD = (
+    r"(?:folder\w*|label\w*|categor\w*|kategorij\w*|oznak\w*|map[aeiu]\b|inbox\w*|tags?\b"
+    r"|arhiv\w*)"
+)
+_ORG_DEST_DET = (
+    r"(?:the|a|an|my|our|your|their|his|her|its|this|that|these|those|each|every|any|some"
+    r"|today'?s|[\w-]+'s|(?:moj|tvoj|nas|vas|svoj|njegov|njezin|njihov)"
+    r"(?:a|e|i|u|o|oj|om|im|ima|eg|ega|em|emu)?|mom|tvom|svom|tom|ovom|taj|ovaj|tu|ovu|ta|ova)"
+)
+# A mailbox place right after the app / the answer noun keeps it in the
+# mailbox ("to the Slack alerts folder", "to the top of my inbox", "u mapu
+# Izvještaji") — not one in another phrase ("in the summary with a label",
+# "in Slack and the inbox").
+_ORG_NOT_PLACE_NEXT = (
+    rf"(?!\s+(?:of\s+)?(?:{_ORG_DEST_DET}\s+)?(?:(?!(?:{_ORG_PLACE_WORD}|and|or|but|then|with|as"
+    r"|of|in|into|on|to|at|by|for|from|not|i|ili|ali|pa|s|sa|kao|u|na|za|od|iz)\b)[\w'#@-]+\s+)?"
+    rf"{_ORG_PLACE_WORD})"
+)
+# Between the preposition that puts it there (in / into / to / onto / on /
+# under / u / na, or an app it goes through: "tag @ana via Slack") and the
+# app or the answer noun, any words but a mailbox place ("in our team's main
+# Slack channel", "in which Slack channel fits", "under a ticket with
+# Zendesk", "in a column of the summary", "to the end of the list"). Never a
+# source: what the mail came through ("emails that came through Zendesk",
+# "sent via HubSpot"), a list of the mailbox's own ("from people in my
+# contacts list"), or the mailbox the object sits in ("archive LinkedIn
+# messages in my inbox").
+_ORG_DEST_SKIP = (
+    rf"(?:(?!(?:{_ORG_PLACE_WORD}|(?:via|through|kroz|preko)\b))[\w'#@-]+(?:\.[\w-]+)*\s+)"
+)
+# Only an explicit list of the mailbox's own ("people in my contacts list",
+# "senders on my block list", "popis kontakata") isn't the answer — never an
+# "email / mail / recipients list".
+_ORG_OWN_LIST = (
+    r"(?!(?:[\w'-]+\s+)?(?:contacts?|(?:block(?:ed)?|safe|allow(?:ed)?|trusted)(?:\s+senders?)?"
+    rf"|mailing|distribution|vip|black|white)\s+lists?\b(?!\s+{_ORG_ANSWER_EN}\b)"
+    r"|(?:popis\w*|list[aeiu])\s+(?:kontak\w*|blokiran\w*|sigurn\w*|vip)\b)"
+)
+_ORG_ELSEWHERE_RE = re.compile(
+    r"\b(?P<prep>in|into|to|onto|on|under|inside|within|via|through|u|na|pod|unutar|kroz"
+    rf"|preko)\s+{_ORG_DEST_SKIP}{{0,4}}?{_ORG_APPS}{_ORG_NOT_PLACE_NEXT}"
+    rf"|\b(?:in|into|to|onto|on|at|under|inside|within)\s+{_ORG_DEST_SKIP}{{0,4}}?{_ORG_DEST_DET}"
+    rf"\s+{_ORG_OWN_LIST}(?:[\w'#@-]+\s+){{0,2}}?{_ORG_ANSWER_EN}\b{_ORG_NOT_PLACE_NEXT}"
+    rf"|\b(?:u|na|pod)\s+{_ORG_DEST_SKIP}{{0,3}}?{_ORG_OWN_LIST}{_ORG_ANSWER_HR}{_ORG_NOT_PLACE_NEXT}"
+    rf"|\b(?:to|at|on)\s+(?:the\s+)?(?:very\s+)?(?:top|bottom)\b{_ORG_NOT_PLACE_NEXT}"
+    r"|\bna\s+(?:sam\s+)?(?:vrh|dno|pocet)\w*"
+)
+# "emails that came through Zendesk", "sent via HubSpot": what the mail
+# arrived through describes it — it isn't where the verb puts it. Only an
+# arrival verb (not "posted / synced via …") right after the mail it
+# describes, with no preposition that puts it somewhere before it ("tag @ana
+# in an email sent via Slack", "tag them and have them sent via Slack").
+_ORG_SOURCE_PREPS = frozenset({"via", "through", "kroz", "preko"})
+_ORG_SOURCE_TAIL_RE = re.compile(
+    r"\b(?:e-?mail|mail|mejl|newsletter)\w*\s+(?:(?:that|which|koji|koje|koja|sto)\s+)?"
+    r"(?:(?:were|was|are|is|have\s+been|has\s+been|had\s+been|i|we|you|they|su|je|se)\s+)?"
+    r"(?:(?:sent|came|come|comes|coming|arrived|arrive|arrives|arriving|received|got|get|gets"
+    r"|delivered|stigl\w*|stize|stizu|poslan\w*|primljen\w*|dosl\w*|dolaz\w*)"
+    r"(?:\s+(?:in|out|over|automatically|directly|here|izravno|automatski))?"
+    r"|forwarded(?=\s+to\s+(?:me|us)\b))(?:\s+to\s+(?:me|us))?\s+$"
+)
+_ORG_PUT_PREP_RE = re.compile(r"\b(?:in|into|to|onto|on|under|inside|within|u|na|pod|unutar)\b")
+# The mailbox the verb's object sits in or comes from, right after it
+# ("LinkedIn messages in my inbox", "the Slack digests from my inbox"): mail,
+# not another app's ("the Slack channel, not the emails in my inbox").
+_ORG_IN_MAILBOX_RE = re.compile(
+    r"\s+(?:in|from|out\s+of|inside|within|u|iz)\s+(?:[\w'-]+\s+){0,2}?"
+    rf"(?:inbox\w*|mailbox\w*|gmail\w*|outlook\w*|sanduc\w*)(?!\s+{_ORG_ANSWER_EN}\b)"
+)
+# …looked for only up to the next instruction ("archive the newsletters and
+# list the rest in the summary": the summary is the list's).
+_ORG_NEXT_ACTION_RE = re.compile(
+    r"(?:,|\b(?:and|then|but|pa|i|te|onda|zatim)\b)\s+(?:(?:then|also|just|please|onda|zatim"
+    rf"|jos|i)\s+)?(?:{_LIST_VERB}|summari[sz]e|list|report|tell|notify|post|share|include"
+    r"|show|give|check|review|highlight|mention|note|compile|let|ping|text|message|log|record"
+    r"|save|export|copy|attach|upload|print|sazmi\w*|javi\w*|provjeri\w*|pregledaj\w*"
+    r"|napravi\w*|dodaj\w*|ukljuci\w*|navedi\w*|izlistaj\w*|reci\w*|obavijesti\w*)\b"
+)
+
+
+def _org_imperative(cased: str, low: str, start: int, *, hr: bool) -> bool:
+    """:func:`_imperative_at`, or after "make sure to" / "always" in one."""
+    if _imperative_at(low, start, hr=hr, cased=cased if hr else ""):
+        return True
+    t = _ORG_ASK_TAIL_RE.search(low, 0, start)
+    return bool(t) and _imperative_at(low, t.start("w"), hr=hr, cased=cased if hr else "")
+
+
+def _org_not_mail(after: str, *, hr: bool) -> bool:
+    """Is the verb's object something other than mail? The head noun decides
+    (EN last word, HR first); a non-mail word with no mail word counts too,
+    and so does another app's ("archive the Slack thread") — unless the
+    mailbox comes right after it ("archive LinkedIn messages in my inbox")."""
+    om = _ORG_OBJ_RE.match(after)
+    words = _ORG_WORD_RE.findall(om.group(0)) if om else []
+    if any(_ORG_APP_WORD_RE.fullmatch(w) and _ORG_APP_THING_RE.fullmatch(nxt)
+           for w, nxt in zip(words, words[1:])) and not any(_ORG_MAIL_RE.search(w) for w in words):
+        if not (om and _ORG_IN_MAILBOX_RE.match(after, om.end())):
+            return True  # "the Slack thread" (but "the GitHub notifications" are mail)
+    bad = [w for w in words if _ORG_NOT_MAIL_RE.fullmatch(w)]
+    if not bad:
+        return False
+    head = words[0] if hr else words[-1]
+    return head in bad or not any(_ORG_MAIL_RE.search(w) for w in words)
+
+
+def _org_elsewhere(low: str, pos: int) -> bool:
+    """Does the organize verb ending at *pos* put things somewhere that isn't
+    the mailbox — another app or the answer ("file them in Notion", "label
+    each in your reply")? Looked for up to the next instruction."""
+    _, b = _clause_window(low, pos)
+    nm = _ORG_NEXT_ACTION_RE.search(low, pos, b)
+    p, end = pos, (nm.start() if nm else b)
+    while True:
+        em = _ORG_ELSEWHERE_RE.search(low, p, end)
+        if not em:
+            return False
+        if em.group("prep") not in _ORG_SOURCE_PREPS:
+            return True
+        sm = _ORG_SOURCE_TAIL_RE.search(low, max(pos, em.start() - 80), em.start())
+        if not sm or _ORG_PUT_PREP_RE.search(low, pos, sm.start()):
+            return True
+        # "emails that came through Zendesk" — but "… sent via Stripe into
+        # Xero" still goes somewhere
+        p = em.end("prep")
+
+
+def _org_mail_context(cased: str, low: str, m: re.Match, *, hr: bool, kind: str) -> bool:
+    """Is the organize verb *m* about email? Mail context in its sentence (the
+    verb and the noun it creates not counted), no other channel, and — for a
+    plain verb — an object that isn't a file, a meeting, a report …"""
+    a, _ = _sentence(low, m.start())
+    _, b = _clause_window(low, m.end())
+    before, after = low[a:m.start()], low[m.end():b]
+    mod = m.groupdict().get("mod") or ""
+    mail = bool(_ORG_MAIL_RE.search(before) or _ORG_MAIL_RE.search(mod)
+                or _ORG_MAIL_RE.search(after))
+    if not mail and _CHANNEL_RE.search(low, a, b):
+        return False  # "archive the Slack thread"
+    if kind == "verb" and _org_not_mail(after, hr=hr):
+        return False
+    if mail or _ORG_PLACE_RE.search(after):
+        return True
+    return any(
+        _addressee_at(cased, low, m.end() + f.end(), mail_ctx=False) >= 0
+        for f in _ORG_FROM_RE.finditer(after)
+    )
+
+
+def organize_intent(text: str) -> bool:
+    """Does *text* itself ask to archive, move, label / tag / categorize email,
+    or to create a mail label or folder (EN + HR)? The verb must be in
+    imperative position, not negated or a reminder (nor in a negated list,
+    "don't archive, move or label …"), with mail in the same sentence and
+    nothing put outside the mailbox ("… in Notion", "… in the summary") — or
+    name the mail tool ("use gmail to archive …").
+
+    Independent of :func:`intent_scope`: asking to organize mail never asks
+    for an email, and asking for an email never asks to organize."""
+    cased, low = _normalize(text)
+    if not low:
+        return False
+    for m in _ORG_TOOL_RE.finditer(low):
+        if _org_imperative(cased, low, m.start(), hr=False) and not _negated_at(low, m.start()):
+            return True
+    for rx, hr, kind in _ORG_VERBS:
+        for m in rx.finditer(low):
+            if not _org_imperative(cased, low, m.start(), hr=hr) or _negated_at(low, m.start()):
+                continue
+            if _org_elsewhere(low, m.end()):
+                continue  # "… in Notion", "… in the summary", "to the top"
+            if kind == "whole" or _org_mail_context(cased, low, m, hr=hr, kind=kind):
+                return True
+    return False
+
+
+def _without_organize(text: str) -> str:
+    """*text* (diacritics folded) with its organize verbs blanked: a judged
+    text that keeps its email intent but asks to organize nothing."""
+    cased, low = _normalize(text)
+    rxs = [rx for rx, _hr, _kind in _ORG_VERBS] + [_ORG_TOOL_RE]
+    out, last = [], 0
+    for s, e in sorted(m.span() for rx in rxs for m in rx.finditer(low)):
+        if s < last:
+            continue
+        out.append(cased[last:s] + "[-]")
+        last = e
+    return "".join(out) + cased[last:]
+
+
+def is_mailbox_change(tool: str, action: str | None) -> bool:
+    return tool in DRAFTING_MAIL_TOOLS and action in MAILBOX_CHANGE_ACTIONS
+
+
+def _mailbox_verb(action: str | None) -> str:
+    return {
+        "archive": "archived", "move": "moved",
+        "add_labels": "labeled", "add_categories": "categorized",
+        "create_label": "created", "create_folder": "created",
+    }.get(str(action or ""), "changed")
+
+
+def mailbox_refusal_text(kind: str, verb: str) -> str:
+    """The refusal for an automated turn that may not change the mailbox;
+    like :func:`refusal_text`, what to tell the user depends on the kind."""
+    head = (
+        f"{MAIL_REFUSAL_TAG} Not {verb}: this turn was started by {_label(kind)}, not by "
+        "the user, and its instructions don't ask to organize email (archive, move, label "
+        "or categorize). Nothing in the mailbox was changed. Don't retry or work around this "
+        "(no other action or tool) — "
+    )
+    if kind in _TRIAGE_KINDS:
+        return head + (
+            "tell the user which emails you would archive, move or label, and offer to do it "
+            "when they ask."
+        )
+    if kind in _JOB_KINDS:
+        return head + (
+            "tell the user that this job's text doesn't ask to organize email, so nothing was "
+            "changed. If they want it to, they can edit the job to say so explicitly, e.g. "
+            "'archive newsletters from Substack' or 'premjesti račune u mapu Računi'."
+        )
+    if kind in _PEER_KINDS:
+        return head + (
+            "tell the user nothing was changed because the request didn't explicitly ask for "
+            "it. They can ask for it in their own words, e.g. 'archive the newsletters from "
+            "Substack'."
+        )
+    return head + (
+        "say in your answer that nothing in the mailbox was changed because this run wasn't "
+        "asked to change it."
+    )
+
+
+def check_mailbox_change(tool: str, action: str | None) -> str | None:
+    """``None`` to proceed, else the refusal for this mailbox change.
+
+    Like :func:`check_mail_write` without recipients: a human turn and an
+    ``allow`` turn proceed, ``deny`` refuses, ``intent`` needs the job's own
+    text to ask to organize email (:func:`organize_intent`) — email intent
+    alone (even "email me the summary") does not count."""
+    if not is_mailbox_change(tool, action):
+        return None
+    a = current()
+    if a.mode == "human" or a.mail_write == "allow":
+        return None
+    if a.mail_write == "intent" and organize_intent(a.job_text):
+        return None
+    return mailbox_refusal_text(a.kind, _mailbox_verb(action))
 
 
 def job_addresses(text: str) -> set[str]:

@@ -130,3 +130,121 @@ async def test_non_mail_run_never_gets_email_allowed(store):
 
     assert await BatDriver(store, attempt_runner=runner).drive(rid) == "done"
     assert not (await store.get_run(rid))["config"].get("email_allowed")
+
+
+# ── organizing mail: its own grant, never email ────────────────────────
+
+def test_bat_automation_frames():
+    task = "Archive the newsletters"
+    deny = bat_routes._bat_automation({"task": task, "config": {}})
+    assert deny == {"kind": "bat", "job_text": task, "mail_write": "deny"}
+    allow = bat_routes._bat_automation(
+        {"task": task, "config": {"email_allowed": True, "organize_allowed": True}})
+    assert allow["mail_write"] == "allow"
+    org = bat_routes._bat_automation(
+        {"task": task, "config": {"organize_allowed": True, "organize_text": "Archive them\nx"}})
+    assert org == {"kind": "bat", "job_text": "Archive them\nx", "mail_write": "intent"}
+
+
+async def _drive_approved(store, task, steps):
+    rid = f"bat_{uuid.uuid4().hex[:8]}"
+    await store.create_run(run_id=rid, owner_id="u1", title="t", task=task,
+                           config={"steps": steps}, status="planning")
+    frames = []
+
+    async def runner(run, step):
+        frames.append(bat_routes._bat_automation(run))
+        return {"ok": True, "output": "ok"}
+
+    drv = BatDriver(store, attempt_runner=runner)
+    assert await drv.drive(rid) == "awaiting_plan"
+    ask = await store.latest_open_ask(rid)
+    await human_ask.answer(store, ask["id"], "approve")
+    assert await drv.drive(rid) == "done"
+    return ask, (await store.get_run(rid))["config"], frames
+
+
+async def test_approving_an_organize_plan_lets_it_organize_but_not_write_email(store):
+    ask, cfg, frames = await _drive_approved(
+        store, "Archive the Substack newsletters and label the receipts Receipts",
+        ["Find the Substack newsletters", "Archive them", "Label receipts"])
+    # The owner was asked about organizing — not about sending email.
+    assert "organize email" in ask["question"] and "send email" not in ask["question"]
+    assert cfg["gate_reason"] == "organize email"
+    assert cfg["organize_allowed"] is True and not cfg.get("email_allowed")
+    assert frames and all(f["mail_write"] == "intent" for f in frames)
+    # What the worker binds from that frame: organizing yes, email no.
+    with ma.bound(ma.from_wire(frames[0], default_kind="bat")):
+        for tool, action in (("google_mail", "archive"), ("google_mail", "add_labels"),
+                             ("microsoft_mail", "move")):
+            assert ma.check_mailbox_change(tool, action) is None, (tool, action)
+        for action in ("create_draft", "send"):
+            assert ma.is_refusal(ma.check_mail_write("google_mail", action))
+        assert ma.is_refusal(ma.check_mail_write("send_mail", None))
+
+
+async def test_an_organize_step_that_refers_back_is_gated_and_honoured(store):
+    # "Archive the ones you summarized" names no mail itself — the task does.
+    ask, cfg, frames = await _drive_approved(
+        store, "Compile a digest of the newsletters I received this week",
+        ["Read newsletters", "Archive the ones you summarized"])
+    assert cfg["gate_reason"] == "organize email" and "organize email" in ask["question"]
+    assert cfg["organize_allowed"] is True and not cfg.get("email_allowed")
+    assert frames and all(f["mail_write"] == "intent" for f in frames)
+    # The approval isn't empty: the worker's guard lets it archive, not write.
+    with ma.bound(ma.from_wire(frames[0], default_kind="bat")):
+        assert ma.check_mailbox_change("google_mail", "archive") is None
+        assert ma.check_mailbox_change("microsoft_mail", "move") is None
+        assert ma.is_refusal(ma.check_mail_write("google_mail", "create_draft"))
+
+
+async def test_approving_organize_and_email_keeps_the_email_grant(store):
+    _, cfg, frames = await _drive_approved(
+        store, "Archive the newsletters in my inbox and email Ana the list", ["archive", "email Ana"])
+    assert cfg["gate_reason"] == "send email, organize email"
+    assert cfg["email_allowed"] is True and cfg["organize_allowed"] is True
+    assert frames and all(f["mail_write"] == "allow" for f in frames)
+
+
+async def test_an_ungated_run_never_asked_to_organize(store):
+    # Deny is only for a run whose own text doesn't ask to organize — so the
+    # refusal ("its instructions don't ask to organize email") is true.
+    rid = f"bat_{uuid.uuid4().hex[:8]}"
+    task = "summarize the research and write it up"
+    await store.create_run(run_id=rid, owner_id="u1", title="t", task=task,
+                           config={"steps": ["read", "write"]}, status="planning")
+    frames = []
+
+    async def runner(run, step):
+        frames.append(bat_routes._bat_automation(run))
+        return {"ok": True, "output": "ok"}
+
+    assert await BatDriver(store, attempt_runner=runner).drive(rid) == "done"
+    assert frames and all(f["mail_write"] == "deny" for f in frames)
+    assert not ma.organize_intent(task)
+    with ma.bound(ma.from_wire(frames[0], default_kind="bat")):
+        assert ma.check_mailbox_change("google_mail", "archive").startswith(ma.MAIL_REFUSAL_TAG)
+
+
+def test_what_an_organize_grant_hands_a_child_run():
+    # The frame isn't inherited, but its job_text is a child's intent source:
+    # an agent-made cron job that asks to organize too may organize when it
+    # fires (as under allow) — never write email; under deny nothing carries.
+    task = "Archive the Substack newsletters and label the receipts Receipts"
+    cron = "Every morning archive the Substack newsletters in Gmail"
+    org = {"task": task, "config": {"organize_allowed": True,
+                                    "organize_text": bat_routes._organize_text(task, [])}}
+    for run, carried in ((org, True), ({"task": task, "config": {}}, False),
+                         ({"task": task, "config": {"email_allowed": True}}, True)):
+        with ma.bound(ma.from_wire(bat_routes._bat_automation(run), default_kind="bat")):
+            src = ma.intent_source_text(None)
+        assert bool(src) is carried
+        job = ma.cron_job_text({"text": cron, "author": "agent", "mail_intent_text": src})
+        with ma.bound(ma.automated("cron", job, "intent")):
+            assert (ma.check_mailbox_change("google_mail", "archive") is None) is carried
+            assert ma.is_refusal(ma.check_mail_write("google_mail", "create_draft"))
+    # …and a child that doesn't ask to organize gets nothing from the grant.
+    job = ma.cron_job_text({"text": "Every morning summarize the newsletters", "author": "agent",
+                            "mail_intent_text": org["config"]["organize_text"]})
+    with ma.bound(ma.automated("cron", job, "intent")):
+        assert ma.is_refusal(ma.check_mailbox_change("google_mail", "archive"))

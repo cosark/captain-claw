@@ -37,6 +37,11 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+# Only its pure judges (organize_intent / explicit_mail_intent: a string in, a
+# bool out) and JOB_TEXT_MAX — safe in Flight Deck: the plan gate binds, reads
+# and changes no mail-authority context state; it only judges the plan the
+# way Bat's workers' own guard will.
+from captain_claw import mail_authority
 from captain_claw.flight_deck.auth import get_current_user
 
 from captain_claw.flight_deck import bat_loop, human_ask
@@ -101,15 +106,120 @@ _GATE_PATTERNS: tuple[tuple[str, str], ...] = (
     ("create an account", r"\b(sign ?up|create an? (new )?account|register (for|an?|with)|open an account|make an account)\b"),
 )
 _GATE_COMPILED = tuple((label, re.compile(rx, re.IGNORECASE)) for label, rx in _GATE_PATTERNS)
+# Archiving / moving / labeling the owner's mail is its own grant: approving it
+# never lets the run write email (see _bat_automation).
+_ORGANIZE_GATE = "organize email"
+
+
+def _plan_text(task: str, steps: list[dict]) -> str:
+    """The task and its step titles — the plan the owner is asked to approve."""
+    return (task or "") + "\n" + "\n".join(s.get("title", "") for s in (steps or []))
+
+
+# The plan's sentences: its lines, and what ends a sentence in one.
+_PLAN_BREAK_RE = re.compile(r"[.!?;]+(?=\s|$)|\n")
+# A sentence that names nothing of its own to act on ("Archive them", "Archive
+# the ones you summarized", "arhiviraj ostale"): it means what the plan named
+# before it.
+_BACK_REF_RE = re.compile(
+    r"\b(?:them|it|those|these|the\s+(?:ones?|rest|others)|each|both|all\s+of\s+them"
+    r"|ih|njih|ga|ostal\w*|preostal\w*)\b",
+    re.IGNORECASE,
+)
+# How many sentences back a back-referring one may reach for what it means —
+# it keeps the gate linear in a long, pronoun-heavy plan.
+_BACK_REF_SPAN = 5
+
+
+def _back_ref_readings(plan: str, room: int = mail_authority.JOB_TEXT_MAX) -> list[str]:
+    """Each plan sentence that refers back ("Archive the ones you summarized"),
+    read as one sentence with what it refers to — the sentences before it,
+    back to the nearest one that names something ("Compile a digest of the
+    newsletters I received this week - Archive the ones you summarized") —
+    when that reading asks to organize email and the sentence alone doesn't.
+    A step that names its own object ("Move the submit button to the footer"
+    after "Build a newsletter signup form") is never read with another, and
+    nothing is read past that nearest naming sentence — nor more than
+    :data:`_BACK_REF_SPAN` sentences back. Readings stop once they would fill
+    *room* characters (the job text has no space for more)."""
+    sents = [t.strip() for t in _PLAN_BREAK_RE.split(plan) if t.strip()]
+    out = []
+    for i in range(1, len(sents)):
+        if room <= 0:
+            break
+        if not _BACK_REF_RE.search(sents[i]) or mail_authority.organize_intent(sents[i]):
+            continue
+        j = i - 1
+        while j > max(0, i - _BACK_REF_SPAN) and _BACK_REF_RE.search(sents[j]):
+            j -= 1
+        reading = " - ".join(sents[j:i + 1])
+        if mail_authority.organize_intent(reading):
+            out.append(reading)
+            room -= len(reading) + 1
+    return out
+
+
+def _organize_text(task: str, steps: list[dict]) -> str:
+    """The plan as an organize-only run's workers get it (``job_text``), cut
+    where their mail guard cuts it — so the gate judges what they will.
+
+    The guard reads a sentence at a time, and a step is part of the whole
+    plan: so the plan is followed by its back-referring steps read with what
+    they refer to (:func:`_back_ref_readings`)."""
+    plan = _plan_text(task, steps)
+    room = mail_authority.JOB_TEXT_MAX - len(plan) - 1
+    readings = _back_ref_readings(plan, room) if room > 0 else []
+    return "\n".join([plan, *readings])[:mail_authority.JOB_TEXT_MAX]
 
 
 def plan_needs_gate(task: str, steps: list[dict]) -> tuple[bool, str]:
     """True + a reason when the task/plan would act in the world in a way the
-    owner asked to approve first (mail / money / account creation). Deterministic
-    keyword scan over the task and the step titles."""
-    blob = (task or "") + "\n" + "\n".join(s.get("title", "") for s in (steps or []))
+    owner asked to approve first (mail / money / account creation / organizing
+    mail). Deterministic keyword scan over the task and the step titles.
+
+    Organizing mail is judged by the workers' own mail guard (mail_authority —
+    stdlib-only) on the text they would get — the whole plan, a step that
+    refers back read with what it refers to (:func:`_organize_text`): every
+    plan it would let organize is offered for approval, so its refusal in an
+    unapproved run is true. An
+    approved organize-only plan runs under that guard's ``intent`` mode, which
+    would also honour an email ask the keywords above miss ("pošalji Ani
+    izvještaj mailom") — so such a plan is gated as mail too."""
+    blob = _plan_text(task, steps)
     hits = [label for label, rx in _GATE_COMPILED if rx.search(blob)]
+    text = _organize_text(task, steps)
+    if mail_authority.organize_intent(text):
+        if "send email" not in hits and mail_authority.explicit_mail_intent(text):
+            hits.insert(0, "send email")
+        hits.append(_ORGANIZE_GATE)
     return (bool(hits), ", ".join(hits))
+
+
+def _bat_automation(run: dict) -> dict:
+    """The automation frame for one Bat step — Bat's own dispatch.
+
+    A child run the worker starts (a peer or Flight Deck hand-off, an
+    agent-made cron job) doesn't inherit the frame, but under ``allow`` and
+    ``intent`` its ``job_text`` is that child's intent source
+    (mail_authority.intent_source_text): the child may write or organize
+    mail only where its own text asks too (narrower_intent). So a cron job
+    "every morning archive the Substack newsletters", made by a worker under
+    an approved organize plan, may archive when it fires — as under
+    ``allow``. Under ``deny`` nothing is carried.
+
+    Run-scoped email exception (Phase 5): ``allow`` ONLY when the owner
+    approved a mail plan for THIS run. An approved organize-only plan may
+    archive / move / label but not write email: ``intent``, judged on the plan
+    the owner approved — it asks to organize, and (the gate made sure) for no
+    email. Otherwise deny (PR #56 default)."""
+    cfg = run.get("config") or {}
+    task = str(run.get("task", ""))
+    if cfg.get("email_allowed"):
+        return {"kind": "bat", "job_text": task[:500], "mail_write": "allow"}
+    if cfg.get("organize_allowed"):
+        return {"kind": "bat", "job_text": str(cfg.get("organize_text") or ""),
+                "mail_write": "intent"}
+    return {"kind": "bat", "job_text": task[:500], "mail_write": "deny"}
 
 
 _APPROVE_WORDS = {"approve", "approved", "go", "yes", "ok", "okay", "proceed", "run", "do it"}
@@ -633,12 +743,9 @@ async def _bat_attempt(run: dict, step: dict) -> dict:
         _run_sid.set(sid)
         _RUN_USAGE.setdefault(sid, [])
         before = len(_RUN_USAGE[sid])
-        # Run-scoped email exception (Phase 5): grant mail-write ONLY when the
-        # owner approved a mail plan for THIS run. Otherwise deny (PR #56 default).
-        # This frame is Bat's own dispatch; it is never carried into a child run.
-        email_allowed = bool((run.get("config") or {}).get("email_allowed"))
-        automation = {"kind": "bat", "job_text": str(run.get("task", ""))[:500],
-                      "mail_write": "allow" if email_allowed else "deny"}
+        # Mail-write / organize grants come only from the owner's approval of
+        # THIS run's plan (see _bat_automation).
+        automation = _bat_automation(run)
         res = await _dispatch_one(
             port, auth, prompt, _STEP_TIMEOUT_S,
             on_action=_on_action, agent_name=step["step_key"], automation=automation,
@@ -791,9 +898,9 @@ async def _gate_check(store, run: dict) -> str:
     """Human-in-the-loop gate (bat_loop seam). Returns proceed|wait|cancelled|error.
 
     Two jobs: (1) the START GATE — a fresh run whose plan would send mail, spend,
-    or create an account pauses (awaiting_plan) for owner approval; (2) RESUME —
-    an awaiting_* run proceeds once its ask is answered, is cancelled if the plan
-    is rejected, and errors if the ask expired."""
+    create an account or organize mail pauses (awaiting_plan) for owner
+    approval; (2) RESUME — an awaiting_* run proceeds once its ask is answered,
+    is cancelled if the plan is rejected, and errors if the ask expired."""
     from captain_claw.flight_deck import human_ask
     run_id = run["id"]
     status = run["status"]
@@ -827,8 +934,11 @@ async def _gate_check(store, run: dict) -> str:
                     cfg["spend_allowed"] = True
                 if "create an account" in reason:
                     cfg["account_allowed"] = True
+                if _ORGANIZE_GATE in reason:
+                    cfg["organize_allowed"] = True
                 await store.set_config(run_id, cfg)
                 grants = [g for g, on in (("email", cfg.get("email_allowed")),
+                                          ("organize", cfg.get("organize_allowed")),
                                           ("spend", cfg.get("spend_allowed")),
                                           ("accounts", cfg.get("account_allowed"))) if on]
                 await store.append_event(
@@ -876,9 +986,12 @@ async def _gate_check(store, run: dict) -> str:
     if not needs:
         return "proceed"
     # Remember what was gated so approval can grant the matching capability
-    # (e.g. 'send email' → the run-scoped email exception).
+    # (e.g. 'send email' → the run-scoped email exception), and for organizing
+    # the plan text the approval covers (the workers' job_text).
     cfg = dict(run.get("config") or {})
     cfg["gate_reason"] = reason
+    if _ORGANIZE_GATE in reason:
+        cfg["organize_text"] = _organize_text(run.get("task", ""), steps)
     await store.set_config(run_id, cfg)
     existing = await store.latest_open_ask(run_id)
     if not (existing and existing["kind"] == "plan_approval"):

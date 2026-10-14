@@ -359,7 +359,7 @@ class GoogleMailToolConfig(BaseModel):
 
 
 class MicrosoftMailToolConfig(BaseModel):
-    """Outlook (microsoft_mail) tool. It drafts only — no send settings."""
+    """Outlook (microsoft_mail) tool. It drafts and organizes mail — no send settings."""
 
     # create_draft refuses an email already in Drafts, or in Sent Items in the
     # last N days, to the same recipient with the same subject — unless the
@@ -1394,6 +1394,10 @@ class GoogleOAuthConfig(BaseModel):
         # google_mail tool only sends when tools.google_mail.allow_send is on
         # (standalone) or the owner enabled sending in Flight Deck.
         "https://www.googleapis.com/auth/gmail.compose",
+        # Gmail modify — organizing (archive / move / add_labels /
+        # remove_labels / create_label). Never deletes or trashes mail; an
+        # automated turn organizes only when its own text asks to.
+        "https://www.googleapis.com/auth/gmail.modify",
         "openid",
         "email",
     ])

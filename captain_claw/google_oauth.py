@@ -128,7 +128,10 @@ SCOPE_CATALOG: list[dict[str, str]] = [
     {
         "scope": "https://www.googleapis.com/auth/gmail.modify",
         "label": "Gmail (read + modify)",
-        "description": "Read + label / archive / trash. Restricted scope.",
+        "description": (
+            "Read, draft and organize mail — google_mail needs it to archive, "
+            "label and move email. Restricted scope."
+        ),
         "sensitivity": "restricted",
         "group": "gmail",
     },

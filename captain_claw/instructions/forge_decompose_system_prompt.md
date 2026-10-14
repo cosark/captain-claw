@@ -106,7 +106,7 @@ Agents have access to these Captain Claw tools. Select the most relevant ones pe
 - `send_mail` — Send emails via SMTP/Mailgun/SendGrid
 - `google_drive` — Google Drive/Docs/Sheets/Slides: list, search, read, info, download, upload, create, update; edits existing Google Sheets/Docs IN PLACE (sheet_read/sheet_update/sheet_append/sheet_clear, doc_read/doc_replace_text/doc_append_text/doc_insert_text)
 - `google_calendar` — Google Calendar operations (list, create, update, delete events)
-- `google_mail` — Gmail: read (list, search, threads), drafts; send only when the user has enabled sending
+- `google_mail` — Gmail: read (list, search, threads), drafts, organize (archive, label, move); send only when the user has enabled sending
 
 ### Media & Vision
 - `image_gen` — Generate images from text prompts
