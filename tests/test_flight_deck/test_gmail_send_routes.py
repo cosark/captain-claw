@@ -173,7 +173,7 @@ class TestPolicyRoutes:
         r = _client().get("/fd/google/gmail-send", headers=_bearer(ALICE))
         assert r.status_code == 200
         assert r.json() == {"enabled": False, "allowed_recipients": [], "daily_limit": 50,
-                            "deck_disabled": False, "sent_last_24h": 0}
+                            "signature": "", "deck_disabled": False, "sent_last_24h": 0}
 
     async def test_needs_a_signed_in_user(self, db):
         c = _client()
@@ -202,7 +202,7 @@ class TestPolicyRoutes:
         })
         assert r.status_code == 200, r.text
         want = {"enabled": True, "allowed_recipients": ["alice@ok.com", "@ok.org", "@corp.io"],
-                "daily_limit": 5, "deck_disabled": False, "sent_last_24h": 0}
+                "daily_limit": 5, "signature": "", "deck_disabled": False, "sent_last_24h": 0}
         assert r.json() == want
         assert c.get("/fd/google/gmail-send", headers=_bearer(ALICE)).json() == want
         # A partial update leaves the rest alone.
@@ -944,3 +944,75 @@ class TestSendAttachments:
         assert r.json()["attachments"] == [{"filename": "old.pdf", "size": 20}]
         (row,) = await db.list_gmail_sends(ALICE)
         assert json.loads(row["attachments"]) == ["old.pdf"]
+
+
+# ── the agentic signature ────────────────────────────────────────────
+
+
+SIG = "Sent by Alice's assistant\nAlice & Co."
+
+
+class TestAgenticSignature:
+    async def test_put_sets_trims_and_clears_without_touching_the_policy(self, db):
+        from captain_claw import mail_signature
+        from captain_claw.flight_deck.settings_routes import _server_owned
+
+        c = _client()
+        r = c.put("/fd/google/gmail-send", headers=_bearer(ALICE),
+                  json={"signature": "  \r\n" + SIG.replace("\n", "  \r\n") + "\n\n"})
+        assert r.status_code == 200, r.text
+        assert r.json()["signature"] == SIG
+        assert r.json()["enabled"] is False  # sending stays as it was
+        assert c.get("/fd/google/gmail-send", headers=_bearer(ALICE)).json()["signature"] == SIG
+        assert c.get("/fd/google/gmail-send", headers=_bearer(BOB)).json()["signature"] == ""
+        # A policy change leaves the signature; "" clears it.
+        assert c.put("/fd/google/gmail-send", headers=_bearer(ALICE),
+                     json={"enabled": True}).json()["signature"] == SIG
+        r = c.put("/fd/google/gmail-send", headers=_bearer(ALICE), json={"signature": ""})
+        assert r.json()["signature"] == "" and r.json()["enabled"] is True
+        assert _server_owned(mail_signature.GOOGLE_KEY)
+
+    @pytest.mark.parametrize("value", [42, ["a"], "x" * 1001])
+    async def test_put_rejects_a_bad_signature(self, db, value):
+        r = _client().put("/fd/google/gmail-send", headers=_bearer(ALICE),
+                          json={"signature": value, "enabled": True})
+        assert r.status_code == 400 and "signature" in r.json()["detail"]
+        assert (await gs.load_gmail_send_policy(db, ALICE))["enabled"] is False
+
+    async def test_agent_status_carries_it_only_when_set(self, db, agents):
+        c = _client()
+        assert "mail_signature" not in c.get("/fd/google/agent_status", headers=_agent()).json()
+        c.put("/fd/google/gmail-send", headers=_bearer(ALICE), json={"signature": SIG})
+        assert c.get("/fd/google/agent_status", headers=_agent()).json()["mail_signature"] == SIG
+        # Bob's agent gets Bob's (none).
+        assert "mail_signature" not in c.get(
+            "/fd/google/agent_status", headers=_agent("tok-bob")).json()
+
+    async def test_a_composed_send_ends_with_it_once(self, db, agents, gmail):
+        await gr._store_tokens(db, ALICE, _tokens("alice-access"))
+        await _enable(db)
+        c = _client()
+        c.put("/fd/google/gmail-send", headers=_bearer(ALICE), json={"signature": SIG})
+        r = c.post("/fd/google/gmail/send", headers=_agent(), json=MSG)
+        assert r.status_code == 200, r.text
+        msg = _decode(json.loads(gmail.sends()[0].content)["raw"])
+        plain = msg.get_body(("plain",)).get_content()
+        html = msg.get_body(("html",)).get_content()
+        assert plain.replace("\r\n", "\n").rstrip().endswith("Hi Bob\n\n" + SIG)
+        assert "Sent by Alice&#x27;s assistant<br>Alice &amp; Co." in html
+        # A body that already ends with it isn't signed twice.
+        r = c.post("/fd/google/gmail/send", headers=_agent(),
+                   json={**MSG, "subject": "Again", "body": "Hi\n\n" + SIG})
+        assert r.status_code == 200, r.text
+        plain = _decode(json.loads(gmail.sends()[1].content)["raw"]).get_body(
+            ("plain",)).get_content()
+        assert plain.count("Alice & Co.") == 1
+
+    async def test_a_draft_send_is_sent_as_it_is(self, db, agents, gmail):
+        await gr._store_tokens(db, ALICE, _tokens("alice-access"))
+        await _enable(db)
+        c = _client()
+        c.put("/fd/google/gmail-send", headers=_bearer(ALICE), json={"signature": SIG})
+        r = c.post("/fd/google/gmail/send", headers=_agent(), json={"draft_id": "d1"})
+        assert r.status_code == 200, r.text
+        assert json.loads(gmail.sends()[0].content) == {"id": "d1"}

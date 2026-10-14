@@ -164,6 +164,27 @@ class MicrosoftOAuthManager:
             raise RuntimeError(NOT_CONNECTED if self.is_flight_deck_client() else NO_FLIGHT_DECK)
         return tokens
 
+    async def mail_signature(self) -> str | None:
+        """The owner's agentic signature (Connections → Microsoft), which
+        microsoft_mail puts at the end of every draft — from Flight Deck's
+        ``/fd/microsoft/agent_status`` (``mail_signature``; absent = none).
+        "" outside Flight Deck; None when Flight Deck couldn't say."""
+        base = self._base()
+        if not base:
+            return ""
+        try:
+            headers = GoogleOAuthManager._flight_deck_headers(as_speaker=False)
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(f"{base}/fd/microsoft/agent_status", headers=headers)
+            data = resp.json() if resp.status_code == 200 else None
+        except Exception as exc:
+            log.info("Flight Deck Microsoft agent_status failed: %s", exc)
+            return None
+        if not isinstance(data, dict):
+            return None
+        value = data.get("mail_signature")
+        return value if isinstance(value, str) else ""
+
     async def is_connected(self) -> bool:
         """Refresh the cached flag (once per agent turn). A member's turn
         reports not connected and leaves the owner's flag alone."""

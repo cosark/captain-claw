@@ -22,6 +22,7 @@ import {
   type GmailSendPolicy,
 } from '../../stores/googleAuthStore'
 import { useAuthStore } from '../../stores/authStore'
+import { AgenticSignatureField, normalizeSignature } from './AgenticSignatureField'
 
 const RECENT_SENDS = 10
 
@@ -565,6 +566,7 @@ function GmailSendSection() {
   const [enabled, setEnabled] = useState(false)
   const [recipientsText, setRecipientsText] = useState('')
   const [limitText, setLimitText] = useState('')
+  const [signatureText, setSignatureText] = useState('')
   const [saving, setSaving] = useState(false)
   const [reloading, setReloading] = useState(true)
 
@@ -572,6 +574,7 @@ function GmailSendSection() {
     setEnabled(p.enabled)
     setRecipientsText(p.allowed_recipients.join('\n'))
     setLimitText(String(p.daily_limit))
+    setSignatureText(p.signature ?? '')
   }
 
   const reload = async () => {
@@ -589,7 +592,7 @@ function GmailSendSection() {
   // Refresh that just brings a new sent-count keeps what's being typed. Done
   // while rendering, not in an effect, so the form never paints a frame empty.
   const savedKey = policy
-    ? JSON.stringify([policy.enabled, policy.allowed_recipients, policy.daily_limit])
+    ? JSON.stringify([policy.enabled, policy.allowed_recipients, policy.daily_limit, policy.signature])
     : ''
   const [seededKey, setSeededKey] = useState('')
   if (policy && savedKey !== seededKey) {
@@ -603,7 +606,9 @@ function GmailSendSection() {
   const enabledDirty = !!policy && enabled !== policy.enabled
   const recipientsDirty = !!policy && recipients.join('\n') !== policy.allowed_recipients.join('\n')
   const limitDirty = !!policy && (!limitValid || limit !== policy.daily_limit)
-  const dirty = enabledDirty || recipientsDirty || limitDirty
+  const signature = normalizeSignature(signatureText)
+  const signatureDirty = !!policy && signature !== (policy.signature ?? '')
+  const dirty = enabledDirty || recipientsDirty || limitDirty || signatureDirty
   const canSave = !!policy && !saving && dirty && limitValid
 
   const handleSave = async () => {
@@ -612,6 +617,7 @@ function GmailSendSection() {
     if (enabledDirty) patch.enabled = enabled
     if (recipientsDirty) patch.allowed_recipients = recipients
     if (limitDirty) patch.daily_limit = limit
+    if (signatureDirty) patch.signature = signature
     setSaving(true)
     const ok = await saveGmailSend(patch)
     setSaving(false)
@@ -719,6 +725,14 @@ function GmailSendSection() {
               <div className="mt-1 text-[11px] text-zinc-500 leading-snug">
                 One address or <span className="text-zinc-300">@domain</span> per line
                 (commas work too). Empty = anyone.
+              </div>
+              <div className="mt-3">
+                <AgenticSignatureField
+                  value={signatureText}
+                  onChange={setSignatureText}
+                  disabled={saving}
+                  writes="email and draft"
+                />
               </div>
             </div>
             <div>

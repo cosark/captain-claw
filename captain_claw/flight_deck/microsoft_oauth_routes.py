@@ -17,6 +17,10 @@ The Microsoft twin of ``google_oauth_routes``, built the same way:
   (also an HttpOnly SameSite=Strict cookie), ``/login`` takes it only from
   that browser, and ``/callback`` only completes a state whose cookie matches.
 
+Each user's agentic signature (``GET``/``PUT /fd/microsoft/mail-signature``,
+stored under :data:`mail_signature.MICROSOFT_KEY`) reaches their agents in
+``/agent_status``; microsoft_mail adds it to the end of every draft.
+
 Not (yet) carried over from Google: shared-agent members' own connections (a
 member request to these routes is refused by the speaker-grant middleware —
 ``/fd/microsoft/*`` is not grant-aware) and a send gate (the agent tools only
@@ -35,6 +39,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
+from captain_claw import mail_signature
 from captain_claw.flight_deck import google_oauth_routes as _g
 from captain_claw.flight_deck.admin_routes import require_admin
 from captain_claw.flight_deck.auth import _fd_auth_enabled, get_current_user, get_db
@@ -621,6 +626,32 @@ async def microsoft_logout(_user: dict = Depends(get_current_user)) -> dict[str,
     return {"disconnected": True, "note": MANAGE_ACCESS_HINT}
 
 
+class MailSignatureUpdate(BaseModel):
+    signature: Any = None  # "" clears it
+
+
+@router.get("/mail-signature")
+async def microsoft_mail_signature_get(_user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    """This user's agentic signature ("" = none)."""
+    uid = _g._effective_owner(_user)
+    return {"signature": await mail_signature.load(get_db(), uid, mail_signature.MICROSOFT_KEY)}
+
+
+@router.put("/mail-signature")
+async def microsoft_mail_signature_put(
+    body: MailSignatureUpdate, _user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Set this user's agentic signature — plain text their agents put at the
+    end of every Outlook draft ("" clears it)."""
+    try:
+        signature = mail_signature.normalize(body.signature)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    uid = _g._effective_owner(_user)
+    await get_db().set_settings(uid, {mail_signature.MICROSOFT_KEY: signature})
+    return {"signature": signature}
+
+
 # ── agent-facing ────────────────────────────────────────────────────
 
 
@@ -649,7 +680,13 @@ async def microsoft_access_token(request: Request) -> dict[str, Any]:
 
 @router.get("/agent_status")
 async def microsoft_agent_status(request: Request) -> dict[str, Any]:
-    """Whether the calling agent's owner has Microsoft connected (no network)."""
+    """Whether the calling agent's owner has Microsoft connected (no network),
+    plus — only when one is set — their agentic signature (``mail_signature``),
+    which microsoft_mail adds to the end of every draft."""
     _g._authorize_agent_call(request)
     owner = await _g._agent_owner(request, service="Microsoft")
-    return {"connected": bool(await is_microsoft_connected(owner)), "enabled": True}
+    out: dict[str, Any] = {"connected": bool(await is_microsoft_connected(owner)), "enabled": True}
+    signature = await mail_signature.load(get_db(), owner, mail_signature.MICROSOFT_KEY)
+    if signature:
+        out["mail_signature"] = signature
+    return out

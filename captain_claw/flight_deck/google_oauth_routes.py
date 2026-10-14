@@ -28,6 +28,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
+from captain_claw import mail_signature
 from captain_claw.flight_deck import speaker_grants
 from captain_claw.flight_deck.auth import (
     _LOCAL_USER,
@@ -1157,7 +1158,9 @@ async def google_agent_status(request: Request) -> dict[str, Any]:
     whether they connected their own Google (only looked at when enabled).
     Otherwise for the agent's owner, always enabled. ``gmail_send_attachments``
     says this deck's /gmail/send takes files — an agent checks it first, since
-    an older deck would send the email without them.
+    an older deck would send the email without them. ``mail_signature`` — only
+    when one is set — is the user's agentic signature (the member's on their
+    turn), which google_mail adds to the end of every draft.
     """
     _authorize_agent_call(request)
     acting = await speaker_grants.acting_member(request, google=False)
@@ -1166,11 +1169,17 @@ async def google_agent_status(request: Request) -> dict[str, Any]:
         enabled = await speaker_grants.google_opted_in(
             db, acting.user_id, acting.agent_ref, acting.owner)
         connected = enabled and await is_google_connected(acting.user_id)
-        return {"connected": bool(connected), "enabled": bool(enabled),
-                "gmail_send_attachments": True}
-    owner = await _agent_owner(request)
-    return {"connected": bool(await is_google_connected(owner)), "enabled": True,
-            "gmail_send_attachments": True}
+        out = {"connected": bool(connected), "enabled": bool(enabled),
+               "gmail_send_attachments": True}
+        user_id = acting.user_id
+    else:
+        user_id = await _agent_owner(request)
+        out = {"connected": bool(await is_google_connected(user_id)), "enabled": True,
+               "gmail_send_attachments": True}
+    signature = await mail_signature.load(db, user_id, mail_signature.GOOGLE_KEY)
+    if signature:
+        out["mail_signature"] = signature
+    return out
 
 
 @router.get("/credentials")
