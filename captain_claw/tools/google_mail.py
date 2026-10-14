@@ -44,7 +44,8 @@ own files (``remove_attachments`` drops some).
 
 Organizing changes labels only — nothing is written, sent or deleted, and
 there are still no trash / spam / delete actions. archive removes INBOX; move
-adds a destination label and removes INBOX; add_labels / remove_labels tag;
+adds a destination label and removes INBOX (other labels stay); add_labels /
+remove_labels tag;
 create_label makes a label ("Parent/Child" nests it). Targets are thread_ids
 (whole conversations, ``threads.modify``) and/or message_ids (one
 ``messages.batchModify``), at most 100 per call. Label names resolve through
@@ -144,8 +145,12 @@ _TAG_SYSTEM_LABELS = frozenset({"INBOX", "UNREAD", "STARRED", "IMPORTANT"})
 # Never added or removed: sending, drafts, trash and spam are out of scope.
 _FORBIDDEN_LABELS = frozenset({"SENT", "DRAFT", "TRASH", "SPAM", "CHAT"})
 _SYSTEM_LABELS = _TAG_SYSTEM_LABELS | _FORBIDDEN_LABELS | frozenset(_CATEGORY_ALIASES.values())
-# Gmail's own folder names a user label can't take (besides the IDs above).
-_RESERVED_LABEL_NAMES = frozenset({"drafts", "sent mail", "all mail"})
+# Gmail's own names for its Sent and Drafts folders (no user label can take
+# them, nor "All Mail").
+_FOLDER_ALIASES = {"sent mail": "SENT", "drafts": "DRAFT"}
+# Not labels: archived mail is mail without INBOX, and All Mail shows every
+# email — "move to the archive" means action=archive.
+_ARCHIVE_NAMES = frozenset({"archive", "archived", "all mail"})
 
 # Max body length returned to the agent.
 _MAX_BODY_CHARS = 30_000
@@ -225,9 +230,18 @@ def _modify_scope_missing(flight_deck: bool) -> str:
             "A Flight Deck admin ticks it in Connections → Google (this makes every user "
             "reconnect), then the user reconnects Google. Nothing was changed."
         )
+    # The login asks for google_oauth.scopes, whose default already has
+    # gmail.modify — and a list in config.yaml replaces that default whole, so
+    # "add it" must not read as "a list of just this one".
+    if set(get_config().google_oauth.scopes or ()) & set(_GMAIL_MODIFY_SCOPES):
+        return head + (
+            "The configured google_oauth.scopes already include it — reconnect Google "
+            "(/auth/google/login) to grant it. Nothing was changed."
+        )
     return head + (
-        "Add https://www.googleapis.com/auth/gmail.modify to google_oauth.scopes in "
-        "config.yaml and reconnect Google (/auth/google/login). Nothing was changed."
+        "Add https://www.googleapis.com/auth/gmail.modify to the google_oauth.scopes list in "
+        "config.yaml (keep its other entries) and reconnect Google (/auth/google/login). "
+        "Nothing was changed."
     )
 
 
@@ -325,11 +339,12 @@ class GoogleMailTool(Tool):
         "report what changed using the IDs and counts the tool printed. If it answers "
         "'[not-authorized: mail-write]', don't retry: tell the user. These need the gmail.modify "
         "scope; if the tool says it's missing, tell the user (don't retry). archive takes emails "
-        "out of the Inbox; move label=<label> files them under that label (label=INBOX brings "
-        "them back); add_labels / remove_labels take labels=[names or IDs] — INBOX, UNREAD, "
-        "STARRED, IMPORTANT and the categories too (removing UNREAD marks read). A label that "
-        "doesn't exist is refused, never created on the fly: create_label makes one only when "
-        "the user asked for it ('Parent/Child' nests it). At most 100 emails per call. "
+        "out of the Inbox; move label=<label> files them under that label (their other labels "
+        "stay; label=INBOX brings them back); add_labels / remove_labels take labels=[names or "
+        "IDs] — INBOX, UNREAD, STARRED, IMPORTANT and the categories too (removing UNREAD marks "
+        "read). A label that doesn't exist is refused, never created on the fly: create_label "
+        "makes one only when the user asked for it ('Parent/Child' nests it). At most 100 "
+        "emails per call. "
         "ROUTING: any user request that refers to an email, message, inbox, thread, "
         "conversation, sender, subject line, or Gmail — including phrases like "
         "'read the one from X', 'open that email', 'show me the Fil Rouge email', "
@@ -1056,16 +1071,49 @@ class GoogleMailTool(Tool):
                 return lab
         return None
 
+    @staticmethod
+    def _own_archive_labels(labels: list[dict[str, Any]]) -> list[str]:
+        """The names of this mailbox's own labels called Archive / Archived (any
+        case) — an IMAP client's, say. Gmail itself has none."""
+        return [str(lab["name"]) for lab in labels
+                if not _is_system_label(lab)
+                and str(lab.get("name") or "").casefold() in _ARCHIVE_NAMES]
+
+    @staticmethod
+    def _labels_named(names: list[str]) -> str:
+        """"label 'A'" / "labels 'A', 'B'"."""
+        return ("labels " if len(names) > 1 else "label ") + ", ".join(f"'{n}'" for n in names)
+
+    def _not_a_label_archive(self, ref: str, labels: list[dict[str, Any]]) -> str:
+        """The move refusal for an archive name (Archive, archived, All Mail)
+        that names none of *labels*: action=archive — or, when the mailbox has
+        an Archive label of its own, that label."""
+        own = self._own_archive_labels(labels)
+        if not own:
+            return (
+                "Gmail has no Archive label — archiving just takes emails out of the Inbox "
+                "(All Mail still shows them). Use google_mail action=archive with the same IDs "
+                "instead. Nothing was changed."
+            )
+        why = (f"{ref!r} is Gmail's view of every email, not a label"
+               if ref.casefold() == "all mail" else f"No such Gmail label: {ref!r}")
+        to = (f"label={json.dumps(own[0], ensure_ascii=False)}" if len(own) == 1
+              else "label=<one of those>")
+        return (f"{why} — this mailbox has its own {self._labels_named(own)}: to file them "
+                f"there, google_mail action=move {to} with the same IDs. Nothing was changed.")
+
     def _find_label(self, ref: str, labels: list[dict[str, Any]]) -> dict[str, Any] | None:
         """The label *ref* names: an exact label ID, else a user label's name
-        (any case), else a system label by ID (any case) or category alias."""
+        (any case), else a system label by ID (any case), category alias or
+        folder name ("Sent Mail", "Drafts")."""
         for lab in labels:
             if lab["id"] == ref:
                 return lab
         lab = self._user_label(labels, ref)
         if lab is not None:
             return lab
-        sys_id = _CATEGORY_ALIASES.get(ref.casefold(), ref.upper())
+        folded = ref.casefold()
+        sys_id = _CATEGORY_ALIASES.get(folded) or _FOLDER_ALIASES.get(folded) or ref.upper()
         for lab in labels:
             if _is_system_label(lab) and str(lab["id"]).upper() == sys_id:
                 return lab
@@ -1096,12 +1144,27 @@ class GoogleMailTool(Tool):
                 have = f"Existing labels: {', '.join(names[:30])}{more}."
             else:
                 have = "This mailbox has no labels of its own yet."
-            return (
-                f"No such Gmail label: {', '.join(repr(m) for m in missing)}. {have} Use a name "
-                "or ID from list_labels. To make a new label — only if the user asked for one — "
-                "call google_mail action=create_label "
-                f"label={json.dumps(missing[0], ensure_ascii=False)} first. Nothing was changed."
-            )
+            text = (f"No such Gmail label: {', '.join(repr(m) for m in missing)}. {have} Use a "
+                    "name or ID from list_labels.")
+            own = self._own_archive_labels(labels)
+            archive = [m for m in missing if m.casefold() in _ARCHIVE_NAMES]
+            if archive and own:
+                which = "that name" if len(own) == 1 else "one of those names"
+                text += (f" This mailbox has its own {self._labels_named(own)} — pass {which} if "
+                         "it's the one meant.")
+            elif archive:
+                text += (" Gmail has no Archive label — archived mail is just mail out of the "
+                         "Inbox (All Mail still shows it): google_mail action=archive takes "
+                         "emails out, action=move label=INBOX brings them back.")
+            # Hint create_label only with a name it would make (not "All Mail"),
+            # and not a second archive label next to the mailbox's own.
+            new = [m for m in missing if not self._unusable_label_name(m, labels)
+                   and not (own and m in archive)]
+            if new:
+                text += (" To make a new label — only if the user asked for one — call "
+                         "google_mail action=create_label "
+                         f"label={json.dumps(new[0], ensure_ascii=False)} first.")
+            return text + " Nothing was changed."
         for lab in found:
             lab_id = str(lab["id"])
             if (_is_system_label(lab) and lab_id not in _TAG_SYSTEM_LABELS
@@ -1229,9 +1292,10 @@ class GoogleMailTool(Tool):
         failed: list[tuple[str, Exception]],
         *,
         inbox_removed: bool = False,
+        note: str = "",
     ) -> ToolResult:
-        """What changed (counts, IDs, the ones that failed, an undo hint) — or,
-        when nothing changed, why."""
+        """What changed (counts, IDs, the ones that failed, *note*, an undo
+        hint) — or, when nothing changed, why."""
         not_lines = [f"  NOT {verb}: {target} ({self._why_not(exc)})"
                      for target, exc in failed[:_MAX_LISTED_IDS]]
         if len(failed) > _MAX_LISTED_IDS:
@@ -1260,6 +1324,8 @@ class GoogleMailTool(Tool):
         if messages:
             lines.append(f"  Message IDs: {self._ids_text(messages)}")
         lines.extend(not_lines)
+        if note:
+            lines.append(note)
         if inbox_removed and messages:
             lines.append(
                 "Note: Gmail shows conversations — a conversation stays in the Inbox while "
@@ -1287,17 +1353,42 @@ class GoogleMailTool(Tool):
         self, token: str, label: str = "", labels: Any = None, **kwargs: Any,
     ) -> ToolResult:
         """File conversations / messages under one label: add it and remove
-        INBOX (label=INBOX only adds INBOX — back to the Inbox)."""
+        INBOX (label=INBOX only adds INBOX — back to the Inbox). Their other
+        labels stay."""
         targets = self._organize_targets(kwargs)
         if isinstance(targets, str):
             return ToolResult(success=False, error=targets)
-        refs = self._label_refs([label]) or self._label_refs(labels)
-        if len(refs) != 1:
+        # label is the destination (a one-name labels list works too); given
+        # both, they must name the same label — a leftover list must not
+        # change where the mail goes.
+        refs = self._label_refs([label], labels)
+        if not refs:
             return ToolResult(success=False, error=(
                 "move takes one destination: label=<label name or ID> (INBOX = back to the "
                 "Inbox; list_labels shows the rest). Nothing was changed."
             ))
-        found = self._resolve_labels(refs, await self._all_labels(token))
+        existing = await self._all_labels(token)
+        # One destination before anything about the names themselves — so a
+        # leftover labels=["Archive"] can't turn "file under Receipts" into
+        # "archive them instead". The archive's names count as one.
+        dests: dict[tuple[str, str], str] = {}
+        for ref in refs:
+            lab = self._find_label(ref, existing)
+            folded = ref.casefold()
+            key = (("id", str(lab["id"])) if lab is not None
+                   else ("archive", "") if folded in _ARCHIVE_NAMES else ("name", folded))
+            dests.setdefault(key, _label_name(lab) if lab is not None else ref)
+        if len(dests) > 1:
+            return ToolResult(success=False, error=(
+                "move takes one destination, but label / labels name "
+                + ", ".join(f"'{n}'" for n in dests.values())
+                + " — pass only label=<the destination> (add_labels adds more than one). "
+                "Nothing was changed."
+            ))
+        # An archive name no label here has (a user label "Archive" resolved above).
+        if next(iter(dests))[0] == "archive":
+            return ToolResult(success=False, error=self._not_a_label_archive(refs[0], existing))
+        found = self._resolve_labels(refs, existing)
         if isinstance(found, str):
             return ToolResult(success=False, error=found)
         dest = found[0]
@@ -1321,8 +1412,13 @@ class GoogleMailTool(Tool):
             undo = (f"google_mail action=remove_labels "
                     f"labels={json.dumps([name], ensure_ascii=False)} {again}, "
                     "then action=move label=INBOX with the same IDs")
+        # Unlike Gmail's "Move to" from a label view, the label they were
+        # filed under before stays on.
+        note = ("Their other labels stay on — to take one off too (e.g. the label they were "
+                'filed under before), google_mail action=remove_labels labels=["<label>"] '
+                "with the same IDs.")
         return self._organize_result(
-            "moved", head, undo, threads, messages, failed, inbox_removed=not back,
+            "moved", head, undo, threads, messages, failed, inbox_removed=not back, note=note,
         )
 
     async def _action_add_labels(self, token: str, **kwargs: Any) -> ToolResult:
@@ -1341,7 +1437,9 @@ class GoogleMailTool(Tool):
         targets = self._organize_targets(kwargs)
         if isinstance(targets, str):
             return ToolResult(success=False, error=targets)
-        refs = self._label_refs(kwargs.get("labels"), [kwargs.get("label")])
+        # labels is the list; a lone label counts only without one — never
+        # merged in (a leftover label=INBOX would archive or un-archive too).
+        refs = self._label_refs(kwargs.get("labels")) or self._label_refs([kwargs.get("label")])
         if not refs:
             return ToolResult(success=False, error=(
                 f"{action} needs labels=[label names or IDs] (list_labels shows them). "
@@ -1372,12 +1470,34 @@ class GoogleMailTool(Tool):
             inbox_removed=not adding and "INBOX" in ids,
         )
 
-    @staticmethod
-    def _system_label_name(name: str) -> bool:
-        """Whether *name* is one of Gmail's own labels (no user label can take it)."""
-        folded = name.casefold()
-        return (folded.upper() in _SYSTEM_LABELS or folded in _CATEGORY_ALIASES
-                or folded in _RESERVED_LABEL_NAMES)
+    def _unusable_label_name(
+        self, name: str, labels: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """Why no user label can be called *name* — its first part is one of
+        Gmail's own labels or folder names — or "". A category's friendly name
+        ("Personal") counts only once *labels* (labels.list) shows no user
+        label by that name: older mailboxes have one, and nesting under it is fine."""
+        parts = name.split("/")
+        first = parts[0].strip()
+        folded = first.casefold()
+        nested = " (labels can't be nested under it)" if len(parts) > 1 else ""
+        if folded == "all mail":
+            return (f"'{first}' is Gmail's view of every email — no label can take that "
+                    f"name{nested}. Archived mail is already there: google_mail action=archive "
+                    "takes emails out of the Inbox.")
+        sys_id = _FOLDER_ALIASES.get(folded) or folded.upper()
+        if sys_id in _FORBIDDEN_LABELS:
+            return (f"'{first}' is a Gmail system label{nested}, and sent mail, drafts, chats, "
+                    "trash and spam are out of scope for this tool — there is nothing to create "
+                    "or to file there.")
+        if sys_id in _SYSTEM_LABELS or (
+                folded in _CATEGORY_ALIASES and labels is not None
+                and self._user_label(labels, first) is None):
+            # Only INBOX is a place move takes email to; the rest (starred,
+            # unread, the categories…) just mark it — move refuses them.
+            how = "add_labels / move" if sys_id == "INBOX" else "add_labels"
+            return f"'{first}' is a Gmail system label — use it with {how}{nested}."
+        return ""
 
     async def _action_create_label(
         self, token: str, label: str = "", labels: Any = None, **kwargs: Any,
@@ -1394,14 +1514,16 @@ class GoogleMailTool(Tool):
                 "create_label needs label=<name> — 'Parent/Child' nests it under Parent (no "
                 "empty parts). Nothing was created."
             ))
-        if self._system_label_name(parts[0]):
-            nested = " (labels can't be nested under it)" if len(parts) > 1 else ""
-            return ToolResult(success=False, error=(
-                f"'{parts[0]}' is a Gmail system label — use it with add_labels / move{nested}. "
-                "Nothing was created."
-            ))
-        existing = await self._all_labels(token)
         full = "/".join(parts)
+        # A system label or Gmail folder name is refused before any call; a
+        # category's name only when no user label has it (see labels.list).
+        refusal = self._unusable_label_name(full)
+        if refusal:
+            return ToolResult(success=False, error=f"{refusal} Nothing was created.")
+        existing = await self._all_labels(token)
+        refusal = self._unusable_label_name(full, existing)
+        if refusal:
+            return ToolResult(success=False, error=f"{refusal} Nothing was created.")
         lab = self._user_label(existing, full)
         if lab is not None:
             return ToolResult(success=True, content=(

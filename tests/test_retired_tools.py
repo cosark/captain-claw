@@ -358,17 +358,6 @@ def _loop_agent(tmp_path, tool):
     ("google_drive", {"action": "doc_replace_text", "file_id": "d1", "find": "a", "replace_with": "ab"}),
     ("google_drive", {"action": "doc_insert_text", "file_id": "d1", "after": "a", "text": "b"}),
     ("google_drive", {"action": "doc_append_text", "file_id": "d1", "text": "b"}),
-    # Mailbox changes: a repeat is a second label / folder, or the same change again.
-    ("google_mail", {"action": "create_label", "label": "Receipts"}),
-    ("google_mail", {"action": "archive", "thread_ids": ["t1", "t2"]}),
-    ("google_mail", {"action": "move", "label": "Receipts", "thread_ids": ["t1"]}),
-    ("google_mail", {"action": "add_labels", "labels": ["Receipts"], "message_ids": ["m1"]}),
-    ("google_mail", {"action": "remove_labels", "labels": ["UNREAD"], "thread_ids": ["t1"]}),
-    ("microsoft_mail", {"action": "create_folder", "folder": "Receipts"}),
-    ("microsoft_mail", {"action": "archive", "message_ids": ["M1"]}),
-    ("microsoft_mail", {"action": "move", "folder": "Receipts", "thread_ids": ["C1"]}),
-    ("microsoft_mail", {"action": "add_categories", "categories": ["Finance"], "message_ids": ["M1"]}),
-    ("microsoft_mail", {"action": "remove_categories", "categories": ["Finance"], "message_ids": ["M1"]}),
 ])
 async def test_identical_google_write_runs_once_per_turn(_dup_limit_one, tmp_path, tool_name, args):
     from captain_claw.llm import ToolCall
@@ -384,6 +373,50 @@ async def test_identical_google_write_runs_once_per_turn(_dup_limit_one, tmp_pat
     blocked = [r for r in results if "DUPLICATE CALL BLOCKED" in str(r.get("content", ""))]
     assert len(blocked) == 2
     assert "would send or create it a second time" in blocked[0]["content"]
+
+
+# Mailbox organizing is idempotent: a repeat changes nothing already changed
+# (an existing label / folder is reported, not made twice).
+_MAILBOX_CHANGES = [
+    ("google_mail", {"action": "create_label", "label": "Receipts"}),
+    ("google_mail", {"action": "archive", "thread_ids": ["t1", "t2"]}),
+    ("google_mail", {"action": "move", "label": "Receipts", "thread_ids": ["t1"]}),
+    ("google_mail", {"action": "add_labels", "labels": ["Receipts"], "message_ids": ["m1"]}),
+    ("google_mail", {"action": "remove_labels", "labels": ["UNREAD"], "thread_ids": ["t1"]}),
+    ("microsoft_mail", {"action": "create_folder", "folder": "Receipts"}),
+    ("microsoft_mail", {"action": "archive", "message_ids": ["M1"]}),
+    ("microsoft_mail", {"action": "move", "folder": "Receipts", "thread_ids": ["C1"]}),
+    ("microsoft_mail", {"action": "add_categories", "categories": ["Finance"], "message_ids": ["M1"]}),
+    ("microsoft_mail", {"action": "remove_categories", "categories": ["Finance"], "message_ids": ["M1"]}),
+]
+
+
+@pytest.mark.parametrize("tool_name,args", _MAILBOX_CHANGES)
+async def test_a_partly_failed_mailbox_change_can_be_retried(_dup_limit_one, tmp_path, tool_name, args):
+    from captain_claw.llm import ToolCall
+
+    tool = _CountingGoogleTool(tool_name)
+
+    async def _partial(action, **kwargs):
+        # Some targets changed, one hit a rate limit: still success=True.
+        tool.ran.append(action)
+        return ToolResult(success=True, content=(
+            f"{action}: 1 changed.\nNOT changed: t2 (rate limit — try again in a moment)"))
+
+    tool.execute = _partial
+    agent = _loop_agent(tmp_path, tool)
+    calls = [ToolCall(id=f"c{i}", name=tool_name, arguments=dict(args)) for i in range(4)]
+
+    results = await agent._handle_tool_calls(calls)
+
+    # The identical retry the result invites runs; a loop is still cut off.
+    assert tool.ran == [args["action"]] * 3
+    blocked = [r for r in results if "DUPLICATE CALL BLOCKED" in str(r.get("content", ""))]
+    assert len(blocked) == 1
+    # Never "it succeeded … tell the user it is done": some IDs were NOT changed.
+    msg = blocked[0]["content"]
+    assert "succeeded" not in msg and "it is done" not in msg
+    assert "NOT changed" in msg
 
 
 async def test_identical_google_reads_keep_the_stateful_headroom(_dup_limit_one, tmp_path):

@@ -54,9 +54,14 @@ def _custom(aid: str, tool: str, action: str, **over) -> dict:
 
 def test_the_mirror_matches_the_agents_set():
     from captain_claw import mail_authority
+    from captain_claw.flight_deck import flow_runner
 
     assert action_catalog.MAIL_ORGANIZE_ACTIONS == mail_authority.MAILBOX_CHANGE_ACTIONS
+    assert flow_runner._MAIL_ORGANIZE_ACTIONS == mail_authority.MAILBOX_CHANGE_ACTIONS
     assert not action_catalog.MAIL_ORGANIZE_ACTIONS & action_catalog.MAIL_WRITE_ACTIONS
+    # The email-write copies agree too.
+    assert action_catalog.MAIL_WRITE_ACTIONS == mail_authority.MAIL_WRITE_ACTIONS
+    assert flow_runner._MAIL_WRITE_ACTIONS == mail_authority.MAIL_WRITE_ACTIONS
 
 
 @pytest.mark.parametrize("tool,action", _ORGANIZE)

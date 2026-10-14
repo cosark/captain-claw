@@ -23,13 +23,13 @@ Microsoft connection (:mod:`captain_claw.microsoft_oauth_manager`):
   :data:`gmail_compose.REPEAT_MARK` so the loop and Flight Deck treat it as
   "already done".
 * Organize: archive (to the mailbox's Archive folder), move (to a folder by
-  name, 'Parent/Child' path or ID — never Deleted Items, Junk, Drafts, Sent
-  Items or Outbox), create_folder, add_categories / remove_categories. Nothing
-  is written, sent or deleted. Targets are thread_ids (a conversation's
-  messages, minus those in Sent Items / Drafts / Deleted Items / Junk / Outbox
-  for a move) and/or message_ids, at most 100 per call. A move gives each
-  message a NEW id — the answer prints old → new. An automated turn may
-  organize only when its own text asks to
+  name, 'Parent/Child' path or ID — never Deleted Items, Junk, a folder inside
+  either, Drafts, Sent Items or Outbox), create_folder, add_categories /
+  remove_categories. Nothing is written, sent or deleted. Targets are
+  thread_ids (a conversation's messages, minus those in Sent Items / Drafts /
+  Deleted Items / Junk / Outbox for a move) and/or message_ids, at most 100
+  per call. A move gives each message a NEW id — the answer prints old → new.
+  An automated turn may organize only when its own text asks to
   (:func:`mail_authority.check_mailbox_change`, before any token fetch).
 
 Scopes: ``Mail.Read`` to read, ``Mail.ReadWrite`` to draft and to organize.
@@ -37,6 +37,7 @@ Scopes: ``Mail.Read`` to read, ``Mail.ReadWrite`` to draft and to organize.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
 import hashlib
@@ -83,6 +84,16 @@ _MAX_LISTED_IDS = 20
 # Well-known folders a move never targets (deleting / junking is out of scope)
 # and whose messages a conversation's move leaves where they are.
 _STAY_PUT = ("drafts", "sentitems", "deleteditems", "junkemail", "outbox")
+# … and the two whose subfolders are just as out of bounds: mail filed inside
+# Deleted Items / Junk Email goes when they are emptied.
+_BINS = ("deleteditems", "junkemail")
+# How far up a folder's parents a move looks for one of _BINS.
+_MAX_FOLDER_DEPTH = 32
+# The well-known folders a move — or a check that a cached folder wasn't
+# deleted since — reads (once per token): _STAY_PUT, the Inbox (for the undo)
+# and the mailbox root (where a walk up the parents ends).
+_MOVE_KNOWN = (*_STAY_PUT, "inbox", "msgfolderroot")
+_FOLDER_SELECT = "id,displayName,parentFolderId"
 _FOLDER_LABELS = {
     "inbox": "Inbox", "drafts": "Drafts", "sentitems": "Sent Items", "deleteditems": "Deleted Items",
     "junkemail": "Junk Email", "outbox": "Outbox", "archive": "Archive",
@@ -171,17 +182,11 @@ def _ids(*values: Any) -> list[str]:
 
 
 def _names(value: Any) -> list[str]:
-    """Category names — a list, or a string holding a JSON list or
-    comma-separated names (they may have spaces) — de-duplicated in any case."""
+    """Category names — a list, or a string holding one (see
+    :func:`_name_list`) or comma-separated names (they may have spaces) —
+    de-duplicated in any case."""
     if isinstance(value, str):
-        text = value.strip()
-        parsed: Any = None
-        if text.startswith("["):
-            try:
-                parsed = json.loads(text)
-            except ValueError:
-                parsed = None
-        value = parsed if isinstance(parsed, list) else text.split(",")
+        value = _name_list(value.strip())
     if not isinstance(value, (list, tuple)):
         return []
     out: list[str] = []
@@ -190,6 +195,36 @@ def _names(value: Any) -> list[str]:
         if name and name.casefold() not in {o.casefold() for o in out}:
             out.append(name)
     return out
+
+
+def _name_list(text: str) -> list[Any]:
+    """The names in *text*. Only a string that is one list as a whole loses
+    its brackets — a JSON list, a ['Python', 'style'] one, or bracketed
+    comma-separated names ('[Receipts, "Red category"]'). Anything else is
+    split on commas, so bracketed names keep their brackets ('[EXT]',
+    '[A], [B]'). A quoted name loses its own pair of quotes."""
+    if text.startswith("[") and text.endswith("]"):
+        for parse in (json.loads, ast.literal_eval):
+            try:
+                parsed = parse(text)
+            except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+                continue
+            if isinstance(parsed, list):
+                return parsed
+        inner = text[1:-1]
+        parts = inner.split(",")
+        quoted = any(_unquoted(p) != p.strip() for p in parts)
+        if "[" not in inner and "]" not in inner and (len(parts) > 1 or quoted):
+            return [_unquoted(p) for p in parts]
+    return [_unquoted(p) for p in text.split(",")]
+
+
+def _unquoted(text: str) -> str:
+    """*text* stripped, without one pair of matching quotes around it."""
+    text = text.strip()
+    if len(text) > 1 and text[0] == text[-1] and text[0] in "'\"":
+        text = text[1:-1].strip()
+    return text
 
 
 def _folder_parts(name: Any) -> list[str]:
@@ -239,6 +274,10 @@ def _who_list(recips: list[dict[str, Any]] | None) -> str:
 
 def _stamp(value: str | None) -> str:
     return str(value or "")[:16].replace("T", " ")
+
+
+class _FolderPlaceError(Exception):
+    """Where a folder sits (inside Deleted Items / Junk Email or not) can't be told."""
 
 
 class MicrosoftMailTool(Tool):
@@ -642,49 +681,118 @@ class MicrosoftMailTool(Tool):
             caches[token] = {}
         return caches[token]
 
-    async def _folder_path(self, token: str, folder: str | None) -> str:
-        """``/me/mailFolders/<id or well-known>`` for a folder argument."""
-        return f"/me/mailFolders/{_seg(await self._folder_ref(token, folder))}"
+    async def _folder_call(
+        self, token: str, folder: str | None, call: Any, *, seen: dict[str, str] | None = None,
+    ) -> Any:
+        """``await call(ref)`` with the ref of the folder *folder* names (see
+        :meth:`_folder_ref`; *seen* as for :meth:`_bin_of`). A ref only assumed
+        that Graph rejects — a cached ID since deleted, a well-known folder this
+        mailbox lacks (no Archive), an ID-shaped name that is really a long
+        display name — is looked up by display name once more and the call
+        retried; when that finds no other folder, Graph's error stands.
+        LookupError when there is no such folder."""
+        ref, how = await self._folder_ref(token, folder, seen=seen)
+        try:
+            return await call(ref)
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            rejected = status == 404 or (status == 400 and how == "id")  # 400: no ID after all
+            if how not in ("cache", "known", "id") or not rejected:
+                raise
+            try:
+                again = (await self._folder_ref(token, folder, fresh=True))[0]
+            except LookupError:
+                again = ref
+            if again == ref:
+                raise
+        return await call(again)
 
-    async def _folder_ref(self, token: str, folder: str | None) -> str:
-        """The ID — or Graph well-known name — of the folder *folder* names
-        (Inbox when empty): a well-known name (Sent, Archive …), a folder ID, a
-        display name (a top-level folder, else one in the Inbox) or a
-        'Parent/Child' path. LookupError when there is no such folder."""
+    async def _folder_ref(
+        self, token: str, folder: str | None, *, fresh: bool = False,
+        seen: dict[str, str] | None = None,
+    ) -> tuple[str, str]:
+        """``(ref, how)``: the ID — or Graph well-known name — of the folder
+        *folder* names (Inbox when empty) and how it was found: "inbox", "cache"
+        (a name resolved earlier under this token), "known" (a well-known name:
+        Sent, Archive …), "id" (an ID-shaped name, taken as the folder ID) or
+        "lookup" (a display name or 'Parent/Child' path, see :meth:`_find_folder`).
+        *fresh*: only a lookup (the cached / assumed ref was just rejected). A
+        cached folder deleted since — moved into Deleted Items, ID kept (or into
+        Junk Email) — is looked up again, as a new session would (*seen* as for
+        :meth:`_bin_of`). LookupError when there is no such folder."""
         name = str(folder or "").strip()
         if not name:
-            return "inbox"
-        known = _WELL_KNOWN.get(name.lower())
-        if known:
-            return known
-        if len(name) > 40 and " " not in name and "/" not in name:  # a folder ID
-            return name
+            return "inbox", "inbox"
         parts = _folder_parts(name)
         cache = self._token_cache(self._folder_cache, token)
-        key = "/".join(parts).casefold()
-        if key not in cache:
-            found = await self._find_folder(token, parts) if parts else None
-            if not found:
-                raise LookupError(
-                    f"No mail folder named '{name}'. list_folders shows the folders (folder=<name> "
-                    "lists one's subfolders); name a subfolder as 'Parent/Child'."
-                )
-            cache[key] = found
-        return str(cache[key])
+        key = "/".join(parts).casefold() if parts else name.casefold()
+        if fresh:
+            cache.pop(key, None)
+        elif key in cache:
+            if not await self._binned_since(token, str(cache[key]), seen):
+                return str(cache[key]), "cache"
+            cache.pop(key, None)
+        elif _WELL_KNOWN.get(name.lower()):
+            return _WELL_KNOWN[name.lower()], "known"
+        elif len(name) > 40 and " " not in name and "/" not in name:  # a folder ID
+            return name, "id"
+        found = await self._find_folder(token, name)
+        if not found:
+            raise LookupError(
+                f"No mail folder named '{name}'. list_folders shows the folders (folder=<name> "
+                "lists one's subfolders); name a subfolder as 'Parent/Child'."
+            )
+        cache[key] = found
+        return found, "lookup"
 
-    async def _find_folder(self, token: str, parts: list[str]) -> str | None:
-        """The ID of the folder *parts* name, or None. One name: a top-level
-        folder, else one in the Inbox. A path: its first part a well-known or
-        top-level folder, then each part a subfolder of the one before."""
-        if len(parts) == 1:
-            return (await self._child_id(token, None, parts[0])
-                    or await self._child_id(token, "inbox", parts[0]))
-        found = _WELL_KNOWN.get(parts[0].lower()) or await self._child_id(token, None, parts[0])
-        for part in parts[1:]:
-            if not found:
-                return None
-            found = await self._child_id(token, found, part)
-        return found
+    async def _find_folder(self, token: str, name: str) -> str | None:
+        """The ID of the folder display name *name* names, or None. One name: a
+        top-level folder, else one in the Inbox. A 'Parent/Child' path: walked
+        down from its first part (:meth:`_walk`); one that leads nowhere is
+        tried as a single name with '/' in it."""
+        parts = _folder_parts(name)
+        if len(parts) > 1:
+            ids, _how = await self._walk(token, parts)
+            if len(ids) == len(parts):
+                return ids[-1]
+        elif parts:
+            name = parts[0]
+        return (await self._child_id(token, None, name)
+                or await self._child_id(token, "inbox", name))
+
+    async def _walk(
+        self, token: str, parts: list[str], *, known_ids: bool = False,
+    ) -> tuple[list[str], str]:
+        """The IDs along the path *parts* as far as its folders exist (all of
+        them when the whole path does) and how its first part was found. That
+        part is tried, until the whole path is found, as a single name is: a
+        well-known folder ("known" — its name, or its ID with *known_ids*; one
+        this mailbox lacks leads nowhere), a top-level folder ("top"), one in
+        the Inbox ("inbox"); the deepest walk wins ("" when none exists)."""
+        best: list[str] = []
+        best_how = ""
+        known = _WELL_KNOWN.get(parts[0].lower())
+        for how in ("known", "top", "inbox"):
+            if how != "known":
+                root = await self._child_id(token, None if how == "top" else "inbox", parts[0])
+            elif known and known_ids:
+                info = (await self._known_folders(token, (known,)))[known]
+                root = str(info["id"]) if info else None
+            else:
+                root = known
+            if not root:
+                continue
+            ids = [root]
+            for part in parts[1:]:
+                child = await self._child_id(token, ids[-1], part)
+                if not child:
+                    break
+                ids.append(child)
+            if len(ids) > len(best):
+                best, best_how = ids, how
+            if len(ids) == len(parts):
+                break
+        return best, best_how
 
     async def _child_id(self, token: str, parent: str | None, name: str) -> str | None:
         """The ID of *parent*'s subfolder called *name* (a top-level folder when
@@ -704,9 +812,10 @@ class MicrosoftMailTool(Tool):
     async def _known_folders(
         self, token: str, names: tuple[str, ...],
     ) -> dict[str, dict[str, Any] | None]:
-        """Well-known folders' ``{id, displayName}`` by name — None for one this
-        mailbox doesn't have (Graph promises only Inbox, Drafts, Sent Items and
-        Deleted Items). Cached per token; folder IDs never change."""
+        """Well-known folders' ``{id, displayName, parentFolderId}`` by name —
+        None for one this mailbox doesn't have (Graph promises only Inbox,
+        Drafts, Sent Items and Deleted Items). Cached per token; folder IDs
+        never change."""
         cache = self._token_cache(self._known_cache, token)
         missing = [n for n in names if n not in cache]
         for name, info, exc in await self._each(missing, lambda n: self._folder_info(token, n)):
@@ -714,6 +823,63 @@ class MicrosoftMailTool(Tool):
                 raise exc
             cache[name] = info
         return {n: cache[n] for n in names}
+
+    async def _bin_of(
+        self, token: str, folder_id: str, parent: str | None = None,
+        *, seen: dict[str, str] | None = None,
+    ) -> str:
+        """"deleteditems" / "junkemail" when the folder *folder_id* is Deleted
+        Items / Junk Email or sits inside one at any depth, else "". Follows
+        parentFolderId up to the mailbox root (*parent*: the folder's own, just
+        read), reading each folder on the way afresh — the user can delete
+        (move) one in Outlook at any time — so only the well-known folders' IDs
+        are cached per token. What one call learns (folder ID → its bin, or "")
+        goes in *seen*: pass the same dict throughout one tool call, never
+        across calls. :class:`_FolderPlaceError` when the walk can't finish (a
+        parent gone while the mailbox root is known, a loop, deeper than
+        :data:`_MAX_FOLDER_DEPTH`) — never taken to mean "not inside one"."""
+        known = await self._known_folders(token, _MOVE_KNOWN)
+        where = {} if seen is None else seen
+        for kind, info in known.items():
+            if info:
+                where.setdefault(str(info["id"]), kind if kind in _BINS else "")
+        root_known = bool(known.get("msgfolderroot"))
+        chain: list[str] = []
+        fid, up = folder_id, parent
+        if up is not None:
+            chain.append(fid)
+            fid = up
+        while fid and fid not in where:
+            if fid in chain or len(chain) >= _MAX_FOLDER_DEPTH:
+                raise _FolderPlaceError("its parent folders loop or go too deep")
+            chain.append(fid)
+            info = await self._folder_info(token, fid)
+            if info is None:
+                if root_known:
+                    raise _FolderPlaceError("one of its parent folders is gone")
+                break  # no root to end at: an unreadable parent is taken as the top
+            fid = str(info.get("parentFolderId") or "")
+        # The walk ended at a folder it knows, or at the top.
+        kind = where.get(fid, "")
+        for f in chain:
+            where[f] = kind
+        return kind
+
+    async def _binned_since(self, token: str, folder_id: str, seen: dict[str, str] | None) -> bool:
+        """Whether the cached folder *folder_id* now sits inside Deleted Items /
+        Junk Email (deleting a folder in Outlook moves it there, ID kept) — not
+        when it is one of them. When that can't be read, False: the call made
+        with it tells."""
+        try:
+            known = await self._known_folders(token, _MOVE_KNOWN)
+            if any(known[kind] and str(known[kind]["id"]) == folder_id for kind in _BINS):
+                return False
+            return bool(await self._bin_of(token, folder_id, seen=seen))
+        except _FolderPlaceError:
+            return False
+        except httpx.HTTPError as exc:
+            log.info("Outlook folder check failed", error=str(exc))
+            return False
 
     @staticmethod
     async def _each(items: list[Any], fn: Any) -> list[tuple[Any, Any, httpx.HTTPError | None]]:
@@ -737,10 +903,6 @@ class MicrosoftMailTool(Tool):
         unread_only: Any = None, focused_only: Any = None, include_body: Any = None,
         group_by_thread: Any = None, **kwargs: Any,
     ) -> ToolResult:
-        try:
-            path = await self._folder_path(token, folder)
-        except LookupError as exc:
-            return ToolResult(success=False, error=str(exc))
         n = limit(max_results, 10, 50)
         grouped = flag(group_by_thread, True)
         # Graph wants the $orderby property first in $filter (else
@@ -756,7 +918,11 @@ class MicrosoftMailTool(Tool):
         }
         if filters:
             params["$filter"] = " and ".join(["receivedDateTime ge 1900-01-01T00:00:00Z", *filters])
-        msgs = await self._collect(token, f"{path}/messages", params, n * 4 if grouped else n)
+        try:
+            msgs = await self._folder_call(token, folder, lambda ref: self._collect(
+                token, f"/me/mailFolders/{_seg(ref)}/messages", params, n * 4 if grouped else n))
+        except LookupError as exc:
+            return ToolResult(success=False, error=str(exc))
         label = str(folder or "Inbox")
         if not msgs:
             return ToolResult(success=True, content=f"No messages in {label}.")
@@ -771,20 +937,21 @@ class MicrosoftMailTool(Tool):
         q = str(query or "").strip()
         if not q:
             return ToolResult(success=False, error="query is required for search.")
-        if str(folder or "").strip().lower() in ("all", "anywhere", "*"):
-            path = "/me/messages"
-        else:
-            try:
-                path = f"{await self._folder_path(token, folder)}/messages"
-            except LookupError as exc:
-                return ToolResult(success=False, error=str(exc))
         n = limit(max_results, 10, 50)
         grouped = flag(group_by_thread, True)
         escaped = q.replace("\\", "\\\\").replace('"', '\\"')
         params = {"$search": f'"{escaped}"', "$select": _MSG_SELECT, "$top": min(n * 3 if grouped else n, 100)}
-        msgs = await self._collect(token, path, params, n * 3 if grouped else n)
+        everywhere = str(folder or "").strip().lower() in ("all", "anywhere", "*")
+        if everywhere:
+            msgs = await self._collect(token, "/me/messages", params, n * 3 if grouped else n)
+        else:
+            try:
+                msgs = await self._folder_call(token, folder, lambda ref: self._collect(
+                    token, f"/me/mailFolders/{_seg(ref)}/messages", params, n * 3 if grouped else n))
+            except LookupError as exc:
+                return ToolResult(success=False, error=str(exc))
         if not msgs:
-            where = "all folders" if path == "/me/messages" else str(folder or "Inbox")
+            where = "all folders" if everywhere else str(folder or "Inbox")
             return ToolResult(success=True, content=f"No messages found for '{q}' in {where}.")
         msgs.sort(key=lambda m: str(m.get("receivedDateTime") or ""), reverse=True)
         return ToolResult(success=True, content=self._render(
@@ -909,16 +1076,15 @@ class MicrosoftMailTool(Tool):
     ) -> ToolResult:
         """The top-level folders, or the subfolders of *folder*."""
         parent = str(folder or "").strip()
+        params = {"$top": 100, "$select": "id,displayName,totalItemCount,unreadItemCount,childFolderCount"}
         if parent:
             try:
-                path = f"{await self._folder_path(token, parent)}/childFolders"
+                data = await self._folder_call(token, parent, lambda ref: self._get(
+                    token, f"/me/mailFolders/{_seg(ref)}/childFolders", params))
             except LookupError as exc:
                 return ToolResult(success=False, error=str(exc))
         else:
-            path = "/me/mailFolders"
-        data = await self._get(token, path, {
-            "$top": 100, "$select": "id,displayName,totalItemCount,unreadItemCount,childFolderCount",
-        })
+            data = await self._get(token, "/me/mailFolders", params)
         folders = data.get("value", [])
         if not folders:
             return ToolResult(success=True, content=(
@@ -1386,9 +1552,12 @@ class MicrosoftMailTool(Tool):
         return lines
 
     @classmethod
-    def _nothing_changed(cls, verb: str, failed: list[tuple[str, str]]) -> ToolResult:
-        """Every email failed: the refusal, listing why."""
+    def _nothing_changed(cls, verb: str, failed: list[tuple[str, str]], skipped: str = "") -> ToolResult:
+        """No email changed and every one tried failed (the *skipped* ones
+        needed no change): the refusal, listing why."""
         lines = [f"Nothing was {verb}:", *cls._not_lines(verb, failed)]
+        if skipped:
+            lines.append(f"  Skipped: {skipped}.")
         if all(why.endswith("not found") for _target, why in failed):
             lines.append("Check the IDs — list_messages / search print them.")
         return ToolResult(success=False, error="\n".join(lines))
@@ -1409,9 +1578,10 @@ class MicrosoftMailTool(Tool):
         ]
 
     async def _folder_info(self, token: str, ref: str) -> dict[str, Any] | None:
-        """A folder's ``{id, displayName}``; None when there is no such folder."""
+        """A folder's ``{id, displayName, parentFolderId}``; None when there is
+        no such folder."""
         try:
-            return await self._get(token, f"/me/mailFolders/{_seg(ref)}", {"$select": "id,displayName"})
+            return await self._get(token, f"/me/mailFolders/{_seg(ref)}", {"$select": _FOLDER_SELECT})
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
                 return None
@@ -1443,36 +1613,56 @@ class MicrosoftMailTool(Tool):
                                 verb="moved", folder_arg=str(folder).strip())
 
     async def _destination(self, token: str, folder: Any) -> dict[str, Any] | str:
-        """The move destination's ``{id, displayName, inbox}``, or the refusal."""
+        """The move destination's ``{id, displayName, parentFolderId, inbox}``,
+        or the refusal."""
         name = str(folder or "").strip()
         if not name:
             return (
                 "move needs folder=<destination> — a folder name, 'Parent/Child' path or ID from "
                 "list_folders (action=archive files emails in the Archive folder). Nothing was moved."
             )
+        if _WELL_KNOWN.get(name.lower()) in _STAY_PUT:
+            return self._no_move_to(_WELL_KNOWN[name.lower()])
+        seen: dict[str, str] = {}  # where its parents are — read afresh for every move
         try:
-            ref = await self._folder_ref(token, name)
+            # A well-known folder this mailbox lacks (e.g. no Archive) falls
+            # back to one the user named so.
+            info = await self._folder_call(token, name, lambda ref: self._get(
+                token, f"/me/mailFolders/{_seg(ref)}", {"$select": _FOLDER_SELECT}), seen=seen)
         except LookupError as exc:
             return f"{exc} Nothing was moved."
-        if ref in _STAY_PUT:
-            return self._no_move_to(ref)
-        info = await self._folder_info(token, ref)
-        if info is None and ref in _WELL_KNOWN.values():
-            # No such well-known folder here (e.g. no Archive): one the user named so.
-            found = await self._find_folder(token, _folder_parts(name))
-            info = await self._folder_info(token, found) if found else None
-        if info is None:
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 404:
+                raise
             return f"No mail folder '{name}' — list_folders shows the folders. Nothing was moved."
-        # Its display name may hide one of them ('Junk Email', an ID …).
-        for kind, known in (await self._known_folders(token, _STAY_PUT)).items():
-            if known and str(known.get("id")) == str(info.get("id")):
+        fid = str(info.get("id") or "")
+        known = await self._known_folders(token, _MOVE_KNOWN)
+        # Its display name or ID may hide one of them ('Junk Email', an ID …) …
+        for kind in _STAY_PUT:
+            if known[kind] and str(known[kind].get("id")) == fid:
                 return self._no_move_to(kind)
-        return {**info, "inbox": ref == "inbox"}
+        # … or it may sit inside Deleted Items / Junk Email ('Deleted Items/Old').
+        try:
+            inside = await self._bin_of(token, fid, str(info.get("parentFolderId") or ""), seen=seen)
+        except _FolderPlaceError as exc:
+            return (
+                f"Couldn't confirm that '{info.get('displayName') or name}' isn't inside Deleted "
+                f"Items or Junk Email ({exc}), so nothing was moved. Try again, or pick another "
+                "folder from list_folders."
+            )
+        if inside:
+            return self._no_move_to(inside, str(info.get("displayName") or name))
+        inbox = known["inbox"]
+        is_inbox = str(inbox.get("id")) == fid if inbox else _WELL_KNOWN.get(name.lower()) == "inbox"
+        return {**info, "inbox": is_inbox}
 
     @staticmethod
-    def _no_move_to(kind: str) -> str:
+    def _no_move_to(kind: str, inside: str = "") -> str:
+        """The refusal to move to the well-known folder *kind* — or to the
+        folder *inside* it."""
+        where = f"'{inside}' (it's inside {_FOLDER_LABELS[kind]})" if inside else _FOLDER_LABELS[kind]
         return (
-            f"microsoft_mail doesn't move email to {_FOLDER_LABELS[kind]} — deleting, junking and "
+            f"microsoft_mail doesn't move email to {where} — deleting, junking and "
             "filing into Drafts / Sent Items / Outbox are out of scope (the user can do that in "
             "Outlook). Nothing was moved."
         )
@@ -1483,17 +1673,42 @@ class MicrosoftMailTool(Tool):
     ) -> ToolResult:
         """Move *messages* and the conversations' messages to *dest* — a
         conversation's messages already there, or in Drafts / Sent Items /
-        Deleted Items / Junk / Outbox, stay where they are."""
+        Deleted Items / Junk / Outbox (or a folder inside Deleted Items / Junk),
+        stay where they are."""
         dest_id = str(dest.get("id") or "")
         plan = list(messages)
         planned = set(plan)
+        came_from: dict[str, str] = {}  # a conversation's message → its folder's ID
+        inbox_id = ""
         failed: list[tuple[str, str]] = []
         already = 0
         left: dict[str, int] = {}
         if threads:
-            known = await self._known_folders(token, _STAY_PUT)
-            stay = {str(info["id"]): kind for kind, info in known.items() if info}
-            for cid, msgs in await self._conversations(token, threads, "id,parentFolderId"):
+            known = await self._known_folders(token, _MOVE_KNOWN)
+            stay = {str(info["id"]): kind for kind, info in known.items() if info and kind in _STAY_PUT}
+            inbox_id = str((known["inbox"] or {}).get("id") or "")
+            convs = await self._conversations(token, threads, "id,parentFolderId")
+            # Mail filed inside Deleted Items / Junk Email stays put too; mail
+            # in a folder whose place couldn't be read isn't moved.
+            places = {str(m.get("parentFolderId") or "") for _cid, msgs in convs
+                      if not isinstance(msgs, str) for m in msgs} - set(stay) - {dest_id, ""}
+            seen: dict[str, str] = {}
+            unchecked: dict[str, str] = {}  # folder ID → why its place is unknown
+
+            async def bin_of(f: str) -> str:
+                try:
+                    return await self._bin_of(token, f, seen=seen)
+                except _FolderPlaceError as exc:
+                    return f"?{exc}"
+
+            for place, kind, exc in await self._each(sorted(places), bin_of):
+                if exc is not None:
+                    unchecked[place] = self._why(exc)
+                elif kind.startswith("?"):
+                    unchecked[place] = kind[1:]
+                elif kind:
+                    stay[place] = kind
+            for cid, msgs in convs:
                 if isinstance(msgs, str):
                     failed.append((cid, msgs))
                     continue
@@ -1504,8 +1719,12 @@ class MicrosoftMailTool(Tool):
                     elif where in stay:
                         left[stay[where]] = left.get(stay[where], 0) + 1
                     elif mid and mid not in planned:
-                        plan.append(mid)
                         planned.add(mid)
+                        if where in unchecked:
+                            failed.append((mid, f"couldn't check its folder — {unchecked[where]}"))
+                            continue
+                        plan.append(mid)
+                        came_from[mid] = where
         if len(plan) > _MAX_ORGANIZE_MESSAGES:
             return ToolResult(success=False, error=(
                 f"These conversations hold {len(plan)} messages to move — at most "
@@ -1529,10 +1748,17 @@ class MicrosoftMailTool(Tool):
                 moved.append((mid, new_id))
             else:
                 failed.append((mid, self._why_not(exc)))
-        if not moved and not already and not left:
-            return self._nothing_changed(verb, failed)
-
         name = str(dest.get("displayName") or folder_arg)
+        skipped = []
+        if already:
+            skipped.append(f"{_plural(already, 'message')} already in '{name}'")
+        if left:
+            skipped.append("left where they are: " + ", ".join(
+                f"{n} in {_FOLDER_LABELS[kind]}" for kind, n in left.items()))
+        # Nothing moved: a success only when nothing needed to (all skipped).
+        if not moved and (failed or not skipped):
+            return self._nothing_changed(verb, failed, "; ".join(skipped))
+
         if moved:
             lines = [
                 f"{verb.capitalize()} {_plural(len(moved), 'message')} to '{name}'.",
@@ -1544,30 +1770,42 @@ class MicrosoftMailTool(Tool):
                              f"folder='{folder_arg}' shows their IDs.")
         else:
             lines = [f"Nothing was {verb}."]
-        skipped = []
-        if already:
-            skipped.append(f"{_plural(already, 'message')} already in '{name}'")
-        if left:
-            skipped.append("left where they are: " + ", ".join(
-                f"{n} in {_FOLDER_LABELS[kind]}" for kind, n in left.items()))
         if skipped:
             lines.append(f"  Skipped: {'; '.join(skipped)}.")
         lines += self._not_lines(verb, failed)
-        if moved:
-            new_ids = (f"message_ids=[{', '.join(new for _old, new in moved)}]"
-                       if len(moved) <= _MAX_LISTED_IDS
-                       else f"message_ids=[their new IDs — list_messages folder='{folder_arg}']")
-            lines.append(
-                f"Undo: microsoft_mail action=move folder=<the folder they came from> {new_ids}"
-                if dest.get("inbox") else
-                f"Undo: microsoft_mail action=move folder=Inbox {new_ids} (or the folder they came "
-                "from, if not the Inbox)"
-            )
+        # Undo by the folder they came from — known for a conversation's
+        # messages ("" for message_ids: not read before the move).
+        back: dict[str, list[str]] = {}
+        for old, new in moved:
+            back.setdefault(came_from.get(old, ""), []).append(new)
+
+        def undo(source: str, new_ids: str) -> str:
+            if source:
+                return (f"microsoft_mail action=move folder={'Inbox' if source == inbox_id else source} "
+                        f"{new_ids}")
+            if dest.get("inbox"):
+                return f"microsoft_mail action=move folder=<the folder they came from> {new_ids}"
+            return (f"microsoft_mail action=move folder=Inbox {new_ids} (or the folder they came "
+                    "from, if not the Inbox)")
+
+        if len(moved) <= _MAX_LISTED_IDS:
+            lines += [f"Undo: {undo(source, 'message_ids=[' + ', '.join(ids) + ']')}"
+                      for source, ids in back.items()]
+        else:  # too many to list: how many came from where, and where to find them
+            lines.append(f"Undo — their new IDs aren't all listed here; list_messages "
+                         f"folder='{folder_arg}' shows them. By the folder they came from:")
+            for source, ids in back.items():
+                origin = f" from {'Inbox' if source == inbox_id else source}" if source else ""
+                lines.append(f"  {_plural(len(ids), 'message')}{origin}: "
+                             f"{undo(source, 'message_ids=[their new IDs]')}")
         return ToolResult(success=True, content="\n".join(lines))
 
     async def _action_create_folder(self, token: str, folder: str = "", **kwargs: Any) -> ToolResult:
-        """Create a mail folder; 'Parent/Child' creates each missing level (a
-        path may start with a well-known folder: 'Inbox/Receipts')."""
+        """Create a mail folder; 'Parent/Child' creates each missing level. A
+        path's first part is found as a single name is — a well-known folder
+        ('Inbox/Receipts'), a top-level folder, else one in the Inbox — and is
+        made at the top level only when it is none of those. Nothing is made
+        inside Deleted Items or Junk Email."""
         parts = _folder_parts(folder)
         if not parts:
             return ToolResult(success=False, error=(
@@ -1575,24 +1813,23 @@ class MicrosoftMailTool(Tool):
                 "it inside Parent; no empty parts. Nothing was created."
             ))
         full = "/".join(parts)
-        cache = self._token_cache(self._folder_cache, token)
+        have, how = await self._walk(token, parts, known_ids=True)
+        if have and len(parts) > 1:
+            for kind, info in (await self._known_folders(token, _BINS)).items():
+                if info and str(info["id"]) == have[0]:
+                    return ToolResult(success=False, error=(
+                        f"microsoft_mail doesn't make folders inside {_FOLDER_LABELS[kind]} — mail "
+                        "filed there goes when it is emptied, and deleting / junking is out of scope. "
+                        "Nothing was created."
+                    ))
+        where = " in the Inbox" if how == "inbox" else ""
         parent: str | None = None  # None: the top level
         created: list[tuple[str, str]] = []  # (path, ID)
-        where = ""
         for i, part in enumerate(parts):
             here = "/".join(parts[:i + 1])
-            if created:
-                found = None  # nothing to find inside a folder made just now
-            elif i == 0:
-                known = _WELL_KNOWN.get(part.lower())
-                info = (await self._known_folders(token, (known,)))[known] if known else None
-                found = str(info["id"]) if info else await self._child_id(token, None, part)
-                if not found and len(parts) == 1:
-                    found = await self._child_id(token, "inbox", part)
-                    where = " in the Inbox" if found else ""
+            if i < len(have):
+                found = have[i]
             else:
-                found = await self._child_id(token, parent, part)
-            if not found:
                 try:
                     found, new = await self._post_folder(token, parent, part)
                 except httpx.HTTPError as exc:
@@ -1604,11 +1841,16 @@ class MicrosoftMailTool(Tool):
                     ))
                 if new:
                     created.append((here, found))
-                cache[here.casefold()] = found
             parent = found
+        # Only the whole path is cached: a lookup of it now finds this folder.
+        # Its first part needn't be what that name alone resolves to (a
+        # top-level 'Projects' beside Inbox/Projects/Acme) — nor a shorter part
+        # of the path; a well-known name stays one ('Inbox' → inbox).
+        if len(parts) > 1 or how != "known":
+            self._token_cache(self._folder_cache, token)[full.casefold()] = parent
         made_leaf = bool(created) and created[-1][0] == full
         if made_leaf:
-            lines = [f"Created folder '{full}'.", f"  Folder ID: {parent}"]
+            lines = [f"Created folder '{full}'{where}.", f"  Folder ID: {parent}"]
         else:
             lines = [f"Folder '{full}' already exists{where} (ID: {parent}) — nothing created."]
         parents = created[:-1] if made_leaf else created
@@ -1709,11 +1951,13 @@ class MicrosoftMailTool(Tool):
                 changed.append((mid, delta))
             else:
                 same += 1
-        if not changed and not same:
-            return self._nothing_changed("changed", failed)
-
         what = ("categories " if len(names) > 1 else "category ") + ", ".join(f"'{n}'" for n in names)
         it = "them" if len(names) > 1 else "it"
+        had = "already had" if adding else "didn't have"
+        # Nothing changed: a success only when nothing needed to.
+        if not changed and (failed or not same):
+            return self._nothing_changed(
+                "changed", failed, f"{_plural(same, 'message')} {had} {it}" if same else "")
         if changed:
             count = _plural(len(changed), "message")
             lines = [f"Added {what} to {count}." if adding else f"Removed {what} from {count}.",
@@ -1721,7 +1965,6 @@ class MicrosoftMailTool(Tool):
         else:
             lines = ["Nothing to change."]
         if same:
-            had = "already had" if adding else "didn't have"
             lines.append(f"  {_plural(same, 'message')} {had} {it} — unchanged.")
         lines += self._not_lines("changed", failed)
         # Undo exactly what changed: messages grouped by the categories they gained / lost.

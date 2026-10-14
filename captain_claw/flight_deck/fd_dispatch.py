@@ -61,7 +61,8 @@ _NO_MAIL_LINE = (
 _AUTONOMY_AUTOMATION: dict[str, str] = {"kind": "autonomy", "job_text": "", "mail_write": "deny"}
 
 # The agent's google_mail / send_mail refusal tag for an unauthorized write
-# (copied as a literal; FD never imports the agent's mail_authority module).
+# (copied as a literal: dispatch doesn't import the agent's mail_authority
+# module — in Flight Deck only bat_routes does, for its pure plan judges).
 _MAIL_REFUSAL_TAG = "[not-authorized: mail-write]"
 
 

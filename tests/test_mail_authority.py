@@ -376,8 +376,18 @@ EMAIL_NOUN_FALSE = [
     "Label email that comes from Ana as Clients",
     "Summarize email that came today",
     "Read email that came today",
+    "Archive email the boss sent last week",
+    "Find unread email that came from Ana",
+    "Delete email that is older than a week",
+    # …nor is a statement about who emails whom
+    "I'll email them myself, just summarize the inbox",
+    "We usually email the team on Fridays; just summarize the inbox",
+    "Summarize who I should email this week",
+    "Check if Ana asked me to email her the deck",
+    "Ana will email me the deck tomorrow, summarize it",
 ]
-# …while "email" as the verb still is one.
+# …while "email" as the verb still is one — wherever the instruction puts it:
+# after a request phrase or an adverb, a dash, or a condition with no comma.
 EMAIL_VERB_STILL = [
     ("Email it to ana@x.co", "any"),
     ("Then email them the deck", "any"),
@@ -385,6 +395,31 @@ EMAIL_VERB_STILL = [
     ("Email this to bob@x.co", "any"),
     ("please email them the report", "any"),
     ("Archive the newsletters and email me the list", "self"),
+    ("Every Friday at 5pm make sure to email the timesheet to hr@x.co", "any"),
+    ("Summarize Hacker News — email the top 5 to ana@x.co", "any"),
+    ("Collect sales data → email the summary to ana@x.co", "any"),
+    ("When the report is ready email it to bob@x.co", "any"),
+    ("When a new invoice arrives email it to accounting@x.co", "any"),
+    ("If sales drop email the team at ops@x.co", "any"),
+    ("If the build fails email dev@x.co", "any"),
+    ("Check the CI status; if red email the on-call engineer oncall@x.co", "any"),
+    ("Go through my inbox and for each invoice email it to accounting@x.co", "any"),
+    ("Run the backup script, and if it fails email the log to ops@x.co", "any"),
+    ("Once done email them the deck", "any"),
+    ("Once a week email them the report", "any"),
+    ("Always email the report to ana@x.co", "any"),
+    ("Don't forget to email the report to ana@x.co", "any"),
+    ("Be sure to email the report to ana@x.co", "any"),
+    ("Make sure you email the report to ana@x.co", "any"),
+    ("Remember to email the report to ana@x.co", "any"),
+    ("You should email the report to ana@x.co", "any"),
+    ("Please always email the report to ana@x.co", "any"),
+    ("Immediately email bob@x.co", "any"),
+    ("Finally email the report to bob@x.co", "any"),
+    ("Automatically email the report to Ana every Friday", "any"),
+    ("Compile the stats and immediately email them to bob@x.co", "any"),
+    ("When ready email that to bob@x.co", "any"),
+    ("Summarize HN — email me the top 5", "self"),
 ]
 
 
@@ -395,6 +430,89 @@ def test_email_as_a_noun_is_no_intent(text):
 
 @pytest.mark.parametrize("text,scope", EMAIL_VERB_STILL)
 def test_email_as_a_verb_still_is(text, scope):
+    assert ma.intent_scope(text) == scope, text
+
+
+def test_jobs_that_email_wherever_the_verb_stands_may_send():
+    """Existing jobs worded "if X email …" / "— email …" / "make sure to
+    email …" keep sending at fire time, an agent-made one included."""
+    for job in ("Every Friday at 5pm make sure to email the timesheet to hr@x.co",
+                "Summarize Hacker News — email the top 5 to ana@x.co",
+                "When the report is ready email it to bob@x.co",
+                "Always email the report to ana@x.co"):
+        with ma.bound(ma.automated("cron", job, "intent")):
+            assert ma.check_mail_write("google_mail", "send", recipients=["ana@x.co"]) is None, job
+    payload = {"text": "Summarize Hacker News — email the top 5 stories to ana@x.co",
+               "author": "agent",
+               "mail_intent_text": "Every morning summarize Hacker News and email the top 5 to ana@x.co"}
+    assert ma.cron_job_text(payload) == payload["text"]
+    with ma.bound(ma.automated("cron", ma.cron_job_text(payload), "intent")):
+        assert ma.check_mail_write("google_mail", "send", recipients=["ana@x.co"]) is None
+    with ma.bound(ma.automated("cron", "Archive email that is older than a week", "intent")):
+        assert ma.is_refusal(ma.check_mail_write("google_mail", "send", recipients=["ana@x.co"]))
+
+
+# A negation before a list of verbs covers them all ("don't draft, send or
+# reply …"), in EN and HR…
+EMAIL_NEGATED_LISTS = [
+    "Don't draft, send or reply to emails",
+    "Never draft or send emails",
+    "Summarize my inbox. Don't draft, send or reply to any email.",
+    "Summarize the new emails. Do not reply, forward or send any email.",
+    "Never reply to, forward or email anyone",
+    "Summarize. Don't draft, send or email anyone.",
+    "Nemoj pisati, slati ni odgovarati na mailove",
+    "Nemoj odgovarati, napisati ni poslati mail Ani",
+    # (round 3) a negation after an earlier verb's object ("read my emails
+    # and …") or with an intensifier ("do not under any circumstances")
+    "Read the report and under no circumstances draft, send or forward it to ana@x.co",
+    "Read my emails and on no account draft, send or reply to anyone",
+    "Open the contract and under no circumstances edit, send or forward it to ana@x.co",
+    "Every morning open the new emails and in no case reply, forward or send anything to ana@x.co",
+    "Pročitaj mailove i nipošto ne piši, šalji ni prosljeđuj ništa na ana@x.co",
+    "Pročitaj mailove nemoj ništa napisati, poslati ni proslijediti na ana@x.co",
+    "Summarize my inbox and do not at any point reply, forward or send anything to ana@x.co",
+    "Summarize the thread and do not under any circumstances send emails to ana@x.co",
+    # A typographic apostrophe (phones and macOS type "Don’t") negates too.
+    "Don’t draft, send or forward it to ana@x.co",
+    "Don’t email the report to ana@x.co",
+    "Summarize my inbox. Don‘t reply to anyone.",
+]
+# …even with a contrast word after the list: "instead" / "rather" ends the
+# negation only in the judged verb's own member ("don't reply, email Ana the
+# report instead"), never in a later clause, after "or", or as "instead of".
+EMAIL_CONTRAST_AFTER_A_LIST = [
+    "Don't draft, send or reply to emails, just summarize them instead",
+    "Never draft, send or forward any email, rather summarize them",
+    "Don't draft, send or reply to anyone instead of me",
+    "Don't draft or send emails instead",
+    # (round 3) a later clause without punctuation isn't the member's
+    "Don't draft, send emails just summarize them instead",
+    "Don't draft, send emails please summarize them instead",
+    "Don't draft, forward anything to ana@x.co just summarize instead",
+]
+# …but not a new instruction after it, nor a reminder's "don't forget to".
+EMAIL_AFTER_A_NEGATION = [
+    ("Don't archive anything, just email me the list", "self"),
+    ("Don't reply, email Ana the report instead", "any"),
+    ("Don't summarize, draft a reply to Ana", "any"),
+    ("Remind me to email Ana, and draft a reply to Bob", "any"),
+    ("Make sure to email the report to ana@x.co and don't archive anything", "any"),
+    # (round 3) an address's "." doesn't end the member
+    ("Don't draft, send the report to ana@x.co instead", "any"),
+    ("Don't draft, forward the report to ana@x.co instead", "any"),
+]
+
+
+@pytest.mark.parametrize("text", EMAIL_NEGATED_LISTS + EMAIL_CONTRAST_AFTER_A_LIST)
+def test_a_negated_list_of_mail_verbs_asks_for_no_email(text):
+    assert ma.intent_scope(text) == "none", text
+    with ma.bound(ma.automated("cron", text, "intent")):
+        assert ma.is_refusal(ma.check_mail_write("google_mail", "send", recipients=["ana@x.co"]))
+
+
+@pytest.mark.parametrize("text,scope", EMAIL_AFTER_A_NEGATION)
+def test_an_instruction_after_a_negation_still_asks(text, scope):
     assert ma.intent_scope(text) == scope, text
 
 
@@ -932,6 +1050,34 @@ ORGANIZE_TRUE = [
     "napravi mapu Klijenti u Outlooku",
     "dodaj labelu Klijenti mailovima od Ane",
     "pospremi mi inbox",
+    # (re-check) a mailbox place right after a summary / app word keeps it,
+    # the summary of the next instruction isn't this one's, and a new
+    # instruction after a negation still asks
+    "Move the report emails to the Reports folder",
+    "Move newsletters to the Digest folder",
+    "Label urgent emails as Urgent so they show at the top of my inbox",
+    "Every morning archive the newsletters and list the rest in the summary",
+    "Mark the newsletters as read and summarize them in the digest",
+    "Archive the GitHub notifications in my inbox",
+    "Archive the Slack notification emails",
+    "Don't forget to archive, label and move the newsletters",
+    "Summarize my inbox but don't archive anything, label urgent emails as Urgent",
+    "Don't archive them, move them to the Old folder instead",
+    "Razvrstaj mailove u mape po pošiljatelju",
+    "Razvrstaj mailove po mapama",
+    "Označi mailove od Ane labelom Klijenti i sažmi ih u izvještaju",
+    # (round 2) a contrast in the verb's own member after a negated one is
+    # a new instruction; HR "u <mailbox place>" with a word before it
+    "Don't reply, archive the newsletters instead",
+    "Nemoj odgovarati, arhiviraj newslettere umjesto toga",
+    "Don't archive, label my emails instead",
+    "Sortiraj mailove u odgovarajuće mape",
+    "Razvrstaj mailove pod labelu Klijenti",
+    # (round 3) "rather" closing the member is a contrast; a mailbox place
+    # right after an app word keeps it
+    "Don't reply, archive the newsletters rather",
+    "Don't reply, archive the newsletters instead please",
+    "Move the emails to the Slack alerts folder",
 ]
 # …and not: negations, reminders, statements, questions, other things than
 # mail (meetings, files, charts, Slack), reading mail, and a label / folder
@@ -991,6 +1137,170 @@ ORGANIZE_FALSE = [
     "Create a new label called Invoices",
     "Create a folder Receipts",
 ]
+# A negation before a list of organize verbs covers every verb in it — a
+# job that forbids organizing must not be allowed to.
+ORGANIZE_NEGATED_LISTS = [
+    "Never archive, label or move my emails",
+    "Don’t archive, move or label my emails",  # typographic apostrophe
+    "Summarize my inbox. Don’t archive anything.",
+    "Summarize my inbox every morning. Don't archive, move or label anything.",
+    "Do not move, archive or tag emails",
+    "Every morning summarize my Outlook inbox. Do not move, categorize or archive any message.",
+    "Summarize my inbox. Don't archive, move, or label emails.",
+    "Summarize my inbox. Don't archive emails, move them or label them.",
+    "Read my emails, don't archive, move them",
+    "Never archive, move my emails",
+    "Don't archive and label my emails",
+    "Never archive/move my emails",
+    "Do not, under any circumstances, archive, move or label emails",
+    "Remind me to archive, label and move the newsletters",
+    "Summarize unread emails. Do not archive, move, label or otherwise reorganize any email.",
+    "Nemoj arhivirati, premjestiti ni označiti mailove",
+    "Sažmi mi inbox. Nemoj arhivirati, premjestiti ili označiti mailove.",
+    "Nemoj arhivirati mailove i premjestiti ih u mapu Stari",
+    # (round 3) an earlier verb's object never hides the negation, a member
+    # over a negation is negated, and a negation may carry an intensifier
+    "Read my emails and under no circumstances archive, move or label them",
+    "Read my emails and on no account archive, label, or move any of them",
+    "Every morning open the new emails and in no case move, archive or tag them",
+    "Go through my unread emails from clients and by no means label, move or archive anything",
+    "Read the report and at no time archive, move or label them",
+    "Pročitaj mailove i nikad ne arhiviraj, premjesti ni označi ih",
+    "Pročitaj mailove i ništa nemoj arhivirati, premjestiti ni označiti",
+    "Pročitaj mailove nemoj ih arhivirati, premjestiti ni označiti",
+    "Pročitaj mailove i nipošto ih ne arhiviraj, premještaj ni označavaj",
+    "Never archive emails without attachments, move them or label them",
+    "Don't archive the read emails, move them or label them",
+    "Summarize my inbox and do not under any circumstances archive, move or label them",
+    "Look at my inbox but under no circumstances whatsoever archive and label them",
+]
+# Organize-like verbs that put things somewhere else than the mailbox —
+# another app, or the answer itself — even with mail earlier in the
+# sentence; and HR razvrstaj / sortiraj / označi with nowhere in the mailbox
+# to put it (like EN sort / file / mark).
+ORGANIZE_ELSEWHERE = [
+    "When an email from a client arrives, tag @ana in the #support Slack channel",
+    "Every morning summarize the emails and file them under the right project in Notion",
+    "Check new emails and file any invoices in QuickBooks",
+    "Summarize today's emails and sort them by importance in the digest",
+    "Read the emails and add the action items to the Tasks folder in Drive",
+    "Read the newsletters and tag @ana in Slack",
+    "Summarize the emails and archive the Slack thread",
+    "Every morning check my inbox and move the important stuff to the top of the summary",
+    "Every morning check my inbox and categorize the emails in your summary",
+    "Every morning read my emails and label each as urgent or not in your reply",
+    "Every morning check my inbox and star anything from my boss in the summary",
+    "Summarize my emails and mark the urgent ones as important in the report",
+    "Every morning summarize my inbox and move urgent emails to the top",
+    "Summarize my inbox and organize my emails into a briefing",
+    "Svako jutro pregledaj mailove i sortiraj ih po hitnosti",
+    "Pročitaj mailove i označi najvažnije u sažetku",
+    "Svako jutro sažmi mailove i razvrstaj ih po prioritetu u sažetku",
+    "Pregledaj mailove i razvrstaj ih po prioritetu u izvještaju",
+    "Svako jutro sažmi mailove i označi hitne",
+    # (round 2) the app / the answer however it is phrased: modifiers,
+    # "the end of", an app it goes through, "on" an app
+    "When an email from a client arrives, tag @ana in our team's main Slack channel",
+    "Every morning check my inbox and label the urgent ones in your daily email summary",
+    "Summarize my emails and move the newsletters to the end of the list",
+    "Summarize the emails and move the action items to my to-do list",
+    "Read the newsletters and tag @ana on Slack",
+    "Read the newsletters and tag @ana via Slack",
+    "Summarize my inbox and archive the Slack thread",
+    # (round 3) the answer however it is phrased ("a column of", "the header
+    # of", an "email / mail / recipients list"); a mailbox place only right
+    # after the noun
+    "Summarize my emails and label the urgent ones in a column of the summary",
+    "Summarize my emails and move the urgent ones to a section of the digest",
+    "Summarize my emails and label the urgent ones in each row of the table",
+    "Summarize my emails and categorize them in the header of your reply",
+    "Every morning summarize my emails and star the important ones in a part of your answer",
+    "Every morning summarize my emails and tag each one with a priority in the first line of each summary item",
+    "Every morning list my unread emails and label each one urgent, normal or low in the email list",
+    "Every morning list my unread emails and label each one urgent, normal or low in the mail list",
+    "Every morning list my unread emails and label each one urgent, normal or low in your email list",
+    "Every morning list my unread emails and label each one urgent, normal or low in today's email list",
+    "Every morning list my unread emails and label each one urgent, normal or low in the daily email list",
+    "Every morning list my unread emails and label each one urgent, normal or low in the recipients list",
+    "Summarize my emails and label the urgent ones in my block list summary",
+    "Pročitaj mailove i označi važne labelom Hitno u popisu primatelja",
+    "Summarize my emails and label the urgent ones in the summary with a label",
+    "When a client emails, tag @ana in Slack and the inbox",
+    # …another app however it is phrased, an object only in the mailbox right
+    # after it, and only an arrival verb right after the mail is a source
+    "When an email arrives, tag @ana in which Slack channel fits",
+    "When an invoice email arrives, file it in which QuickBooks account fits",
+    "Read new emails and file each one under a ticket with Zendesk",
+    "When a client emails, tag @ana in the customer support team Slack channel",
+    "Every morning summarize my emails and categorize them in a thread of our Slack",
+    "Archive the Slack channel but keep the emails in my inbox",
+    "Archive the Slack thread, not the emails in my inbox",
+    "Summarize my inbox and archive the Slack channel from my inbox list",
+    "When a client emails, tag @ana in a message posted via Slack",
+    "When a client emails, tag @ana in a message sent via Slack",
+    "When a client emails, tag @ana and have it sent via Slack",
+    "Check new emails and file the invoices to be synced through QuickBooks",
+    "Check new emails and file the invoices sent via Stripe into Xero",
+    "Check emails and file the invoices that came through Stripe in QuickBooks",
+]
+# A negation before a list still covers every verb with a contrast word after
+# the list: only one in the judged verb's own member, right after the negated
+# one ("don't reply, archive the newsletters instead"), starts a new
+# instruction — not one in a later clause, after an "or" list, or "instead of"
+# / "rather than".
+ORGANIZE_CONTRAST_AFTER_A_LIST = [
+    "Please don't archive, label or move my emails, just summarize them instead.",
+    "Summarize my inbox. Don't archive, move or label any email, rather list them.",
+    "Don't archive, move or label my emails instead of summarizing them",
+    "Never archive, label or move emails rather than reading them",
+    "Nemoj arhivirati, premjestiti ni označiti mailove, radije ih sažmi.",
+    "Nemoj arhivirati, premjestiti ili označiti mailove umjesto sažetka.",
+    "Don't archive, move or label my emails instead",
+    "Never archive, label, move my emails instead",
+    # (round 3) "just" / "please" / "only" or a verb with its own object
+    # starts a new instruction, and "rather" before a word is no contrast
+    "Don't archive, move my emails just summarize them instead",
+    "Never archive, label the emails please just list them instead",
+    "Don't archive, tag my emails only list them instead",
+    "Don't archive, star my emails summarize them instead",
+    "Don't archive, label the rather old newsletters",
+]
+# …and a list member with a long object, or an "or" inside it.
+ORGANIZE_LONG_LIST_MEMBERS = [
+    "Do not archive any of the emails, move them or label them",
+    "Summarize my inbox. Do not archive any of the emails from my bank, move them or label them.",
+    "Do not archive any of the newsletters from Substack or Medium, move them or label them",
+]
+# HR razvrstaj / sortiraj "u …" counts only into a mailbox place.
+ORGANIZE_HR_NOT_INTO_A_MAILBOX_PLACE = [
+    "sortiraj mailove po hitnosti u 8 sati",
+    "Razvrstaj mailove po hitnosti u tri skupine",
+    "Svako jutro sažmi mailove i razvrstaj ih po hitnosti u tri skupine",
+    "Pregledaj mailove i sortiraj ih po važnosti u ponedjeljak",
+]
+# Another app the mail came through, or that the object belongs to, is no
+# destination — nor is a list of the mailbox's own ("my contacts list").
+ORGANIZE_FROM_ANOTHER_APP = [
+    "Archive LinkedIn messages in my inbox",
+    "Archive emails that came through Zendesk",
+    "Label all emails sent via HubSpot as Marketing",
+    "Archive the Slack message digests from my inbox",
+    "Archive newsletters from senders on my block list",
+    "Label emails from people in my contacts list as Contacts",
+    # (round 3) other arrival verbs and explicit mailbox lists
+    "Archive emails forwarded to me via Zendesk",
+    "Label emails coming in through Intercom as Support",
+    "Archive emails from addresses on my blocked senders list",
+    "Archive the Slack thread in my inbox",
+    "Pročitaj mailove i označi važne labelom Hitno u popisu kontakata",
+]
+# Read as a destination, so refused — failing closed on purpose: a word
+# between the preposition and the app ("to people at HubSpot") isn't told
+# apart from "under a ticket with Zendesk".
+ORGANIZE_FAILS_CLOSED = [
+    "Label emails to people at HubSpot as Partners",
+    "Archive emails in which Zendesk is mentioned",
+]
 # Organizing and an email in one text: each judged on its own.
 ORGANIZE_AND_EMAIL = [
     ("Archive the newsletters and email me the list", "self"),
@@ -1010,6 +1320,37 @@ def test_organize_intent_true(text):
 @pytest.mark.parametrize("text", ORGANIZE_FALSE)
 def test_organize_intent_false(text):
     assert ma.organize_intent(text) is False, text
+
+
+@pytest.mark.parametrize("text", ORGANIZE_NEGATED_LISTS + ORGANIZE_ELSEWHERE
+                         + ORGANIZE_CONTRAST_AFTER_A_LIST + ORGANIZE_LONG_LIST_MEMBERS
+                         + ORGANIZE_HR_NOT_INTO_A_MAILBOX_PLACE + ORGANIZE_FAILS_CLOSED)
+def test_organize_intent_negated_lists_and_other_places(text):
+    assert ma.organize_intent(text) is False, text
+    with ma.bound(ma.automated("cron", text, "intent")):
+        for tool, action in (("google_mail", "archive"), ("google_mail", "move"),
+                             ("google_mail", "create_label"), ("microsoft_mail", "move")):
+            assert ma.is_refusal(ma.check_mailbox_change(tool, action)), (text, action)
+
+
+@pytest.mark.parametrize("text", ORGANIZE_FROM_ANOTHER_APP)
+def test_an_app_the_mail_came_through_is_no_destination(text):
+    assert ma.organize_intent(text) is True, text
+    assert ma.intent_scope(text) == "none", text
+    with ma.bound(ma.automated("cron", text, "intent")):
+        assert ma.check_mailbox_change("google_mail", "archive") is None, text
+        assert ma.check_mailbox_change("microsoft_mail", "move") is None, text
+        assert ma.is_refusal(ma.check_mail_write("google_mail", "send", recipients=["ana@x.co"]))
+
+
+def test_agent_cron_job_that_forbids_organizing():
+    """The user forbids it and the agent's task repeats it: both texts say
+    "never archive …", so the job may not archive, move or label."""
+    user = "Every morning summarize my inbox. Never archive, label or move my emails."
+    payload = {"text": user, "author": "agent", "mail_intent_text": user}
+    with ma.bound(ma.automated("cron", ma.cron_job_text(payload), "intent")):
+        assert ma.is_refusal(ma.check_mailbox_change("google_mail", "archive"))
+        assert ma.is_refusal(ma.check_mailbox_change("microsoft_mail", "move"))
 
 
 @pytest.mark.parametrize("text,scope", ORGANIZE_AND_EMAIL)

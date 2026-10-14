@@ -15,6 +15,7 @@ No network: Gmail answers through httpx.MockTransport.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
@@ -132,8 +133,10 @@ OK = (200, {"id": "x"})
 _NOT_FOUND = (404, {"error": {"code": 404, "message": "Requested entity was not found."}})
 _NO_SCOPE = (403, {"error": {"code": 403, "message": "Request had insufficient authentication scopes.",
                              "status": "PERMISSION_DENIED"}})
-_STANDALONE_FIX = "google_oauth.scopes in config.yaml and reconnect Google (/auth/google/login)"
+# Standalone: the default google_oauth.scopes already has gmail.modify — just reconnect.
+_STANDALONE_FIX = "already include it — reconnect Google (/auth/google/login) to grant it"
 _FD_FIX = "A Flight Deck admin ticks it in Connections → Google"
+_OTHER_LABELS_STAY = "Their other labels stay on"
 
 
 # ── archive ──────────────────────────────────────────────────────────
@@ -166,13 +169,18 @@ async def test_archive_messages_is_one_batch_modify(monkeypatch):
     assert "pass thread_ids" in res.content
 
 
-async def test_batch_failure_retries_one_by_one_to_isolate_the_bad_id(monkeypatch):
+@pytest.mark.parametrize("status, why", [
+    (400, "rejected: Invalid id value"),
+    (404, "not found"),  # one of the IDs is gone
+])
+async def test_batch_failure_retries_one_by_one_to_isolate_the_bad_id(monkeypatch, status, why):
     _set_mode(monkeypatch)
+    bad = (status, {"error": {"code": status, "message": "Invalid id value"}})
     gmail = _Gmail({
-        ("POST", "/messages/batchModify"): (400, {"error": {"message": "Invalid id value"}}),
+        ("POST", "/messages/batchModify"): bad,
         ("POST", "/messages/m1/modify"): OK,
         ("POST", "/messages/m3/modify"): OK,
-        ("POST", "/messages/bad/modify"): (400, {"error": {"message": "Invalid id value"}}),
+        ("POST", "/messages/bad/modify"): bad,
     })
     res = await _tool_with(gmail).execute("archive", message_ids=["m1", "bad", "m3"])
     assert res.success, res.error
@@ -180,7 +188,7 @@ async def test_batch_failure_retries_one_by_one_to_isolate_the_bad_id(monkeypatc
         "/messages/batchModify", "/messages/m1/modify", "/messages/bad/modify", "/messages/m3/modify"]
     assert gmail.calls()[1][1] == {"removeLabelIds": ["INBOX"]}  # no ids in a single modify
     assert "Archived 2 messages" in res.content and "Message IDs: m1, m3" in res.content
-    assert "NOT archived: bad (rejected: Invalid id value)" in res.content
+    assert f"NOT archived: bad ({why})" in res.content
     assert "message_ids=[m1, m3]" in res.content  # the undo names only what changed
 
 
@@ -214,6 +222,65 @@ async def test_all_failed_is_a_failure_with_nothing_changed(monkeypatch):
     for target in ("a", "b", "c"):
         assert f"NOT archived: {target} (not found)" in res.error
     assert "Nothing was changed. Check the IDs" in res.error
+
+
+async def test_a_batch_rate_limit_is_not_retried_one_by_one(monkeypatch):
+    _set_mode(monkeypatch)
+    gmail = _Gmail({("POST", "/messages/batchModify"): (429, {"error": {"message": "Too many"}})})
+    res = await _tool_with(gmail).execute("archive", message_ids=["m1", "m2"])
+    assert not res.success
+    assert gmail.calls() == [("/messages/batchModify",
+                              {"ids": ["m1", "m2"], "removeLabelIds": ["INBOX"]})]
+    for target in ("m1", "m2"):
+        assert f"NOT archived: {target} (Gmail rate limit — try again in a moment)" in res.error
+    assert res.error.endswith("Nothing was changed.")  # not "Check the IDs" — they're fine
+
+
+async def test_a_batch_server_error_fails_its_messages_but_not_the_threads(monkeypatch):
+    _set_mode(monkeypatch)
+    gmail = _Gmail({("POST", "/threads/t1/modify"): OK,
+                    ("POST", "/messages/batchModify"): (500, {"error": {"message": "Backend"}})})
+    res = await _tool_with(gmail).execute("archive", thread_ids=["t1"], message_ids=["m1", "m2"])
+    assert res.success, res.error
+    assert [p for p, _ in gmail.calls()] == ["/threads/t1/modify", "/messages/batchModify"]
+    assert "Archived 1 conversation" in res.content and "Message IDs" not in res.content
+    for target in ("m1", "m2"):
+        assert f"NOT archived: {target} (Gmail API error 500)" in res.content
+    assert "Undo: google_mail action=move label=INBOX thread_ids=[t1]" in res.content
+    assert "message_ids=[" not in res.content
+
+
+async def test_expired_authentication_on_every_target_says_reconnect(monkeypatch):
+    _set_mode(monkeypatch)
+    expired = (401, {"error": {"code": 401, "message": "Invalid Credentials"}})
+    gmail = _Gmail({("POST", "/threads/t1/modify"): expired,
+                    ("POST", "/messages/batchModify"): expired})
+    res = await _tool_with(gmail).execute("archive", thread_ids=["t1"], message_ids=["m1", "m2"])
+    assert not res.success
+    assert res.error == ("Google authentication expired. Please reconnect your Google account. "
+                         "Nothing was changed.")
+
+
+async def test_at_most_five_gmail_requests_run_at_once(monkeypatch):
+    _set_mode(monkeypatch)
+    state = {"now": 0, "peak": 0}
+
+    async def gmail(request: httpx.Request) -> httpx.Response:
+        state["now"] += 1
+        state["peak"] = max(state["peak"], state["now"])
+        await asyncio.sleep(0.01)  # stays in flight while the others start
+        state["now"] -= 1
+        if request.url.path.endswith("/batchModify"):  # retried one by one
+            return httpx.Response(400, json={"error": {"message": "Invalid id value"}})
+        return httpx.Response(200, json={"id": "x"})
+
+    tool = GoogleMailTool()
+    tool._client = httpx.AsyncClient(transport=httpx.MockTransport(gmail))
+    res = await tool.execute("archive", thread_ids=[f"t{i}" for i in range(30)],
+                             message_ids=[f"m{i}" for i in range(30)])
+    assert res.success, res.error
+    assert "Archived 30 conversations and 30 messages" in res.content
+    assert 1 < state["peak"] <= 5, state["peak"]
 
 
 @pytest.mark.parametrize("kwargs, threads, messages", [
@@ -282,8 +349,11 @@ async def test_move_to_a_user_label_adds_it_and_leaves_the_inbox(monkeypatch):
     assert len(gmail.calls("GET")) == 1  # one labels.list per call
     assert "Moved 1 conversation and 1 message to 'Receipts'" in res.content
     assert "Note: Gmail shows conversations" in res.content
-    assert 'Undo: google_mail action=remove_labels labels=["Receipts"] thread_ids=[t1] message_ids=[m1]' \
-        in res.content
+    assert _OTHER_LABELS_STAY in res.content
+    # The undo also brings them back to the Inbox — removing the label alone wouldn't.
+    assert res.content.splitlines()[-1] == (
+        'Undo: google_mail action=remove_labels labels=["Receipts"] thread_ids=[t1] message_ids=[m1], '
+        "then action=move label=INBOX with the same IDs")
 
 
 async def test_move_to_inbox_only_adds_inbox(monkeypatch):
@@ -293,11 +363,28 @@ async def test_move_to_inbox_only_adds_inbox(monkeypatch):
     assert res.success, res.error
     assert gmail.calls() == [("/threads/t1/modify", {"addLabelIds": ["INBOX"]})]
     assert "Moved 1 conversation back to the Inbox." in res.content
+    assert _OTHER_LABELS_STAY in res.content  # still under Receipts, if it was
     assert "Undo: google_mail action=archive thread_ids=[t1]" in res.content
+
+
+async def test_moving_between_labels_says_the_old_label_stays(monkeypatch):
+    # "Move the Acme threads from Receipts to Clients": move adds Clients and
+    # removes INBOX — Receipts stays on, and the answer says how to take it off.
+    _set_mode(monkeypatch)
+    gmail = _Gmail({("GET", "/labels"): LABELS, ("POST", "/threads/t1/modify"): OK})
+    res = await _tool_with(gmail).execute("move", label="Clients", thread_ids=["t1"])
+    assert res.success, res.error
+    assert gmail.calls() == [("/threads/t1/modify",
+                              {"addLabelIds": ["Label_2"], "removeLabelIds": ["INBOX"]})]
+    assert "Moved 1 conversation to 'Clients'" in res.content
+    assert (_OTHER_LABELS_STAY + " — to take one off too (e.g. the label they were filed under "
+            'before), google_mail action=remove_labels labels=["<label>"] with the same IDs.') \
+        in res.content
 
 
 @pytest.mark.parametrize("dest, hint", [
     ("TRASH", "out of scope"), ("spam", "out of scope"), ("SENT", "out of scope"),
+    ("Sent Mail", "out of scope"), ("Drafts", "out of scope"),  # Gmail's folder names
     ("UNREAD", "add_labels"), ("starred", "add_labels"), ("promotions", "add_labels"),
 ])
 async def test_move_refuses_destinations_that_are_not_places(monkeypatch, dest, hint):
@@ -306,6 +393,106 @@ async def test_move_refuses_destinations_that_are_not_places(monkeypatch, dest, 
     res = await _tool_with(gmail).execute("move", label=dest, thread_ids=["t1"])
     assert not res.success
     assert hint in res.error and "Nothing was changed." in res.error
+    assert "create_label" not in res.error  # never "make a label called Sent Mail"
+    assert gmail.calls() == []
+
+
+@pytest.mark.parametrize("dest", ["Archive", "archived", "All Mail"])
+async def test_move_to_the_archive_points_at_action_archive(monkeypatch, dest):
+    # Gmail has no Archive label: "move these to the archive" is action=archive,
+    # not a new label called Archive.
+    _set_mode(monkeypatch)
+    gmail = _Gmail({("GET", "/labels"): LABELS, ("POST", "/threads/t1/modify"): OK})
+    res = await _tool_with(gmail).execute("move", label=dest, thread_ids=["t1"])
+    assert not res.success
+    assert res.error == (
+        "Gmail has no Archive label — archiving just takes emails out of the Inbox (All Mail "
+        "still shows them). Use google_mail action=archive with the same IDs instead. "
+        "Nothing was changed.")
+    assert gmail.calls() == []
+
+
+def _with_own_label(name: str, label_id: str = "Label_9") -> tuple[int, dict]:
+    """LABELS plus a user label *name* of the mailbox's own."""
+    return 200, {"labels": [*LABELS[1]["labels"], {"id": label_id, "name": name, "type": "user"}]}
+
+
+async def test_move_to_a_user_label_called_archive_files_there(monkeypatch):
+    _set_mode(monkeypatch)
+    gmail = _Gmail({("GET", "/labels"): _with_own_label("Archive"), ("POST", "/threads/t1/modify"): OK})
+    res = await _tool_with(gmail).execute("move", label="archive", thread_ids=["t1"])
+    assert res.success, res.error
+    assert gmail.calls() == [("/threads/t1/modify",
+                              {"addLabelIds": ["Label_9"], "removeLabelIds": ["INBOX"]})]
+
+    # An exact user label wins over the archive pointer — "Archived" too.
+    gmail = _Gmail({("GET", "/labels"): _with_own_label("Archived", "Label_8"),
+                    ("POST", "/threads/t1/modify"): OK})
+    res = await _tool_with(gmail).execute("move", label="ARCHIVED", thread_ids=["t1"])
+    assert res.success, res.error
+    assert gmail.calls() == [("/threads/t1/modify",
+                              {"addLabelIds": ["Label_8"], "removeLabelIds": ["INBOX"]})]
+
+
+@pytest.mark.parametrize("dest, why", [
+    ("archived", "No such Gmail label: 'archived'"),
+    ("All Mail", "'All Mail' is Gmail's view of every email, not a label"),
+])
+async def test_move_to_an_archive_name_points_at_the_mailboxs_own_archive_label(
+        monkeypatch, dest, why):
+    # With a label "Archive" of its own, "Gmail has no Archive label" would be
+    # false — and would hide the label the user may have meant.
+    _set_mode(monkeypatch)
+    gmail = _Gmail({("GET", "/labels"): _with_own_label("Archive"), ("POST", "/threads/t1/modify"): OK})
+    res = await _tool_with(gmail).execute("move", label=dest, thread_ids=["t1"])
+    assert not res.success
+    assert res.error == (
+        f"{why} — this mailbox has its own label 'Archive': to file them there, google_mail "
+        'action=move label="Archive" with the same IDs. Nothing was changed.')
+    assert "no Archive label" not in res.error and "action=archive" not in res.error
+    assert gmail.calls() == []
+
+
+async def test_add_labels_with_an_archive_name_points_at_the_mailboxs_own_archive_label(monkeypatch):
+    _set_mode(monkeypatch)
+    gmail = _Gmail({("GET", "/labels"): _with_own_label("Archive"), ("POST", "/threads/t1/modify"): OK})
+    res = await _tool_with(gmail).execute("add_labels", labels=["archived"], thread_ids=["t1"])
+    assert not res.success
+    assert "No such Gmail label: 'archived'. Existing labels: Archive, Clients, Receipts." in res.error
+    assert ("This mailbox has its own label 'Archive' — pass that name if it's the one meant."
+            in res.error)
+    assert "no Archive label" not in res.error and "action=archive" not in res.error
+    # Not "make a label called archived" next to Archive.
+    assert "create_label" not in res.error
+    assert res.error.endswith("Nothing was changed.")
+    assert gmail.calls() == []
+
+
+@pytest.mark.parametrize("kwargs, named", [
+    ({"label": "Receipts", "labels": ["Archive"]}, "'Receipts', 'Archive'"),
+    ({"label": "All Mail", "labels": ["Receipts"]}, "'All Mail', 'Receipts'"),
+    ({"label": "Receipts", "labels": ["Invoices 2026"]}, "'Receipts', 'Invoices 2026'"),
+])
+async def test_move_checks_one_destination_before_the_names_themselves(monkeypatch, kwargs, named):
+    # A leftover list naming the archive must not turn "file under Receipts"
+    # into "use action=archive instead" — the conflict is what's wrong.
+    _set_mode(monkeypatch)
+    gmail = _Gmail({("GET", "/labels"): LABELS, ("POST", "/threads/t1/modify"): OK})
+    res = await _tool_with(gmail).execute("move", thread_ids=["t1"], **kwargs)
+    assert not res.success
+    assert res.error == (
+        f"move takes one destination, but label / labels name {named} — pass only "
+        "label=<the destination> (add_labels adds more than one). Nothing was changed.")
+    assert gmail.calls() == []
+
+
+async def test_move_to_the_archive_named_twice_is_one_destination(monkeypatch):
+    _set_mode(monkeypatch)
+    gmail = _Gmail({("GET", "/labels"): LABELS, ("POST", "/threads/t1/modify"): OK})
+    res = await _tool_with(gmail).execute("move", label="Archive", labels=["archived", "all mail"],
+                                          thread_ids=["t1"])
+    assert not res.success
+    assert res.error.startswith("Gmail has no Archive label")
     assert gmail.calls() == []
 
 
@@ -315,6 +502,26 @@ async def test_move_needs_one_destination(monkeypatch):
     res = await _tool_with(gmail).execute("move", thread_ids=["t1"])
     assert not res.success and "label=<label name or ID>" in res.error
     assert gmail.requests == []
+
+
+async def test_move_refuses_label_and_labels_naming_different_destinations(monkeypatch):
+    # A leftover label=INBOX must not send the mail back to the Inbox instead of to Receipts.
+    _set_mode(monkeypatch)
+    gmail = _Gmail({("GET", "/labels"): LABELS, ("POST", "/threads/t1/modify"): OK})
+    res = await _tool_with(gmail).execute("move", label="INBOX", labels=["Receipts"],
+                                          thread_ids=["t1"])
+    assert not res.success
+    assert "move takes one destination, but label / labels name 'INBOX', 'Receipts'" in res.error
+    assert res.error.endswith("Nothing was changed.")
+    assert gmail.calls() == []
+
+    # The same label both ways — or a one-name labels list alone — is one destination.
+    for kwargs in ({"label": "Receipts", "labels": ["receipts", "Label_1"]}, {"labels": "Receipts"}):
+        gmail = _Gmail({("GET", "/labels"): LABELS, ("POST", "/threads/t1/modify"): OK})
+        res = await _tool_with(gmail).execute("move", thread_ids=["t1"], **kwargs)
+        assert res.success, (kwargs, res.error)
+        assert gmail.calls() == [("/threads/t1/modify",
+                                  {"addLabelIds": ["Label_1"], "removeLabelIds": ["INBOX"]})]
 
 
 # ── add_labels / remove_labels ───────────────────────────────────────
@@ -356,7 +563,49 @@ async def test_an_unknown_label_refuses_the_whole_call(monkeypatch):
     assert gmail.calls() == []  # no modify, nothing created
 
 
-@pytest.mark.parametrize("label", ["TRASH", "spam", "SENT", "DRAFT", "CHAT"])
+async def test_an_unknown_archive_label_points_at_archive_not_only_create_label(monkeypatch):
+    _set_mode(monkeypatch)
+    gmail = _Gmail({("GET", "/labels"): LABELS, ("POST", "/threads/t1/modify"): OK})
+    res = await _tool_with(gmail).execute("add_labels", labels=["All Mail"], thread_ids=["t1"])
+    assert not res.success
+    assert "No such Gmail label: 'All Mail'" in res.error
+    assert ("Gmail has no Archive label — archived mail is just mail out of the Inbox (All Mail "
+            "still shows it): google_mail action=archive takes emails out, action=move "
+            "label=INBOX brings them back.") in res.error
+    # create_label refuses "All Mail" — so the refusal doesn't send the model there.
+    assert "create_label" not in res.error
+    assert res.error.endswith("Nothing was changed.")
+
+    # "Archive" is a name a label may take: create_label stays on offer, for a user who asked.
+    res = await _tool_with(gmail).execute("add_labels", labels=["Archive"], thread_ids=["t1"])
+    assert not res.success
+    assert "action=archive takes emails out" in res.error
+    assert 'action=create_label label="Archive" first' in res.error
+    assert gmail.calls() == []
+
+
+@pytest.mark.parametrize("action, removed", [("add_labels", None), ("remove_labels", ["UNREAD"])])
+async def test_a_lone_label_param_does_not_join_the_labels_list(monkeypatch, action, removed):
+    # After list_messages label=INBOX the model may pass label="INBOX" along:
+    # marking read must not archive too, and tagging must not un-archive.
+    _set_mode(monkeypatch)
+    gmail = _Gmail({("GET", "/labels"): LABELS, ("POST", "/threads/t1/modify"): OK})
+    labels = ["UNREAD"] if removed else ["Receipts"]
+    res = await _tool_with(gmail).execute(action, labels=labels, label="INBOX", thread_ids=["t1"])
+    assert res.success, res.error
+    body = {"removeLabelIds": ["UNREAD"]} if removed else {"addLabelIds": ["Label_1"]}
+    assert gmail.calls() == [("/threads/t1/modify", body)]
+    assert "INBOX" not in res.content
+
+    # Without labels, a lone label is the one to change.
+    gmail = _Gmail({("GET", "/labels"): LABELS, ("POST", "/threads/t1/modify"): OK})
+    res = await _tool_with(gmail).execute(action, label="Receipts", thread_ids=["t1"])
+    assert res.success, res.error
+    key = "removeLabelIds" if removed else "addLabelIds"
+    assert gmail.calls() == [("/threads/t1/modify", {key: ["Label_1"]})]
+
+
+@pytest.mark.parametrize("label", ["TRASH", "spam", "SENT", "DRAFT", "CHAT", "Sent Mail", "drafts"])
 async def test_trash_spam_and_sent_labels_are_never_touched(monkeypatch, label):
     _set_mode(monkeypatch)
     gmail = _Gmail({("GET", "/labels"): LABELS, ("POST", "/threads/t1/modify"): OK})
@@ -430,15 +679,85 @@ async def test_create_nested_label_creates_the_missing_parent_first(monkeypatch)
     assert "parent" not in res.content
 
 
-@pytest.mark.parametrize("name", ["Inbox", "STARRED", "promotions", "Sent Mail", "inbox/Receipts"])
+@pytest.mark.parametrize("name", ["Inbox", "inbox/Receipts"])
 async def test_create_label_refuses_system_names_without_http(monkeypatch, name):
     _set_mode(monkeypatch)
     gmail = _Gmail({})
     res = await _tool_with(gmail).execute("create_label", label=name)
     assert not res.success
+    # move label=INBOX works (back to the Inbox), so both are on offer.
     assert "is a Gmail system label — use it with add_labels / move" in res.error
     assert "Nothing was created." in res.error
     assert gmail.requests == []
+
+
+@pytest.mark.parametrize("name", [
+    "STARRED", "Starred", "important", "Unread", "category_social", "Starred/Old", "Promotions",
+])
+async def test_create_label_points_marker_labels_at_add_labels_only(monkeypatch, name):
+    # move refuses these ("isn't a place to move email to … use add_labels") —
+    # so create_label must not offer move either.
+    _set_mode(monkeypatch)
+    gmail = _Gmail({("GET", "/labels"): LABELS, ("POST", "/threads/t1/modify"): OK})
+    res = await _tool_with(gmail).execute("create_label", label=name)
+    assert not res.success
+    assert "is a Gmail system label — use it with add_labels" in res.error
+    assert "move" not in res.error and res.error.endswith("Nothing was created.")
+
+    res = await _tool_with(gmail).execute("move", label=name.split("/")[0], thread_ids=["t1"])
+    assert not res.success
+    assert "isn't a place to move email to" in res.error and "action=add_labels" in res.error
+    assert gmail.calls() == []  # nothing created, nothing moved
+
+
+@pytest.mark.parametrize("name, why", [
+    ("Sent Mail", "out of scope"), ("drafts", "out of scope"), ("Trash", "out of scope"),
+    ("Spam/Old", "out of scope"), ("All Mail", "action=archive takes emails out of the Inbox"),
+])
+async def test_create_label_refuses_gmail_folder_names_without_sending_to_add_labels(
+        monkeypatch, name, why):
+    # add_labels / move refuse these too — the refusal mustn't point there.
+    _set_mode(monkeypatch)
+    gmail = _Gmail({})
+    res = await _tool_with(gmail).execute("create_label", label=name)
+    assert not res.success
+    assert why in res.error and res.error.endswith("Nothing was created.")
+    assert "add_labels" not in res.error and "move" not in res.error
+    assert gmail.requests == []
+
+
+@pytest.mark.parametrize("name", ["promotions", "Personal/Taxes"])
+async def test_create_label_refuses_a_category_name_no_user_label_has(monkeypatch, name):
+    _set_mode(monkeypatch)
+    gmail = _Gmail({("GET", "/labels"): LABELS})
+    res = await _tool_with(gmail).execute("create_label", label=name)
+    assert not res.success
+    assert "is a Gmail system label — use it with add_labels" in res.error
+    assert "move" not in res.error  # a category only marks email
+    assert res.error.endswith("Nothing was created.")
+    assert gmail.calls() == []  # looked, created nothing
+
+
+async def test_create_label_uses_a_user_label_with_a_category_name(monkeypatch):
+    # Older mailboxes have a user label "Personal"; add_labels already resolves
+    # "personal" to it, so create_label must agree.
+    _set_mode(monkeypatch)
+    made: list[str] = []
+    existing = [*LABELS[1]["labels"], {"id": "Label_3", "name": "Personal", "type": "user"}]
+    gmail = _Gmail({**_create_routes(existing, made), ("POST", "/threads/t1/modify"): OK})
+
+    res = await _tool_with(gmail).execute("create_label", label="personal")
+    assert res.success, res.error
+    assert res.content == "Label 'Personal' already exists (ID: Label_3) — nothing created."
+
+    res = await _tool_with(gmail).execute("create_label", label="Personal/Taxes")
+    assert res.success, res.error
+    assert made == ["Personal/Taxes"]
+    assert "Created label 'Personal/Taxes'." in res.content and "parent" not in res.content
+
+    res = await _tool_with(gmail).execute("add_labels", labels=["personal"], thread_ids=["t1"])
+    assert res.success, res.error
+    assert gmail.calls()[-1] == ("/threads/t1/modify", {"addLabelIds": ["Label_3"]})
 
 
 @pytest.mark.parametrize("name", ["", "  ", "a//b", "/a", "a/"])
@@ -473,6 +792,48 @@ async def test_create_label_reports_a_name_gmail_refuses(monkeypatch):
     assert res.error.endswith("Nothing was created.")
 
 
+async def test_create_label_failing_after_its_parent_names_what_was_created(monkeypatch):
+    _set_mode(monkeypatch)
+    made: list[str] = []
+
+    def create(request: httpx.Request):
+        name = json.loads(request.content)["name"]
+        made.append(name)
+        if "/" in name:
+            return 400, {"error": {"message": "Invalid label name"}}
+        return 200, {"id": "Label_11", "name": name, "type": "user"}
+
+    gmail = _Gmail({("GET", "/labels"): (200, {"labels": []}), ("POST", "/labels"): create})
+    res = await _tool_with(gmail).execute("create_label", label="Projects/Acme")
+    assert not res.success
+    assert made == ["Projects", "Projects/Acme"]
+    assert "Gmail refused the label name 'Projects/Acme' (Invalid label name)" in res.error
+    assert res.error.endswith("Created before that: 'Projects' (Label ID: Label_11).")
+    assert "Nothing was created" not in res.error  # the parent was
+
+
+async def test_create_label_409_on_the_parent_reuses_it(monkeypatch):
+    _set_mode(monkeypatch)
+    made: list[str] = []
+    listings = iter([[], [{"id": "Label_7", "name": "Projects", "type": "user"}]])
+
+    def create(request: httpx.Request):
+        name = json.loads(request.content)["name"]
+        made.append(name)
+        if name == "projects":  # made meanwhile, by someone else
+            return 409, {"error": {"code": 409, "message": "Label name exists or conflicts"}}
+        return 200, {"id": "Label_12", "name": name, "type": "user"}
+
+    gmail = _Gmail({("GET", "/labels"): lambda r: (200, {"labels": next(listings)}),
+                    ("POST", "/labels"): create})
+    res = await _tool_with(gmail).execute("create_label", label="projects/Acme")
+    assert res.success, res.error
+    assert made == ["projects", "Projects/Acme"]  # nested under the existing spelling
+    assert len(gmail.calls("GET")) == 2  # re-listed after the 409
+    assert res.content.startswith("Created label 'Projects/Acme'.\n  Label ID: Label_12")
+    assert "parent" not in res.content  # it wasn't created by this call
+
+
 # ── the gmail.modify scope ───────────────────────────────────────────
 
 
@@ -504,25 +865,51 @@ async def test_full_mail_scope_also_organizes(monkeypatch):
     assert res.success, res.error
 
 
-async def test_gmail_403_insufficient_scope_maps_to_the_scope_message(monkeypatch):
-    _set_mode(monkeypatch)  # the token claims gmail.modify; Gmail disagrees
+@pytest.mark.parametrize("fd, fix", [(False, _STANDALONE_FIX), (True, _FD_FIX)])
+async def test_gmail_403_insufficient_scope_maps_to_the_scope_message(monkeypatch, fd, fix):
+    _set_mode(monkeypatch, fd=fd)  # the token claims gmail.modify; Gmail disagrees
     gmail = _Gmail({("POST", "/threads/t1/modify"): _NO_SCOPE})
     res = await _tool_with(gmail).execute("archive", thread_ids=["t1"])
-    assert not res.success and res.error == gm._modify_scope_missing(False)
+    assert not res.success and res.error == gm._modify_scope_missing(fd)
+    assert fix in res.error
 
     gmail = _Gmail({("GET", "/labels"): _NO_SCOPE})
     res = await _tool_with(gmail).execute("add_labels", labels=["x"], thread_ids=["t1"])
-    assert not res.success and res.error == gm._modify_scope_missing(False)
+    assert not res.success and res.error == gm._modify_scope_missing(fd)
 
     gmail = _Gmail({("GET", "/labels"): (200, {"labels": []}), ("POST", "/labels"): _NO_SCOPE})
     res = await _tool_with(gmail).execute("create_label", label="Invoices")
-    assert not res.success and _STANDALONE_FIX in res.error
+    assert not res.success and fix in res.error
     assert res.error.endswith("Nothing was created.")
 
     # Any other 403 stays a plain permission error.
     gmail = _Gmail({("POST", "/threads/t1/modify"): (403, {"error": {"message": "Delegation denied"}})})
     res = await _tool_with(gmail).execute("archive", thread_ids=["t1"])
     assert not res.success and "permission denied: Delegation denied" in res.error
+
+
+@pytest.mark.parametrize("scopes, add", [
+    (None, False),  # the default list already has gmail.modify: reconnecting grants it
+    ([READ, COMPOSE, "https://mail.google.com/", "openid"], False),
+    ([_G + "drive", _G + "calendar", READ, COMPOSE, "openid", "email"], True),
+])
+async def test_standalone_scope_fix_depends_on_the_configured_scopes(monkeypatch, _config, scopes, add):
+    if scopes is not None:
+        _config.google_oauth.scopes = scopes
+    _set_mode(monkeypatch, scope=f"{READ} {COMPOSE}")  # connected before gmail.modify was asked for
+    gmail = _Gmail({})
+    res = await _tool_with(gmail).execute("archive", thread_ids=["t1"])
+    assert not res.success and gmail.requests == []
+    if add:
+        # A scopes list in config.yaml replaces the default whole — "add it" keeps the rest.
+        assert ("Add https://www.googleapis.com/auth/gmail.modify to the google_oauth.scopes list "
+                "in config.yaml (keep its other entries) and reconnect Google "
+                "(/auth/google/login). Nothing was changed.") in res.error
+    else:
+        assert res.error.endswith(
+            "The configured google_oauth.scopes already include it — reconnect Google "
+            "(/auth/google/login) to grant it. Nothing was changed.")
+        assert "Add " not in res.error
 
 
 # ── schema, description, follow-up hint ──────────────────────────────

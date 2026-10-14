@@ -13,6 +13,7 @@ import os
 import re
 from typing import Any
 
+from captain_claw import mail_authority
 from captain_claw.config import get_config
 from captain_claw.context_spill import SPILL_TOOLS as _SPILL_TOOLS
 from captain_claw.context_spill import governor_enabled as _governor_enabled
@@ -1020,15 +1021,17 @@ class AgentToolLoopMixin:
             }
             # Vatra team-board reads (see the board-is-live rule below).
             _VATRA_LIVE_ACTIONS = ("map", "read", "search", "inbox", "wait")
-            # Google actions that send, create or change something the user
-            # sees. A byte-identical repeat is a second email / event / file
-            # (or the same change made twice), not a re-read, so these keep
-            # the plain limit instead of the stateful headroom below.
+            # Google actions that send or create something the user sees. A
+            # byte-identical repeat is a second email / event / file, not a
+            # re-read, so these keep the plain limit instead of the stateful
+            # headroom below.
+            # Not mailbox organizing (archive, move, labels / categories, a new
+            # label or folder): a repeat changes nothing already changed (an
+            # existing label / folder is reported, not made twice), and it is
+            # how the model retries the IDs a partial failure listed as NOT
+            # changed — that call still succeeds. Those keep the headroom.
             _GOOGLE_WRITE_ACTIONS = {
-                "google_mail": {
-                    "send", "send_draft", "create_draft", "update_draft",
-                    "archive", "move", "add_labels", "remove_labels", "create_label",
-                },
+                "google_mail": {"send", "send_draft", "create_draft", "update_draft"},
                 "google_calendar": {"create_event", "update_event", "delete_event"},
                 # In-place Sheet/Doc edits too: a repeated append is a second
                 # set of rows, a repeated insert a second copy of the text.
@@ -1037,10 +1040,7 @@ class AgentToolLoopMixin:
                     "sheet_update", "sheet_append", "sheet_clear",
                     "doc_replace_text", "doc_append_text", "doc_insert_text",
                 },
-                "microsoft_mail": {
-                    "create_draft", "update_draft",
-                    "archive", "move", "create_folder", "add_categories", "remove_categories",
-                },
+                "microsoft_mail": {"create_draft", "update_draft"},
                 "microsoft_calendar": {
                     "create_event", "update_event", "delete_event", "respond_event",
                 },
@@ -1052,6 +1052,7 @@ class AgentToolLoopMixin:
                 if isinstance(arguments, dict) else ""
             )
             _google_write = _call_action in _GOOGLE_WRITE_ACTIONS.get(_tool_lower, ())
+            _mailbox_change = mail_authority.is_mailbox_change(_tool_lower, _call_action)
             # Stateful tools that modify data between calls — allow more
             # repeated calls (CRUD patterns) but still catch infinite loops.
             _STATEFUL_TOOLS = {
@@ -1139,6 +1140,18 @@ class AgentToolLoopMixin:
                         "create it a second time (or apply the same edit twice). "
                         "Do NOT repeat it — use the result "
                         "of the first call and tell the user it is done."
+                    )
+                elif _mailbox_change:
+                    # The same archive / move / label change, again and again:
+                    # whatever it could change has changed. Don't claim it all
+                    # worked — a partial failure still counts as success.
+                    dup_msg = (
+                        f"DUPLICATE CALL BLOCKED: `{tc.name}` action={_call_action} "
+                        f"already ran with these exact arguments {_dup_count} times "
+                        "this turn; running it again won't change anything more. "
+                        "Do NOT repeat it — tell the user what those results say was "
+                        "changed, and list any IDs they say were NOT changed (with "
+                        "the reason) so the user can try those later."
                     )
                 elif _tool_lower in _STATEFUL_TOOLS:
                     # Don't claim "the content has not changed" about a store

@@ -367,6 +367,25 @@ def _posts(graph):
     return [r for r in graph.requests if r.method == "POST"]
 
 
+def _folder(fid: str, name: str, parent: str = "ROOT"):
+    """A mailFolder answer (``$select=id,displayName,parentFolderId``)."""
+    return 200, {"id": fid, "displayName": name, "parentFolderId": parent}
+
+
+# The mailbox root and the well-known folders a move checks (no Archive, no Outbox).
+_KNOWN = {
+    ("GET", "/me/mailFolders/msgfolderroot"): _folder("ROOT", "Top of Information Store", "NONIPM"),
+    ("GET", "/me/mailFolders/inbox"): _folder("INBOX", "Inbox"),
+    ("GET", "/me/mailFolders/sentitems"): _folder("SENT", "Sent Items"),
+    ("GET", "/me/mailFolders/drafts"): _folder("DRAFTS", "Drafts"),
+    ("GET", "/me/mailFolders/deleteditems"): _folder("DEL", "Deleted Items"),
+    ("GET", "/me/mailFolders/junkemail"): _folder("JUNK", "Junk Email"),
+}
+# A real Graph folder ID (base64, longer than any name).
+_FOLDER_ID = ("AAMkAGVmMDEzMTM4LTZmYWUtNDdkNC1hMDZiLTU1OGY5OTZhYmY4OAAuAAAAAAAiQ8W967B7TKBjgx9rVEURAQAi"
+              "IsqMbYjsT5e-T7KzowPTAAAAAAEMAAA=")
+
+
 class TestMicrosoftMailOrganize:
     def test_organizing_is_a_mailbox_change_not_an_email_write(self):
         from captain_claw.tools.microsoft_mail import MicrosoftMailTool
@@ -572,6 +591,7 @@ class TestMicrosoftMailOrganize:
     async def test_create_a_nested_folder_creates_its_parent(self, monkeypatch):
         graph = _Graph({
             ("GET", "/me/mailFolders"): _by_name({}),
+            ("GET", "/me/mailFolders/inbox/childFolders"): _by_name({}),
             ("POST", "/me/mailFolders"): (201, {"id": "P1", "displayName": "Projects"}),
             ("POST", "/me/mailFolders/P1/childFolders"): (200, {"id": "A1", "displayName": "Acme"}),
         })
@@ -580,7 +600,9 @@ class TestMicrosoftMailOrganize:
         assert graph.bodies("POST") == [{"displayName": "Projects"}, {"displayName": "Acme"}]
         assert "Created folder 'Projects/Acme'." in res.content and "Folder ID: A1" in res.content
         assert "Also created its parent folder: 'Projects' (ID: P1)" in res.content
-        assert not any("childFolders" in r.url.path for r in graph.requests if r.method == "GET")
+        # Projects was looked for at the top level and in the Inbox — never inside the one made just now.
+        assert [r.url.path for r in graph.requests if r.method == "GET"] == [
+            "/v1.0/me/mailFolders", "/v1.0/me/mailFolders/inbox/childFolders"]
 
     async def test_create_a_folder_inside_the_inbox(self, monkeypatch):
         graph = _Graph({
@@ -696,6 +718,665 @@ class TestMicrosoftMailOrganize:
         assert res.content.startswith("Subfolders of 'Projects' (1):")
         assert "Acme  (2 unread / 5 total)\n    ID: A1" in res.content
         assert "$filter" not in graph.requests[-1].url.params
+
+    # ── folders inside Deleted Items / Junk Email ──
+
+    @pytest.mark.parametrize("folder,name,bin_label", [
+        ("Deleted Items/Old", "Old", "Deleted Items"),
+        ("trash / Old / Deeper", "Deeper", "Deleted Items"),
+        ("Junk/X", "X", "Junk Email"),
+        (_FOLDER_ID, "X", "Junk Email"),  # by ID
+    ])
+    async def test_move_into_a_folder_inside_deleted_items_or_junk_is_refused(
+        self, monkeypatch, folder, name, bin_label,
+    ):
+        graph = _Graph({
+            **_KNOWN,
+            ("GET", "/me/mailFolders/deleteditems/childFolders"): _by_name({"Old": "OLD"}),
+            ("GET", "/me/mailFolders/OLD/childFolders"): _by_name({"Deeper": "DEEP"}),
+            ("GET", "/me/mailFolders/junkemail/childFolders"): _by_name({"X": _FOLDER_ID}),
+            ("GET", "/me/mailFolders/OLD"): _folder("OLD", "Old", "DEL"),
+            ("GET", "/me/mailFolders/DEEP"): _folder("DEEP", "Deeper", "OLD"),
+            ("GET", f"/me/mailFolders/{_FOLDER_ID}"): _folder(_FOLDER_ID, "X", "JUNK"),
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+        })
+        res = await _mail(graph, monkeypatch).execute("move", folder=folder, message_ids=["M1"])
+        assert not res.success
+        assert res.error.startswith(f"microsoft_mail doesn't move email to '{name}' (it's inside {bin_label})")
+        assert "Nothing was moved." in res.error and _posts(graph) == []
+
+    async def test_move_into_an_ordinary_subfolder_still_works(self, monkeypatch):
+        graph = _Graph({
+            **_KNOWN,
+            ("GET", "/me/mailFolders/inbox/childFolders"): _by_name({"Receipts": "R1"}),
+            ("GET", "/me/mailFolders/R1/childFolders"): _by_name({"2026": "R26"}),
+            ("GET", "/me/mailFolders/R26"): _folder("R26", "2026", "R1"),
+            ("GET", "/me/mailFolders/R1"): _folder("R1", "Receipts", "INBOX"),
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+        })
+        tool = _mail(graph, monkeypatch)
+        res = await tool.execute("move", folder="Inbox/Receipts/2026", message_ids=["M1"])
+        assert res.success, res.error
+        assert graph.bodies("POST") == [{"destinationId": "R26"}]
+        walked = len(graph.requests)
+        res = await tool.execute("move", folder="Inbox/Receipts/2026", message_ids=["M1"])
+        assert res.success, res.error
+        # The folder comes from the cache (no lookup by name); where its
+        # parents are is read afresh, then the move.
+        again = graph.requests[walked:]
+        assert not any(r.url.params.get("$filter") for r in again)
+        assert "/v1.0/me/mailFolders/R1" in [r.url.path for r in again]
+        assert again[-1].method == "POST" and len(_posts(graph)) == 2
+
+    async def test_a_folder_deleted_since_it_was_cached_is_refused(self, monkeypatch):
+        graph = _Graph({
+            **_KNOWN,
+            ("GET", "/me/mailFolders"): _by_name({"Receipts": "R1"}),
+            ("GET", "/me/mailFolders/R1"): _folder("R1", "Receipts"),
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+        })
+        tool = _mail(graph, monkeypatch)
+        assert (await tool.execute("move", folder="Receipts", message_ids=["M1"])).success
+        # Deleting it in Outlook moves it (same ID) into Deleted Items.
+        graph.routes[("GET", "/me/mailFolders/R1")] = _folder("R1", "Receipts", "DEL")
+        res = await tool.execute("move", folder="Receipts", message_ids=["M1"])
+        assert not res.success
+        assert res.error.startswith("microsoft_mail doesn't move email to 'Receipts' (it's inside Deleted Items)")
+        assert len(_posts(graph)) == 1
+
+    @pytest.mark.parametrize("folder", ["Projects/Acme", _FOLDER_ID])  # by name (cached) / by ID
+    async def test_a_move_reads_afresh_where_the_destinations_parents_are(self, monkeypatch, folder):
+        top = {"Projects": "P1"}
+        where = {"P1": "ROOT"}
+        graph = _Graph({
+            **_KNOWN,
+            ("GET", "/me/mailFolders"): _by_name(top),
+            ("GET", "/me/mailFolders/inbox/childFolders"): _by_name({}),
+            ("GET", "/me/mailFolders/P1/childFolders"): _by_name({"Acme": _FOLDER_ID}),
+            ("GET", f"/me/mailFolders/{_FOLDER_ID}"): _folder(_FOLDER_ID, "Acme", "P1"),
+            ("GET", "/me/mailFolders/P1"): lambda r: _folder("P1", "Projects", where["P1"]),
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+        })
+        tool = _mail(graph, monkeypatch)
+        res = await tool.execute("move", folder=folder, message_ids=["M1"])
+        assert res.success, res.error
+        # The user deletes Projects in Outlook: it moves (same IDs) into Deleted Items.
+        where["P1"] = "DEL"
+        top.clear()
+        res = await tool.execute("move", folder=folder, message_ids=["M1"])
+        assert not res.success and res.error.endswith("Nothing was moved.")
+        if folder == _FOLDER_ID:
+            assert res.error.startswith("microsoft_mail doesn't move email to 'Acme' (it's inside Deleted Items)")
+        else:  # the name is looked up again, as a new session would: there is no such folder now
+            assert res.error.startswith("No mail folder named 'Projects/Acme'.")
+        assert len(_posts(graph)) == 1
+
+    async def test_a_cached_folder_deleted_into_deleted_items_gives_way_to_a_live_one(self, monkeypatch):
+        top = {"Receipts": "R1"}
+        where = {"R1": "ROOT", "R2": "ROOT"}
+
+        def mail(subject):
+            return 200, {"value": [{"id": "m-" + subject, "conversationId": "c1", "subject": subject,
+                                    "isRead": True}]}
+        graph = _Graph({
+            **_KNOWN,
+            ("GET", "/me/mailFolders"): _by_name(top),
+            ("GET", "/me/mailFolders/inbox/childFolders"): _by_name({}),
+            ("GET", "/me/mailFolders/R1"): lambda r: _folder("R1", "Receipts", where["R1"]),
+            ("GET", "/me/mailFolders/R2"): lambda r: _folder("R2", "Receipts", where["R2"]),
+            ("GET", "/me/mailFolders/R1/messages"): mail("Old receipt"),
+            ("GET", "/me/mailFolders/R2/messages"): mail("New receipt"),
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+        })
+        tool = _mail(graph, monkeypatch)
+        res = await tool.execute("list_messages", folder="Receipts")
+        assert res.success and "Old receipt" in res.content
+        # Deleted in Outlook (into Deleted Items, ID kept) and made again.
+        where["R1"] = "DEL"
+        top["Receipts"] = "R2"
+        res = await tool.execute("list_messages", folder="Receipts")
+        assert res.success, res.error
+        assert "New receipt" in res.content and "Old receipt" not in res.content
+        res = await tool.execute("move", folder="Receipts", message_ids=["M1"])
+        assert res.success, res.error
+        assert graph.bodies("POST") == [{"destinationId": "R2"}]
+        # Deleted again, with no live folder of that name: as in a new session.
+        where["R2"] = "DEL"
+        top.clear()
+        res = await tool.execute("list_messages", folder="Receipts")
+        assert not res.success and res.error.startswith("No mail folder named 'Receipts'.")
+        res = await tool.execute("move", folder="Receipts", message_ids=["M1"])
+        assert not res.success and res.error.endswith("Nothing was moved.")
+        assert len(_posts(graph)) == 1
+        assert sum(r.url.path == "/v1.0/me/mailFolders/R1/messages" for r in graph.requests) == 1
+
+    async def test_junk_email_named_by_its_display_name_stays_cached(self, monkeypatch):
+        graph = _Graph({
+            **_KNOWN,
+            ("GET", "/me/mailFolders"): _by_name({"Junk Email": "JUNK"}),
+            ("GET", "/me/mailFolders/JUNK/messages"): _EMPTY,
+        })
+        tool = _mail(graph, monkeypatch)
+        for _ in range(2):
+            res = await tool.execute("list_messages", folder="Junk Email")
+            assert res.success and res.content == "No messages in Junk Email."
+        # It is Junk Email — not a folder deleted since: looked up once.
+        assert sum(bool(r.url.params.get("$filter")) for r in graph.requests) == 1
+
+    @pytest.mark.parametrize("folder", ["Deleted Items/Bin", "Junk Email/Old/Bin"])  # an alias / its name
+    async def test_create_folder_inside_deleted_items_or_junk_is_refused(self, monkeypatch, folder):
+        graph = _Graph({
+            **_KNOWN,
+            ("GET", "/me/mailFolders"): _by_name({"Junk Email": "JUNK"}),
+            ("GET", "/me/mailFolders/inbox/childFolders"): _by_name({}),
+            ("GET", "/me/mailFolders/DEL/childFolders"): _by_name({}),
+            ("GET", "/me/mailFolders/JUNK/childFolders"): _by_name({"Old": "JOLD"}),
+            ("GET", "/me/mailFolders/JOLD/childFolders"): _by_name({}),
+            ("POST", "/me/mailFolders/DEL/childFolders"): (201, {"id": "BIN"}),
+            ("POST", "/me/mailFolders/JOLD/childFolders"): (201, {"id": "BIN"}),
+        })
+        res = await _mail(graph, monkeypatch).execute("create_folder", folder=folder)
+        assert not res.success
+        assert res.error.startswith("microsoft_mail doesn't make folders inside ")
+        assert "Nothing was created." in res.error and _posts(graph) == []
+
+    async def test_a_conversation_move_leaves_mail_inside_deleted_items_subfolders(self, monkeypatch):
+        graph = _Graph({
+            **_KNOWN, _ARCHIVE: _ARCHIVE_OK,
+            ("GET", "/me/messages"): (200, {"value": [
+                {"id": "M1", "parentFolderId": "INBOX"}, {"id": "M2", "parentFolderId": "OLD"},
+                {"id": "M3", "parentFolderId": "ACME"}, {"id": "M4", "parentFolderId": "DEEP"},
+                {"id": "M5", "parentFolderId": "JX"}]}),
+            ("GET", "/me/mailFolders/OLD"): _folder("OLD", "Old", "DEL"),
+            ("GET", "/me/mailFolders/DEEP"): _folder("DEEP", "Deeper", "OLD"),
+            ("GET", "/me/mailFolders/JX"): _folder("JX", "X", "JUNK"),
+            ("GET", "/me/mailFolders/ACME"): _folder("ACME", "Acme", "CLIENTS"),
+            ("GET", "/me/mailFolders/CLIENTS"): _folder("CLIENTS", "Clients"),
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+            ("POST", "/me/messages/M3/move"): (201, {"id": "N3"}),
+        })
+        res = await _mail(graph, monkeypatch).execute("archive", thread_ids=["C1"])
+        assert res.success, res.error
+        assert sorted(r.url.path.rsplit("/", 2)[-2] for r in _posts(graph)) == ["M1", "M3"]
+        assert "Skipped: left where they are: 2 in Deleted Items, 1 in Junk Email." in res.content
+
+    @pytest.mark.parametrize("parent, routes, why", [
+        # 40 levels below Deleted Items: deeper than the walk goes.
+        ("F39", {("GET", f"/me/mailFolders/F{i}"): _folder(f"F{i}", f"L{i}", f"F{i - 1}" if i else "DEL")
+                 for i in range(40)}, "go too deep"),
+        # A parent that is gone (the mailbox root is known, so it isn't the top).
+        ("GONE", {}, "is gone"),
+        # Parents that loop.
+        ("F1", {("GET", "/me/mailFolders/F1"): _folder("F1", "L1", "F2"),
+                ("GET", "/me/mailFolders/F2"): _folder("F2", "L2", "F1")}, "loop"),
+    ])
+    async def test_a_destination_whose_place_cant_be_told_is_refused(
+        self, monkeypatch, parent, routes, why,
+    ):
+        graph = _Graph({
+            **_KNOWN, **routes,
+            ("GET", f"/me/mailFolders/{_FOLDER_ID}"): _folder(_FOLDER_ID, "Deep", parent),
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+        })
+        res = await _mail(graph, monkeypatch).execute("move", folder=_FOLDER_ID, message_ids=["M1"])
+        assert not res.success
+        assert res.error.startswith("Couldn't confirm that ")
+        assert why in res.error and "nothing was moved" in res.error
+        assert _posts(graph) == []
+
+    async def test_a_conversation_message_whose_folder_cant_be_placed_stays(self, monkeypatch):
+        graph = _Graph({
+            **_KNOWN, _ARCHIVE: _ARCHIVE_OK,
+            ("GET", "/me/messages"): (200, {"value": [
+                {"id": "M1", "parentFolderId": "INBOX"}, {"id": "M2", "parentFolderId": "ORPHAN"}]}),
+            ("GET", "/me/mailFolders/ORPHAN"): _folder("ORPHAN", "Old stuff", "GONE"),
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+            ("POST", "/me/messages/M2/move"): (201, {"id": "N2"}),
+        })
+        res = await _mail(graph, monkeypatch).execute("archive", thread_ids=["C1"])
+        assert res.success, res.error
+        assert [r.url.path.rsplit("/", 2)[-2] for r in _posts(graph)] == ["M1"]
+        assert "NOT archived: M2 (couldn't check its folder — one of its parent folders is gone)" in res.content
+
+    # ── finding folders ──
+
+    async def test_a_path_under_an_inbox_subfolder(self, monkeypatch):
+        children = {"Acme": "AIN"}
+        graph = _Graph({
+            ("GET", "/me/mailFolders"): _by_name({}),  # no top-level Projects
+            ("GET", "/me/mailFolders/inbox/childFolders"): _by_name({"Projects": "PIN"}),
+            ("GET", "/me/mailFolders/PIN/childFolders"): _by_name(children),
+            ("GET", "/me/mailFolders/AIN/messages"): (200, {"value": [
+                {"id": "m1", "conversationId": "c1", "subject": "Kickoff", "isRead": True}]}),
+            ("GET", "/me/mailFolders/AIN"): _folder("AIN", "Acme", "PIN"),
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+            ("POST", "/me/mailFolders/PIN/childFolders"): (201, {"id": "BETA", "displayName": "Beta"}),
+        })
+        tool = _mail(graph, monkeypatch)
+        res = await tool.execute("list_messages", folder="Projects/Acme")
+        assert res.success, res.error
+        assert "Kickoff" in res.content
+        res = await tool.execute("move", folder="Projects/Acme", message_ids=["M1"])
+        assert res.success, res.error
+        assert graph.bodies("POST") == [{"destinationId": "AIN"}]
+        res = await tool.execute("create_folder", folder="Projects/Acme")
+        assert res.success, res.error
+        assert res.content == "Folder 'Projects/Acme' already exists in the Inbox (ID: AIN) — nothing created."
+        assert len(_posts(graph)) == 1
+        res = await tool.execute("create_folder", folder="Projects/Beta")
+        assert res.success, res.error
+        assert res.content.startswith("Created folder 'Projects/Beta' in the Inbox.\n  Folder ID: BETA")
+        assert [r.url.path for r in _posts(graph)][1:] == ["/v1.0/me/mailFolders/PIN/childFolders"]
+        assert "Also created" not in res.content  # no second, top-level Projects
+
+    async def test_list_and_search_find_inbox_subfolders_and_paths(self, monkeypatch):
+        msgs = (200, {"value": [{"id": "m1", "conversationId": "c1", "subject": "Invoice", "isRead": True,
+                                 "receivedDateTime": "2026-10-01T08:00:00Z"}]})
+        graph = _Graph({
+            ("GET", "/me/mailFolders"): _by_name({}),
+            ("GET", "/me/mailFolders/inbox/childFolders"): _by_name({"Receipts": "R2"}),
+            ("GET", "/me/mailFolders/R2/messages"): msgs,
+        })
+        for folder in ("Receipts", "Inbox/Receipts"):
+            for action, extra in (("list_messages", {}), ("search", {"query": "invoice"})):
+                res = await _mail(graph, monkeypatch).execute(action, folder=folder, **extra)
+                assert res.success, res.error
+                assert "Invoice" in res.content
+                assert graph.requests[-1].url.path == "/v1.0/me/mailFolders/R2/messages"
+
+    async def test_a_mailbox_without_an_archive_folder_reaches_one_named_archive(self, monkeypatch):
+        msgs = (200, {"value": [{"id": "m1", "conversationId": "c1", "subject": "Old news", "isRead": True}]})
+        graph = _Graph({
+            ("GET", "/me/mailFolders"): _by_name({"Archive": "UA1"}),
+            ("GET", "/me/mailFolders/inbox/childFolders"): _by_name({}),
+            ("GET", "/me/mailFolders/UA1/childFolders"): _by_name({"2024": "Y24"}),
+            ("GET", "/me/mailFolders/UA1/messages"): msgs,
+            ("GET", "/me/mailFolders/Y24"): _folder("Y24", "2024", "UA1"),
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+        })  # GET /me/mailFolders/archive: 404
+        tool = _mail(graph, monkeypatch)
+        res = await tool.execute("list_messages", folder="Archive")
+        assert res.success, res.error
+        assert "Old news" in res.content
+        res = await tool.execute("search", folder="archive", query="news")
+        assert res.success and "Old news" in res.content
+        res = await tool.execute("list_folders", folder="Archive")
+        assert res.success, res.error
+        assert res.content.startswith("Subfolders of 'Archive' (1):") and "ID: Y24" in res.content
+        res = await tool.execute("move", folder="Archive/2024", message_ids=["M1"])
+        assert res.success, res.error
+        assert graph.bodies("POST") == [{"destinationId": "Y24"}]
+        # The well-known Archive was tried once; then the user's folder came from the cache.
+        assert sum(r.url.path == "/v1.0/me/mailFolders/archive/messages" for r in graph.requests) == 1
+
+    async def test_a_folder_created_for_archiving_is_listed_by_name(self, monkeypatch):
+        graph = _Graph({
+            ("GET", "/me/mailFolders"): _by_name({}),
+            ("GET", "/me/mailFolders/inbox/childFolders"): _by_name({}),
+            ("POST", "/me/mailFolders"): (201, {"id": "UA1", "displayName": "Archive"}),
+            ("GET", "/me/mailFolders/UA1/messages"): _EMPTY,
+        })
+        tool = _mail(graph, monkeypatch)
+        res = await tool.execute("archive", message_ids=["M1"])
+        assert not res.success and "create_folder folder=Archive" in res.error
+        res = await tool.execute("create_folder", folder="Archive")
+        assert res.success and res.content.startswith("Created folder 'Archive'.")
+        res = await tool.execute("list_messages", folder="Archive")
+        assert res.success and res.content == "No messages in Archive."
+        assert graph.requests[-1].url.path == "/v1.0/me/mailFolders/UA1/messages"
+
+    async def test_a_folder_name_with_a_slash(self, monkeypatch):
+        graph = _Graph({
+            ("GET", "/me/mailFolders"): _by_name({"Invoices 2024/25": "FS"}),
+            ("GET", "/me/mailFolders/inbox/childFolders"): _by_name({}),
+            ("GET", "/me/mailFolders/FS/messages"): _EMPTY,
+            ("GET", "/me/mailFolders/FS"): _folder("FS", "Invoices 2024/25"),
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+        })
+        res = await _mail(graph, monkeypatch).execute("list_messages", folder="Invoices 2024/25")
+        assert res.success, res.error
+        assert graph.requests[-1].url.path == "/v1.0/me/mailFolders/FS/messages"
+        res = await _mail(graph, monkeypatch).execute("move", folder="Invoices 2024/25", message_ids=["M1"])
+        assert res.success, res.error
+        assert graph.bodies("POST") == [{"destinationId": "FS"}]
+
+    async def test_move_by_folder_id(self, monkeypatch):
+        graph = _Graph({
+            ("GET", f"/me/mailFolders/{_FOLDER_ID}"): _folder(_FOLDER_ID, "Receipts"),
+            ("GET", f"/me/mailFolders/{_FOLDER_ID}/messages"): _EMPTY,
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+        })
+        tool = _mail(graph, monkeypatch)
+        res = await tool.execute("move", folder=_FOLDER_ID, message_ids=["M1"])
+        assert res.success, res.error
+        assert graph.bodies("POST") == [{"destinationId": _FOLDER_ID}]
+        assert "Moved 1 message to 'Receipts'." in res.content
+        res = await tool.execute("list_messages", folder=_FOLDER_ID)
+        assert res.success, res.error
+        assert graph.requests[-1].url.path == f"/v1.0/me/mailFolders/{_FOLDER_ID}/messages"
+        assert not any(r.url.params.get("$filter") for r in graph.requests)  # never looked up by name
+
+    async def test_a_long_one_word_folder_name_is_not_taken_for_an_id(self, monkeypatch):
+        name = "Newsletters_and_marketing_updates_from_vendors"  # 46 characters
+        malformed = (400, {"error": {"code": "ErrorInvalidIdMalformed", "message": "Id is malformed."}})
+        graph = _Graph({
+            ("GET", f"/me/mailFolders/{name}"): malformed,
+            ("GET", f"/me/mailFolders/{name}/messages"): malformed,
+            ("GET", "/me/mailFolders"): _by_name({name: "NL"}),
+            ("GET", "/me/mailFolders/NL"): _folder("NL", name),
+            ("GET", "/me/mailFolders/NL/messages"): _EMPTY,
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+        })
+        res = await _mail(graph, monkeypatch).execute("move", folder=name, message_ids=["M1"])
+        assert res.success, res.error
+        assert graph.bodies("POST") == [{"destinationId": "NL"}]
+        res = await _mail(graph, monkeypatch).execute("list_messages", folder=name)
+        assert res.success and res.content == f"No messages in {name}."
+
+    async def test_a_long_folder_name_create_folder_made_is_found_from_the_cache(self, monkeypatch):
+        name = "Receipts_and_Invoices_2026_Accounting_Dept"  # 42 characters
+        graph = _Graph({
+            ("GET", "/me/mailFolders"): _by_name({}),
+            ("GET", "/me/mailFolders/inbox/childFolders"): _by_name({}),
+            ("POST", "/me/mailFolders"): (201, {"id": "F1", "displayName": name}),
+            ("GET", "/me/mailFolders/F1"): _folder("F1", name),
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+        })
+        tool = _mail(graph, monkeypatch)
+        res = await tool.execute("create_folder", folder=name)
+        assert res.success, res.error
+        assert f"microsoft_mail action=move folder='{name}'" in res.content
+        res = await tool.execute("move", folder=name, message_ids=["M1"])
+        assert res.success, res.error
+        assert graph.bodies("POST")[-1] == {"destinationId": "F1"}
+        assert not any(r.url.path.endswith(name) for r in graph.requests)
+
+    async def test_a_cached_folder_since_deleted_is_looked_up_again(self, monkeypatch):
+        folders = {"Receipts": "R1"}
+        graph = _Graph({
+            ("GET", "/me/mailFolders"): _by_name(folders),
+            ("GET", "/me/mailFolders/R1"): _folder("R1", "Receipts"),
+            ("GET", "/me/mailFolders/R2"): _folder("R2", "Receipts"),
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+        })
+        tool = _mail(graph, monkeypatch)
+        res = await tool.execute("move", folder="Receipts", message_ids=["M1"])
+        assert res.success and graph.bodies("POST") == [{"destinationId": "R1"}]
+        # The user deletes Receipts in Outlook and makes it again.
+        del graph.routes[("GET", "/me/mailFolders/R1")]
+        folders["Receipts"] = "R2"
+        res = await tool.execute("move", folder="Receipts", message_ids=["M1"])
+        assert res.success, res.error
+        assert graph.bodies("POST")[-1] == {"destinationId": "R2"}
+
+    async def test_create_folder_refreshes_the_cache_with_the_folder_it_found(self, monkeypatch):
+        folders = {"Receipts": "R1"}
+        graph = _Graph({
+            ("GET", "/me/mailFolders"): _by_name(folders),
+            ("GET", "/me/mailFolders/R1"): _folder("R1", "Receipts"),
+            ("GET", "/me/mailFolders/R2"): _folder("R2", "Receipts"),
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+        })
+        tool = _mail(graph, monkeypatch)
+        assert (await tool.execute("move", folder="Receipts", message_ids=["M1"])).success
+        del graph.routes[("GET", "/me/mailFolders/R1")]
+        folders["Receipts"] = "R2"
+        res = await tool.execute("create_folder", folder="Receipts")
+        assert res.content == "Folder 'Receipts' already exists (ID: R2) — nothing created."
+        seen = len(graph.requests)
+        res = await tool.execute("move", folder="Receipts", message_ids=["M1"])
+        assert res.success, res.error
+        assert graph.bodies("POST")[-1] == {"destinationId": "R2"}
+        assert graph.requests[seen].url.path == "/v1.0/me/mailFolders/R2"  # straight from the cache
+
+    async def test_create_a_top_level_folder_conflict_reports_the_existing_one(self, monkeypatch):
+        seen = {"n": 0}
+
+        def top(request):
+            seen["n"] += 1  # not there on the first look; made meanwhile
+            return _by_name({"Receipts": "R1"} if seen["n"] > 1 else {})(request)
+        graph = _Graph({
+            ("GET", "/me/mailFolders"): top,
+            ("GET", "/me/mailFolders/inbox/childFolders"): _by_name({}),
+            ("POST", "/me/mailFolders"): (409, {"error": {
+                "code": "ErrorFolderExists", "message": "A folder with the specified name already exists."}}),
+        })
+        res = await _mail(graph, monkeypatch).execute("create_folder", folder="Receipts")
+        assert res.success, res.error
+        assert res.content == "Folder 'Receipts' already exists (ID: R1) — nothing created."
+
+    async def test_create_folder_leaves_what_a_shorter_name_means(self, monkeypatch):
+        # A top-level Projects/Acme, and Inbox/Projects/Acme/Q1.
+        graph = _Graph({
+            **_KNOWN,
+            ("GET", "/me/mailFolders"): _by_name({"Projects": "PTOP"}),
+            ("GET", "/me/mailFolders/PTOP/childFolders"): _by_name({"Acme": "ATOP"}),
+            ("GET", "/me/mailFolders/ATOP/childFolders"): _by_name({}),
+            ("GET", "/me/mailFolders/inbox/childFolders"): _by_name({"Projects": "PIN"}),
+            ("GET", "/me/mailFolders/PIN/childFolders"): _by_name({"Acme": "AIN"}),
+            ("GET", "/me/mailFolders/AIN/childFolders"): _by_name({"Q1": "Q1IN"}),
+            ("GET", "/me/mailFolders/PTOP"): _folder("PTOP", "Projects"),
+            ("GET", "/me/mailFolders/ATOP"): _folder("ATOP", "Acme", "PTOP"),
+            ("GET", "/me/mailFolders/PIN"): _folder("PIN", "Projects", "INBOX"),
+            ("GET", "/me/mailFolders/AIN"): _folder("AIN", "Acme", "PIN"),
+            ("GET", "/me/mailFolders/Q1IN"): _folder("Q1IN", "Q1", "AIN"),
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+        })
+        tool = _mail(graph, monkeypatch)
+        res = await tool.execute("create_folder", folder="Projects/Acme/Q1")
+        assert res.content == "Folder 'Projects/Acme/Q1' already exists in the Inbox (ID: Q1IN) — nothing created."
+        for folder, dest in (("Projects", "PTOP"), ("Projects/Acme", "ATOP"), ("Projects/Acme/Q1", "Q1IN")):
+            res = await tool.execute("move", folder=folder, message_ids=["M1"])
+            assert res.success, res.error
+            assert graph.bodies("POST")[-1] == {"destinationId": dest}, folder
+
+    # ── what a move answers ──
+
+    async def test_a_conversation_moves_undo_names_the_folder_each_came_from(self, monkeypatch):
+        graph = _Graph({
+            **_KNOWN, _ARCHIVE: _ARCHIVE_OK,
+            ("GET", "/me/messages"): (200, {"value": [
+                {"id": "M1", "parentFolderId": "INBOX"}, {"id": "M2", "parentFolderId": "ACME"}]}),
+            ("GET", "/me/mailFolders/ACME"): _folder("ACME", "Acme"),
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+            ("POST", "/me/messages/M2/move"): (201, {"id": "N2"}),
+        })
+        res = await _mail(graph, monkeypatch).execute("archive", thread_ids=["C1"])
+        assert res.success, res.error
+        assert "Undo: microsoft_mail action=move folder=Inbox message_ids=[N1]" in res.content
+        assert "Undo: microsoft_mail action=move folder=ACME message_ids=[N2]" in res.content
+        assert "came from" not in res.content
+
+    async def test_undo_after_many_moves_from_several_folders_counts_each(self, monkeypatch):
+        msgs = [{"id": f"M{i}", "parentFolderId": "ACME" if i < 3 else "INBOX"} for i in range(25)]
+        graph = _Graph({
+            **_KNOWN, _ARCHIVE: _ARCHIVE_OK,
+            ("GET", "/me/messages"): (200, {"value": msgs}),
+            ("GET", "/me/mailFolders/ACME"): _folder("ACME", "Acme"),
+            **{("POST", f"/me/messages/M{i}/move"): (201, {"id": f"N{i}"}) for i in range(25)},
+        })
+        res = await _mail(graph, monkeypatch).execute("archive", thread_ids=["C1"])
+        assert res.success, res.error
+        undo = res.content.split("\nUndo", 1)[1]
+        assert undo == (
+            " — their new IDs aren't all listed here; list_messages folder='Archive' shows them. "
+            "By the folder they came from:\n"
+            "  3 messages from ACME: microsoft_mail action=move folder=ACME message_ids=[their new IDs]\n"
+            "  22 messages from Inbox: microsoft_mail action=move folder=Inbox message_ids=[their new IDs]")
+
+    async def test_a_conversation_move_where_one_folder_cant_be_checked_moves_the_rest(self, monkeypatch):
+        busy = (503, {"error": {"code": "ServiceUnavailable", "message": "busy"}})
+        graph = _Graph({
+            **_KNOWN, _ARCHIVE: _ARCHIVE_OK,
+            ("GET", "/me/messages"): (200, {"value": [
+                {"id": "M1", "parentFolderId": "INBOX"}, {"id": "M2", "parentFolderId": "UF"},
+                {"id": "M3", "parentFolderId": "ACME"}]}),
+            ("GET", "/me/mailFolders/UF"): busy,
+            ("GET", "/me/mailFolders/ACME"): _folder("ACME", "Acme"),
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+            ("POST", "/me/messages/M3/move"): (201, {"id": "N3"}),
+        })
+        tool = _mail(graph, monkeypatch)
+        res = await tool.execute("archive", thread_ids=["C1"])
+        assert res.success, res.error
+        assert sorted(r.url.path.rsplit("/", 2)[-2] for r in _posts(graph)) == ["M1", "M3"]
+        assert "Archived 2 messages to 'Archive'." in res.content
+        assert "  NOT archived: M2 (couldn't check its folder — Outlook HTTP 503: busy)" in res.content
+        # Only that one: nothing moved, and not a success.
+        graph.routes[("GET", "/me/messages")] = (200, {"value": [{"id": "M2", "parentFolderId": "UF"}]})
+        res = await tool.execute("archive", thread_ids=["C1"])
+        assert not res.success
+        assert res.error == ("Nothing was archived:\n  NOT archived: M2 (couldn't check its folder — "
+                             "Outlook HTTP 503: busy)")
+        assert len(_posts(graph)) == 2
+
+    @pytest.mark.parametrize("folder", ["Posteingang", "INBOXID" * 8])
+    async def test_a_move_into_the_inbox_by_its_id_or_local_name_undoes_to_the_source(
+        self, monkeypatch, folder,
+    ):
+        graph = _Graph({
+            **_KNOWN,
+            ("GET", "/me/mailFolders/inbox"): _folder("INBOXID" * 8, "Posteingang"),
+            ("GET", "/me/mailFolders"): _by_name({"Posteingang": "INBOXID" * 8}),
+            ("GET", f"/me/mailFolders/{'INBOXID' * 8}"): _folder("INBOXID" * 8, "Posteingang"),
+            ("POST", "/me/messages/M1/move"): (201, {"id": "N1"}),
+        })
+        res = await _mail(graph, monkeypatch).execute("move", folder=folder, message_ids=["M1"])
+        assert res.success, res.error
+        assert "Undo: microsoft_mail action=move folder=<the folder they came from> message_ids=[N1]" in res.content
+        assert "folder=Inbox" not in res.content
+
+    async def test_a_move_where_every_try_failed_is_not_a_success(self, monkeypatch):
+        graph = _Graph({
+            **_KNOWN, _ARCHIVE: _ARCHIVE_OK,
+            ("GET", "/me/messages"): (200, {"value": [
+                {"id": "M1", "parentFolderId": "INBOX"}, {"id": "M2", "parentFolderId": "SENT"}]}),
+            ("POST", "/me/messages/M1/move"): (429, {"error": {"code": "TooManyRequests", "message": "slow down"}}),
+        })
+        res = await _mail(graph, monkeypatch).execute("archive", thread_ids=["C1"])
+        assert not res.success
+        assert res.error == ("Nothing was archived:\n  NOT archived: M1 (Outlook HTTP 429: slow down)\n"
+                             "  Skipped: left where they are: 1 in Sent Items.")
+
+    async def test_categories_where_every_change_failed_is_not_a_success(self, monkeypatch):
+        graph = _Graph({
+            ("GET", "/me/messages/M1"): (200, {"id": "M1", "categories": ["Receipts"]}),
+            ("GET", "/me/messages/M2"): (200, {"id": "M2", "categories": []}),
+            ("PATCH", "/me/messages/M2"): (503, {"error": {"code": "ServiceUnavailable", "message": "busy"}}),
+        })
+        res = await _mail(graph, monkeypatch).execute(
+            "add_categories", message_ids=["M1", "M2"], categories=["Receipts"])
+        assert not res.success
+        assert res.error == ("Nothing was changed:\n  NOT changed: M2 (Outlook HTTP 503: busy)\n"
+                             "  Skipped: 1 message already had it.")
+
+    async def test_moves_run_at_most_four_at_a_time(self, monkeypatch):
+        import asyncio
+
+        flight = {"now": 0, "peak": 0}
+
+        async def graph(request):
+            path = request.url.path.split("/v1.0", 1)[-1]
+            if request.method == "GET":  # the Archive folder
+                return httpx.Response(200, json=_ARCHIVE_OK[1])
+            flight["now"] += 1
+            flight["peak"] = max(flight["peak"], flight["now"])
+            await asyncio.sleep(0.01)
+            flight["now"] -= 1
+            return httpx.Response(201, json={"id": "N" + path.split("/")[3]})
+        tool = _mail(_Graph({}), monkeypatch)
+        tool._client = _RealAsyncClient(transport=httpx.MockTransport(graph))
+        res = await tool.execute("archive", message_ids=[f"M{i}" for i in range(30)])
+        assert res.success, res.error
+        assert "Archived 30 messages" in res.content
+        assert 1 < flight["peak"] <= 4
+
+    # ── limits and the rest ──
+
+    async def test_a_conversation_over_500_messages_is_refused(self, monkeypatch):
+        huge = (200, {"value": [{"id": f"M{i}", "parentFolderId": "INBOX", "categories": []}
+                                for i in range(501)]})
+        graph = _Graph({**_KNOWN, _ARCHIVE: _ARCHIVE_OK, ("GET", "/me/messages"): huge})
+        tool = _mail(graph, monkeypatch)
+        res = await tool.execute("archive", thread_ids=["C1"])
+        assert not res.success
+        assert res.error == ("These conversations hold 501 messages to move — at most 500 per call. "
+                             "Pass fewer thread_ids. Nothing was moved.")
+        res = await tool.execute("add_categories", thread_ids=["C1"], categories=["X"])
+        assert not res.success
+        assert res.error == ("These conversations hold 501 messages — at most 500 per call. "
+                             "Pass fewer thread_ids. Nothing was changed.")
+        assert {r.method for r in graph.requests} == {"GET"}
+
+    async def test_well_known_folders_are_read_once_per_token(self, monkeypatch):
+        graph = _Graph({_ARCHIVE: _ARCHIVE_OK, ("POST", "/me/messages/M1/move"): (201, {"id": "N1"})})
+        tool = _mail(graph, monkeypatch)
+        for _ in range(2):
+            assert (await tool.execute("archive", message_ids=["M1"])).success
+        assert sum(r.url.path == "/v1.0/me/mailFolders/archive" for r in graph.requests) == 1
+
+    async def test_remove_categories_on_a_conversation(self, monkeypatch):
+        graph = _Graph({
+            ("GET", "/me/messages"): (200, {"value": [
+                {"id": "M1", "categories": ["Finance", "x"]}, {"id": "M2", "categories": []}]}),
+            ("PATCH", "/me/messages/M1"): (200, {}),
+        })
+        res = await _mail(graph, monkeypatch).execute(
+            "remove_categories", thread_ids=["C1"], categories=["finance"])
+        assert res.success, res.error
+        assert graph.bodies("PATCH") == [{"categories": ["x"]}]
+        assert "Removed category 'finance' from 1 message." in res.content
+        assert "1 message didn't have it — unchanged." in res.content
+        assert 'Undo: microsoft_mail action=add_categories categories=["Finance"] message_ids=[M1]' in res.content
+
+    def test_category_names_from_a_python_style_list(self):
+        from captain_claw.tools.microsoft_mail import _names
+
+        assert _names("['Receipts', 'Travel']") == ["Receipts", "Travel"]
+        assert _names("[Receipts, \"Red category\"]") == ["Receipts", "Red category"]
+        assert _names('["Receipts", "Travel"]') == ["Receipts", "Travel"]
+        assert _names("Receipts, travel, RECEIPTS") == ["Receipts", "travel"]
+        assert _names("[EXT] Vendor") == ["[EXT] Vendor"]
+        assert _names(["Students'"]) == ["Students'"]
+
+    async def test_add_categories_from_a_python_style_list(self, monkeypatch):
+        graph = _Graph({
+            ("GET", "/me/messages/M1"): (200, {"id": "M1", "categories": []}),
+            ("PATCH", "/me/messages/M1"): (200, {}),
+        })
+        res = await _mail(graph, monkeypatch).execute(
+            "add_categories", message_ids=["M1"], categories="['Receipts', 'Travel']")
+        assert res.success, res.error
+        assert graph.bodies("PATCH") == [{"categories": ["Receipts", "Travel"]}]
+
+    def test_bracketed_category_names_keep_their_brackets(self):
+        from captain_claw.tools.microsoft_mail import _names
+
+        # Not one list as a whole: comma-separated names, brackets kept.
+        assert _names("[EXT]") == ["[EXT]"]
+        assert _names("[A], [B]") == ["[A]", "[B]"]
+        assert _names("[EXT], Travel") == ["[EXT]", "Travel"]
+        # A quoted name loses only its own quotes.
+        assert _names("'Receipts', \"Red category\"") == ["Receipts", "Red category"]
+        assert _names("O'Brien, Students'") == ["O'Brien", "Students'"]
+        # A list literal's names keep theirs.
+        assert _names("['[EXT]', 'Travel']") == ["[EXT]", "Travel"]
+        assert _names('["[A]", "[B]"]') == ["[A]", "[B]"]
+
+    async def test_bracketed_categories_are_added_and_removed_as_named(self, monkeypatch):
+        graph = _Graph({
+            ("GET", "/me/messages/M1"): (200, {"id": "M1", "categories": []}),
+            ("PATCH", "/me/messages/M1"): (200, {}),
+            ("GET", "/me/messages/M2"): (200, {"id": "M2", "categories": ["[EXT]", "Blue"]}),
+            ("PATCH", "/me/messages/M2"): (200, {}),
+        })
+        tool = _mail(graph, monkeypatch)
+        res = await tool.execute("add_categories", message_ids=["M1"], categories="[A], [B]")
+        assert res.success, res.error
+        res = await tool.execute("remove_categories", message_ids=["M2"], categories="[EXT]")
+        assert res.success, res.error
+        assert "Removed category '[EXT]' from 1 message." in res.content
+        assert graph.bodies("PATCH") == [{"categories": ["[A]", "[B]"]}, {"categories": ["Blue"]}]
 
 
 # ── microsoft_calendar ───────────────────────────────────────────────

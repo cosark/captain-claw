@@ -128,8 +128,8 @@ CATALOG: dict[str, dict[str, Any]] = {
 # google_mail sub-actions that write email (create/change/send a draft or mail).
 MAIL_WRITE_ACTIONS = frozenset({"create_draft", "update_draft", "send", "send_draft"})
 # google_mail / microsoft_mail sub-actions that change the mailbox without
-# writing email (mirrors mail_authority.MAILBOX_CHANGE_ACTIONS by string; FD
-# never imports the agent's module).
+# writing email (mirrors mail_authority.MAILBOX_CHANGE_ACTIONS by string, like
+# MAIL_WRITE_ACTIONS; a test pins the two sets equal).
 MAIL_ORGANIZE_ACTIONS = frozenset({
     "archive", "move", "add_labels", "remove_labels", "create_label",
     "create_folder", "add_categories", "remove_categories",

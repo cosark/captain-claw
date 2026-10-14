@@ -1242,11 +1242,52 @@ class TestStallNag:
                                        "Let me send the email",
                                        "I'll create the email to Ana now.",
                                        "I'll draft a reply and label the emails",
-                                       "I'll create the email label, then send the email to Bob."])
+                                       "I'll create the email label, then send the email to Bob.",
+                                       # Only "create" makes a label / folder: a
+                                       # place word next to any other verb is
+                                       # still an email being written …
+                                       "Let me write the label update email to Ana now.",
+                                       "Let me send the category breakdown by email to Ana.",
+                                       "I'll send the folder link by email now.",
+                                       "Let me compose the folder summary email for Ana.",
+                                       "I'll draft the email labels report for Ana now.",
+                                       "I'll draft the reply, label it Follow-up and send it.",
+                                       # … and one in the next clause, sentence
+                                       # or line isn't part of the phrase.
+                                       "I'll prepare the email. Labels next.",
+                                       "I'll draft the emails, folder by folder.",
+                                       "Let me write the email\nlabels: none",
+                                       "I'll compose the mail; folders after",
+                                       "I'll write the reply.\n- tags: none",
+                                       "I'll create the email, label it Urgent and send it.",
+                                       "Let me create the reply; folders after.",
+                                       # after create too: a new line ends the phrase
+                                       "Let me create the email\nlabels: none",
+                                       "Let me create the reply\n\nfolders: n/a",
+                                       "I'll create the email\r\ntags: none"])
     def test_email_stalls_next_to_organizing_still_match(self, stall):
         from captain_claw.agent_orchestration_mixin import _STALL_MAIL_RE
 
         assert _STALL_MAIL_RE.search(stall)
+
+    @pytest.mark.parametrize("stall", ["Let me write the label update email to Ana now.",
+                                       "I'll send the folder link by email now.",
+                                       "I'll draft the emails, folder by folder.",
+                                       "Let me create the email\nlabels: none",
+                                       "Let me create the reply\n\nfolders: n/a"])
+    def test_email_stall_next_to_a_place_word_forces_no_tool(self, stall):
+        from captain_claw.agent_orchestration_mixin import (
+            _STALL_MAIL_NEUTRAL_INSTRUCTION,
+            _STALL_NO_MAIL_INSTRUCTION,
+        )
+
+        # Nobody asked for an email: no draft is forced in either kind of turn.
+        with ma.bound(ma.human("summarize which labels changed this week")):
+            instr, force = self._instr(_Loop(), stall)
+        assert instr == _STALL_MAIL_NEUTRAL_INSTRUCTION and force is False
+        with ma.bound(ma.automated("cron", "", "deny")):
+            instr, force = self._instr(_Loop(), stall)
+        assert instr == _STALL_NO_MAIL_INSTRUCTION and force is False
 
     @pytest.mark.parametrize("stall", ["Let me draft chapter 3 now.",
                                        "I'll write the draft of section 2 to the file.",
