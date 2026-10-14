@@ -23,6 +23,7 @@ import {
 } from '../../stores/googleAuthStore'
 import { useAuthStore } from '../../stores/authStore'
 import { AgenticSignatureField, normalizeSignature } from './AgenticSignatureField'
+import GmailAutoReplySection from './GmailAutoReplySection'
 
 const RECENT_SENDS = 10
 
@@ -371,6 +372,10 @@ export default function GoogleConnection() {
         {/* Email sending — the signed-in user's own policy, so it shows for
             non-admins and in the kiosk Connections dialog too. */}
         {connected && <GmailSendSection />}
+
+        {/* Topic auto-replies — the user's own too; in the kiosk only an off
+            switch, once they're on. */}
+        {connected && <GmailAutoReplySection />}
 
         {/* Credentials form — deck-wide OAuth client, admins only (the save
             endpoint is require_admin; non-admins would only get 403s). */}

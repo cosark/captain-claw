@@ -1016,3 +1016,356 @@ class TestAgenticSignature:
         r = c.post("/fd/google/gmail/send", headers=_agent(), json={"draft_id": "d1"})
         assert r.status_code == 200, r.text
         assert json.loads(gmail.sends()[0].content) == {"id": "d1"}
+
+
+# ── origins: the agents' limit and history vs topic auto-replies ─────
+
+
+async def _add_sends(db, n, origin, uid=ALICE):
+    for i in range(n):
+        await db.add_gmail_send(uid, agent="a", to_addrs="x@y.co", subject=f"{origin}-{i}",
+                                gmail_message_id=f"g-{origin}-{i}", origin=origin)
+
+
+class TestSendOrigins:
+    async def test_agent_count_and_history_leave_auto_replies_out(self, db):
+        await _add_sends(db, 2, "agent")
+        await _add_sends(db, 3, "autoreply")
+        await _add_sends(db, 1, "autoreply_approved")
+        c = _client()
+        assert c.get("/fd/google/gmail-send", headers=_bearer(ALICE)).json()["sent_last_24h"] == 2
+        sends = c.get("/fd/google/gmail-sends", headers=_bearer(ALICE)).json()["sends"]
+        assert sorted(s["subject"] for s in sends) == ["agent-0", "agent-1"]
+        assert set(sends[0]) == {"id", "status", "agent", "to", "cc", "bcc", "subject",
+                                 "gmail_message_id", "thread_id", "draft_id", "attachments",
+                                 "created_at"}
+        # The table still holds every row.
+        assert len(await db.list_gmail_sends(ALICE)) == 6
+
+    async def test_auto_replies_do_not_use_up_the_agents_limit(self, db, agents, gmail):
+        await gr._store_tokens(db, ALICE, _tokens("alice-access"))
+        await _enable(db, daily_limit=1)
+        await _add_sends(db, 3, "autoreply")
+        c = _client()
+        r = c.post("/fd/google/gmail/send", headers=_agent(), json=MSG)
+        assert r.status_code == 200, r.text
+        assert r.json()["sent_last_24h"] == 1
+        r = c.post("/fd/google/gmail/send", headers=_agent(), json={**MSG, "subject": "s2"})
+        assert r.status_code == 429 and "1 of 1 emails" in r.json()["detail"]
+        assert "create_draft" in r.json()["detail"]  # the agents' wording, unchanged
+
+    async def test_an_agent_send_carries_no_auto_reply_header(self, db, agents, gmail):
+        await gr._store_tokens(db, ALICE, _tokens("alice-access"))
+        await _enable(db)
+        r = _client().post("/fd/google/gmail/send", headers=_agent(),
+                           json={"reply_to_message_id": "m1", "body": "Count me in"})
+        assert r.status_code == 200, r.text
+        msg = _decode(json.loads(gmail.sends()[0].content)["raw"])
+        assert msg["Auto-Submitted"] is None and msg["X-Auto-Response-Suppress"] is None
+        (row,) = await db.list_gmail_sends(ALICE)
+        assert (row["origin"], row["topic_id"], row["in_reply_to_message_id"]) == ("agent", "", "")
+
+
+# ── send_autoreply: the topic auto-reply engine's sender ─────────────
+
+
+INBOUND = "in-1"
+
+
+def _inbound(gmail, mid=INBOUND, *, subject="Opening hours", reply_to="", thread="t-in"):
+    headers = [{"name": "From", "value": "Carol <carol@ok.com>"},
+               {"name": "To", "value": "alice@x.co"},
+               {"name": "Message-ID", "value": f"<{mid}@ok.com>"}]
+    if subject:
+        headers.append({"name": "Subject", "value": subject})
+    if reply_to:
+        headers.append({"name": "Reply-To", "value": reply_to})
+    gmail.routes[("GET", f"/messages/{mid}")] = (200, {
+        "id": mid, "threadId": thread, "labelIds": ["INBOX"], "internalDate": "1000",
+        "payload": {"headers": headers}})
+
+
+async def _autoreply(db, **kw):
+    args = {"token": "alice-access", "inbound_message_id": INBOUND, "to_addr": "carol@ok.com",
+            "subject_fallback": "", "body": "We open at 9.", "agent_label": "alice-agent · auto-reply",
+            "topic_id": "hours", "daily_limit": 20, "origin": "autoreply", "before_send": None}
+    return await gs.send_autoreply(db, ALICE, **{**args, **kw})
+
+
+class TestSendAutoreply:
+    def test_headers_are_the_rfc_3834_markers_and_read_only(self):
+        assert dict(gs.AUTOREPLY_HEADERS) == {"Auto-Submitted": "auto-replied",
+                                              "X-Auto-Response-Suppress": "All"}
+        with pytest.raises(TypeError):
+            gs.AUTOREPLY_HEADERS["Bcc"] = "x@y.co"
+        assert gs.AUTOREPLY_ORIGINS == ("autoreply", "autoreply_approved")
+
+    async def test_sends_one_threaded_marked_reply_to_the_verified_sender(self, db, gmail):
+        # Sending is OFF in the user's policy (decision 3) and the inbound
+        # email's Reply-To points elsewhere: neither matters.
+        _inbound(gmail, reply_to="Mallory <mallory@evil.com>")
+        out = await _autoreply(db)
+        assert out == {"ok": True, "message_id": "sent-1", "thread_id": "t-new",
+                       "to": "carol@ok.com", "subject": "Re: Opening hours",
+                       "body": "We open at 9.", "sent_last_24h": 1, "daily_limit": 20}
+        (send,) = gmail.sends()
+        assert send.url.path.endswith("/users/me/messages/send")
+        assert send.headers["Authorization"] == "Bearer alice-access"
+        payload = json.loads(send.content)
+        assert payload["threadId"] == "t-in"
+        msg = _decode(payload["raw"])
+        assert msg["To"] == "carol@ok.com" and msg["Cc"] is None and msg["Bcc"] is None
+        assert msg["Subject"] == "Re: Opening hours"
+        assert msg["In-Reply-To"] == "<in-1@ok.com>" and msg["References"] == "<in-1@ok.com>"
+        assert msg["Auto-Submitted"] == "auto-replied"
+        assert msg["X-Auto-Response-Suppress"] == "All"
+        assert not list(msg.iter_attachments())
+
+        (row,) = await db.list_gmail_sends(ALICE)
+        assert (row["origin"], row["topic_id"], row["in_reply_to_message_id"]) == (
+            "autoreply", "hours", INBOUND)
+        assert row["status"] == "sent" and row["agent"] == "alice-agent · auto-reply"
+        assert row["to_addrs"] == "carol@ok.com" and row["cc_addrs"] == row["bcc_addrs"] == ""
+        assert row["gmail_message_id"] == "sent-1" and row["thread_id"] == "t-new"
+        assert row["content_hash"]
+        # No email_sent bell (the engine rings its own); not in the agents' history.
+        assert await db.list_notifications(ALICE) == []
+        c = _client()
+        assert c.get("/fd/google/gmail-sends", headers=_bearer(ALICE)).json()["sends"] == []
+        assert c.get("/fd/google/gmail-send", headers=_bearer(ALICE)).json()["sent_last_24h"] == 0
+
+    async def test_the_core_checks_the_recipient_against_that_one_address(
+        self, db, gmail, monkeypatch,
+    ):
+        _inbound(gmail)
+        seen = []
+        real = gs._check_recipients
+
+        def spy(to, cc, bcc, allowlist):
+            seen.append((to, cc, bcc, list(allowlist)))
+            return real(to, cc, bcc, allowlist)
+
+        monkeypatch.setattr(gs, "_check_recipients", spy)
+        await _autoreply(db, to_addr="Carol@OK.com")
+        assert seen == [("Carol@OK.com", "", "", ["carol@ok.com"])]
+        assert _decode(json.loads(gmail.sends()[0].content)["raw"])["To"] == "Carol@OK.com"
+
+    async def test_the_binding_allowlist_refuses_any_other_recipient(self, db, gmail):
+        # What the bound allowlist stops: were "to" ever left empty, the
+        # reply would default to the Reply-To — refused, nothing sent.
+        _inbound(gmail, reply_to="Mallory <mallory@evil.com>")
+        async with gs.httpx.AsyncClient() as client:
+            with pytest.raises(gs.HTTPException) as exc:
+                await gs._compose_checked(
+                    db, ALICE, client, "alice-access", to="", cc="", bcc="", subject="",
+                    body="hi", html_body="", reply_to=INBOUND, atts=[],
+                    allowlist=["carol@ok.com"], allow_repeat=False,
+                    extra_headers=gs.AUTOREPLY_HEADERS,
+                )
+        assert exc.value.status_code == 403 and "mallory@evil.com" in exc.value.detail
+        assert gmail.sends() == []
+
+    async def test_the_users_allowlist_is_not_consulted(self, db, gmail):
+        # Decision 1: the topic decides who gets a reply, not the agents' list.
+        await _enable(db, allowed_recipients=["@corp.io"])
+        _inbound(gmail)
+        assert (await _autoreply(db))["message_id"] == "sent-1"
+
+    @pytest.mark.parametrize("to_addr", [
+        "", "   ", "Carol <carol@ok.com>", "<carol@ok.com>", "carol@ok.com, mallory@evil.com",
+        "carol@ok.com; mallory@evil.com", "ok.com", "@ok.com", "carol", "josé@example.com",
+    ])
+    async def test_anything_but_one_plain_address_is_a_400(self, db, gmail, to_addr):
+        _inbound(gmail)
+        with pytest.raises(gs.HTTPException) as exc:
+            await _autoreply(db, to_addr=to_addr)
+        assert exc.value.status_code == 400 and "Nothing was sent" in exc.value.detail
+        assert gmail.requests == [] and await db.list_gmail_sends(ALICE) == []
+
+    @pytest.mark.parametrize("value", ["off", "0", "false", "NO"])
+    async def test_the_deck_kill_switch_refuses(self, db, gmail, monkeypatch, value):
+        monkeypatch.setenv("FD_GMAIL_SEND", value)
+        _inbound(gmail)
+        with pytest.raises(gs.HTTPException) as exc:
+            await _autoreply(db)
+        assert exc.value.status_code == 403
+        assert exc.value.headers[gs.gmail_compose.SEND_REFUSED_HEADER] == "deck-disabled"
+        assert "FD_GMAIL_SEND" in exc.value.detail
+        assert gmail.requests == []
+
+    @pytest.mark.parametrize("origin", ["agent", "", "autoreplied"])
+    async def test_only_an_auto_reply_origin(self, db, gmail, origin):
+        with pytest.raises(ValueError):
+            await _autoreply(db, origin=origin)
+        assert gmail.requests == []
+
+    async def test_bad_or_gone_inbound_and_no_token(self, db, gmail):
+        with pytest.raises(gs.HTTPException) as exc:
+            await _autoreply(db, inbound_message_id="../drafts/d1")
+        assert exc.value.status_code == 400
+        with pytest.raises(gs.HTTPException) as exc:
+            await _autoreply(db, token="")
+        assert exc.value.status_code == 404
+        assert gmail.requests == []
+        with pytest.raises(gs.HTTPException) as exc:
+            await _autoreply(db, inbound_message_id="gone")  # Gmail answers 404
+        assert exc.value.status_code == 404 and "not found" in exc.value.detail
+        assert gmail.sends() == [] and await db.list_gmail_sends(ALICE) == []
+
+    async def test_an_inbound_without_a_subject_takes_the_fallback(self, db, gmail):
+        _inbound(gmail, subject="")
+        with pytest.raises(gs.HTTPException) as exc:
+            await _autoreply(db)
+        assert exc.value.status_code == 400 and "subject" in exc.value.detail
+        out = await _autoreply(db, subject_fallback="Re: (no subject)")
+        assert out["subject"] == "Re: (no subject)"
+        assert _decode(json.loads(gmail.sends()[0].content)["raw"])["Subject"] == "Re: (no subject)"
+
+    async def test_signed_once_and_plain_text_escaped(self, db, gmail):
+        from captain_claw import mail_signature
+
+        await db.set_settings(ALICE, {mail_signature.GOOGLE_KEY: SIG})
+        _inbound(gmail)
+        out = await _autoreply(db, body="Use <b>this</b> & that.")
+        assert out["body"] == "Use <b>this</b> & that.\n\n" + SIG
+        msg = _decode(json.loads(gmail.sends()[0].content)["raw"])
+        plain = msg.get_body(("plain",)).get_content().replace("\r\n", "\n")
+        html = msg.get_body(("html",)).get_content()
+        assert plain.rstrip().endswith("Use <b>this</b> & that.\n\n" + SIG)
+        assert plain.count("Alice & Co.") == 1
+        assert "Use &lt;b&gt;this&lt;/b&gt; &amp; that." in html and "<b>" not in html
+        # A body that already ends with it isn't signed twice.
+        _inbound(gmail, "in-2")
+        out = await _autoreply(db, inbound_message_id="in-2", body="Hi\n\n" + SIG)
+        assert out["body"] == "Hi\n\n" + SIG
+
+    @pytest.mark.parametrize("failure", ["timeout", "5xx"])
+    async def test_an_unknown_outcome_is_audited_without_a_bell_and_never_resent(
+        self, db, gmail, failure,
+    ):
+        _inbound(gmail)
+        if failure == "timeout":
+            gmail.raises[("POST", "/messages/send")] = httpx.ReadTimeout
+        else:
+            gmail.routes[("POST", "/messages/send")] = (503, {"error": {"message": "Backend Error"}})
+        with pytest.raises(gs.HTTPException) as exc:
+            await _autoreply(db)
+        assert exc.value.status_code == 502
+        assert exc.value.headers[gs.gmail_compose.SEND_OUTCOME_HEADER] == "unknown"
+        (row,) = await db.list_gmail_sends(ALICE)
+        assert (row["status"], row["origin"], row["topic_id"], row["in_reply_to_message_id"]) == (
+            "unknown", "autoreply", "hours", INBOUND)
+        assert row["gmail_message_id"] == "" and row["content_hash"]
+        assert await db.list_notifications(ALICE) == []
+        # A retry is a duplicate: Gmail is not called again.
+        gmail.raises.clear()
+        gmail.routes[("POST", "/messages/send")] = (200, {"id": "sent-1", "threadId": "t"})
+        with pytest.raises(gs.HTTPException) as exc:
+            await _autoreply(db)
+        assert exc.value.status_code == 409 and "never confirmed" in exc.value.detail
+        assert len(gmail.sends()) == 1
+
+    async def test_a_known_failure_is_not_audited(self, db, gmail):
+        _inbound(gmail)
+        gmail.routes[("POST", "/messages/send")] = (400, {"error": {"message": "Invalid To header"}})
+        with pytest.raises(gs.HTTPException) as exc:
+            await _autoreply(db)
+        assert exc.value.status_code == 502 and "was not sent" in exc.value.detail
+        assert gs.gmail_compose.SEND_OUTCOME_HEADER not in (exc.value.headers or {})
+        assert await db.list_gmail_sends(ALICE) == []
+
+    async def test_its_limit_counts_only_its_own_origin(self, db, gmail):
+        await _add_sends(db, 5, "agent")
+        await _add_sends(db, 1, "autoreply_approved")
+        _inbound(gmail)
+        _inbound(gmail, "in-2")
+        assert (await _autoreply(db, daily_limit=2))["sent_last_24h"] == 1
+        assert (await _autoreply(db, inbound_message_id="in-2", body="Again.",
+                                 daily_limit=2))["sent_last_24h"] == 2
+        with pytest.raises(gs.HTTPException) as exc:
+            await _autoreply(db, inbound_message_id="in-2", body="Third.", daily_limit=2)
+        assert exc.value.status_code == 429
+        assert "auto-reply limit reached: 2 of 2" in exc.value.detail
+        assert "create_draft" not in exc.value.detail
+        assert len(gmail.sends()) == 2
+
+    async def test_no_daily_limit_for_an_approved_send(self, db, gmail):
+        await _add_sends(db, 5, "autoreply_approved")
+        _inbound(gmail)
+        out = await _autoreply(db, origin="autoreply_approved", daily_limit=None)
+        assert out["sent_last_24h"] == 6 and out["daily_limit"] is None
+        rows = await db.list_gmail_sends(ALICE, origin="autoreply_approved")
+        assert len(rows) == 6
+        _inbound(gmail, "in-2")
+        with pytest.raises(gs.HTTPException) as exc:
+            await _autoreply(db, inbound_message_id="in-2", origin="autoreply_approved",
+                             daily_limit=6)
+        assert exc.value.status_code == 429
+
+    async def test_before_send_runs_under_the_lock_after_every_check(self, db, gmail, monkeypatch):
+        _inbound(gmail)
+        events = []
+        real = gs.gmail_compose.find_repeats
+
+        async def repeats(*a, **kw):
+            events.append(("repeats", gs._send_locks.get(ALICE) is not None
+                           and gs._send_locks[ALICE].locked()))
+            return await real(*a, **kw)
+
+        async def before_send():
+            events.append(("before_send", gs._send_locks[ALICE].locked(), len(gmail.sends())))
+
+        monkeypatch.setattr(gs.gmail_compose, "find_repeats", repeats)
+        await _autoreply(db, before_send=before_send)
+        assert events == [("repeats", False), ("before_send", True, 0)]
+        assert len(gmail.sends()) == 1
+
+    async def test_before_send_can_stop_it(self, db, gmail):
+        _inbound(gmail)
+
+        async def before_send():
+            raise gs.HTTPException(status_code=409, detail="already handled")
+
+        with pytest.raises(gs.HTTPException) as exc:
+            await _autoreply(db, before_send=before_send)
+        assert (exc.value.status_code, exc.value.detail) == (409, "already handled")
+        assert gmail.sends() == [] and await db.list_gmail_sends(ALICE) == []
+        assert not gs._send_locks[ALICE].locked()
+
+    async def test_before_send_is_not_reached_past_a_refusal(self, db, gmail):
+        _inbound(gmail)
+        calls = []
+
+        async def before_send():
+            calls.append(1)
+
+        with pytest.raises(gs.HTTPException) as exc:  # the limit
+            await _autoreply(db, daily_limit=0, before_send=before_send)
+        assert exc.value.status_code == 429
+        await _autoreply(db, before_send=before_send)
+        assert calls == [1]
+        with pytest.raises(gs.HTTPException) as exc:  # the same reply again: a duplicate
+            await _autoreply(db, before_send=before_send)
+        assert exc.value.status_code == 409 and "already sent" in exc.value.detail
+        assert calls == [1] and len(gmail.sends()) == 1
+
+    async def test_a_draft_or_reply_in_the_thread_is_a_repeat(self, db, gmail):
+        # The owner is already answering: a draft in the thread → 409, never sent.
+        _inbound(gmail)
+        status, original = gmail.routes[("GET", f"/messages/{INBOUND}")]
+        gmail.routes[("GET", "/threads/t-in")] = (200, {"id": "t-in", "messages": [
+            original,
+            {"id": "m2", "threadId": "t-in", "labelIds": ["DRAFT"], "internalDate": "2000",
+             "payload": {"headers": [{"name": "To", "value": "carol@ok.com"},
+                                     {"name": "Subject", "value": "Re: Opening hours"}]}},
+        ]})
+        calls = []
+
+        async def before_send():
+            calls.append(1)
+
+        with pytest.raises(gs.HTTPException) as exc:
+            await _autoreply(db, before_send=before_send)
+        assert exc.value.status_code == 409
+        assert gs.gmail_compose.is_repeat_refusal(exc.value.detail)
+        assert gmail.sends() == [] and calls == []

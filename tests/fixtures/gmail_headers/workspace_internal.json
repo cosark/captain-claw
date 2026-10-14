@@ -1,0 +1,90 @@
+{
+  "_fixture": "SYNTHETIC, not a real capture: header names, order and value shapes mirror what Gmail prepends to a received message (Delivered-To, internal Received/X-Received, ARC set, Return-Path, MX Received, Received-SPF, Authentication-Results) above the sender's own headers. Replace with sanitised real captures before shipping.",
+  "id": "19a1c2d3e4f5a6e0",
+  "threadId": "19a1c2d3e4f5a6e0",
+  "labelIds": [
+    "UNREAD",
+    "IMPORTANT",
+    "CATEGORY_PERSONAL",
+    "INBOX"
+  ],
+  "snippet": "Hi, what's the wifi password for the meeting room? Petra",
+  "payload": {
+    "partId": "",
+    "mimeType": "text/plain",
+    "filename": "",
+    "headers": [
+      {
+        "name": "Delivered-To",
+        "value": "owner@acme.example"
+      },
+      {
+        "name": "Received",
+        "value": "by 2002:a05:6a10:8e4b:b0:5c1:9f20:aa31 with SMTP id i11csp302114pxm;\r\n        Tue, 13 Oct 2026 02:31:02 -0700 (PDT)"
+      },
+      {
+        "name": "X-Received",
+        "value": "by 2002:a05:6214:2a4c:b0:6f1:a2b3:c4d5 with SMTP id 6a1803df08f44-6f1a2b3c4d5mr2233445566d6.21.1791883862117;\r\n        Tue, 13 Oct 2026 02:31:02 -0700 (PDT)"
+      },
+      {
+        "name": "Return-Path",
+        "value": "<petra@acme.example>"
+      },
+      {
+        "name": "Received",
+        "value": "by 2002:a05:6214:19c4:b0:6e8:f7a6:b5c4 with HTTP; Tue, 13 Oct 2026 02:31:01 -0700 (PDT)"
+      },
+      {
+        "name": "DKIM-Signature",
+        "value": "v=1; a=rsa-sha256; c=relaxed/relaxed;\r\n        d=acme.example; s=google; t=1791883861; x=1792488661; darn=acme.example;\r\n        h=to:subject:message-id:date:from:mime-version:from:to:cc:subject\r\n        :date:message-id:reply-to;\r\n        bh=Lp0sYtC8nH1uJdE5aKoVf6gRzXwTyBc4NmPqS2lD9fG=;\r\n        b=Mq8wE5rT8yU1iO4pA6sD9fG0hJ3kL7zX1cV5bN8mQ2wE4rT6yU9iO3pA5sD8fG0h"
+      },
+      {
+        "name": "X-Google-DKIM-Signature",
+        "value": "v=1; a=rsa-sha256; c=relaxed/relaxed;\r\n        d=1e100.net; s=20230601; t=1791883861; x=1792488661;\r\n        h=to:subject:message-id:date:from:mime-version:x-gm-message-state;\r\n        bh=Lp0sYtC8nH1uJdE5aKoVf6gRzXwTyBc4NmPqS2lD9fG=;\r\n        b=Rt5yU8iO2pA4sD7fG1hJ9kL3zX6cV0bN4mQ8wE2rT5yU7iO1pA3sD6fG9hJ2kL4z"
+      },
+      {
+        "name": "X-Gm-Message-State",
+        "value": "AOJu0YwR2mK7pYvB0cN5sHdJ8gFa3eUo1iTzXrVlNyQwEkPb"
+      },
+      {
+        "name": "X-Google-Smtp-Source",
+        "value": "AGHT+IGt2WnB5cH9sJd4FgA1eUo6iTzXrVlNyQwEkPbMa2CsDf"
+      },
+      {
+        "name": "MIME-Version",
+        "value": "1.0"
+      },
+      {
+        "name": "From",
+        "value": "Petra Novak <petra@acme.example>"
+      },
+      {
+        "name": "Date",
+        "value": "Tue, 13 Oct 2026 11:31:00 +0200"
+      },
+      {
+        "name": "Message-ID",
+        "value": "<CAGx9y8z7w6v5u4t3s2r1q0pOnMlKjIhGfEdCbA@mail.gmail.com>"
+      },
+      {
+        "name": "Subject",
+        "value": "Meeting room wifi"
+      },
+      {
+        "name": "To",
+        "value": "owner@acme.example"
+      },
+      {
+        "name": "Content-Type",
+        "value": "text/plain; charset=\"UTF-8\""
+      }
+    ],
+    "body": {
+      "size": 59,
+      "data": "SGksCgp3aGF0J3MgdGhlIHdpZmkgcGFzc3dvcmQgZm9yIHRoZSBtZWV0aW5nIHJvb20_CgpQZXRyYQo"
+    }
+  },
+  "sizeEstimate": 8123,
+  "historyId": "4182736",
+  "internalDate": "1791883862000"
+}

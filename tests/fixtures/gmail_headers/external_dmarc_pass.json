@@ -1,0 +1,250 @@
+{
+  "_fixture": "SYNTHETIC, not a real capture: header names, order and value shapes mirror what Gmail prepends to a received message (Delivered-To, internal Received/X-Received, ARC set, Return-Path, MX Received, Received-SPF, Authentication-Results) above the sender's own headers. Replace with sanitised real captures before shipping.",
+  "id": "19a1c2d3e4f5a6c8",
+  "threadId": "19a1b0c9d8e7f6a5",
+  "labelIds": [
+    "UNREAD",
+    "CATEGORY_PERSONAL",
+    "INBOX"
+  ],
+  "snippet": "Hi, thanks for the quick answer. Can I still change the delivery address on order 1234?",
+  "payload": {
+    "partId": "",
+    "mimeType": "multipart/mixed",
+    "filename": "",
+    "headers": [
+      {
+        "name": "Delivered-To",
+        "value": "owner.inbox@gmail.com"
+      },
+      {
+        "name": "Received",
+        "value": "by 2002:a05:7208:3c8a:b0:a7:5e21:1f3c with SMTP id m10csp2178423rbe;\r\n        Tue, 13 Oct 2026 02:14:07 -0700 (PDT)"
+      },
+      {
+        "name": "X-Google-Smtp-Source",
+        "value": "AGHT+IF3kQx9vZr2mWbq7Lp0sYtC8nH1uJdE5aKoVf6gRzXwTyBc4NmPqS2lD"
+      },
+      {
+        "name": "X-Received",
+        "value": "by 2002:a17:907:7d8c:b0:b3c:1a2f:9e01 with SMTP id oz12-20020a1709077d8cb0b3c1a2f9e01mr1834201ejc.12.1791882847123;\r\n        Tue, 13 Oct 2026 02:14:07 -0700 (PDT)"
+      },
+      {
+        "name": "ARC-Seal",
+        "value": "i=1; a=rsa-sha256; t=1791882847; cv=none;\r\n        d=google.com; s=arc-20240605;\r\n        b=Kq3vL8xZ0pR7mYt2WnB5cH9sJd4FgA1eUo6iTzXrVlNyQwEkPbMa2CsDf8Gh0Jk"
+      },
+      {
+        "name": "ARC-Message-Signature",
+        "value": "i=1; a=rsa-sha256; c=relaxed/relaxed; d=google.com; s=arc-20240605;\r\n        h=to:subject:message-id:date:from:mime-version:dkim-signature;\r\n        bh=4Xq9ZtLwR2mK7pYvB0cN5sHdJ8gFa3eUo1iTzXrVlNy=;\r\n        fh=Qw7Lp0sYtC8nH1uJdE5aKoVf6gRzXwTyBc4NmPqS2lD=;\r\n        b=Vb6nM1qP9wE3rT7yU2iO5pA8sD4fG0hJ6kL1zX3cV9bN2mQ7wE5rT8yU1iO4pA==;\r\n        dara=google.com"
+      },
+      {
+        "name": "ARC-Authentication-Results",
+        "value": "i=1; mx.google.com;\r\n       dkim=pass header.i=@example.com header.s=s1 header.b=Ab3dEf9h;\r\n       spf=pass (google.com: domain of alice@example.com designates 192.0.2.25 as permitted sender) smtp.mailfrom=alice@example.com;\r\n       dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=example.com"
+      },
+      {
+        "name": "Return-Path",
+        "value": "<alice@example.com>"
+      },
+      {
+        "name": "Received",
+        "value": "from mail.example.com (mail.example.com. [192.0.2.25])\r\n        by mx.google.com with ESMTPS id a640c23a62f3a-b3c1a2f9e01si1234567ejc.412.2026.10.13.02.14.06\r\n        for <owner.inbox@gmail.com>\r\n        (version=TLS1_3 cipher=TLS_AES_256_GCM_SHA384 bits=256/256);\r\n        Tue, 13 Oct 2026 02:14:07 -0700 (PDT)"
+      },
+      {
+        "name": "Received-SPF",
+        "value": "pass (google.com: domain of alice@example.com designates 192.0.2.25 as permitted sender) client-ip=192.0.2.25;"
+      },
+      {
+        "name": "Authentication-Results",
+        "value": "mx.google.com;\r\n       dkim=pass header.i=@example.com header.s=s1 header.b=Ab3dEf9h;\r\n       spf=pass (google.com: domain of alice@example.com designates 192.0.2.25 as permitted sender) smtp.mailfrom=alice@example.com;\r\n       dmarc=pass (p=REJECT sp=REJECT dis=NONE) header.from=example.com"
+      },
+      {
+        "name": "DKIM-Signature",
+        "value": "v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.com; s=s1;\r\n        t=1791882845; bh=Qw7Lp0sYtC8nH1uJdE5aKoVf6gRzXwTyBc4NmPqS2lD=;\r\n        h=From:Date:Subject:To:Cc:Reply-To:In-Reply-To:References:From;\r\n        b=Ab3dEf9hLp0sYtC8nH1uJdE5aKoVf6gRzXwTyBc4NmPqS2lD9fG0hJ6kL1zX3cV9bN2m"
+      },
+      {
+        "name": "Received",
+        "value": "from laptop.example.com (unknown [198.51.100.7])\r\n        (Authenticated sender: alice@example.com)\r\n        by mail.example.com (Postfix) with ESMTPSA id 4C9AB1F00D\r\n        for <owner.inbox@gmail.com>; Tue, 13 Oct 2026 11:14:05 +0200 (CEST)"
+      },
+      {
+        "name": "MIME-Version",
+        "value": "1.0"
+      },
+      {
+        "name": "References",
+        "value": "<CAF8owner1@mail.gmail.com> <a1b2c3d4-1@mail.example.com>"
+      },
+      {
+        "name": "In-Reply-To",
+        "value": "<CAF8owner1@mail.gmail.com>"
+      },
+      {
+        "name": "From",
+        "value": "Alice Example <alice@example.com>"
+      },
+      {
+        "name": "Reply-To",
+        "value": "Alice <Alice@Example.com>"
+      },
+      {
+        "name": "Date",
+        "value": "Tue, 13 Oct 2026 11:14:05 +0200"
+      },
+      {
+        "name": "Message-ID",
+        "value": "<a1b2c3d4-2@mail.example.com>"
+      },
+      {
+        "name": "Subject",
+        "value": "Re: Your order 1234"
+      },
+      {
+        "name": "To",
+        "value": "Owner Inbox <owner.inbox@gmail.com>"
+      },
+      {
+        "name": "Cc",
+        "value": "Bob Example <bob@example.com>"
+      },
+      {
+        "name": "Content-Type",
+        "value": "multipart/mixed; boundary=\"000000000000d9e304063f1a2b3e\""
+      }
+    ],
+    "body": {
+      "size": 0
+    },
+    "parts": [
+      {
+        "partId": "0",
+        "mimeType": "multipart/related",
+        "filename": "",
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "multipart/related; boundary=\"000000000000c8d2f3063f1a2b3d\""
+          }
+        ],
+        "body": {
+          "size": 0
+        },
+        "parts": [
+          {
+            "partId": "0.0",
+            "mimeType": "multipart/alternative",
+            "filename": "",
+            "headers": [
+              {
+                "name": "Content-Type",
+                "value": "multipart/alternative; boundary=\"000000000000b7c1e2063f1a2b3c\""
+              }
+            ],
+            "body": {
+              "size": 0
+            },
+            "parts": [
+              {
+                "partId": "0.0.0",
+                "mimeType": "text/plain",
+                "filename": "",
+                "headers": [
+                  {
+                    "name": "Content-Type",
+                    "value": "text/plain; charset=\"UTF-8\""
+                  },
+                  {
+                    "name": "Content-Transfer-Encoding",
+                    "value": "quoted-printable"
+                  }
+                ],
+                "body": {
+                  "size": 240,
+                  "data": "SGksCgp0aGFua3MgZm9yIHRoZSBxdWljayBhbnN3ZXIuIENhbiBJIHN0aWxsIGNoYW5nZSB0aGUgZGVsaXZlcnkgYWRkcmVzcyBvbiBvcmRlciAxMjM0PwoKQmVzdCwKQWxpY2UKCk9uIE1vbiwgT2N0IDEyLCAyMDI2IGF0IDQ6MDIgUE0gT3duZXIgSW5ib3ggPG93bmVyLmluYm94QGdtYWlsLmNvbT4gd3JvdGU6Cgo-IEhpIEFsaWNlLAo-Cj4geW91ciBvcmRlciAxMjM0IHNoaXBzIG9uIFRodXJzZGF5Lgo-Cj4gT3duZXIK"
+                }
+              },
+              {
+                "partId": "0.0.1",
+                "mimeType": "text/html",
+                "filename": "",
+                "headers": [
+                  {
+                    "name": "Content-Type",
+                    "value": "text/html; charset=\"UTF-8\""
+                  },
+                  {
+                    "name": "Content-Transfer-Encoding",
+                    "value": "quoted-printable"
+                  }
+                ],
+                "body": {
+                  "size": 499,
+                  "data": "PGRpdiBkaXI9Imx0ciI-SGksPGJyPjxicj50aGFua3MgZm9yIHRoZSBxdWljayBhbnN3ZXIuIENhbiBJIHN0aWxsIGNoYW5nZSB0aGUgZGVsaXZlcnkgYWRkcmVzcyBvbiBvcmRlciAxMjM0Pzxicj48YnI-QmVzdCw8YnI-QWxpY2U8YnI-PGltZyBzcmM9ImNpZDpsb2dvQGV4YW1wbGUuY29tIiBhbHQ9IkV4YW1wbGUiPjwvZGl2Pjxicj48ZGl2IGNsYXNzPSJnbWFpbF9xdW90ZSI-PGRpdiBkaXI9Imx0ciIgY2xhc3M9ImdtYWlsX2F0dHIiPk9uIE1vbiwgT2N0IDEyLCAyMDI2IGF0IDQ6MDIgUE0gT3duZXIgSW5ib3ggJmx0OzxhIGhyZWY9Im1haWx0bzpvd25lci5pbmJveEBnbWFpbC5jb20iPm93bmVyLmluYm94QGdtYWlsLmNvbTwvYT4mZ3Q7IHdyb3RlOjxicj48L2Rpdj48YmxvY2txdW90ZSBjbGFzcz0iZ21haWxfcXVvdGUiPkhpIEFsaWNlLDxicj48YnI-eW91ciBvcmRlciAxMjM0IHNoaXBzIG9uIFRodXJzZGF5Ljxicj48YnI-T3duZXI8L2Jsb2NrcXVvdGU-PC9kaXY-Cg"
+                }
+              }
+            ]
+          },
+          {
+            "partId": "0.1",
+            "mimeType": "image/png",
+            "filename": "logo.png",
+            "headers": [
+              {
+                "name": "Content-Type",
+                "value": "image/png; name=\"logo.png\""
+              },
+              {
+                "name": "Content-Disposition",
+                "value": "inline; filename=\"logo.png\""
+              },
+              {
+                "name": "Content-Transfer-Encoding",
+                "value": "base64"
+              },
+              {
+                "name": "Content-ID",
+                "value": "<logo@example.com>"
+              },
+              {
+                "name": "X-Attachment-Id",
+                "value": "logo@example.com"
+              }
+            ],
+            "body": {
+              "attachmentId": "ANGjdJ8logo0000000000000000000000000000000000001",
+              "size": 4182
+            }
+          }
+        ]
+      },
+      {
+        "partId": "1",
+        "mimeType": "application/pdf",
+        "filename": "order-1234.pdf",
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "application/pdf; name=\"order-1234.pdf\""
+          },
+          {
+            "name": "Content-Disposition",
+            "value": "attachment; filename=\"order-1234.pdf\""
+          },
+          {
+            "name": "Content-Transfer-Encoding",
+            "value": "base64"
+          },
+          {
+            "name": "X-Attachment-Id",
+            "value": "f_mgk2a1b20"
+          }
+        ],
+        "body": {
+          "attachmentId": "ANGjdJ8pdf00000000000000000000000000000000000002",
+          "size": 48213
+        }
+      }
+    ]
+  },
+  "sizeEstimate": 8123,
+  "historyId": "4182736",
+  "internalDate": "1791882847000"
+}

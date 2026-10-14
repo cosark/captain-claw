@@ -441,6 +441,13 @@ async def _clear_oauth_state(db: FlightDeckDB, user_id: str) -> None:
         await db.set_system_setting(_K_TOKENS, "")
         await db.set_system_setting(_K_USER, "")
         await db.set_system_setting(_K_TOKEN_MODE, "")
+    # Topic auto-replies stop with the connection they were bound to (lazy:
+    # the engine imports this module). Never fails the disconnect.
+    try:
+        from captain_claw.flight_deck import gmail_autoreply
+        await gmail_autoreply.on_google_disconnect(db, user_id)
+    except Exception as exc:
+        log.warning("Gmail auto-reply disconnect hook failed: %s", type(exc).__name__)
 
 
 async def _clear_all_oauth_state(db: FlightDeckDB) -> None:
@@ -457,6 +464,11 @@ async def _clear_all_oauth_state(db: FlightDeckDB) -> None:
         if uid:
             await db.delete_setting(uid, _K_TOKENS)
             await db.delete_setting(uid, _K_USER)
+            try:  # as in _clear_oauth_state: auto-replies stop with the connection
+                from captain_claw.flight_deck import gmail_autoreply
+                await gmail_autoreply.on_google_disconnect(db, uid)
+            except Exception as exc:
+                log.warning("Gmail auto-reply disconnect hook failed: %s", type(exc).__name__)
     await db.set_system_setting(_K_TOKENS, "")
     await db.set_system_setting(_K_USER, "")
     await db.set_system_setting(_K_TOKEN_MODE, "")

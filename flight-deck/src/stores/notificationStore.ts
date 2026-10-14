@@ -14,6 +14,11 @@ function mapServerType(t: string): NotificationType {
   if (t === 'bat_error') return 'error'
   if (t === 'bat_done') return 'success'
   if (t === 'bat_ask') return 'warning'
+  // Topic auto-replies (Connections → Google): one went out; one waits for
+  // the owner or something needs a look; one was stopped for sensitive data.
+  if (t === 'email_autoreply') return 'success'
+  if (t === 'email_autoreply_held' || t === 'email_autoreply_issue') return 'warning'
+  if (t === 'email_autoreply_blocked') return 'error'
   if (t === 'share' || t === 'info') return 'info'
   if (t === 'success' || t === 'warning' || t === 'error') return t
   return 'info'

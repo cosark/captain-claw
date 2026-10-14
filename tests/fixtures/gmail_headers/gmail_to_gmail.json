@@ -1,0 +1,165 @@
+{
+  "_fixture": "SYNTHETIC, not a real capture: header names, order and value shapes mirror what Gmail prepends to a received message (Delivered-To, internal Received/X-Received, ARC set, Return-Path, MX Received, Received-SPF, Authentication-Results) above the sender's own headers. Replace with sanitised real captures before shipping.",
+  "id": "19a1c2d3e4f5a6b7",
+  "threadId": "19a1c2d3e4f5a6b7",
+  "labelIds": [
+    "UNREAD",
+    "IMPORTANT",
+    "CATEGORY_PERSONAL",
+    "INBOX"
+  ],
+  "snippet": "Pozdrav, koje je radno vrijeme za blagdane? Hvala, Ivan",
+  "payload": {
+    "partId": "",
+    "mimeType": "multipart/alternative",
+    "filename": "",
+    "headers": [
+      {
+        "name": "Delivered-To",
+        "value": "owner.inbox@gmail.com"
+      },
+      {
+        "name": "Received",
+        "value": "by 2002:a05:7208:3c8a:b0:a7:5e21:1f3c with SMTP id m10csp2178423rbe;\r\n        Tue, 13 Oct 2026 02:14:07 -0700 (PDT)"
+      },
+      {
+        "name": "X-Google-Smtp-Source",
+        "value": "AGHT+IF3kQx9vZr2mWbq7Lp0sYtC8nH1uJdE5aKoVf6gRzXwTyBc4NmPqS2lD"
+      },
+      {
+        "name": "X-Received",
+        "value": "by 2002:a17:907:7d8c:b0:b3c:1a2f:9e01 with SMTP id oz12-20020a1709077d8cb0b3c1a2f9e01mr1834201ejc.12.1791882847123;\r\n        Tue, 13 Oct 2026 02:14:07 -0700 (PDT)"
+      },
+      {
+        "name": "ARC-Seal",
+        "value": "i=1; a=rsa-sha256; t=1791882847; cv=none;\r\n        d=google.com; s=arc-20240605;\r\n        b=Kq3vL8xZ0pR7mYt2WnB5cH9sJd4FgA1eUo6iTzXrVlNyQwEkPbMa2CsDf8Gh0Jk"
+      },
+      {
+        "name": "ARC-Message-Signature",
+        "value": "i=1; a=rsa-sha256; c=relaxed/relaxed; d=google.com; s=arc-20240605;\r\n        h=to:subject:message-id:date:from:mime-version:dkim-signature;\r\n        bh=4Xq9ZtLwR2mK7pYvB0cN5sHdJ8gFa3eUo1iTzXrVlNy=;\r\n        fh=Qw7Lp0sYtC8nH1uJdE5aKoVf6gRzXwTyBc4NmPqS2lD=;\r\n        b=Vb6nM1qP9wE3rT7yU2iO5pA8sD4fG0hJ6kL1zX3cV9bN2mQ7wE5rT8yU1iO4pA==;\r\n        dara=google.com"
+      },
+      {
+        "name": "ARC-Authentication-Results",
+        "value": "i=1; mx.google.com;\r\n       dkim=pass header.i=@gmail.com header.s=20230601 header.b=Xk3pQ9aB;\r\n       spf=pass (google.com: domain of ivan.horvat.sender@gmail.com designates 209.85.220.41 as permitted sender) smtp.mailfrom=ivan.horvat.sender@gmail.com;\r\n       dmarc=pass (p=NONE sp=QUARANTINE dis=NONE) header.from=gmail.com;\r\n       dara=pass header.i=@gmail.com"
+      },
+      {
+        "name": "Return-Path",
+        "value": "<ivan.horvat.sender@gmail.com>"
+      },
+      {
+        "name": "Received",
+        "value": "from mail-sor-f41.google.com (mail-sor-f41.google.com. [209.85.220.41])\r\n        by mx.google.com with SMTPS id 2adb3069b0e04-5a1b2c3d4e5sor1234567e87.9.2026.10.13.02.14.06\r\n        for <owner.inbox@gmail.com>\r\n        (Google Transport Security);\r\n        Tue, 13 Oct 2026 02:14:07 -0700 (PDT)"
+      },
+      {
+        "name": "Received-SPF",
+        "value": "pass (google.com: domain of ivan.horvat.sender@gmail.com designates 209.85.220.41 as permitted sender) client-ip=209.85.220.41;"
+      },
+      {
+        "name": "Authentication-Results",
+        "value": "mx.google.com;\r\n       dkim=pass header.i=@gmail.com header.s=20230601 header.b=Xk3pQ9aB;\r\n       spf=pass (google.com: domain of ivan.horvat.sender@gmail.com designates 209.85.220.41 as permitted sender) smtp.mailfrom=ivan.horvat.sender@gmail.com;\r\n       dmarc=pass (p=NONE sp=QUARANTINE dis=NONE) header.from=gmail.com;\r\n       dara=pass header.i=@gmail.com"
+      },
+      {
+        "name": "DKIM-Signature",
+        "value": "v=1; a=rsa-sha256; c=relaxed/relaxed;\r\n        d=gmail.com; s=20230601; t=1791882846; x=1792487646; darn=gmail.com;\r\n        h=to:subject:message-id:date:from:mime-version:from:to:cc:subject\r\n        :date:message-id:reply-to;\r\n        bh=8sJd4FgA1eUo6iTzXrVlNyQwEkPbMa2CsDf8Gh0Jk2c=;\r\n        b=Xk3pQ9aBvZr2mWbq7Lp0sYtC8nH1uJdE5aKoVf6gRzXwTyBc4NmPqS2lD9fG0hJ6kL1z"
+      },
+      {
+        "name": "X-Google-DKIM-Signature",
+        "value": "v=1; a=rsa-sha256; c=relaxed/relaxed;\r\n        d=1e100.net; s=20230601; t=1791882846; x=1792487646;\r\n        h=to:subject:message-id:date:from:mime-version:x-gm-message-state;\r\n        bh=8sJd4FgA1eUo6iTzXrVlNyQwEkPbMa2CsDf8Gh0Jk2c=;\r\n        b=Pm2nQ7wE5rT8yU1iO4pA6sD9fG0hJ3kL7zX1cV5bN8mQ2wE4rT6yU9iO3pA5sD8f"
+      },
+      {
+        "name": "X-Gm-Message-State",
+        "value": "AOJu0YzK3pQ9aBvZr2mWbq7Lp0sYtC8nH1uJdE5aKoVf6gRzXwTyBc4N"
+      },
+      {
+        "name": "X-Gm-Gg",
+        "value": "ASbGncu4Xq9ZtLwR2mK7pYvB0cN5sHdJ8gFa3eUo1iTzXrVlNyQwEkPbMa2CsDf8Gh0Jk"
+      },
+      {
+        "name": "X-Google-Smtp-Source",
+        "value": "AGHT+IHq7Lp0sYtC8nH1uJdE5aKoVf6gRzXwTyBc4NmPqS2lD9fG0hJ6k"
+      },
+      {
+        "name": "X-Received",
+        "value": "by 2002:a05:6512:3b8a:b0:5a1:b2c3:d4e5 with SMTP id 2adb3069b0e04-5a1b2c3d4e5mr1234567e87.9.1791882846551; Tue, 13 Oct 2026 02:14:06 -0700 (PDT)"
+      },
+      {
+        "name": "MIME-Version",
+        "value": "1.0"
+      },
+      {
+        "name": "From",
+        "value": "Ivan Horvat <ivan.horvat.sender@gmail.com>"
+      },
+      {
+        "name": "Date",
+        "value": "Tue, 13 Oct 2026 11:14:05 +0200"
+      },
+      {
+        "name": "X-Gm-Features",
+        "value": "AS18NWBq7Lp0sYtC8nH1uJdE5aKoVf6gRzXwTyBc4NmPqS2l"
+      },
+      {
+        "name": "Message-ID",
+        "value": "<CAF8a1b2c3d4e5f6g7h8i9j0kLmNoPqRsTuVwXyZ0123456789@mail.gmail.com>"
+      },
+      {
+        "name": "Subject",
+        "value": "Radno vrijeme za blagdane"
+      },
+      {
+        "name": "To",
+        "value": "owner.inbox@gmail.com"
+      },
+      {
+        "name": "Content-Type",
+        "value": "multipart/alternative; boundary=\"000000000000b7c1e2063f1a2b3c\""
+      }
+    ],
+    "body": {
+      "size": 0
+    },
+    "parts": [
+      {
+        "partId": "0",
+        "mimeType": "text/plain",
+        "filename": "",
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "text/plain; charset=\"UTF-8\""
+          },
+          {
+            "name": "Content-Transfer-Encoding",
+            "value": "quoted-printable"
+          }
+        ],
+        "body": {
+          "size": 58,
+          "data": "UG96ZHJhdiwKCmtvamUgamUgcmFkbm8gdnJpamVtZSB6YSBibGFnZGFuZT8KCkh2YWxhLApJdmFuCg"
+        }
+      },
+      {
+        "partId": "1",
+        "mimeType": "text/html",
+        "filename": "",
+        "headers": [
+          {
+            "name": "Content-Type",
+            "value": "text/html; charset=\"UTF-8\""
+          },
+          {
+            "name": "Content-Transfer-Encoding",
+            "value": "quoted-printable"
+          }
+        ],
+        "body": {
+          "size": 148,
+          "data": "PGRpdiBkaXI9Imx0ciI-PGRpdj5Qb3pkcmF2LDwvZGl2PjxkaXY-PGJyPjwvZGl2PjxkaXY-a29qZSBqZSByYWRubyB2cmlqZW1lIHphIGJsYWdkYW5lPzwvZGl2PjxkaXY-PGJyPjwvZGl2PjxkaXY-SHZhbGEsPC9kaXY-PGRpdj5JdmFuPC9kaXY-PC9kaXY-Cg"
+        }
+      }
+    ]
+  },
+  "sizeEstimate": 8123,
+  "historyId": "4182736",
+  "internalDate": "1791882847000"
+}

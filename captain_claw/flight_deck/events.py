@@ -21,6 +21,12 @@ from typing import Any
 
 EVENT_STATUSES = ("new", "surfaced", "acted", "ignored")
 
+# A row ``claim_handled`` wrote for a signal its source hasn't ingested yet:
+# only the key (no type, no summary), so the source's later ``add_event`` is
+# deduped. It has nothing to show — listings leave it out — until that
+# ``add_event`` fills in the signal itself.
+_PLACEHOLDER_SQL = "(event_type = '' AND summary = '')"
+
 
 def _norm_user(user_id: str | None) -> str:
     return (user_id or "").strip() or "local"
@@ -163,10 +169,13 @@ class EventsStore:
         dedup_key: str = "",
     ) -> dict[str, Any] | None:
         """Insert one event. With a ``dedup_key`` already seen (same user+source),
-        it's a no-op returning None; otherwise returns the new row."""
+        it's a no-op returning None — except that a placeholder
+        :meth:`claim_handled` left for it gets this event's content (its status
+        kept, so it stays handled); otherwise returns the new row."""
         uid = _norm_user(user_id)
         eid = "evt_" + secrets.token_hex(8)
         now = _utcnow_iso()
+        content = (event_type, summary[:500], body[:8000], json.dumps(metadata or {}))
         with self._lock:
             conn = self._c()
             cur = conn.execute(
@@ -174,13 +183,79 @@ class EventsStore:
                 " (id, user_id, source, event_type, summary, body, metadata, dedup_key,"
                 "  status, ingested_at)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'new', ?)",
-                (eid, uid, source, event_type, summary[:500], body[:8000],
-                 json.dumps(metadata or {}), dedup_key, now),
+                (eid, uid, source, *content, dedup_key, now),
             )
+            if cur.rowcount == 0 and dedup_key and (event_type or summary):
+                conn.execute(
+                    "UPDATE external_events SET event_type = ?, summary = ?, body = ?,"
+                    " metadata = ? WHERE user_id = ? AND source = ? AND dedup_key = ?"
+                    f" AND {_PLACEHOLDER_SQL}",
+                    (*content, uid, source, dedup_key),
+                )
             conn.commit()
             if cur.rowcount == 0:
                 return None  # deduped
         return self.get_event(eid)
+
+    def claim_handled(self, user_id: str, source: str, dedup_key: str) -> bool:
+        """Mark the signal ``dedup_key`` as already handled elsewhere (e.g. a
+        Gmail topic auto-reply), so the arbiter never picks it up. An event
+        already ingested keeps its content: a ``new`` one flips to ``acted``, a
+        surfaced/acted/ignored one is left alone. Only when there is none yet is
+        an ``acted`` placeholder written — so a later ``add_event`` of it is
+        deduped (returns None) and fills it in; until then listings leave it
+        out (it has nothing to show). True when a row was flipped or written."""
+        if not dedup_key:
+            return False  # nothing to dedup against
+        uid = _norm_user(user_id)
+        now = _utcnow_iso()
+        with self._lock:
+            conn = self._c()
+            cur = conn.execute(
+                "UPDATE external_events SET status = 'acted', processed_at = ?"
+                " WHERE user_id = ? AND source = ? AND dedup_key = ? AND status = 'new'",
+                (now, uid, source, dedup_key),
+            )
+            if cur.rowcount == 0:
+                # No new event to flip: a placeholder, unless a row is there
+                # already (the unique key then ignores it).
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO external_events"
+                    " (id, user_id, source, dedup_key, status, ingested_at, processed_at)"
+                    " VALUES (?, ?, ?, ?, 'acted', ?, ?)",
+                    ("evt_" + secrets.token_hex(8), uid, source, dedup_key, now, now),
+                )
+            conn.commit()
+            return cur.rowcount > 0
+
+    def release_claim(self, user_id: str, source: str, dedup_key: str) -> bool:
+        """Undo :meth:`claim_handled` for a signal its claimant ended up NOT
+        handling (an auto-reply that was skipped or failed), so the arbiter
+        sees it after all: a claimed event goes back to ``new``, and a bare
+        placeholder is dropped so a later ``add_event`` ingests it fresh.
+        Only ``acted`` rows are touched — the spine writes that status for
+        claims alone — so an event the arbiter surfaced or ignored is left
+        as it is. True when a row changed."""
+        if not dedup_key:
+            return False
+        uid = _norm_user(user_id)
+        with self._lock:
+            conn = self._c()
+            cur = conn.execute(
+                "DELETE FROM external_events WHERE user_id = ? AND source = ?"
+                f" AND dedup_key = ? AND status = 'acted' AND {_PLACEHOLDER_SQL}",
+                (uid, source, dedup_key),
+            )
+            changed = cur.rowcount
+            if not changed:
+                cur = conn.execute(
+                    "UPDATE external_events SET status = 'new', processed_at = NULL"
+                    " WHERE user_id = ? AND source = ? AND dedup_key = ? AND status = 'acted'",
+                    (uid, source, dedup_key),
+                )
+                changed = cur.rowcount
+            conn.commit()
+            return changed > 0
 
     def get_event(self, event_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -202,32 +277,42 @@ class EventsStore:
         return [self._row(r) for r in rows]
 
     def list_events(self, user_id: str, *, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        """Newest-first events (GET /fd/events, the Autonomous Work page) —
+        without the placeholders :meth:`claim_handled` leaves for a signal not
+        ingested yet: they have nothing to show."""
         uid = _norm_user(user_id)
         limit = max(1, min(500, limit))
         with self._lock:
             if status:
                 rows = self._c().execute(
                     "SELECT * FROM external_events WHERE user_id = ? AND status = ?"
+                    f" AND NOT {_PLACEHOLDER_SQL}"
                     " ORDER BY ingested_at DESC LIMIT ?",
                     (uid, status, limit),
                 ).fetchall()
             else:
                 rows = self._c().execute(
                     "SELECT * FROM external_events WHERE user_id = ?"
+                    f" AND NOT {_PLACEHOLDER_SQL}"
                     " ORDER BY ingested_at DESC LIMIT ?",
                     (uid, limit),
                 ).fetchall()
         return [self._row(r) for r in rows]
 
     def mark(self, event_ids: list[str], status: str) -> None:
+        """Set the events' status. An ``acted`` event (claimed by
+        :meth:`claim_handled`, handled elsewhere) is never moved back to
+        another status: a pass that read it as ``new`` just before the claim
+        can't undo it."""
         if not event_ids or status not in EVENT_STATUSES:
             return
         now = _utcnow_iso()
         with self._lock:
             conn = self._c()
             conn.executemany(
-                "UPDATE external_events SET status = ?, processed_at = ? WHERE id = ?",
-                [(status, now, eid) for eid in event_ids],
+                "UPDATE external_events SET status = ?, processed_at = ?"
+                " WHERE id = ? AND (status != 'acted' OR ? = 'acted')",
+                [(status, now, eid, status) for eid in event_ids],
             )
             conn.commit()
 

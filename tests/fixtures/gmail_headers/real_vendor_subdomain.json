@@ -1,0 +1,111 @@
+{
+ "_fixture": "REAL CAPTURE, sanitised: the header block of a real message received by a Google Workspace inbox via the Gmail API (raw order and folding kept). Owner/vendor addresses, domains and names replaced; Google/AWS relay hosts, ARC/DKIM blobs and ids kept. No body was stored.",
+ "id": "1a13197cc85211a8",
+ "threadId": "1a13197cc85211a8",
+ "labelIds": [
+  "CATEGORY_UPDATES",
+  "INBOX"
+ ],
+ "snippet": "",
+ "payload": {
+  "partId": "",
+  "mimeType": "multipart/alternative",
+  "filename": "",
+  "headers": [
+   {
+    "name": "Delivered-To",
+    "value": "owner@workspace.example"
+   },
+   {
+    "name": "Received",
+    "value": "by 2002:a05:7108:498d:b0:5c1:66cc:f7b2 with SMTP id hb13csp6613935gdb;\r\n        Mon, 12 Oct 2026 12:29:54 -0700 (PDT)"
+   },
+   {
+    "name": "X-Received",
+    "value": "by 2002:a05:6000:2912:b0:48b:5e2:52dd with SMTP id ffacd0b85a97d-48dbace9d5cmr18581389f8f.11.1791833394378;\r\n        Mon, 12 Oct 2026 12:29:54 -0700 (PDT)"
+   },
+   {
+    "name": "ARC-Seal",
+    "value": "i=1; a=rsa-sha256; t=1791833394; cv=none;\r\n        d=google.com; s=arc-20260327;\r\n        b=Z8ShZMJxs98Os52p6y1xwRsYTqkOXCaSejIKZG6gQz5R7F9T3606lf3/Wh5fCoE4th\r\n         +KAuhda4juO/X/2yG4qL4JQ2oSmzuvV8ChIzKrIJ2dDgvymA0QUgLFMUs0oCX+TDVMJF\r\n         6Oz1vkCEIZ/p9Nn9EnfKF9SCkVrMf4LgYfGam7V0AW9Xv2h/JdmM8x8HjmWdgLWci80V\r\n         eRTd1rNZFOZsRAPOmgqivdHcUUzWZc6lOjOApwtwJoY/ZVrf0Rs06LY61VjjLTrXmkkb\r\n         IMzHjQn4uSlI2c2vDEQm+8SJEsgKqAV2xDRvV+biFOU+Rjrg403fX/D6UT2Xb94NHjqi\r\n         Onnw=="
+   },
+   {
+    "name": "ARC-Message-Signature",
+    "value": "i=1; a=rsa-sha256; c=relaxed/relaxed; d=google.com; s=arc-20260327;\r\n        h=feedback-id:mime-version:date:message-id:subject:reply-to:to:from\r\n         :dkim-signature:dkim-signature;\r\n        bh=pN+ZjH9jHjRHSf/5rjRpI+hxOwvmIIzXbpgQpJgg8bk=;\r\n        fh=/u17FoSFxHmMrIzOgUR//3e/2z1JX1k8zw9LUojL74k=;\r\n        b=FgnzomNdeVppG2PsmmsVF2dYBd/21kqKqErmvK7AtxxjQ+b4N1VBtzdHCzC0iC5aZ/\r\n         ahZkDwRCdSRLiIPyzKBTrfcb3swUj/xEu2SkdFcSHjCEC42Bg0O7BPkCBNyBYEPeswlw\r\n         L4wFPFmA//jdKzFI9gruyOtTPV3EVGRrlsS5Xl59JAxjTyv0UgUuTGjc4OIxx7hI9NFP\r\n         1ju3LUz3yHvQPejt0+3FL0RHDRpUJNa3ER4tnd/lyvW+BNAjaNcGZwCdIjwo2TFV6v1H\r\n         CEHC1iSGrpasd4RXfOJkEvhVwVF824uigg9YTpZfDlpBkISI3jq17addDSbQGI3yaZpg\r\n         UtdA==;\r\n        dara=google.com"
+   },
+   {
+    "name": "ARC-Authentication-Results",
+    "value": "i=1; mx.google.com;\r\n       dkim=pass header.i=@auth.vendor.example header.s=resend header.b=\"Pli4S9/s\";\r\n       dkim=pass header.i=@amazonses.com header.s=shh3fegwg5fppqsuzphvschd53n6ihuv header.b=\"ZNbhDAs/\";\r\n       spf=pass (google.com: domain of 010201a13197c993-e15697a6-85c6-493a-ba82-499608334ea5-000000@send.auth.vendor.example designates 54.240.3.10 as permitted sender) smtp.mailfrom=010201a13197c993-e15697a6-85c6-493a-ba82-499608334ea5-000000@send.auth.vendor.example;\r\n       dmarc=pass (p=NONE sp=NONE dis=NONE) header.from=vendor.example"
+   },
+   {
+    "name": "Return-Path",
+    "value": "<010201a13197c993-e15697a6-85c6-493a-ba82-499608334ea5-000000@send.auth.vendor.example>"
+   },
+   {
+    "name": "Received",
+    "value": "from a3-10.smtp-out.eu-west-1.amazonses.com (a3-10.smtp-out.eu-west-1.amazonses.com. [54.240.3.10])\r\n        by mx.google.com with ESMTPS id ffacd0b85a97d-48de0ac80afsi1114983f8f.95.2026.10.12.12.29.54\r\n        for <owner@workspace.example>\r\n        (version=TLS1_3 cipher=TLS_AES_128_GCM_SHA256 bits=128/128);\r\n        Mon, 12 Oct 2026 12:29:54 -0700 (PDT)"
+   },
+   {
+    "name": "Received-SPF",
+    "value": "pass (google.com: domain of 010201a13197c993-e15697a6-85c6-493a-ba82-499608334ea5-000000@send.auth.vendor.example designates 54.240.3.10 as permitted sender) client-ip=54.240.3.10;"
+   },
+   {
+    "name": "Authentication-Results",
+    "value": "mx.google.com;\r\n       dkim=pass header.i=@auth.vendor.example header.s=resend header.b=\"Pli4S9/s\";\r\n       dkim=pass header.i=@amazonses.com header.s=shh3fegwg5fppqsuzphvschd53n6ihuv header.b=\"ZNbhDAs/\";\r\n       spf=pass (google.com: domain of 010201a13197c993-e15697a6-85c6-493a-ba82-499608334ea5-000000@send.auth.vendor.example designates 54.240.3.10 as permitted sender) smtp.mailfrom=010201a13197c993-e15697a6-85c6-493a-ba82-499608334ea5-000000@send.auth.vendor.example;\r\n       dmarc=pass (p=NONE sp=NONE dis=NONE) header.from=vendor.example"
+   },
+   {
+    "name": "DKIM-Signature",
+    "value": "v=1; a=rsa-sha256; q=dns/txt; c=relaxed/simple; s=resend;\r\n\td=auth.vendor.example; t=1791833393;\r\n\th=From:To:Reply-To:Subject:Message-ID:Date:MIME-Version:Content-Type;\r\n\tbh=pN+ZjH9jHjRHSf/5rjRpI+hxOwvmIIzXbpgQpJgg8bk=;\r\n\tb=Pli4S9/sKNHdZ9LjW6Yd1K4qCXqH/lq3rp2lqkTbzqD4v//DB1ZAKpARBmla+KhC\r\n\t+1vdVcaqQATrsOH8WDHWO5npF7oQnPLc90kKkcrUyrW+H5QXie7nPD7+4GqCCMkEmJg\r\n\tF3nEx3JWoB4kDufxFxLQYeiQMAnB9yulGQ0sVZGw="
+   },
+   {
+    "name": "DKIM-Signature",
+    "value": "v=1; a=rsa-sha256; q=dns/txt; c=relaxed/simple;\r\n\ts=shh3fegwg5fppqsuzphvschd53n6ihuv; d=amazonses.com; t=1791833393;\r\n\th=From:To:Reply-To:Subject:Message-ID:Date:MIME-Version:Content-Type:Feedback-ID;\r\n\tbh=pN+ZjH9jHjRHSf/5rjRpI+hxOwvmIIzXbpgQpJgg8bk=;\r\n\tb=ZNbhDAs/AqUMZmBkRxIDQjzehpXDB+8ajjrQsfkp/GDlgBbkU9SVG+QHaPsNjApb\r\n\tZdFWmgAH8CnKfCfA3O2Cf4fAfFLbtTSeJbQBCjBsciWJo3mJ7+2e2aTMk7ULntorcIn\r\n\tDvUOlc1Ot/2nVGMAjHWz980TEVWYhrjSfg1UsQAk="
+   },
+   {
+    "name": "From",
+    "value": "Vendor Co <deck@auth.vendor.example>"
+   },
+   {
+    "name": "To",
+    "value": "owner@workspace.example"
+   },
+   {
+    "name": "Reply-To",
+    "value": "contact@vendor.example"
+   },
+   {
+    "name": "Subject",
+    "value": "Your Vendor Co pitch deck"
+   },
+   {
+    "name": "Message-ID",
+    "value": "<010201a13197c993-e15697a6-85c6-493a-ba82-499608334ea5-000000@eu-west-1.amazonses.com>"
+   },
+   {
+    "name": "Date",
+    "value": "Mon, 12 Oct 2026 19:29:53 +0000"
+   },
+   {
+    "name": "MIME-Version",
+    "value": "1.0"
+   },
+   {
+    "name": "Content-Type",
+    "value": "multipart/alternative;\r\n boundary=\"--_NmP-92b7888305f1cfd7-Part_1\""
+   },
+   {
+    "name": "Feedback-ID",
+    "value": ":1.eu-west-1.ZeLEfH18tl7bMiwX0kZOlDW/jX9lsXtgXEwfEGO5kIlidiF7gPYi6TUpOru0i+5q7l2KkE421ST8TrV9mTJLAhfBCFQD9eOXowYw56TyLBndH6lvOXuWuxWj0ya0WoQ/WUybrsPLEX2BZITtUESIp6WKcZK5tVz/Hcote5BTvAI=:1.eu-west-1.duyiEkLYPi4nGdRFd7LaGmAjRWieZlOvGu1wIBVR/Ks=:AmazonSES"
+   },
+   {
+    "name": "X-SES-Outgoing",
+    "value": "2026.10.12-54.240.3.10"
+   }
+  ],
+  "body": {
+   "size": 0
+  }
+ },
+ "sizeEstimate": 0,
+ "historyId": "1",
+ "internalDate": "1791833393000"
+}
