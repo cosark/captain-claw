@@ -1020,12 +1020,15 @@ class AgentToolLoopMixin:
             }
             # Vatra team-board reads (see the board-is-live rule below).
             _VATRA_LIVE_ACTIONS = ("map", "read", "search", "inbox", "wait")
-            # Google actions that send or create something the user sees. A
-            # byte-identical repeat is a second email / event / file, not a
-            # re-read, so these keep the plain limit instead of the stateful
-            # headroom below.
+            # Google actions that send, create or change something the user
+            # sees. A byte-identical repeat is a second email / event / file
+            # (or the same change made twice), not a re-read, so these keep
+            # the plain limit instead of the stateful headroom below.
             _GOOGLE_WRITE_ACTIONS = {
-                "google_mail": {"send", "send_draft", "create_draft", "update_draft"},
+                "google_mail": {
+                    "send", "send_draft", "create_draft", "update_draft",
+                    "archive", "move", "add_labels", "remove_labels", "create_label",
+                },
                 "google_calendar": {"create_event", "update_event", "delete_event"},
                 # In-place Sheet/Doc edits too: a repeated append is a second
                 # set of rows, a repeated insert a second copy of the text.
@@ -1034,7 +1037,10 @@ class AgentToolLoopMixin:
                     "sheet_update", "sheet_append", "sheet_clear",
                     "doc_replace_text", "doc_append_text", "doc_insert_text",
                 },
-                "microsoft_mail": {"create_draft", "update_draft"},
+                "microsoft_mail": {
+                    "create_draft", "update_draft",
+                    "archive", "move", "create_folder", "add_categories", "remove_categories",
+                },
                 "microsoft_calendar": {
                     "create_event", "update_event", "delete_event", "respond_event",
                 },

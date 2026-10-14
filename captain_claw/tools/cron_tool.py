@@ -183,13 +183,24 @@ class CronTool(Tool):
             ],
         }
         _mail_note = ""
+        # The judged text may keep organize authority without email authority,
+        # so each note asks about its own kind of intent.
+        _judged = mail_authority.cron_job_text(payload)
         if (mail_authority.explicit_mail_intent(payload["text"])
-                and not mail_authority.cron_job_text(payload)):
+                and not mail_authority.explicit_mail_intent(_judged)):
             _mail_note = (
                 "\n  Note:     this job can't write email when it runs — the user's own "
                 "messages didn't explicitly ask for one. If they want it to, ask them to "
                 "say so in their words (e.g. 'email Ana the report every Friday'), then "
                 "re-create the job."
+            )
+        if (mail_authority.organize_intent(payload["text"])
+                and not mail_authority.organize_intent(_judged)):
+            _mail_note += (
+                "\n  Note:     this job can't archive, label or move email when it runs — the "
+                "user's own messages didn't explicitly ask for that. If they want it to, ask "
+                "them to say so in their words (e.g. 'archive the newsletters every morning'), "
+                "then re-create the job."
             )
         sm = self._get_session_manager()
         job = await sm.create_cron_job(

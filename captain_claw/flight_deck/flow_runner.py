@@ -307,6 +307,13 @@ _HUMAN_TRIGGER_CHANNELS = frozenset({
     "web", "whatsapp", "glasses", "telegram", "messenger", "slack", "discord",
 })
 _MAIL_WRITE_ACTIONS = frozenset({"create_draft", "update_draft", "send", "send_draft"})
+# google_mail / microsoft_mail actions that change the mailbox without writing an
+# email (mirrors mail_authority.MAILBOX_CHANGE_ACTIONS by string): a literal one
+# in a person's flow is that person asking for it, like a literal write.
+_MAIL_ORGANIZE_ACTIONS = frozenset({
+    "archive", "move", "add_labels", "remove_labels", "create_label",
+    "create_folder", "add_categories", "remove_categories",
+})
 
 
 # The run's mail context, computed ONCE from the inbound payload of the root run
@@ -372,8 +379,9 @@ def _flow_automation(
     Agent step: ``flow`` / ``intent``, judged on the step's RAW (unrendered)
     prompt template — unless the flow was synthesized by an agent — plus the
     human trigger text. Tool step: ``flow_tool``, ``allow`` only for a literal
-    mail-write (send_mail, or google_mail with a literal write action) in a
-    non-synthesized flow, else ``deny``. The trigger text and the deny stamp come
+    mail-write (send_mail, or google_mail with a literal write action) or a
+    literal organize action (archive / move / labels …) in a non-synthesized
+    flow, else ``deny``. The trigger text and the deny stamp come
     only from the run's mail context (``_MAIL_CTX_KEY``), never from the
     payload's own ``text`` (call args may have overwritten it)."""
     synthesized = str((ctx.get("system") or {}).get("flow_origin") or "") == "agent"
@@ -393,7 +401,7 @@ def _flow_automation(
                 raw_args = step.get("args") if isinstance(step.get("args"), dict) else {}
                 action = raw_args.get("action")
                 if (isinstance(action, str) and "{{" not in action
-                        and action.strip() in _MAIL_WRITE_ACTIONS):
+                        and action.strip() in _MAIL_WRITE_ACTIONS | _MAIL_ORGANIZE_ACTIONS):
                     mode = "allow"
         return {"kind": "flow_tool", "job_text": "", "mail_write": mode}
     raw = "" if synthesized else str(step.get("prompt") or "")

@@ -314,7 +314,7 @@ Captain Claw ships with 33 built-in tools. The agent picks the right tool for ea
 | `send_mail` | Send email via SMTP, Mailgun, or SendGrid |
 | `google_drive` | Google Drive — list, search, read, download, upload, create and update files (Docs/Sheets/Slides exported); accepts Drive URLs |
 | `google_calendar` | Google Calendar — list, search, create, update and delete events |
-| `google_mail` | Gmail — read, search, threads, drafts, and opt-in sending |
+| `google_mail` | Gmail — read, search, threads, drafts, organizing (archive, labels, move), and opt-in sending |
 | `todo` | Persistent cross-session to-do list with auto-capture |
 | `contacts` | Persistent cross-session address book with auto-capture |
 | `scripts` | Persistent cross-session script/file memory with auto-capture |

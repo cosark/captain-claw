@@ -421,6 +421,8 @@ google_oauth:
   - https://www.googleapis.com/auth/drive
   - https://www.googleapis.com/auth/calendar
   - https://www.googleapis.com/auth/gmail.readonly
+  # google_mail archive / labels / move need gmail.modify too:
+  # - https://www.googleapis.com/auth/gmail.modify
   - openid
   - email
 todo:

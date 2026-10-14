@@ -8,7 +8,8 @@ the loop needs to act safely:
   * ``reversibility``  — read_only | reversible | irreversible
   * ``reverse``        — how to undo a reversible action (built from the result)
   * ``human_only``     — never auto-dispatched, by grant or by earned trust
-                          (irreversible / outward-facing / any email write)
+                          (irreversible / outward-facing / any email write or
+                          mailbox change)
   * ``proposable``     — the arbiter / plans may PROPOSE a ``human_only``
                           action (human approval, never auto). Without it a
                           ``human_only`` action is never proposed either.
@@ -126,6 +127,13 @@ CATALOG: dict[str, dict[str, Any]] = {
 
 # google_mail sub-actions that write email (create/change/send a draft or mail).
 MAIL_WRITE_ACTIONS = frozenset({"create_draft", "update_draft", "send", "send_draft"})
+# google_mail / microsoft_mail sub-actions that change the mailbox without
+# writing email (mirrors mail_authority.MAILBOX_CHANGE_ACTIONS by string; FD
+# never imports the agent's module).
+MAIL_ORGANIZE_ACTIONS = frozenset({
+    "archive", "move", "add_labels", "remove_labels", "create_label",
+    "create_folder", "add_categories", "remove_categories",
+})
 
 
 # A Gmail-like MCP proxy tool (``mcp_<server>_<tool>``, a user-promoted custom
@@ -150,9 +158,10 @@ def _is_mcp_mail_write(tool: str) -> bool:
 
 def is_mail_write(spec: dict[str, Any] | None) -> bool:
     """True for any spec that writes email: send_mail, or google_mail /
-    microsoft_mail whose fixed action is a write — or such a spec with no fixed action (the action
-    would come from args, so assume a write). A custom action over a Gmail-like
-    MCP proxy tool (``mcp_gmail_create_draft`` …) counts too."""
+    microsoft_mail whose fixed action is a write — or such a spec with no fixed
+    action, or one whose args may set ``action`` (``build_tool_call`` lets an
+    arg override ``base_args``), so assume a write. A custom action over a
+    Gmail-like MCP proxy tool (``mcp_gmail_create_draft`` …) counts too."""
     if not spec:
         return False
     tool = str(spec.get("tool") or "").strip().lower()
@@ -162,8 +171,21 @@ def is_mail_write(spec: dict[str, Any] | None) -> bool:
         return True
     if tool not in ("google_mail", "microsoft_mail"):
         return False
+    if "action" in list(spec.get("required") or []) + list(spec.get("optional") or []):
+        return True
     action = str((spec.get("base_args") or {}).get("action") or "").strip().lower()
     return not action or action in MAIL_WRITE_ACTIONS
+
+
+def is_mail_organize(spec: dict[str, Any] | None) -> bool:
+    """True for a google_mail / microsoft_mail spec whose fixed action changes
+    the mailbox (archive, move, labels / categories, a new label or folder) and
+    that isn't a mail write (:func:`is_mail_write` wins)."""
+    if not spec or is_mail_write(spec):
+        return False
+    tool = str(spec.get("tool") or "").strip().lower()
+    action = str((spec.get("base_args") or {}).get("action") or "").strip().lower()
+    return tool in ("google_mail", "microsoft_mail") and action in MAIL_ORGANIZE_ACTIONS
 
 
 def may_propose(spec: dict[str, Any] | None) -> bool:
@@ -207,6 +229,12 @@ def _custom_to_spec(ca: dict[str, Any]) -> dict[str, Any] | None:
         # A user can't widen a custom email action: it never auto-fires and is
         # never proposed (proposable stays False).
         spec["human_only"] = True
+    elif is_mail_organize(spec):
+        # Archive / move / labels may be proposed but always wait for the
+        # user's approval: unapproved, the agent runs it under ``deny`` and
+        # refuses it anyway.
+        spec["human_only"] = True
+        spec["proposable"] = True
     return spec
 
 

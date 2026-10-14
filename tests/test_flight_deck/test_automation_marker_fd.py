@@ -382,6 +382,14 @@ async def test_synthesized_flow_job_text_is_only_the_trigger(flows):
     ("google_mail", {"action": "{{steps.x.output}}"}, {}, "deny"),
     ("google_mail", {"action": "create_draft"}, {"origin": "agent"}, "deny"),
     ("google_mail", {"action": "list"}, {}, "deny"),
+    # A literal organize action in a person's flow is that person asking for it.
+    ("google_mail", {"action": "archive", "thread_ids": ["t1"]}, {}, "allow"),
+    ("google_mail", {"action": "add_labels", "labels": ["Receipts"],
+                     "thread_ids": "{{steps.x.output}}"}, {}, "allow"),
+    ("microsoft_mail", {"action": "move", "folder": "Receipts", "message_ids": ["M1"]}, {}, "allow"),
+    ("microsoft_mail", {"action": "create_folder", "folder": "Receipts"}, {}, "allow"),
+    ("google_mail", {"action": "archive"}, {"origin": "agent"}, "deny"),
+    ("microsoft_mail", {"action": "{{steps.x.output}}", "folder": "Receipts"}, {}, "deny"),
     ("send_mail", {"to": "a@x.co"}, {}, "allow"),
     ("web_fetch", {"url": "x"}, {}, "deny"),
 ])

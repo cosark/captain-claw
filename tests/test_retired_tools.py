@@ -358,6 +358,17 @@ def _loop_agent(tmp_path, tool):
     ("google_drive", {"action": "doc_replace_text", "file_id": "d1", "find": "a", "replace_with": "ab"}),
     ("google_drive", {"action": "doc_insert_text", "file_id": "d1", "after": "a", "text": "b"}),
     ("google_drive", {"action": "doc_append_text", "file_id": "d1", "text": "b"}),
+    # Mailbox changes: a repeat is a second label / folder, or the same change again.
+    ("google_mail", {"action": "create_label", "label": "Receipts"}),
+    ("google_mail", {"action": "archive", "thread_ids": ["t1", "t2"]}),
+    ("google_mail", {"action": "move", "label": "Receipts", "thread_ids": ["t1"]}),
+    ("google_mail", {"action": "add_labels", "labels": ["Receipts"], "message_ids": ["m1"]}),
+    ("google_mail", {"action": "remove_labels", "labels": ["UNREAD"], "thread_ids": ["t1"]}),
+    ("microsoft_mail", {"action": "create_folder", "folder": "Receipts"}),
+    ("microsoft_mail", {"action": "archive", "message_ids": ["M1"]}),
+    ("microsoft_mail", {"action": "move", "folder": "Receipts", "thread_ids": ["C1"]}),
+    ("microsoft_mail", {"action": "add_categories", "categories": ["Finance"], "message_ids": ["M1"]}),
+    ("microsoft_mail", {"action": "remove_categories", "categories": ["Finance"], "message_ids": ["M1"]}),
 ])
 async def test_identical_google_write_runs_once_per_turn(_dup_limit_one, tmp_path, tool_name, args):
     from captain_claw.llm import ToolCall

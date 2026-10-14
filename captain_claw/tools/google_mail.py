@@ -1,4 +1,4 @@
-"""Google Mail (Gmail) tool — read, draft, and (opt-in) send.
+"""Google Mail (Gmail) tool — read, draft, organize, and (opt-in) send.
 
 Uses the Gmail REST API v1 via httpx with OAuth2 Bearer tokens managed
 by :class:`~captain_claw.google_oauth_manager.GoogleOAuthManager`. This
@@ -9,8 +9,12 @@ Required OAuth scopes:
 
 * ``gmail.readonly`` — list, search, read messages and threads.
 * ``gmail.compose``  — create drafts (and, Gmail-side, send them).
+* ``gmail.modify``   — organize: archive / move / add_labels /
+  remove_labels / create_label (``https://mail.google.com/`` also works).
 
-Both are requested as part of the standard Google OAuth login flow.
+The standalone default (``google_oauth.scopes``) requests all three; under
+Flight Deck an admin picks them in Connections → Google, so gmail.modify may
+be missing — the organize actions then say so before any Gmail call.
 
 Sending (``send`` / ``send_draft``) is OFF unless the user opts in — the
 scope is not the gate (``gmail.compose`` already lets Google accept a send):
@@ -38,18 +42,30 @@ anything is created or sent. A message with files goes through Gmail's upload
 endpoint (:func:`gmail_compose.start_upload`); update_draft keeps the draft's
 own files (``remove_attachments`` drops some).
 
-There are still no label / trash / delete actions.
+Organizing changes labels only — nothing is written, sent or deleted, and
+there are still no trash / spam / delete actions. archive removes INBOX; move
+adds a destination label and removes INBOX; add_labels / remove_labels tag;
+create_label makes a label ("Parent/Child" nests it). Targets are thread_ids
+(whole conversations, ``threads.modify``) and/or message_ids (one
+``messages.batchModify``), at most 100 per call. Label names resolve through
+one labels.list per call; an unknown name refuses the whole call (labels are
+never created on the fly). An automated turn may organize only when its own
+text asks to — :func:`mail_authority.check_mailbox_change`, run before any
+token fetch or HTTP.
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import email.utils
+import json
 import mimetypes
 import re
 import unicodedata
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -77,6 +93,16 @@ _GMAIL_COMPOSE_SCOPES = (
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/gmail.modify",
 )
+# messages.modify / batchModify / threads.modify take only these (labels.create
+# also takes gmail.labels, which the scope catalog doesn't offer).
+_GMAIL_MODIFY_SCOPES = (
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://mail.google.com/",
+)
+
+# Organizing the mailbox — label changes, never an email write. Gated by
+# mail_authority.check_mailbox_change and the gmail.modify scope.
+_ORGANIZE_ACTIONS = frozenset({"archive", "move", "add_labels", "remove_labels", "create_label"})
 
 # Which grant each token-using action needs (anything unlisted reads).
 # drafts.list / drafts.get take a read OR a compose scope.
@@ -86,6 +112,7 @@ _ACTION_SCOPES = {
     "send": "send",
     "send_draft": "send_draft",
     "list_drafts": "drafts",
+    **{a: "modify" for a in _ORGANIZE_ACTIONS},
 }
 
 # Sends go through Flight Deck's policy gate (or, standalone, the local
@@ -98,6 +125,27 @@ _LOCAL_SEND_OFF = (
     "CLAW_TOOLS__GOOGLE_MAIL__ALLOW_SEND=true, to allow sends). Nothing was "
     "sent. Create a draft with action=create_draft instead and tell the user."
 )
+
+# One organize call changes at most this many emails (thread_ids + message_ids).
+_MAX_ORGANIZE_IDS = 100
+# Concurrent threads.modify / messages.modify requests.
+_ORGANIZE_CONCURRENCY = 5
+# An organize answer lists this many IDs, then "… and N more".
+_MAX_LISTED_IDS = 20
+# Friendly names for Gmail's inbox categories.
+_CATEGORY_ALIASES = {
+    "primary": "CATEGORY_PERSONAL", "personal": "CATEGORY_PERSONAL",
+    "social": "CATEGORY_SOCIAL", "promotions": "CATEGORY_PROMOTIONS",
+    "updates": "CATEGORY_UPDATES", "forums": "CATEGORY_FORUMS",
+}
+# System labels organizing may add / remove (removing INBOX archives,
+# removing UNREAD marks read) — plus any CATEGORY_*.
+_TAG_SYSTEM_LABELS = frozenset({"INBOX", "UNREAD", "STARRED", "IMPORTANT"})
+# Never added or removed: sending, drafts, trash and spam are out of scope.
+_FORBIDDEN_LABELS = frozenset({"SENT", "DRAFT", "TRASH", "SPAM", "CHAT"})
+_SYSTEM_LABELS = _TAG_SYSTEM_LABELS | _FORBIDDEN_LABELS | frozenset(_CATEGORY_ALIASES.values())
+# Gmail's own folder names a user label can't take (besides the IDs above).
+_RESERVED_LABEL_NAMES = frozenset({"drafts", "sent mail", "all mail"})
 
 # Max body length returned to the agent.
 _MAX_BODY_CHARS = 30_000
@@ -146,22 +194,80 @@ _FOLLOWUP_HINT_NO_REPLY = (
     "  • Narrow the list: google_mail action=search query='from:... is:unread'"
 )
 
+# Appended when this turn may change the mailbox (a human turn, or a job whose
+# own text asks to organize email).
+_FOLLOWUP_ORGANIZE = (
+    "\n  • Archive / label / move — ONLY if the user asked: google_mail action=archive "
+    "thread_ids=[<Thread ID above>] (also move, add_labels, remove_labels, create_label)"
+)
+
 
 def _followup_hint() -> str:
-    """The reply bullet only when this turn may write email."""
+    """The reply bullet only when this turn may write email; the organize
+    bullet only when it may change the mailbox."""
     if mail_authority.check_mail_write("google_mail", "create_draft") is None:
-        return _FOLLOWUP_HINT
-    return _FOLLOWUP_HINT_NO_REPLY
+        hint = _FOLLOWUP_HINT
+    else:
+        hint = _FOLLOWUP_HINT_NO_REPLY
+    if mail_authority.check_mailbox_change("google_mail", "archive") is None:
+        hint += _FOLLOWUP_ORGANIZE
+    return hint
+
+
+def _modify_scope_missing(flight_deck: bool) -> str:
+    """The refusal when the Google connection lacks gmail.modify."""
+    head = (
+        "Gmail organizing (archive / labels / move) needs the 'Gmail (read + modify)' scope "
+        "(gmail.modify), which this Google connection doesn't include. "
+    )
+    if flight_deck:
+        return head + (
+            "A Flight Deck admin ticks it in Connections → Google (this makes every user "
+            "reconnect), then the user reconnects Google. Nothing was changed."
+        )
+    return head + (
+        "Add https://www.googleapis.com/auth/gmail.modify to google_oauth.scopes in "
+        "config.yaml and reconnect Google (/auth/google/login). Nothing was changed."
+    )
+
+
+def _scope_insufficient(exc: Exception) -> bool:
+    """Gmail's 403 for a token without the scope the call needs."""
+    if not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code != 403:
+        return False
+    text = exc.response.text.lower()
+    return "insufficient" in text and "scope" in text
+
+
+def _gmail_error_message(exc: httpx.HTTPStatusError) -> str:
+    """The ``error.message`` of a Gmail error response."""
+    try:
+        return str(exc.response.json().get("error", {}).get("message") or exc)
+    except Exception:
+        return str(exc)
+
+
+def _is_system_label(lab: dict[str, Any]) -> bool:
+    return lab.get("type") == "system" or str(lab.get("id")) in _SYSTEM_LABELS
+
+
+def _label_name(lab: dict[str, Any]) -> str:
+    """How an answer names a label: a system label by its ID, a user label by name."""
+    return str(lab["id"] if _is_system_label(lab) else lab.get("name") or lab["id"])
 
 
 class GoogleMailTool(Tool):
-    """Read Gmail, create drafts and — when the user has enabled it — send.
+    """Read Gmail, create drafts, organize (archive / labels / move) and — when
+    the user has enabled it — send.
     Actions: list_messages, search, read_message, get_thread, list_labels,
-    create_draft, update_draft, list_drafts, send, send_draft."""
+    create_draft, update_draft, list_drafts, send, send_draft, get_attachment,
+    archive, move, add_labels, remove_labels, create_label (the last five need
+    gmail.modify)."""
 
     name = "google_mail"
     description = (
-        "Gmail — read, create drafts, and (when the user has enabled it) send email. "
+        "Gmail — read, create drafts, organize (archive / labels / move), and (when the user "
+        "has enabled it) send email. "
         "WRITE ONLY WHEN ASKED: create_draft / update_draft / send / send_draft only when the user asked "
         "for that email in this conversation (or a scheduled job's own text explicitly says to draft or "
         "send it). Reading, listing, summarizing or triaging mail NEVER implies drafting replies — when an "
@@ -212,6 +318,18 @@ class GoogleMailTool(Tool):
         "numbers, or 'all'] drops some; with only file changes the body can be left out. "
         "send_draft sends the draft as it is — add files with update_draft first. A file is "
         "attached only when the tool's answer lists it under 'Attachments:'. "
+        "ORGANIZE ONLY WHEN ASKED: archive / move / labels / create_label only when the user "
+        "asked to organize those emails (or a scheduled job's own text says so). Reading, "
+        "summarizing or triaging mail never implies it — suggest it instead. Find the emails "
+        "first (list_messages / search), then pass their IDs (thread_ids = whole conversations); "
+        "report what changed using the IDs and counts the tool printed. If it answers "
+        "'[not-authorized: mail-write]', don't retry: tell the user. These need the gmail.modify "
+        "scope; if the tool says it's missing, tell the user (don't retry). archive takes emails "
+        "out of the Inbox; move label=<label> files them under that label (label=INBOX brings "
+        "them back); add_labels / remove_labels take labels=[names or IDs] — INBOX, UNREAD, "
+        "STARRED, IMPORTANT and the categories too (removing UNREAD marks read). A label that "
+        "doesn't exist is refused, never created on the fly: create_label makes one only when "
+        "the user asked for it ('Parent/Child' nests it). At most 100 emails per call. "
         "ROUTING: any user request that refers to an email, message, inbox, thread, "
         "conversation, sender, subject line, or Gmail — including phrases like "
         "'read the one from X', 'open that email', 'show me the Fil Rouge email', "
@@ -251,7 +369,11 @@ class GoogleMailTool(Tool):
         "send (send an email now — only on the user's explicit request, and only when "
         "sending is enabled; call it in the same response the user asks — only 'Email sent.' "
         "with a Message ID means it went), "
-        "send_draft (send an existing draft by draft_id — same rules as send). "
+        "send_draft (send an existing draft by draft_id — same rules as send), "
+        "archive (remove from the Inbox — thread_ids and/or message_ids), "
+        "move (to label=<name or ID>, out of the Inbox; INBOX = back to the Inbox), "
+        "add_labels / remove_labels (labels=[...] on thread_ids / message_ids), "
+        "create_label (label=<name>; 'Parent/Child' nests it). "
         "When drafting or sending a REPLY to an existing email, always pass "
         "`reply_to_message_id` (the original message's ID) so it is threaded under the "
         "original conversation in Gmail, with proper In-Reply-To/References headers and a "
@@ -276,6 +398,11 @@ class GoogleMailTool(Tool):
                     "send",
                     "send_draft",
                     "get_attachment",
+                    "archive",
+                    "move",
+                    "add_labels",
+                    "remove_labels",
+                    "create_label",
                 ],
                 "description": "The action to perform.",
             },
@@ -326,7 +453,28 @@ class GoogleMailTool(Tool):
             },
             "message_id": {
                 "type": "string",
-                "description": "Message ID (for read_message and get_attachment).",
+                "description": (
+                    "Message ID (for read_message and get_attachment; for archive / move / "
+                    "add_labels / remove_labels, one email — see message_ids)."
+                ),
+            },
+            "message_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "For archive / move / add_labels / remove_labels: Message IDs of single "
+                    "emails. Gmail shows conversations — to act on a whole conversation pass "
+                    "thread_ids instead. At most 100 emails per call (thread_ids + message_ids)."
+                ),
+            },
+            "thread_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "For archive / move / add_labels / remove_labels: Thread IDs — each acts on "
+                    "the whole conversation (the 'Thread:' IDs list_messages / search print). "
+                    "At most 100 emails per call (thread_ids + message_ids)."
+                ),
             },
             "attachment": {
                 "type": "string",
@@ -367,7 +515,10 @@ class GoogleMailTool(Tool):
             },
             "thread_id": {
                 "type": "string",
-                "description": "Thread ID (for get_thread action).",
+                "description": (
+                    "Thread ID (for get_thread; for archive / move / add_labels / "
+                    "remove_labels, one conversation — see thread_ids)."
+                ),
             },
             "draft_id": {
                 "type": "string",
@@ -392,7 +543,20 @@ class GoogleMailTool(Tool):
                     "Label/folder to list from (for list_messages). "
                     "Common values: INBOX, SENT, DRAFT, STARRED, UNREAD, SPAM, TRASH. "
                     "Defaults to INBOX (auto-narrowed to the Primary category). "
-                    "Only override when the user explicitly asks for a different folder."
+                    "Only override when the user explicitly asks for a different folder. "
+                    "For move: the destination label's name or ID (INBOX = back to the Inbox). "
+                    "For create_label: the new label's name ('Parent/Child' nests it)."
+                ),
+            },
+            "labels": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "For add_labels / remove_labels: label names or IDs (list_labels shows "
+                    "them). INBOX, UNREAD, STARRED, IMPORTANT and the categories (primary, "
+                    "social, promotions, updates, forums) work too — removing INBOX archives, "
+                    "removing UNREAD marks read. A missing label is refused (create_label "
+                    "makes one only when the user asked)."
                 ),
             },
             "max_results": {
@@ -453,6 +617,11 @@ class GoogleMailTool(Tool):
             "send": self._action_send,
             "send_draft": self._action_send_draft,
             "get_attachment": self._action_get_attachment,
+            "archive": self._action_archive,
+            "move": self._action_move,
+            "add_labels": self._action_add_labels,
+            "remove_labels": self._action_remove_labels,
+            "create_label": self._action_create_label,
         }
 
         # Mail writes in an automated turn need the job's own explicit words
@@ -480,6 +649,17 @@ class GoogleMailTool(Tool):
                     action=action, kind=mail_authority.current().kind,
                 )
                 return ToolResult(success=False, error=_refusal)
+
+        # Archive / move / labels: an automated turn needs its own text to ask
+        # to organize email — also before any token fetch or HTTP.
+        if mail_authority.is_mailbox_change(self.name, action):
+            refusal = mail_authority.check_mailbox_change(self.name, action)
+            if refusal:
+                log.info(
+                    "google_mail mailbox change refused (automated turn)",
+                    action=action, kind=mail_authority.current().kind,
+                )
+                return ToolResult(success=False, error=refusal)
 
         # Files to attach: every one checked and read before anything is
         # created or sent — one that can't be attached refuses the call.
@@ -522,6 +702,10 @@ class GoogleMailTool(Tool):
         try:
             return await handler(token, **kwargs)
         except httpx.HTTPStatusError as exc:
+            if action in _ORGANIZE_ACTIONS and _scope_insufficient(exc):
+                return ToolResult(
+                    success=False, error=_modify_scope_missing(self._flight_deck_mode()),
+                )
             return self._handle_http_error(exc)
         except httpx.HTTPError as exc:
             log.error("Gmail HTTP error", action=action, error=str(exc))
@@ -544,6 +728,8 @@ class GoogleMailTool(Tool):
         (``_remove_attachments``); the refusal, or "" when they are usable."""
         raw = kwargs.pop("attachments", None)
         raw_remove = kwargs.pop("remove_attachments", None)
+        if action in _ORGANIZE_ACTIONS:
+            return ""  # organizing never touches files
         try:
             values = mail_attachments.parse_list(raw)
             remove = mail_attachments.parse_list(raw_remove)
@@ -634,8 +820,9 @@ class GoogleMailTool(Tool):
         ``gmail.readonly`` or ``gmail.modify``), ``"compose"`` (drafts —
         ``gmail.compose`` or ``gmail.modify``; also what *need_compose*
         asks for), ``"drafts"`` (list/read drafts — read OR compose),
-        ``"send"`` (:data:`gmail_compose.SEND_SCOPES`) or ``"send_draft"``
-        (:data:`gmail_compose.DRAFT_SEND_SCOPES`).
+        ``"send"`` (:data:`gmail_compose.SEND_SCOPES`), ``"send_draft"``
+        (:data:`gmail_compose.DRAFT_SEND_SCOPES`) or ``"modify"`` (organizing —
+        ``gmail.modify`` or ``https://mail.google.com/``).
         """
         from captain_claw.google_oauth_manager import GoogleOAuthManager
         from captain_claw.session import get_session_manager
@@ -680,6 +867,9 @@ class GoogleMailTool(Tool):
                        " (gmail.compose, gmail.send or gmail.modify is needed).")
                     + " Please disconnect and reconnect your Google account."
                 )
+        elif need == "modify":
+            if not any(s in granted for s in _GMAIL_MODIFY_SCOPES):
+                raise RuntimeError(_modify_scope_missing(mgr._is_flight_deck_client()))
         elif need == "drafts":
             if not any(s in granted for s in _GMAIL_READ_SCOPES + _GMAIL_COMPOSE_SCOPES):
                 raise RuntimeError(
@@ -699,6 +889,13 @@ class GoogleMailTool(Tool):
 
     def _auth_headers(self, token: str) -> dict[str, str]:
         return {"Authorization": f"Bearer {token}"}
+
+    @staticmethod
+    def _flight_deck_mode() -> bool:
+        """Whether Google comes from Flight Deck (``GoogleOAuthManager._is_flight_deck_client``)."""
+        from captain_claw.google_oauth_manager import GoogleOAuthManager
+
+        return bool(GoogleOAuthManager._flight_deck_base())
 
     # ------------------------------------------------------------------
     # Error handling
@@ -773,6 +970,517 @@ class GoogleMailTool(Tool):
             lines.extend(sorted(user_labels))
 
         return ToolResult(success=True, content="\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # Actions: archive / move / add_labels / remove_labels / create_label
+    #
+    # Label changes only (gmail.modify) — nothing is written, sent or
+    # deleted. execute() has already run mail_authority.check_mailbox_change.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _id_list(*values: Any) -> list[str]:
+        """IDs from *values* — lists, or strings holding a JSON list or comma /
+        whitespace separated IDs — de-duplicated, in order."""
+        out: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if isinstance(value, str) and value.strip().startswith("["):
+                try:
+                    value = json.loads(value)
+                except ValueError:
+                    pass
+            for item in value if isinstance(value, (list, tuple)) else [value]:
+                for tok in re.split(r"[\s,]+", "" if item is None else str(item)):
+                    tok = tok.strip("[]'\"")
+                    if tok and tok not in seen:
+                        seen.add(tok)
+                        out.append(tok)
+        return out
+
+    @staticmethod
+    def _label_refs(*values: Any) -> list[str]:
+        """Label names / IDs from *values* — lists, or strings holding a JSON
+        list or comma-separated names (names may have spaces) — in order."""
+        out: list[str] = []
+        for value in values:
+            if isinstance(value, str):
+                text = value.strip()
+                parsed: Any = None
+                if text.startswith("["):
+                    try:
+                        parsed = json.loads(text)
+                    except ValueError:
+                        parsed = None
+                value = parsed if isinstance(parsed, list) else text.split(",")
+            if not isinstance(value, (list, tuple)):
+                continue
+            for item in value:
+                ref = "" if item is None else str(item).strip()
+                if ref and ref not in out:
+                    out.append(ref)
+        return out
+
+    def _organize_targets(self, kwargs: dict[str, Any]) -> tuple[list[str], list[str]] | str:
+        """(thread IDs, message IDs) to organize, or the refusal."""
+        threads = self._id_list(kwargs.get("thread_ids"), kwargs.get("thread_id"))
+        messages = self._id_list(kwargs.get("message_ids"), kwargs.get("message_id"))
+        if not threads and not messages:
+            return (
+                "Which emails? Pass thread_ids (whole conversations) and/or message_ids — "
+                "find them with list_messages or search first. Nothing was changed."
+            )
+        if len(threads) + len(messages) > _MAX_ORGANIZE_IDS:
+            return (
+                f"At most {_MAX_ORGANIZE_IDS} emails per call — call again for the rest. "
+                "Nothing was changed."
+            )
+        return threads, messages
+
+    async def _all_labels(self, token: str) -> list[dict[str, Any]]:
+        """labels.list — each label's id, name and type."""
+        resp = await self._client.get(
+            f"{_GMAIL_API}/users/me/labels",
+            headers=self._auth_headers(token),
+        )
+        resp.raise_for_status()
+        labels = (resp.json() or {}).get("labels") or []
+        return [lab for lab in labels if isinstance(lab, dict) and lab.get("id")]
+
+    @staticmethod
+    def _user_label(labels: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
+        """The user label called *name* (any case)."""
+        folded = name.casefold()
+        for lab in labels:
+            if not _is_system_label(lab) and str(lab.get("name") or "").casefold() == folded:
+                return lab
+        return None
+
+    def _find_label(self, ref: str, labels: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """The label *ref* names: an exact label ID, else a user label's name
+        (any case), else a system label by ID (any case) or category alias."""
+        for lab in labels:
+            if lab["id"] == ref:
+                return lab
+        lab = self._user_label(labels, ref)
+        if lab is not None:
+            return lab
+        sys_id = _CATEGORY_ALIASES.get(ref.casefold(), ref.upper())
+        for lab in labels:
+            if _is_system_label(lab) and str(lab["id"]).upper() == sys_id:
+                return lab
+        if sys_id in _SYSTEM_LABELS:
+            return {"id": sys_id, "name": sys_id, "type": "system"}
+        return None
+
+    def _resolve_labels(
+        self, refs: list[str], labels: list[dict[str, Any]],
+    ) -> list[dict[str, Any]] | str:
+        """The labels *refs* name, or the refusal (one is missing, or one is a
+        system label this tool never adds or removes)."""
+        found: list[dict[str, Any]] = []
+        missing: list[str] = []
+        for ref in refs:
+            lab = self._find_label(ref, labels)
+            if lab is None:
+                missing.append(ref)
+            elif all(lab["id"] != f["id"] for f in found):
+                found.append(lab)
+        if missing:
+            names = sorted(
+                (str(lab.get("name") or lab["id"]) for lab in labels if not _is_system_label(lab)),
+                key=str.casefold,
+            )
+            if names:
+                more = f", … and {len(names) - 30} more" if len(names) > 30 else ""
+                have = f"Existing labels: {', '.join(names[:30])}{more}."
+            else:
+                have = "This mailbox has no labels of its own yet."
+            return (
+                f"No such Gmail label: {', '.join(repr(m) for m in missing)}. {have} Use a name "
+                "or ID from list_labels. To make a new label — only if the user asked for one — "
+                "call google_mail action=create_label "
+                f"label={json.dumps(missing[0], ensure_ascii=False)} first. Nothing was changed."
+            )
+        for lab in found:
+            lab_id = str(lab["id"])
+            if (_is_system_label(lab) and lab_id not in _TAG_SYSTEM_LABELS
+                    and not lab_id.startswith("CATEGORY_")):
+                return (
+                    f"'{lab_id}' is a Gmail system label this tool doesn't add or remove — sent "
+                    "mail, drafts, chats, trash and spam are out of scope. Nothing was changed."
+                )
+        return found
+
+    async def _modify_labels(
+        self,
+        token: str,
+        threads: list[str],
+        messages: list[str],
+        *,
+        add: list[str],
+        remove: list[str],
+    ) -> tuple[list[str], list[str], list[tuple[str, Exception]]]:
+        """Add / remove label IDs on whole conversations (``threads.modify``
+        each) and single messages (one ``messages.batchModify``); returns the
+        thread IDs and message IDs changed and ``(ID, error)`` for the rest."""
+        body: dict[str, list[str]] = {}
+        if add:
+            body["addLabelIds"] = add
+        if remove:
+            body["removeLabelIds"] = remove
+        headers = {**self._auth_headers(token), "Content-Type": "application/json"}
+        gate = asyncio.Semaphore(_ORGANIZE_CONCURRENCY)
+
+        async def modify(kind: str, target: str) -> Exception | None:
+            async with gate:
+                try:
+                    resp = await self._client.post(
+                        f"{_GMAIL_API}/users/me/{kind}/{quote(target, safe='')}/modify",
+                        headers=headers, json=body,
+                    )
+                    resp.raise_for_status()
+                except httpx.HTTPError as exc:
+                    return exc
+            return None
+
+        thread_errors = list(await asyncio.gather(*(modify("threads", t) for t in threads)))
+        message_errors: list[Exception | None] = []
+        if messages:
+            try:
+                # batchModify answers 204 with no body — nothing to parse.
+                resp = await self._client.post(
+                    f"{_GMAIL_API}/users/me/messages/batchModify",
+                    headers=headers, json={"ids": messages, **body},
+                )
+                resp.raise_for_status()
+                message_errors = [None] * len(messages)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in (400, 404) and len(messages) > 1:
+                    # One bad ID fails the whole batch: retry one by one to find it.
+                    message_errors = list(await asyncio.gather(
+                        *(modify("messages", m) for m in messages)))
+                else:
+                    message_errors = [exc] * len(messages)
+            except httpx.HTTPError as exc:
+                message_errors = [exc] * len(messages)
+        failed = [(t, e) for t, e in zip(threads, thread_errors) if e is not None]
+        failed += [(m, e) for m, e in zip(messages, message_errors) if e is not None]
+        return (
+            [t for t, e in zip(threads, thread_errors) if e is None],
+            [m for m, e in zip(messages, message_errors) if e is None],
+            failed,
+        )
+
+    @staticmethod
+    def _why_not(exc: Exception) -> str:
+        """Why one email wasn't changed (the "NOT archived: <id> (…)" reason)."""
+        if not isinstance(exc, httpx.HTTPStatusError):
+            return f"Gmail didn't answer ({type(exc).__name__}) — safe to retry"
+        status = exc.response.status_code
+        if status == 404:
+            return "not found"
+        if status == 400:
+            return f"rejected: {_gmail_error_message(exc)}"
+        if status == 401:
+            return "Google authentication expired"
+        if status == 403:
+            if _scope_insufficient(exc):
+                return "the connection lacks gmail.modify"
+            return f"permission denied: {_gmail_error_message(exc)}"
+        if status == 429:
+            return "Gmail rate limit — try again in a moment"
+        return f"Gmail API error {status}"
+
+    @staticmethod
+    def _ids_text(ids: list[str]) -> str:
+        more = f", … and {len(ids) - _MAX_LISTED_IDS} more" if len(ids) > _MAX_LISTED_IDS else ""
+        return ", ".join(ids[:_MAX_LISTED_IDS]) + more
+
+    @staticmethod
+    def _count_text(threads: list[str], messages: list[str]) -> str:
+        """"2 conversations and 1 message"."""
+        parts = []
+        if threads:
+            parts.append(f"{len(threads)} conversation{'' if len(threads) == 1 else 's'}")
+        if messages:
+            parts.append(f"{len(messages)} message{'' if len(messages) == 1 else 's'}")
+        return " and ".join(parts)
+
+    @staticmethod
+    def _targets_text(threads: list[str], messages: list[str]) -> str:
+        """The thread_ids / message_ids arguments naming these emails again."""
+        if len(threads) + len(messages) > _MAX_LISTED_IDS:
+            return "with the same thread_ids / message_ids"
+        parts = []
+        if threads:
+            parts.append(f"thread_ids=[{', '.join(threads)}]")
+        if messages:
+            parts.append(f"message_ids=[{', '.join(messages)}]")
+        return " ".join(parts)
+
+    def _organize_result(
+        self,
+        verb: str,
+        head: str,
+        undo: str,
+        threads: list[str],
+        messages: list[str],
+        failed: list[tuple[str, Exception]],
+        *,
+        inbox_removed: bool = False,
+    ) -> ToolResult:
+        """What changed (counts, IDs, the ones that failed, an undo hint) — or,
+        when nothing changed, why."""
+        not_lines = [f"  NOT {verb}: {target} ({self._why_not(exc)})"
+                     for target, exc in failed[:_MAX_LISTED_IDS]]
+        if len(failed) > _MAX_LISTED_IDS:
+            not_lines.append(f"  … and {len(failed) - _MAX_LISTED_IDS} more not {verb}.")
+        if not threads and not messages:
+            errors = [exc for _, exc in failed]
+            if any(_scope_insufficient(e) for e in errors):
+                return ToolResult(
+                    success=False, error=_modify_scope_missing(self._flight_deck_mode()),
+                )
+            statuses = {e.response.status_code if isinstance(e, httpx.HTTPStatusError) else 0
+                        for e in errors}
+            if 401 in statuses:
+                return ToolResult(success=False, error=(
+                    "Google authentication expired. Please reconnect your Google account. "
+                    "Nothing was changed."))
+            tail = "Nothing was changed."
+            if statuses <= {400, 404}:
+                tail += " Check the IDs — list_messages / search print them."
+            return ToolResult(
+                success=False, error="\n".join([f"Nothing was {verb}:", *not_lines, tail]),
+            )
+        lines = [head]
+        if threads:
+            lines.append(f"  Thread IDs: {self._ids_text(threads)}")
+        if messages:
+            lines.append(f"  Message IDs: {self._ids_text(messages)}")
+        lines.extend(not_lines)
+        if inbox_removed and messages:
+            lines.append(
+                "Note: Gmail shows conversations — a conversation stays in the Inbox while "
+                "another of its messages is there; pass thread_ids to act on whole conversations."
+            )
+        lines.append(f"Undo: {undo}")
+        return ToolResult(success=True, content="\n".join(lines))
+
+    async def _action_archive(self, token: str, **kwargs: Any) -> ToolResult:
+        """Take conversations / messages out of the Inbox (remove INBOX)."""
+        targets = self._organize_targets(kwargs)
+        if isinstance(targets, str):
+            return ToolResult(success=False, error=targets)
+        threads, messages, failed = await self._modify_labels(
+            token, *targets, add=[], remove=["INBOX"],
+        )
+        return self._organize_result(
+            "archived",
+            f"Archived {self._count_text(threads, messages)} — removed from the Inbox.",
+            f"google_mail action=move label=INBOX {self._targets_text(threads, messages)}",
+            threads, messages, failed, inbox_removed=True,
+        )
+
+    async def _action_move(
+        self, token: str, label: str = "", labels: Any = None, **kwargs: Any,
+    ) -> ToolResult:
+        """File conversations / messages under one label: add it and remove
+        INBOX (label=INBOX only adds INBOX — back to the Inbox)."""
+        targets = self._organize_targets(kwargs)
+        if isinstance(targets, str):
+            return ToolResult(success=False, error=targets)
+        refs = self._label_refs([label]) or self._label_refs(labels)
+        if len(refs) != 1:
+            return ToolResult(success=False, error=(
+                "move takes one destination: label=<label name or ID> (INBOX = back to the "
+                "Inbox; list_labels shows the rest). Nothing was changed."
+            ))
+        found = self._resolve_labels(refs, await self._all_labels(token))
+        if isinstance(found, str):
+            return ToolResult(success=False, error=found)
+        dest = found[0]
+        name = _label_name(dest)
+        if dest["id"] != "INBOX" and _is_system_label(dest):
+            return ToolResult(success=False, error=(
+                f"'{name}' isn't a place to move email to — it only marks it. Use google_mail "
+                f"action=add_labels labels={json.dumps([name])} instead. Nothing was changed."
+            ))
+        back = dest["id"] == "INBOX"
+        threads, messages, failed = await self._modify_labels(
+            token, *targets, add=[dest["id"]], remove=[] if back else ["INBOX"],
+        )
+        count = self._count_text(threads, messages)
+        again = self._targets_text(threads, messages)
+        if back:
+            head = f"Moved {count} back to the Inbox."
+            undo = f"google_mail action=archive {again}"
+        else:
+            head = f"Moved {count} to '{name}' — label added, removed from the Inbox."
+            undo = (f"google_mail action=remove_labels "
+                    f"labels={json.dumps([name], ensure_ascii=False)} {again}, "
+                    "then action=move label=INBOX with the same IDs")
+        return self._organize_result(
+            "moved", head, undo, threads, messages, failed, inbox_removed=not back,
+        )
+
+    async def _action_add_labels(self, token: str, **kwargs: Any) -> ToolResult:
+        """Add labels to conversations / messages."""
+        return await self._change_labels(token, kwargs, adding=True)
+
+    async def _action_remove_labels(self, token: str, **kwargs: Any) -> ToolResult:
+        """Remove labels from conversations / messages (INBOX archives, UNREAD
+        marks read)."""
+        return await self._change_labels(token, kwargs, adding=False)
+
+    async def _change_labels(
+        self, token: str, kwargs: dict[str, Any], *, adding: bool,
+    ) -> ToolResult:
+        action = "add_labels" if adding else "remove_labels"
+        targets = self._organize_targets(kwargs)
+        if isinstance(targets, str):
+            return ToolResult(success=False, error=targets)
+        refs = self._label_refs(kwargs.get("labels"), [kwargs.get("label")])
+        if not refs:
+            return ToolResult(success=False, error=(
+                f"{action} needs labels=[label names or IDs] (list_labels shows them). "
+                "Nothing was changed."
+            ))
+        found = self._resolve_labels(refs, await self._all_labels(token))
+        if isinstance(found, str):
+            return ToolResult(success=False, error=found)
+        ids = [str(lab["id"]) for lab in found]
+        names = [_label_name(lab) for lab in found]
+        threads, messages, failed = await self._modify_labels(
+            token, *targets, add=ids if adding else [], remove=[] if adding else ids,
+        )
+        what = ("labels " if len(names) > 1 else "label ") + ", ".join(f"'{n}'" for n in names)
+        count = self._count_text(threads, messages)
+        head = f"Added {what} to {count}" if adding else f"Removed {what} from {count}"
+        effects = (
+            {"INBOX": "back in the Inbox", "UNREAD": "marked unread"} if adding
+            else {"INBOX": "archived", "UNREAD": "marked read"}
+        )
+        shown = [effects[i] for i in ids if i in effects]
+        head += f" ({', '.join(shown)})." if shown else "."
+        undo = (f"google_mail action={'remove_labels' if adding else 'add_labels'} "
+                f"labels={json.dumps(names, ensure_ascii=False)} "
+                f"{self._targets_text(threads, messages)}")
+        return self._organize_result(
+            "changed", head, undo, threads, messages, failed,
+            inbox_removed=not adding and "INBOX" in ids,
+        )
+
+    @staticmethod
+    def _system_label_name(name: str) -> bool:
+        """Whether *name* is one of Gmail's own labels (no user label can take it)."""
+        folded = name.casefold()
+        return (folded.upper() in _SYSTEM_LABELS or folded in _CATEGORY_ALIASES
+                or folded in _RESERVED_LABEL_NAMES)
+
+    async def _action_create_label(
+        self, token: str, label: str = "", labels: Any = None, **kwargs: Any,
+    ) -> ToolResult:
+        """Create a user label; "Parent/Child" creates each missing ancestor
+        first (Gmail nests labels by name)."""
+        raw = str(label or "").strip()
+        if not raw:
+            refs = self._label_refs(labels)
+            raw = refs[0] if len(refs) == 1 else ""
+        parts = [p.strip() for p in raw.split("/")]
+        if not raw or not all(parts):
+            return ToolResult(success=False, error=(
+                "create_label needs label=<name> — 'Parent/Child' nests it under Parent (no "
+                "empty parts). Nothing was created."
+            ))
+        if self._system_label_name(parts[0]):
+            nested = " (labels can't be nested under it)" if len(parts) > 1 else ""
+            return ToolResult(success=False, error=(
+                f"'{parts[0]}' is a Gmail system label — use it with add_labels / move{nested}. "
+                "Nothing was created."
+            ))
+        existing = await self._all_labels(token)
+        full = "/".join(parts)
+        lab = self._user_label(existing, full)
+        if lab is not None:
+            return ToolResult(success=True, content=(
+                f"Label '{lab.get('name') or full}' already exists (ID: {lab['id']}) — "
+                "nothing created."
+            ))
+        created: list[dict[str, Any]] = []
+        path = ""
+        for part in parts:
+            # An existing ancestor keeps its own spelling, so the new one nests under it.
+            want = f"{path}/{part}" if path else part
+            lab = self._user_label(existing, want)
+            if lab is None:
+                try:
+                    lab = await self._post_label(token, want)
+                    created.append(lab)
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code == 409:  # it exists after all (made meanwhile)
+                        existing = await self._all_labels(token)
+                        lab = self._user_label(existing, want)
+                    if lab is None:
+                        return ToolResult(
+                            success=False, error=self._label_not_created(exc, want, created),
+                        )
+            path = str(lab.get("name") or want)
+        name = str(lab.get("name") or full)
+        if not any(c is lab for c in created):
+            lines = [f"Label '{name}' already exists (ID: {lab['id']})"
+                     + ("." if created else " — nothing created.")]
+        else:
+            lines = [f"Created label '{name}'.", f"  Label ID: {lab['id']}"]
+        parents = [c for c in created if c is not lab]
+        if parents:
+            lines.append(
+                f"  Also created its parent label{'s' if len(parents) > 1 else ''}: "
+                + ", ".join(f"'{p['name']}' (Label ID: {p['id']})" for p in parents)
+            )
+        if created:
+            lines.append(
+                "Apply it only to emails the user asked about: google_mail action=add_labels "
+                f"labels={json.dumps([name], ensure_ascii=False)} thread_ids=[…] (or action=move "
+                f"label={json.dumps(name, ensure_ascii=False)} to file them there)."
+            )
+            lines.append("Undo: delete the label in Gmail (this tool doesn't delete labels).")
+        return ToolResult(success=True, content="\n".join(lines))
+
+    async def _post_label(self, token: str, name: str) -> dict[str, Any]:
+        """labels.create — a label shown in the label list and on messages."""
+        resp = await self._client.post(
+            f"{_GMAIL_API}/users/me/labels",
+            headers={**self._auth_headers(token), "Content-Type": "application/json"},
+            json={"name": name, "labelListVisibility": "labelShow",
+                  "messageListVisibility": "show"},
+        )
+        resp.raise_for_status()
+        data = resp.json() or {}
+        return {"id": str(data.get("id") or "?"), "name": str(data.get("name") or name),
+                "type": "user"}
+
+    def _label_not_created(
+        self, exc: httpx.HTTPStatusError, name: str, created: list[dict[str, Any]],
+    ) -> str:
+        """The error for a label Gmail wouldn't create (after *created* were)."""
+        status = exc.response.status_code
+        if _scope_insufficient(exc):
+            why = _modify_scope_missing(self._flight_deck_mode()).removesuffix(
+                " Nothing was changed.")
+        elif status == 400:
+            why = (f"Gmail refused the label name '{name}' ({_gmail_error_message(exc)}) — it may "
+                   "be reserved or invalid; pick another name.")
+        elif status == 409:
+            why = (f"Gmail says '{name}' conflicts with an existing label, but list_labels has "
+                   "none by that name.")
+        else:
+            why = self._handle_http_error(exc).error or f"Gmail API error ({status})."
+        if not created:
+            return f"{why} Nothing was created."
+        return why + " Created before that: " + ", ".join(
+            f"'{c['name']}' (Label ID: {c['id']})" for c in created) + "."
 
     # ------------------------------------------------------------------
     # Action: list_messages

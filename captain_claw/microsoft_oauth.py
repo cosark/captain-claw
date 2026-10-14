@@ -61,9 +61,10 @@ MANAGE_ACCESS_HINT = (
 REQUIRED_SCOPES = ["openid", "email", "profile", "offline_access", "User.Read"]
 
 # A working default for mail + calendar + OneDrive, minus sending (Mail.Send
-# is opt-in; the tools don't send yet). Unlike Google, none of these needs
-# app verification — users consent themselves unless their organization
-# requires admin consent.
+# is opt-in; the tools don't send yet). Mail.ReadWrite covers drafts and
+# organizing (archive, move, folders, categories). Unlike Google, none of
+# these needs app verification — users consent themselves unless their
+# organization requires admin consent.
 DEFAULT_SCOPES = [
     *REQUIRED_SCOPES,
     "Mail.ReadWrite",
@@ -90,7 +91,8 @@ SCOPE_CATALOG: list[dict[str, str]] = [
      "description": "List, search and read Outlook mail.",
      "sensitivity": "sensitive", "group": "mail"},
     {"scope": "Mail.ReadWrite", "label": "Mail (read + drafts)",
-     "description": "Read mail and create / edit drafts. Drafts are never sent by agents.",
+     "description": ("Read mail, create / edit drafts, and organize it (archive, move, folders, "
+                     "categories). Drafts are never sent by agents."),
      "sensitivity": "sensitive", "group": "mail"},
     {"scope": "Mail.Send", "label": "Mail (send)",
      "description": "Send mail as you. Not used by the agent tools yet — leave off unless needed.",

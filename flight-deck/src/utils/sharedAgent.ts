@@ -344,8 +344,9 @@ export function googleOptInWarning(agentName: string, ownerName: string): string
     + `It acts as you, through ${owner}'s agent: while one of your messages is being answered (up to 20 `
     + 'minutes), that agent can read your mail, calendar and Drive — including the Drive folders you '
     + 'added to Flight Deck — and act in them as you: write drafts and, if your Gmail send settings '
-    + 'allow it, send email as you; create, change or delete calendar events; and upload or overwrite '
-    + 'Drive files. A Google access token it gets covers everything you allowed when you connected '
+    + 'allow it, send email as you; organize your mail (archive, label and move it); create, change '
+    + 'or delete calendar events; and upload or overwrite Drive files. A Google access token it gets '
+    + 'covers everything you allowed when you connected '
     + `Google and stays valid for about an hour, so ${owner}, who controls the agent, could `
     + 'keep using your account for up to about an hour and a half after your message.\n\n'
     + 'Anything the agent reads from your mail, calendar or Drive can also become shared knowledge '

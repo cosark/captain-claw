@@ -368,6 +368,36 @@ def test_detector_explicit_jobs_false(text):
     assert ma.intent_scope(text) == "none", text
 
 
+# EN-4: "email" after another verb is a noun ("Archive email that is older
+# than a week") — an archive job worded so must not email anyone…
+EMAIL_NOUN_FALSE = [
+    "Archive email that is older than a week",
+    "Every morning archive email that's older than a week",
+    "Label email that comes from Ana as Clients",
+    "Summarize email that came today",
+    "Read email that came today",
+]
+# …while "email" as the verb still is one.
+EMAIL_VERB_STILL = [
+    ("Email it to ana@x.co", "any"),
+    ("Then email them the deck", "any"),
+    ("Every Friday email the team the report", "any"),
+    ("Email this to bob@x.co", "any"),
+    ("please email them the report", "any"),
+    ("Archive the newsletters and email me the list", "self"),
+]
+
+
+@pytest.mark.parametrize("text", EMAIL_NOUN_FALSE)
+def test_email_as_a_noun_is_no_intent(text):
+    assert ma.intent_scope(text) == "none", text
+
+
+@pytest.mark.parametrize("text,scope", EMAIL_VERB_STILL)
+def test_email_as_a_verb_still_is(text, scope):
+    assert ma.intent_scope(text) == scope, text
+
+
 # ── check_mail_write matrix ──────────────────────────────────────────
 
 WRITES = ["create_draft", "update_draft", "send", "send_draft"]
@@ -845,6 +875,343 @@ def test_parse_recipients():
     assert ma.parse_recipients("Ana <ANA@x.co>, bob@x.co", None, ["c@x.co"]) == [
         "ana@x.co", "bob@x.co", "c@x.co"]
     assert ma.parse_recipients(None, "", []) == []
+
+
+# ── mailbox changes: archive / move / labels / folders ───────────────
+# A separate class from email writes: an automated turn may organize mail
+# only when its own text asks to (organize_intent), and neither intent
+# grants the other.
+
+ORGANIZE_TRUE = [
+    "Every morning archive newsletters from Substack",
+    "Archive the email from Ana",
+    "archive emails older than a week",
+    "Label emails from Ana as Clients",
+    "Move emails from bob@x.co to the Receipts folder",
+    "Tag the email from Ana as urgent",
+    "Create a label Invoices and label all invoice emails with it",
+    "Categorize my inbox",
+    "Every Friday, move receipts into the Receipts folder",
+    "Use google_mail to archive the newsletters",
+    "Then archive them in Gmail",
+    "Create a folder Receipts in Outlook",
+    "Mark the newsletters as read and archive them",
+    "arhiviraj mailove od Ane",
+    "Svako jutro arhiviraj newslettere",
+    "premjesti mail od Ane u mapu Klijenti",
+    "oznaci mailove od Ane labelom Klijenti",
+    "napravi labelu Racuni za mailove",
+    "Svaki petak prebaci racune u mapu Racuni",
+    "Kategoriziraj poruke u inboxu",
+    # (extended) other verbs, request phrasings and the tool's own words
+    "Summarize my inbox, then archive everything older than a week",
+    "Every weekday at 8:00 label emails from ana@x.co as Clients",
+    "Every morning file invoices from Stripe under Finance",
+    "Star the emails from Ana",
+    "Mark all newsletters as read",
+    "Apply the label Clients to emails from Ana",
+    "Remove the Clients label from emails from Bob",
+    "Put the newsletters in the Reading folder",
+    "Add the emails from Ana to the Clients label",
+    "Create a Gmail label called Invoices",
+    "Unarchive the email from Ana",
+    "Move them back to the inbox",
+    "Always archive newsletters from Substack",
+    "Make sure to archive the newsletters",
+    "Can you archive the newsletters from Substack?",
+    "Set up a cron job to archive newsletters every morning",
+    "Organize my inbox",
+    "Every Friday clean up my inbox: archive newsletters and label invoices",
+    "Use google_mail action=archive on the newsletters",
+    "Via outlook create_folder Receipts",
+    "Svako jutro prebaci račune od Ane u mapu Računi",
+    "Svaki dan označi newslettere kao pročitane",
+    "Spremi mail od Ane u mapu Klijenti",
+    "Možeš li arhivirati newslettere?",
+    "Uvijek arhiviraj newslettere",
+    "napravi mapu Klijenti u Outlooku",
+    "dodaj labelu Klijenti mailovima od Ane",
+    "pospremi mi inbox",
+]
+# …and not: negations, reminders, statements, questions, other things than
+# mail (meetings, files, charts, Slack), reading mail, and a label / folder
+# with no mail in the sentence.
+ORGANIZE_FALSE = [
+    "summarize my inbox",
+    "Don't archive anything",
+    "Never move emails",
+    "Remind me to archive the newsletters",
+    "I archive newsletters myself, just summarize",
+    "Make sure the email from Ana is archived",
+    "Move the meeting to Friday",
+    "Sort the list alphabetically",
+    "Archive the old project files to backup.zip",
+    "File the report in Drive",
+    "Tag the release v1.2 on GitHub",
+    "Nemoj arhivirati mailove",
+    "Ne premjestaj nista",
+    "Podsjeti me da arhiviram newslettere",
+    "Label the chart axes",
+    "Create a folder for the project files",
+    "Which emails should I archive?",
+    "list emails to archive",
+    "Use gmail to search for invoices",
+    # (extended)
+    "Do not archive or move anything",
+    "Never use gmail to archive anything",
+    "Do not, under any circumstances, archive emails from Ana",
+    "Nemoj ništa arhivirati",
+    "Remind me every Friday to move receipts into the Receipts folder",
+    "I always archive newsletters",
+    "I organize my inbox myself",
+    "Did you archive the newsletters?",
+    "How do I archive emails in Gmail?",
+    "The newsletters were archived yesterday.",
+    "Summarize the emails I archived yesterday",
+    "Označila sam mail kao pročitan",
+    "Summarize my emails and sort the results by date",
+    "Check my inbox and file a report in Jira",
+    "Read the newsletters and tag the key points",
+    "Summarize new emails and move on to the calendar",
+    "Move the files into the Projects folder",
+    "Add the file to the Projects folder",
+    "Categorize the expenses into categories",
+    "Label the chart axes in the email report",
+    "Move the meeting with Ana to Friday and email her the agenda",
+    "Archive the email attachments to Drive",
+    "Archive the Slack thread",
+    "Organize my inbox into a summary",
+    "Archive folder: summarize what's in it",
+    "Find the email from Ana in the Archive folder",
+    "List my Gmail labels",
+    "Pomakni sastanak s Anom na petak",
+    "Spremi izvještaj u mapu Projekti",
+    "Premjesti dokumente iz mailova u mapu Arhiva",
+    "Otvori mapu Klijenti i sažmi mailove",
+    "Create a new label called Invoices",
+    "Create a folder Receipts",
+]
+# Organizing and an email in one text: each judged on its own.
+ORGANIZE_AND_EMAIL = [
+    ("Archive the newsletters and email me the list", "self"),
+    ("Label the emails from Ana as Clients and draft a reply to her", "any"),
+    ("arhiviraj newslettere i pošalji mi sažetak mailom", "self"),
+]
+MAILBOX_CHANGES = ["archive", "move", "add_labels", "remove_labels", "create_label",
+                   "create_folder", "add_categories", "remove_categories"]
+
+
+@pytest.mark.parametrize("text", ORGANIZE_TRUE)
+def test_organize_intent_true(text):
+    assert ma.organize_intent(text) is True, text
+    assert ma.intent_scope(text) == "none", text  # never an email
+
+
+@pytest.mark.parametrize("text", ORGANIZE_FALSE)
+def test_organize_intent_false(text):
+    assert ma.organize_intent(text) is False, text
+
+
+@pytest.mark.parametrize("text,scope", ORGANIZE_AND_EMAIL)
+def test_organize_and_email_judged_apart(text, scope):
+    assert ma.organize_intent(text) is True, text
+    assert ma.intent_scope(text) == scope, text
+
+
+def test_email_intent_is_not_organize_intent():
+    for text in MUST_BE_TRUE + [t for t, _ in EXTRA_TRUE + EXPLICIT_JOBS]:
+        assert ma.organize_intent(text) is False, text
+    assert ma.organize_intent("") is False
+
+
+def test_mailbox_change_actions():
+    assert ma.MAILBOX_CHANGE_ACTIONS == frozenset(MAILBOX_CHANGES)
+    assert not ma.MAILBOX_CHANGE_ACTIONS & ma.MAIL_WRITE_ACTIONS
+    for tool in ("google_mail", "microsoft_mail"):
+        for action in MAILBOX_CHANGES:
+            assert ma.is_mailbox_change(tool, action), (tool, action)
+            assert not ma.is_mail_write(tool, action), (tool, action)
+        for action in WRITES + READS + [None, "trash", "delete", "list_folders"]:
+            assert not ma.is_mailbox_change(tool, action), (tool, action)
+    for tool in ("send_mail", "mcp_mail", "google_calendar"):
+        for action in MAILBOX_CHANGES:
+            assert not ma.is_mailbox_change(tool, action), (tool, action)
+    # anything else is not this gate's business
+    with ma.bound(ma.automated("cron", "", "deny")):
+        assert ma.check_mailbox_change("google_mail", "create_draft") is None
+        assert ma.check_mailbox_change("google_mail", "list_messages") is None
+        assert ma.check_mailbox_change("send_mail", "archive") is None
+
+
+def test_mailbox_change_gate():
+    def _all():
+        return {(tool, action): ma.check_mailbox_change(tool, action)
+                for tool in ("google_mail", "microsoft_mail") for action in MAILBOX_CHANGES}
+
+    # a human turn is never gated
+    assert ma.current() == ma.HUMAN
+    assert set(_all().values()) == {None}
+    with ma.bound(ma.human("summarize my inbox")):
+        assert set(_all().values()) == {None}
+    # allow: a human vouched for it
+    with ma.bound(ma.automated("autonomy_tool", "", "allow")):
+        assert set(_all().values()) == {None}
+    # deny: refused, even when the text asks
+    with ma.bound(ma.automated("cron", "Every morning archive newsletters from Substack", "deny")):
+        assert ma.check_mailbox_change("google_mail", "archive") == (
+            ma.mailbox_refusal_text("cron", "archived"))
+        assert all(ma.is_refusal(r) for r in _all().values())
+    # intent: the job's own text asks to organize — and that never grants email
+    with ma.bound(ma.automated("cron", "Every morning archive newsletters from Substack")):
+        assert set(_all().values()) == {None}
+        assert ma.is_refusal(ma.check_mail_write("google_mail", "create_draft"))
+        assert ma.is_refusal(ma.check_mail_write("send_mail", None, recipients=["a@x.co"]))
+        assert ma.needs_recipient_check() is False
+    # (EN-4) "email" as a noun in an archive job doesn't let it email anyone
+    with ma.bound(ma.automated("cron", "Every morning archive email that's older than a week")):
+        assert ma.check_mailbox_change("google_mail", "archive") is None
+        assert ma.is_refusal(ma.check_mail_write("google_mail", "send"))
+    # email intent only: no organizing
+    with ma.bound(ma.automated("cron", "draft a reply to Ana")):
+        assert ma.check_mail_write("google_mail", "create_draft") is None
+        assert ma.check_mailbox_change("google_mail", "archive") == (
+            ma.mailbox_refusal_text("cron", "archived"))
+        assert all(ma.is_refusal(r) for r in _all().values())
+    # a self-scope job: the mailbox refusal, never "write one email to the user"
+    with ma.bound(ma.automated("cron", "email me the summary every morning")):
+        assert ma.needs_recipient_check() is True
+        r = ma.check_mailbox_change("microsoft_mail", "move")
+        assert r == ma.mailbox_refusal_text("cron", "moved")
+        assert r != ma.refusal_text_self("cron", "moved") and "Write one new email" not in r
+    # both in one job: each gate on its own
+    with ma.bound(ma.automated("fd_scheduler", "Archive the newsletters and email me the list")):
+        assert set(_all().values()) == {None}
+        assert ma.needs_recipient_check() is True
+    # neither, and a malformed marker
+    with ma.bound(ma.automated("flow", "summarize my inbox")):
+        assert all(ma.is_refusal(r) for r in _all().values())
+    with ma.bound(ma.from_wire({"kind": "nope", "job_text": "archive emails from Ana",
+                                "mail_write": "intent"}, default_kind="x")):
+        assert all(ma.is_refusal(r) for r in _all().values())
+
+
+def test_mailbox_change_in_a_worker_is_denied(monkeypatch):
+    monkeypatch.setenv("CLAW_BASNA_WORKER", "1")
+    assert ma.check_mailbox_change("google_mail", "archive") == (
+        ma.mailbox_refusal_text("fd_worker", "archived"))
+
+
+def test_mailbox_refusal_texts_exact():
+    head = (
+        "[not-authorized: mail-write] Not archived: this turn was started by {}, not by the "
+        "user, and its instructions don't ask to organize email (archive, move, label or "
+        "categorize). Nothing in the mailbox was changed. Don't retry or work around this "
+        "(no other action or tool) — "
+    )
+    assert ma.mailbox_refusal_text("autonomy", "archived") == head.format("Autonomous Work") + (
+        "tell the user which emails you would archive, move or label, and offer to do it "
+        "when they ask."
+    )
+    assert ma.mailbox_refusal_text("cron", "archived") == head.format("a scheduled task") + (
+        "tell the user that this job's text doesn't ask to organize email, so nothing was "
+        "changed. If they want it to, they can edit the job to say so explicitly, e.g. "
+        "'archive newsletters from Substack' or 'premjesti račune u mapu Računi'."
+    )
+    assert ma.mailbox_refusal_text("peer", "archived") == head.format("another agent") + (
+        "tell the user nothing was changed because the request didn't explicitly ask for "
+        "it. They can ask for it in their own words, e.g. 'archive the newsletters from "
+        "Substack'."
+    )
+    assert ma.mailbox_refusal_text("being", "archived") == head.format("a being tick") + (
+        "say in your answer that nothing in the mailbox was changed because this run wasn't "
+        "asked to change it."
+    )
+    for kind in ("cron", "fd_scheduler", "flow", "flow_tool", "plan", "mcp_task"):
+        r = ma.mailbox_refusal_text(kind, "moved")
+        assert "edit the job" in r and "which emails you would" not in r, kind
+    assert "which emails you would" in ma.mailbox_refusal_text("autonomy_tool", "moved")
+    assert "in their own words" in ma.mailbox_refusal_text("peer_relay", "moved")
+    for kind in ma.AUTOMATION_KINDS:
+        r = ma.mailbox_refusal_text(kind, "moved")
+        assert r.startswith(ma.MAIL_REFUSAL_TAG + " Not moved: ") and ma.is_refusal(r), kind
+        assert "Write one new email" not in r and "send_mail" not in r, kind
+    # the examples it gives do ask to organize — and for nothing else
+    for example in ("archive newsletters from Substack", "premjesti račune u mapu Računi",
+                    "archive the newsletters from Substack"):
+        assert ma.organize_intent(example) is True and ma.intent_scope(example) == "none"
+
+
+def test_mailbox_verbs_by_action():
+    verbs = {
+        "archive": "archived", "move": "moved", "add_labels": "labeled",
+        "remove_labels": "changed", "add_categories": "categorized",
+        "remove_categories": "changed", "create_label": "created", "create_folder": "created",
+    }
+    assert set(verbs) == ma.MAILBOX_CHANGE_ACTIONS
+    with ma.bound(ma.automated("flow", "", "deny")):
+        for action, verb in verbs.items():
+            for tool in ("google_mail", "microsoft_mail"):
+                assert ma.check_mailbox_change(tool, action).startswith(
+                    f"[not-authorized: mail-write] Not {verb}: this turn was started by a flow,"
+                ), (tool, action)
+
+
+def test_narrower_intent_keeps_organizing_never_email():
+    """Agent-made cron jobs and peer relays: organizing needs both texts to
+    ask for it, and the text that grants it never grants email."""
+    user = "every morning archive my newsletters"
+    task = "Archive newsletters in my inbox"
+    assert ma.narrower_intent(task, user) == task
+    assert ma.narrower_intent(user, task) == user
+    # only one asks to organize: nothing
+    assert ma.narrower_intent("Summarize my inbox", user) == ""
+    assert ma.narrower_intent(task, "summarize my inbox") == ""
+    assert ma.narrower_intent(task, "") == ""
+    # one also asks for an email: the one that doesn't
+    mixed = "Every morning archive newsletters and email Ana the list"
+    assert ma.narrower_intent(mixed, user) == user
+    assert ma.narrower_intent(user, mixed) == user
+    for a, b in ((task, user), (mixed, user), (user, mixed)):
+        out = ma.narrower_intent(a, b)
+        assert ma.organize_intent(out) is True and ma.intent_scope(out) == "none"
+    # both ask for an email, only the agent's task to organize: its organize verbs go
+    out = ma.narrower_intent("Every morning archive newsletters and email me a summary",
+                             "email me a summary every morning")
+    assert out == "Every morning [-] newsletters and email me a summary"
+    assert ma.organize_intent(out) is False and ma.intent_scope(out) == "self"
+    out = ma.narrower_intent("Label the emails from Ana as Clients and draft a reply to her",
+                             "draft a reply to Ana")
+    assert ma.organize_intent(out) is False and ma.intent_scope(out) == "any"
+    # both ask for both: kept as it was
+    both = "Every morning archive newsletters and email me a summary"
+    assert ma.narrower_intent(both, "archive the newsletters and email me a summary") == both
+
+
+def test_agent_cron_job_that_organizes():
+    """ "every morning archive my newsletters" → the agent's job "Archive
+    newsletters in my inbox": it may archive when it fires, never email."""
+    payload = {"text": "Archive newsletters in my inbox", "author": "agent",
+               "mail_intent_text": "every morning archive my newsletters"}
+    with ma.bound(ma.automated("cron", ma.cron_job_text(payload))):
+        assert ma.check_mailbox_change("google_mail", "archive") is None
+        assert ma.check_mailbox_change("microsoft_mail", "move") is None
+        assert ma.is_refusal(ma.check_mail_write("google_mail", "create_draft"))
+        assert ma.is_refusal(ma.check_mail_write("send_mail", None, recipients=["me@x.co"]))
+    # a job whose text doesn't ask to organize is refused, whatever the user said
+    for p in (
+        {"text": "Summarize my inbox", "author": "agent",
+         "mail_intent_text": "every morning archive my newsletters"},
+        {"text": "Archive newsletters in my inbox", "author": "agent",
+         "mail_intent_text": "summarize my inbox"},
+        {"text": "Summarize my inbox every morning"},
+    ):
+        with ma.bound(ma.automated("cron", ma.cron_job_text(p))):
+            assert ma.check_mailbox_change("google_mail", "archive") == (
+                ma.mailbox_refusal_text("cron", "archived")), p
+    # a job the user wrote is judged on its own text
+    job = {"text": "Svako jutro arhiviraj newslettere"}
+    with ma.bound(ma.automated("cron", ma.cron_job_text(job))):
+        assert ma.check_mailbox_change("google_mail", "archive") is None
 
 
 def test_module_has_no_flight_deck_import():

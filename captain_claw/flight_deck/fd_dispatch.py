@@ -45,10 +45,13 @@ _JUDGE_SYSTEM = (
 
 # Appended to EVERY autonomy chat turn (nudge / run_prompt / materialize_schedule),
 # auto-fired or approved: Autonomous Work writes email only through an approved
-# mail.draft tool_action, never from inside a chat turn (U1, J5).
+# mail.draft tool_action, never from inside a chat turn (U1, J5) — and doesn't
+# reorganize the mailbox there either (the turn runs under ``deny``, which the
+# agent also applies to archive / move / labels).
 _NO_MAIL_LINE = (
-    " Do not create, update or send any email or email draft in this turn — if a "
-    "reply seems needed, tell the user who is waiting and offer to draft it."
+    " Do not create, update or send any email or email draft in this turn, and do not "
+    "archive, move, label or otherwise reorganize any email — if a reply seems needed, "
+    "tell the user who is waiting and offer to draft it."
 )
 
 # The automation marker every autonomy chat turn carries (part 0 §4). Always

@@ -722,9 +722,14 @@ _MAIL_FROM_LINE_RE = _re.compile(r"(?:\*\*From:\*\*|\bFrom:\s)")
 # Stall nag: an intent-only reply about WRITING an email ("I'll draft the
 # reply to Ana now", "Let me send the email") — whole words, so "responds
 # with a 404", "draft chapter 3" or "check your email" are ordinary stalls.
+# So is organizing mail ("I'll create a label for those emails", "a Gmail
+# folder"): a label / folder / category / tag before or right after the mail
+# word is the thing being made, not an email.
+_STALL_MAIL_PLACE = r"(?:labels?|folders?|categor(?:y|ies)|tags?)\b"
 _STALL_MAIL_RE = _re.compile(
     r"\b(?:draft|drafting|compose|composing|write|writing|send|sending|prepare|preparing"
-    r"|create|creating)\b(?:\W+\w+){0,4}?\W+(?:e-?mails?|mails?|gmail|repl(?:y|ies))\b"
+    r"|create|creating)\b(?:\W+(?!" + _STALL_MAIL_PLACE + r")\w+){0,4}?\W+"
+    r"(?:e-?mails?|mails?|gmail|repl(?:y|ies))\b(?!\W+" + _STALL_MAIL_PLACE + r")"
     r"|\b(?:create|creating|send|sending|save|saving)\b(?:\W+\w+){0,2}?\W+drafts?\b"
     r"|\b(?:reply|replying|respond|responding)\s+to\b(?:\W+\w+){0,4}?\W+(?:e-?mails?|mails?|thread)\b"
     r"|\be-?mail(?:ing)?\s+(?:him|her|them|back)\b"

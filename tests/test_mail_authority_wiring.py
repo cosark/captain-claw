@@ -256,13 +256,58 @@ class TestGoogleMailGuard:
     def test_followup_hint_reply_bullet_only_when_writes_allowed(self):
         from captain_claw.tools import google_mail as gm
 
-        assert gm._followup_hint() == gm._FOLLOWUP_HINT
+        # A human turn may also organize: the archive / label bullet follows.
+        assert gm._followup_hint() == gm._FOLLOWUP_HINT + gm._FOLLOWUP_ORGANIZE
         with ma.bound(ma.automated("cron", "summarize my inbox")):
             assert gm._followup_hint() == gm._FOLLOWUP_HINT_NO_REPLY
         with ma.bound(ma.automated("cron", "email me the summary")):
             assert gm._followup_hint() == gm._FOLLOWUP_HINT_NO_REPLY
         with ma.bound(ma.automated("cron", "draft a reply to Ana")):
             assert gm._followup_hint() == gm._FOLLOWUP_HINT
+        with ma.bound(ma.automated("cron", "archive newsletters in my inbox")):
+            assert gm._followup_hint() == gm._FOLLOWUP_HINT_NO_REPLY + gm._FOLLOWUP_ORGANIZE
+
+    # Organizing (archive / move / labels) is its own class: an automated turn
+    # needs its own text to ask for it; email intent never grants it.
+
+    _ORGANIZE_ROUTES = {
+        ("GET", "/labels"): (200, {"labels": [
+            {"id": "INBOX", "name": "INBOX", "type": "system"},
+            {"id": "UNREAD", "name": "UNREAD", "type": "system"},
+            {"id": "Label_1", "name": "Receipts", "type": "user"},
+        ]}),
+        ("POST", "/threads/t1/modify"): (200, {"id": "t1"}),
+        ("POST", "/labels"): (200, {"id": "Label_2", "name": "Invoices", "type": "user"}),
+    }
+    _ORGANIZE_CALLS = [
+        ("archive", {"thread_ids": ["t1"]}),
+        ("move", {"thread_ids": ["t1"], "label": "Receipts"}),
+        ("add_labels", {"thread_ids": ["t1"], "labels": ["Receipts"]}),
+        ("remove_labels", {"thread_ids": ["t1"], "labels": ["UNREAD"]}),
+        ("create_label", {"label": "Invoices"}),
+    ]
+
+    @pytest.mark.parametrize("action, args", _ORGANIZE_CALLS)
+    @pytest.mark.parametrize("authority, allowed", [
+        (ma.automated("cron", "summarize my inbox"), False),
+        (ma.automated("cron", "draft a reply to bob@x.co"), False),
+        (ma.automated("cron", "archive newsletters in my inbox"), True),
+        (ma.automated("autonomy_tool", "", "deny"), False),
+        (ma.automated("flow_tool", "", mail_write="allow"), True),
+    ])
+    async def test_organize_needs_the_turns_own_words(self, monkeypatch, action, args,
+                                                      authority, allowed):
+        calls = _set_mode(monkeypatch, fd=False, scope=f"{READ} {_G}gmail.modify")
+        gmail = _Gmail(self._ORGANIZE_ROUTES)
+        with ma.bound(authority):
+            res = await _gmail_tool(gmail).execute(action, **args)
+        if allowed:
+            assert res.success, res.error
+            assert calls["get_tokens"] == 1 and any(r.method == "POST" for r in gmail.requests)
+        else:
+            assert not res.success
+            assert res.error.startswith("[not-authorized: mail-write]")
+            assert gmail.requests == [] and calls["get_tokens"] == 0
 
 
 # ── send_mail ────────────────────────────────────────────────────────
@@ -917,6 +962,35 @@ class TestCron:
             res = await tool.execute("create", schedule="daily 09:00", task="Summarize my inbox")
         assert "can't write email" not in res.content
 
+    async def test_cron_tool_notes_for_organize_jobs(self, monkeypatch):
+        """Organize authority without email authority: the email note still
+        shows for an added email ask, and an organize ask the user never made
+        gets its own note."""
+        stored: list = []
+        tool = self._cron_tool(monkeypatch, stored)
+        tool._agent.session = types.SimpleNamespace(id="s1", messages=[
+            {"role": "user", "content": "every morning archive my newsletters", "turn_input": True},
+        ])
+        with ma.bound(ma.human("every morning archive my newsletters")):
+            res = await tool.execute("create", schedule="daily 07:00",
+                                     task="Every morning archive newsletters and email Ana the list")
+        assert res.success, res.error
+        assert "this job can't write email when it runs" in res.content
+        assert "can't archive, label or move email" not in res.content
+        with ma.bound(ma.automated("cron", ma.cron_job_text(stored[0]), "intent")):
+            assert ma.check_mailbox_change("google_mail", "archive") is None
+            assert ma.check_mail_write("google_mail", "create_draft") is not None
+
+        tool._agent.session = types.SimpleNamespace(id="s2", messages=[
+            {"role": "user", "content": "summarize my inbox every morning", "turn_input": True},
+        ])
+        with ma.bound(ma.human("summarize my inbox every morning")):
+            res = await tool.execute("create", schedule="daily 07:00",
+                                     task="Every morning archive the newsletters in my inbox")
+        assert res.success, res.error
+        assert "this job can't archive, label or move email when it runs" in res.content
+        assert "can't write email" not in res.content
+
     async def test_legacy_warning(self, monkeypatch):
         from captain_claw import cron_dispatch
 
@@ -1150,6 +1224,29 @@ class TestStallNag:
         with ma.bound(ma.human(human)):
             instr, force = self._instr(_Loop(), stall)
         assert "Call the appropriate tool now" in instr and force is True
+
+    @pytest.mark.parametrize("stall", ["I will create a label for those emails now.",
+                                       "Let me create a folder for these emails",
+                                       "Let me create the Gmail label 'Receipts' now.",
+                                       "I'll create an email folder called Receipts."])
+    def test_organizing_mail_is_not_an_email_stall(self, stall):
+        from captain_claw.agent_orchestration_mixin import _STALL_MAIL_RE
+
+        assert not _STALL_MAIL_RE.search(stall)
+        with ma.bound(ma.human("make a Receipts label and file the invoices there")):
+            instr, force = self._instr(_Loop(), stall)
+        assert "Call the appropriate tool now" in instr and force is True
+
+    @pytest.mark.parametrize("stall", ["I'll create the draft now…",
+                                       "I'll draft the reply to Ana now.",
+                                       "Let me send the email",
+                                       "I'll create the email to Ana now.",
+                                       "I'll draft a reply and label the emails",
+                                       "I'll create the email label, then send the email to Bob."])
+    def test_email_stalls_next_to_organizing_still_match(self, stall):
+        from captain_claw.agent_orchestration_mixin import _STALL_MAIL_RE
+
+        assert _STALL_MAIL_RE.search(stall)
 
     @pytest.mark.parametrize("stall", ["Let me draft chapter 3 now.",
                                        "I'll write the draft of section 2 to the file.",
