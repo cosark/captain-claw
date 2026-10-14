@@ -53,12 +53,15 @@ export interface GmailSendPolicy {
   // Exact addresses, or whole domains written '@b.c'. Empty = anyone.
   allowed_recipients: string[]
   daily_limit: number
+  // The agentic signature: plain text the agents add to the end of every
+  // email and draft (drafts too — sending needn't be on). '' = none.
+  signature: string
   // The deck's FD_GMAIL_SEND=off: no agent sends, whatever the policy says.
   deck_disabled: boolean
   sent_last_24h: number
 }
 
-export type GmailSendPatch = Partial<Pick<GmailSendPolicy, 'enabled' | 'allowed_recipients' | 'daily_limit'>>
+export type GmailSendPatch = Partial<Pick<GmailSendPolicy, 'enabled' | 'allowed_recipients' | 'daily_limit' | 'signature'>>
 
 // While the deck switch is off, the opt-in box refuses only turning sending
 // ON (it would do nothing). A user who opted in can still opt out, or their

@@ -13,6 +13,12 @@ and a Google disconnect leaves it in place):
   ``@domain`` entries (see :mod:`captain_claw.gmail_compose`);
 * ``daily_limit`` — emails per rolling 24 hours (default 50, 1..500).
 
+The same routes carry the user's agentic signature (``signature``; stored
+apart, under :data:`mail_signature.GOOGLE_KEY`): plain text Flight Deck adds
+to the end of every send it composes here, and the agent's google_mail adds
+to every draft (it reads the signature from ``/agent_status``). Sending
+doesn't need to be on for it — drafts get it too.
+
 The deck kill switch ``FD_GMAIL_SEND=off`` (also ``0`` / ``false`` / ``no``)
 refuses every send regardless. A composed send that repeats an email already in
 the user's Drafts or Sent (recipient + subject; ``FD_GMAIL_REPEAT_CHECK_DAYS``,
@@ -54,7 +60,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-from captain_claw import gmail_compose, mail_attachments
+from captain_claw import gmail_compose, mail_attachments, mail_signature
 from captain_claw.flight_deck import google_oauth_routes as _google
 from captain_claw.flight_deck import speaker_grants, tenant_profile
 from captain_claw.flight_deck.auth import get_current_user, get_db
@@ -183,6 +189,7 @@ async def _policy_view(db: FlightDeckDB, user_id: str, policy: dict[str, Any]) -
         "enabled": bool(policy["enabled"]),
         "allowed_recipients": list(policy["allowed_recipients"]),
         "daily_limit": int(policy["daily_limit"]),
+        "signature": await mail_signature.load(db, user_id, mail_signature.GOOGLE_KEY),
         "deck_disabled": deck_send_disabled(),
         "sent_last_24h": await _sent_last_24h(db, user_id),
     }
@@ -194,6 +201,7 @@ class GmailSendPolicyUpdate(BaseModel):
     enabled: Any = None
     allowed_recipients: Any = None
     daily_limit: Any = None
+    signature: Any = None  # "" clears it
 
 
 # ── user routes: the signed-in user's own policy + history ──────────
@@ -243,11 +251,20 @@ async def gmail_send_policy_put(
                 ),
             )
         updates["allowed_recipients"] = allowed
+    stored: dict[str, str] = {}
+    if body.signature is not None:
+        try:
+            stored[mail_signature.GOOGLE_KEY] = mail_signature.normalize(body.signature)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     async with _lock(_policy_locks, uid):
         policy = await load_gmail_send_policy(db, uid)
-        policy.update(updates)
-        await db.set_settings(uid, {_K_GMAIL_SEND: json.dumps(policy, ensure_ascii=True)})
+        if updates:
+            policy.update(updates)
+            stored[_K_GMAIL_SEND] = json.dumps(policy, ensure_ascii=True)
+        if stored:
+            await db.set_settings(uid, stored)
     return await _policy_view(db, uid, policy)
 
 
@@ -663,6 +680,12 @@ async def gmail_send(request: Request) -> dict[str, Any]:
                     detail="A send needs a subject and a body (body or html_body). Nothing was sent.",
                 )
             _check_recipients(to, cc, bcc, policy["allowed_recipients"])
+            # The sender's agentic signature goes at the end (once — a body
+            # that already ends with it is left alone).
+            body, html_body = mail_signature.apply(
+                body, html_body,
+                await mail_signature.load(db, owner, mail_signature.GOOGLE_KEY),
+            )
             try:
                 # Put exactly the checked addresses on the wire.
                 to, cc, bcc = (gmail_compose.format_recipients(f) for f in (to, cc, bcc))

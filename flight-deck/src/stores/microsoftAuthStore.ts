@@ -52,6 +52,10 @@ interface MicrosoftAuthStore {
   loading: boolean
   error: string | null
   lastPopupMessage: string | null
+  // The agentic signature (GET/PUT /fd/microsoft/mail-signature): plain text
+  // the agents add to the end of every Outlook draft. null = not loaded yet.
+  signature: string | null
+  signatureError: string | null
 
   refresh: () => Promise<void>
   syncStatus: () => Promise<void>
@@ -65,6 +69,8 @@ interface MicrosoftAuthStore {
   connect: () => Promise<void>
   disconnect: () => Promise<void>
   startMessageListener: () => () => void
+  fetchSignature: () => Promise<void>
+  saveSignature: (signature: string) => Promise<boolean>
 }
 
 const emptyStatus: MicrosoftAuthStatus = {
@@ -191,6 +197,8 @@ export const useMicrosoftAuthStore = create<MicrosoftAuthStore>((set, get) => ({
   loading: false,
   error: null,
   lastPopupMessage: null,
+  signature: null,
+  signatureError: null,
 
   refresh: async () => {
     if (useAuthStore.getState().authEnabled === false) {
@@ -296,6 +304,31 @@ export const useMicrosoftAuthStore = create<MicrosoftAuthStore>((set, get) => ({
     }
   },
 
+  fetchSignature: async () => {
+    set({ signatureError: null })
+    try {
+      const data = await fetchJson('/fd/microsoft/mail-signature')
+      set({ signature: typeof data?.signature === 'string' ? data.signature : '' })
+    } catch (exc) {
+      set({ signatureError: _errorText(exc) })
+    }
+  },
+
+  saveSignature: async (signature) => {
+    set({ signatureError: null })
+    try {
+      const data = await fetchJson('/fd/microsoft/mail-signature', {
+        method: 'PUT',
+        body: JSON.stringify({ signature }),
+      })
+      set({ signature: typeof data?.signature === 'string' ? data.signature : '' })
+      return true
+    } catch (exc) {
+      set({ signatureError: _errorText(exc) })
+      return false
+    }
+  },
+
   startMessageListener: () => {
     const handler = (event: MessageEvent) => {
       if (event.origin !== window.location.origin) return
@@ -321,5 +354,7 @@ export const useMicrosoftAuthStore = create<MicrosoftAuthStore>((set, get) => ({
 }))
 
 registerSignOutTeardown(() => {
-  useMicrosoftAuthStore.setState({ status: null, config: null, lastPopupMessage: null, error: null })
+  useMicrosoftAuthStore.setState({
+    status: null, config: null, lastPopupMessage: null, error: null, signature: null, signatureError: null,
+  })
 })

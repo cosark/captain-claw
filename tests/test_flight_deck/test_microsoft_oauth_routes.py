@@ -287,3 +287,35 @@ class TestAuthDisabledDeck:
         r = c.get("/fd/microsoft/access_token", headers={"X-Agent-Auth": "tok-bob"})
         assert r.status_code == 403 and r.headers["X-FD-Microsoft-Unavailable"] == "auth-disabled"
         assert c.get("/fd/microsoft/status").status_code == 503
+
+
+class TestMailSignature:
+    async def test_per_user_and_server_owned(self, db):
+        from captain_claw import mail_signature
+        from captain_claw.flight_deck.settings_routes import _server_owned
+
+        c = _client()
+        assert c.get("/fd/microsoft/mail-signature").status_code == 401
+        assert c.get("/fd/microsoft/mail-signature", headers=_bearer(BOB)).json() == {"signature": ""}
+        r = c.put("/fd/microsoft/mail-signature", headers=_bearer(BOB),
+                  json={"signature": " Bob's agent \r\n"})
+        assert r.status_code == 200 and r.json() == {"signature": "Bob's agent"}
+        assert c.get("/fd/microsoft/mail-signature", headers=_bearer(BOB)).json() == \
+            {"signature": "Bob's agent"}
+        assert c.get("/fd/microsoft/mail-signature", headers=_bearer(ALICE)).json() == {"signature": ""}
+        assert c.put("/fd/microsoft/mail-signature", headers=_bearer(BOB),
+                     json={"signature": ""}).json() == {"signature": ""}
+        assert _server_owned(mail_signature.MICROSOFT_KEY)
+
+    @pytest.mark.parametrize("value", [7, {"a": 1}, "x" * 1001])
+    async def test_bad_values_are_a_400(self, db, value):
+        r = _client().put("/fd/microsoft/mail-signature", headers=_bearer(BOB), json={"signature": value})
+        assert r.status_code == 400 and "signature" in r.json()["detail"]
+
+    async def test_agent_status_carries_the_owners_only_when_set(self, db, agents):
+        c = _client()
+        c.put("/fd/microsoft/mail-signature", headers=_bearer(BOB), json={"signature": "Bob's agent"})
+        assert c.get("/fd/microsoft/agent_status", headers={"X-Agent-Auth": "tok-bob"}).json() == \
+            {"connected": False, "enabled": True, "mail_signature": "Bob's agent"}
+        assert "mail_signature" not in c.get(
+            "/fd/microsoft/agent_status", headers={"X-Agent-Auth": "tok-alice"}).json()

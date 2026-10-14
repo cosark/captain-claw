@@ -42,6 +42,11 @@ anything is created or sent. A message with files goes through Gmail's upload
 endpoint (:func:`gmail_compose.start_upload`); update_draft keeps the draft's
 own files (``remove_attachments`` drops some).
 
+Agentic signature: under Flight Deck, create_draft and update_draft (with a
+new body) add the user's signature (Connections → Google; Flight Deck's
+agent_status ``mail_signature``) to the end of the text — see
+:mod:`captain_claw.mail_signature`; Flight Deck adds it to a composed send.
+
 Organizing changes labels only — nothing is written, sent or deleted, and
 there are still no trash / spam / delete actions. archive removes INBOX; move
 adds a destination label and removes INBOX (other labels stay); add_labels /
@@ -70,7 +75,7 @@ from urllib.parse import quote
 
 import httpx
 
-from captain_claw import gmail_compose, mail_attachments, mail_authority
+from captain_claw import gmail_compose, mail_attachments, mail_authority, mail_signature
 from captain_claw.config import get_config
 from captain_claw.logging import get_logger
 from captain_claw.tools.registry import Tool, ToolResult
@@ -332,6 +337,8 @@ class GoogleMailTool(Tool):
         "numbers, or 'all'] drops some; with only file changes the body can be left out. "
         "send_draft sends the draft as it is — add files with update_draft first. A file is "
         "attached only when the tool's answer lists it under 'Attachments:'. "
+        "SIGNATURE: the user's agentic signature (set in Flight Deck) is added to the end of "
+        "every draft and send automatically — never write it into the body yourself. "
         "ORGANIZE ONLY WHEN ASKED: archive / move / labels / create_label only when the user "
         "asked to organize those emails (or a scheduled job's own text says so). Reading, "
         "summarizing or triaging mail never implies it — suggest it instead. Find the emails "
@@ -2137,6 +2144,9 @@ class GoogleMailTool(Tool):
             if problem:
                 return ToolResult(success=False, error=problem)
 
+        signature = await self._draft_signature()
+        body, html_body = mail_signature.apply(body, html_body, signature or "")
+
         if atts:
             message = gmail_compose.build_message_bytes(
                 to=to, cc=cc, bcc=bcc, subject=subject,
@@ -2177,6 +2187,7 @@ class GoogleMailTool(Tool):
                 f"  Draft ID: {data.get('id', '?')}\n"
                 f"  Message ID: {data.get('message', {}).get('id', '?')}"
                 + self._attachments_line(atts)
+                + self._signature_line(signature)
             ),
         )
 
@@ -2298,8 +2309,12 @@ class GoogleMailTool(Tool):
         if problem:
             return ToolResult(success=False, error=problem)
         dropped_inline = 0
+        signature: str | None = ""
         if has_body:
-            # New text: a fresh message, the draft's files carried over as they are.
+            # New text: the signature at its end, then a fresh message with
+            # the draft's files carried over as they are.
+            signature = await self._draft_signature()
+            body, html_body = mail_signature.apply(body, html_body, signature or "")
             message = mail_attachments.parse_message(gmail_compose.build_message_bytes(
                 to=to, cc=cc, bcc=bcc, subject=subject,
                 body=body, html_body=html_body,
@@ -2367,6 +2382,7 @@ class GoogleMailTool(Tool):
                 f"  To: {to or '(no recipient)'}\n"
                 f"  Subject: {subject or '(no subject)'}"
                 + files_line
+                + self._signature_line(signature)
             ),
         )
 
@@ -2807,20 +2823,57 @@ class GoogleMailTool(Tool):
         return ToolResult(success=True, content=summary)
 
     @staticmethod
-    async def _fd_takes_attachments(mgr: Any, headers: dict[str, str], params: dict[str, str]) -> bool:
-        """Does this Flight Deck's send route take files? (Its agent_status
-        says so; an older deck — or no answer — counts as no.)"""
+    async def _fd_agent_status(base: str, headers: dict[str, str], params: dict[str, str]) -> dict[str, Any] | None:
+        """Flight Deck's ``/fd/google/agent_status`` answer for this agent —
+        None when there is none to read."""
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.get(
-                    f"{mgr._flight_deck_base()}/fd/google/agent_status",
-                    headers=headers, params=params,
+                    f"{base}/fd/google/agent_status", headers=headers, params=params,
                 )
-            data = resp.json() if resp.status_code == 200 else {}
-        except Exception as exc:  # noqa: BLE001 — unknown counts as no
-            log.info("Flight Deck capability check failed", error=str(exc))
-            return False
-        return isinstance(data, dict) and data.get("gmail_send_attachments") is True
+            data = resp.json() if resp.status_code == 200 else None
+        except Exception as exc:  # noqa: BLE001 — the callers treat it as unknown
+            log.info("Flight Deck agent_status failed", error=str(exc))
+            return None
+        return data if isinstance(data, dict) else None
+
+    @classmethod
+    async def _fd_takes_attachments(cls, mgr: Any, headers: dict[str, str], params: dict[str, str]) -> bool:
+        """Does this Flight Deck's send route take files? (Its agent_status
+        says so; an older deck — or no answer — counts as no.)"""
+        data = await cls._fd_agent_status(mgr._flight_deck_base(), headers, params)
+        return bool(data) and data.get("gmail_send_attachments") is True
+
+    @classmethod
+    async def _draft_signature(cls) -> str | None:
+        """The agentic signature a draft ends with: Flight Deck's
+        agent_status ``mail_signature`` — the user's, or a shared-agent
+        member's own on their turn ("" = none; always "" outside Flight
+        Deck). None when Flight Deck couldn't say — the draft is made
+        without it and the answer says so."""
+        from captain_claw import speaker as _speaker
+        from captain_claw.google_oauth_manager import GoogleOAuthManager
+
+        base = GoogleOAuthManager._flight_deck_base()
+        if not base:
+            return ""
+        try:
+            headers = GoogleOAuthManager._flight_deck_headers()
+            params = _speaker.grant_params()
+        except _speaker.SpeakerGrantMissing:
+            return None
+        data = await cls._fd_agent_status(base, headers, params)
+        if data is None:
+            return None
+        value = data.get("mail_signature")
+        return value if isinstance(value, str) else ""
+
+    @staticmethod
+    def _signature_line(signature: str | None) -> str:
+        if signature is None:
+            return ("\n  Signature: NOT added — Flight Deck didn't answer; tell the user the "
+                    "draft is without their agentic signature.")
+        return "\n  Signature: added at the end" if signature else ""
 
     # ------------------------------------------------------------------
     # Raw RFC-822 message builder

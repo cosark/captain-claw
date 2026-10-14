@@ -15,6 +15,9 @@ Microsoft connection (:mod:`captain_claw.microsoft_oauth_manager`):
   mail; the user reviews the draft and sends it from Outlook. (Gmail sends go
   through Flight Deck's per-user policy, audit and limits; Outlook has no such
   gate yet, so no send action exists.)
+* Every draft create_draft writes, and update_draft's new body, ends with
+  the owner's agentic signature (Connections → Microsoft — see
+  :mod:`captain_claw.mail_signature`).
 * Mail writes in automated turns go through :mod:`captain_claw.mail_authority`
   exactly like google_mail's, and create_draft refuses a repeat (same
   recipient + subject already in Drafts, or in Sent Items within
@@ -49,7 +52,7 @@ from urllib.parse import quote
 
 import httpx
 
-from captain_claw import gmail_compose, mail_attachments, mail_authority
+from captain_claw import gmail_compose, mail_attachments, mail_authority, mail_signature
 from captain_claw.config import get_config
 from captain_claw.logging import get_logger
 from captain_claw.microsoft_graph import (
@@ -309,6 +312,8 @@ class MicrosoftMailTool(Tool):
         "same-named file replaces the old one); remove_attachments=[names or numbers, or 'all'] "
         "drops some; with only file changes the body can be left out. A file is attached only when "
         "the tool's answer lists it under 'Attachments:'. "
+        "SIGNATURE: the user's agentic signature (set in Flight Deck) is added to the end of "
+        "every draft automatically — never write it into the body yourself. "
         "ORGANIZE ONLY WHEN ASKED: archive / move / categories / create_folder only when the user "
         "asked to organize those emails (or a scheduled job's own text says so). Reading, "
         "summarizing or triaging mail never implies it — suggest it instead. Find the emails "
@@ -1202,6 +1207,8 @@ class MicrosoftMailTool(Tool):
             )
             if problem:
                 return ToolResult(success=False, error=problem)
+        signature = await self._signature()
+        body, html_body = mail_signature.apply(body, html_body, signature or "")
         message: dict[str, Any] = {
             "subject": subject,
             "body": ({"contentType": "html", "content": html_body} if html_body
@@ -1217,7 +1224,7 @@ class MicrosoftMailTool(Tool):
         draft = resp.json()
         return ToolResult(success=True, content=await self._saved_with_files(
             token, draft, "Draft created", atts,
-        ))
+        ) + self._signature_line(signature))
 
     async def _reply_draft(
         self, token: str, original_id: str, *, to: str, cc: str, bcc: str, subject: str,
@@ -1256,15 +1263,34 @@ class MicrosoftMailTool(Tool):
         if subject:
             message["subject"] = subject
         verb = "createReplyAll" if reply_all else "createReply"
+        # The reply's own text (Outlook quotes the original below it) ends
+        # with the signature.
+        signature = await self._signature()
+        comment = mail_signature.apply(body or "", "", signature or "")[0]
         resp = await self._client.post(
             f"{GRAPH_API}/me/messages/{_seg(original_id)}/{verb}",
-            json={"comment": body or "", "message": message}, headers=self._headers(token),
+            json={"comment": comment, "message": message}, headers=self._headers(token),
         )
         resp.raise_for_status()
         return ToolResult(success=True, content=await self._saved_with_files(
             token, resp.json(), f"Reply draft created in conversation {orig.get('conversationId')}",
             list(atts or []),
-        ))
+        ) + self._signature_line(signature))
+
+    @staticmethod
+    async def _signature() -> str | None:
+        """The owner's agentic signature for a draft ("" = none; None when
+        Flight Deck couldn't say — the draft is made without it)."""
+        from captain_claw.microsoft_oauth_manager import MicrosoftOAuthManager
+
+        return await MicrosoftOAuthManager().mail_signature()
+
+    @staticmethod
+    def _signature_line(signature: str | None) -> str:
+        if signature is None:
+            return ("\n  Signature: NOT added — Flight Deck didn't answer; tell the user the "
+                    "draft is without their agentic signature.")
+        return "\n  Signature: added at the end" if signature else ""
 
     @staticmethod
     def _draft_saved(d: dict[str, Any], lead: str) -> str:
@@ -1322,7 +1348,10 @@ class MicrosoftMailTool(Tool):
             return ToolResult(success=False, error=problem)
 
         patch: dict[str, Any] = {}
+        signature: str | None = ""
         if has_body:
+            signature = await self._signature()
+            body, html_body = mail_signature.apply(body, html_body, signature or "")
             patch["body"] = ({"contentType": "html", "content": html_body} if html_body
                              else {"contentType": "text", "content": body})
         if subject:
@@ -1343,7 +1372,7 @@ class MicrosoftMailTool(Tool):
         if not new_atts and not remove:
             return ToolResult(success=True, content=self._draft_saved(
                 draft, "Draft updated (same draft — no new one was created)",
-            ))
+            ) + self._signature_line(signature))
 
         failed = await self._attach_all(token, draft_id, new_atts)
         failed_names = {a.filename.casefold() for a, _why in failed}
@@ -1373,7 +1402,7 @@ class MicrosoftMailTool(Tool):
         lines += self._failure_lines(draft_id, failed)
         if not_removed:
             lines.append(f"  NOT removed (still on the draft): {', '.join(not_removed)}")
-        return ToolResult(success=True, content="\n".join(lines))
+        return ToolResult(success=True, content="\n".join(lines) + self._signature_line(signature))
 
     @staticmethod
     def _removal_ids(existing: list[dict[str, Any]], remove: list[str]) -> tuple[set[str], str]:

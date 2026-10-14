@@ -15,6 +15,7 @@ import {
 } from 'lucide-react'
 import { useMicrosoftAuthStore } from '../../stores/microsoftAuthStore'
 import { useAuthStore } from '../../stores/authStore'
+import { AgenticSignatureField, normalizeSignature } from './AgenticSignatureField'
 
 // The Microsoft twin of GoogleConnection: one app registration per deck
 // (admin-managed — POST /fd/microsoft/config is require_admin), one Microsoft
@@ -314,6 +315,10 @@ export default function MicrosoftConnection() {
           </div>
         )}
 
+        {/* The signed-in user's own setting, so it shows for non-admins and
+            in the kiosk Connections dialog too. */}
+        {connected && <OutlookSignatureSection />}
+
         {canManageClient && (
         <div className="space-y-3 rounded-md border border-zinc-800 bg-zinc-950/50 p-3">
           <div className="text-xs text-zinc-500">
@@ -456,6 +461,74 @@ export default function MicrosoftConnection() {
         </div>
         )}
       </div>
+      )}
+    </div>
+  )
+}
+
+// The user's agentic signature for Outlook drafts (GET/PUT
+// /fd/microsoft/mail-signature) — the Google twin lives in the Email sending
+// section, under the recipients list.
+function OutlookSignatureSection() {
+  const saved = useMicrosoftAuthStore((s) => s.signature)
+  const error = useMicrosoftAuthStore((s) => s.signatureError)
+  const fetchSignature = useMicrosoftAuthStore((s) => s.fetchSignature)
+  const saveSignature = useMicrosoftAuthStore((s) => s.saveSignature)
+
+  const [text, setText] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    fetchSignature()
+  }, [fetchSignature])
+
+  // Re-seed the box when the saved value changes (load, save) — done while
+  // rendering, so it never paints a frame empty.
+  const [seeded, setSeeded] = useState<string | null>(null)
+  if (saved !== null && saved !== seeded) {
+    setSeeded(saved)
+    setText(saved)
+  }
+
+  const signature = normalizeSignature(text)
+  const dirty = saved !== null && signature !== saved
+
+  const handleSave = async () => {
+    if (!dirty || saving) return
+    setSaving(true)
+    await saveSignature(signature)
+    setSaving(false)
+  }
+
+  return (
+    <div className="space-y-3 rounded-md border border-zinc-800 bg-zinc-950/50 p-3">
+      {error && (
+        <div className="flex items-start gap-2 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-500">
+          <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+          <span className="break-words">{error}</span>
+        </div>
+      )}
+      {saved === null ? (
+        !error && (
+          <div className="flex items-center gap-2 text-xs text-zinc-500">
+            <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…
+          </div>
+        )
+      ) : (
+        <>
+          <AgenticSignatureField value={text} onChange={setText} disabled={saving} writes="draft" />
+          <div className="flex items-center gap-2 flex-wrap">
+            <button
+              onClick={handleSave}
+              disabled={!dirty || saving}
+              className="inline-flex items-center gap-2 rounded-md bg-violet-600 hover:bg-violet-500 px-3 py-1.5 text-sm text-white disabled:opacity-50 shadow-sm"
+            >
+              {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+              Save
+            </button>
+            {dirty && !saving && <span className="text-xs text-zinc-500">Unsaved changes</span>}
+          </div>
+        </>
       )}
     </div>
   )
