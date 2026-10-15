@@ -1,0 +1,172 @@
+#include "portal.h"
+
+#include <DNSServer.h>
+#include <M5Unified.h>
+#include <WebServer.h>
+#include <WiFi.h>
+
+#include "settings.h"
+#include "ui.h"
+
+static WebServer server(80);
+static DNSServer dns;
+static String scanOptions;
+
+static String esc(const String& s) {
+  String o;
+  o.reserve(s.length() + 8);
+  for (char c : s) {
+    switch (c) {
+      case '&': o += "&amp;"; break;
+      case '<': o += "&lt;"; break;
+      case '>': o += "&gt;"; break;
+      case '"': o += "&quot;"; break;
+      default: o += c;
+    }
+  }
+  return o;
+}
+
+static void scanNetworks() {
+  int n = WiFi.scanNetworks(false, false);
+  scanOptions = "";
+  for (int i = 0; i < n; ++i) {
+    String ssid = WiFi.SSID(i);
+    if (ssid.isEmpty() || scanOptions.indexOf("value=\"" + esc(ssid) + "\"") >= 0) continue;
+    scanOptions += "<option value=\"" + esc(ssid) + "\">" + esc(ssid) + " (" + String(WiFi.RSSI(i)) +
+                   " dBm)</option>";
+  }
+  WiFi.scanDelete();
+}
+
+static const char kStyle[] PROGMEM = R"(
+<meta name=viewport content="width=device-width,initial-scale=1">
+<style>body{font-family:-apple-system,system-ui,sans-serif;max-width:480px;margin:0 auto;padding:16px;
+background:#111;color:#eee}h1{font-size:20px}h2{font-size:15px;margin-top:22px;color:#9cf}
+label{display:block;margin:10px 0 4px;font-size:13px;color:#aaa}input,select{width:100%;box-sizing:border-box;
+padding:10px;border-radius:8px;border:1px solid #444;background:#222;color:#eee;font-size:15px}
+button{margin-top:18px;width:100%;padding:12px;border:0;border-radius:8px;background:#3a7bd5;color:#fff;
+font-size:16px}.net{display:flex;justify-content:space-between;align-items:center;padding:6px 0;
+border-bottom:1px solid #333}.net label{margin:0;color:#eee;font-size:14px}.net input{width:auto}
+small{color:#888}</style>)";
+
+static void handleRoot() {
+  String h;
+  h.reserve(6000);
+  h += F("<!doctype html><html><head><meta charset=utf-8><title>Claw StickS3 setup</title>");
+  h += FPSTR(kStyle);
+  h += F("</head><body><h1>Captain Claw &middot; StickS3</h1><form method=post action=/save>");
+
+  h += F("<h2>Wi-Fi networks</h2>");
+  if (settings.netCount == 0) h += F("<small>None saved yet.</small>");
+  for (int i = 0; i < settings.netCount; ++i) {
+    h += "<div class=net><label>" + esc(settings.nets[i].ssid) +
+         "</label><label><input type=checkbox name=del" + String(i) + "> remove</label></div>";
+  }
+  h += F("<label>Add a network</label><select name=pick><option value=''>&mdash; pick a scanned network &mdash;</option>");
+  h += scanOptions;
+  h += F("</select><label>&hellip;or type its name</label><input name=ssid autocapitalize=none>"
+         "<label>Password</label><input name=pass type=password autocomplete=off>");
+
+  h += F("<h2>Flight Deck</h2><label>Address</label><input name=server placeholder='ws://192.168.1.10:25080' value=\"");
+  h += esc(settings.server);
+  h += F("\" autocapitalize=none><small>ws://host:port on your network, or wss://your.domain</small>"
+         "<label>Access token</label><input name=token autocomplete=off autocapitalize=none placeholder='");
+  h += settings.token.length() ? F("saved &mdash; leave blank to keep") : F("cc_pat_&hellip;");
+  h += F("'><small>Flight Deck &rarr; Connections &rarr; Agent access for Claude (MCP) &rarr; Generate token</small>"
+         "<label>Agent (optional)</label><input name=agent autocapitalize=none value=\"");
+  h += esc(settings.agent);
+  h += F("\" placeholder='first running agent'>");
+
+  h += F("<h2>Voice</h2><label>Spoken reply language</label><input name=lang autocapitalize=none value=\"");
+  h += esc(settings.lang);
+  h += F("\" placeholder='server default, e.g. en or hr'><label>Read replies aloud</label><select name=speak>");
+  h += settings.speak ? F("<option value=1 selected>Yes</option><option value=0>No</option>")
+                      : F("<option value=1>Yes</option><option value=0 selected>No</option>");
+  h += F("</select><label>Volume (0&ndash;190)</label><input name=vol type=number min=0 max=190 value=");
+  h += String(settings.volume);
+  h += F("><label>Sleep after idle minutes (0 = never)</label><input name=sleep type=number min=0 max=240 value=");
+  h += String(settings.sleepMin);
+  h += F("><button type=submit>Save &amp; restart</button></form><p><small>Device ");
+  h += deviceId();
+  h += F("</small></p></body></html>");
+  server.send(200, "text/html; charset=utf-8", h);
+}
+
+static void handleSave() {
+  for (int i = settings.netCount - 1; i >= 0; --i) {
+    if (server.hasArg("del" + String(i))) settings.removeNetwork(i);
+  }
+  String ssid = server.arg("ssid");
+  ssid.trim();
+  if (ssid.isEmpty()) ssid = server.arg("pick");
+  if (ssid.length()) settings.addNetwork(ssid, server.arg("pass"));
+
+  String srv = server.arg("server");
+  srv.trim();
+  while (srv.endsWith("/")) srv.remove(srv.length() - 1);
+  if (srv.length() && !srv.startsWith("ws://") && !srv.startsWith("wss://")) {
+    srv = (srv.startsWith("https://") ? "wss://" + srv.substring(8)
+           : srv.startsWith("http://") ? "ws://" + srv.substring(7)
+                                       : "ws://" + srv);
+  }
+  settings.server = srv;
+  String tok = server.arg("token");
+  tok.trim();
+  if (tok.length()) settings.token = tok;
+  settings.agent = server.arg("agent");
+  settings.agent.trim();
+  settings.lang = server.arg("lang");
+  settings.lang.trim();
+  settings.speak = server.arg("speak") != "0";
+  settings.volume = constrain(server.arg("vol").toInt(), 0, 190);
+  settings.sleepMin = constrain(server.arg("sleep").toInt(), 0, 240);
+  settings.save();
+
+  server.send(200, "text/html; charset=utf-8",
+              F("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+                "<body style='font-family:system-ui;background:#111;color:#eee;padding:24px'>"
+                "<h2>Saved.</h2><p>The stick restarts and connects now. You can close this page.</p>"));
+  delay(800);
+  ESP.restart();
+}
+
+static void handleCaptive() {
+  server.sendHeader("Location", "http://192.168.4.1/", true);
+  server.send(302, "text/plain", "");
+}
+
+void runSetupPortal(const char* reason) {
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_AP_STA);
+  scanNetworks();
+  String id = deviceId();
+  String ap = "Claw-StickS3-" + id.substring(id.length() - 4);
+  WiFi.softAP(ap.c_str());
+  delay(200);
+  dns.start(53, "*", WiFi.softAPIP());
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/rescan", HTTP_GET, [] {
+    scanNetworks();
+    handleCaptive();
+  });
+  server.onNotFound(handleCaptive);  // phones' captive-portal probes land on the form
+  server.begin();
+
+  Serial.printf("[claw] setup portal: %s — join %s, open http://192.168.4.1\n", reason, ap.c_str());
+  ui::showSetup(reason, ap.c_str(), "192.168.4.1");
+  uint32_t lastLog = 0;
+  for (;;) {
+    if (millis() - lastLog > 10000) {  // for a serial monitor attached later
+      lastLog = millis();
+      Serial.printf("[claw] setup portal open: join %s, open http://192.168.4.1 (%d client(s))\n",
+                    ap.c_str(), WiFi.softAPgetStationNum());
+    }
+    dns.processNextRequest();
+    server.handleClient();
+    M5.update();
+    delay(2);
+  }
+}

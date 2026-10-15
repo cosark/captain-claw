@@ -41,7 +41,7 @@ _BACKGROUND_NOTES_LEAD = (
 )
 _STANDALONE_NOTES_LEAD = "background context; reference only, do not repeat or quote it in your reply"
 # Chat surfaces whose formatting rules ride on their turns.
-_RULED_SURFACES = frozenset({"glasses", "whatsapp", "messenger"})
+_RULED_SURFACES = frozenset({"glasses", "whatsapp", "messenger", "device"})
 # "[Flight Deck] Agent '<name>' has <event> the fleet …" (anywhere in a notice).
 _FLEET_NOTICE_RE = re.compile(
     r"\[Flight Deck\] Agent '(?P<name>[^']*)' has (?P<event>\w+) the fleet"
@@ -4374,6 +4374,11 @@ class AgentContextMixin:
         if self._turn_channel() not in _RULED_SURFACES or not self.session:
             return ""
         metadata = self.session.metadata if isinstance(self.session.metadata, dict) else {}
+        by_surface = metadata.get("surface_rules_by")
+        if isinstance(by_surface, dict):
+            own = by_surface.get(self._turn_channel())
+            if isinstance(own, dict) and str(own.get("text", "") or "").strip():
+                return str(own["text"]).strip()
         stored = metadata.get("surface_rules")
         if isinstance(stored, dict) and str(stored.get("text", "") or "").strip():
             return str(stored["text"]).strip()

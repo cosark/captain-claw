@@ -216,6 +216,26 @@ async def test_a_surface_block_is_taken_out_of_the_turn_on_arrival():
     assert agent.session.metadata["surface_rules"]["text"].startswith("Keep replies to 1–3")
 
 
+def test_each_surface_keeps_its_own_rules():
+    agent = _agent()
+    whatsapp_block = _SURFACE.replace("Keep replies to 1–3", "WhatsApp: keep replies to 1–3")
+    device_block = _SURFACE.replace("Keep replies to 1–3", "Device: speak in 1–3")
+    agent._absorb_surface_block(whatsapp_block + "hi", surface="whatsapp")
+    agent._absorb_surface_block(device_block + "hello", surface="device")
+    agent.session.add_message("user", "what's this", origin="human")
+    turn_start = len(agent.session.messages) - 1
+
+    agent._turn_origin = ("human", "", "whatsapp")
+    wa = agent._build_messages(tool_messages_from_index=turn_start, query="what's this")
+    assert "WhatsApp: keep replies" in wa[-1].content
+    assert "Device: speak" not in wa[-1].content
+
+    agent._turn_origin = ("human", "", "device")
+    agent._turn_context_notes = None
+    dev = agent._build_messages(tool_messages_from_index=turn_start, query="what's this")
+    assert "Device: speak" in dev[-1].content
+
+
 def test_a_person_writing_like_a_corrective_stays_in_history():
     text = "You said you delegated the hotel search to Marko - did he reply? Also check Ryanair."
     assert msg_origin.resolve_turn_origin(text) == ("human", "")

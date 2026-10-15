@@ -160,6 +160,39 @@ def _reply_waid(whatsapp_waid: str | None, origin: dict | None,
     return str(media_to or "").lstrip("+").strip()
 
 
+# What a handheld device (surface "device") can show or play: pictures and
+# audio — no documents.
+_DEVICE_IMAGE_EXT = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"})
+_DEVICE_AUDIO_EXT = frozenset({".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac"})
+
+
+async def _send_device_media(
+    send: Any, agent: Any, turn_start_idx: int, reply: str, started_at: float,
+) -> None:
+    """After a turn that came from a handheld device: name the pictures and
+    audio it made, so Flight Deck fetches them (``/api/media``) and shows or
+    plays them there. Never raises."""
+    from captain_claw.tools.whatsapp_send_file import collect_turn_media
+
+    try:
+        paths = await collect_turn_media(
+            agent, turn_start_idx, reply, started_at,
+            nameable=set(_DEVICE_IMAGE_EXT | _DEVICE_AUDIO_EXT))
+        items = []
+        for path in paths:
+            ext = path.suffix.lower()
+            kind = "image" if ext in _DEVICE_IMAGE_EXT else "audio" if ext in _DEVICE_AUDIO_EXT else ""
+            if kind:
+                items.append({"path": str(path), "name": path.name, "kind": kind})
+        if items:
+            send({
+                "type": "turn_media", "items": items[:6],
+                "timestamp": datetime.now(UTC).isoformat(),
+            })
+    except Exception as exc:
+        log.warning("Device media listing failed", error=str(exc))
+
+
 def automation_lane_for(server: Any, automation: Any, lane: str, is_public: bool) -> str:
     """The lane an automated turn on the main chat moves to ("" = it stays)."""
     if automation is None or is_public or lane != server.LANE_MAIN:
@@ -1441,6 +1474,9 @@ async def _run_agent(
                     turn_started_at=_wa_started_at,
                     already_sent=_wa_files.sent_this_turn(agent),
                 ))
+            if turn_channel == "device":
+                asyncio.create_task(_send_device_media(
+                    send, agent, _wa_turn_start, str(response or ""), _wa_started_at))
 
             # Extract and broadcast suggested next steps — skip for FD-spawned
             # workers (Basna/Vatra/Council/Code): they're orchestrated, headless,

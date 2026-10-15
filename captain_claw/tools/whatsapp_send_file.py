@@ -331,12 +331,60 @@ _NAMEABLE = {
 }
 
 
-def _named_new_files(agent: Any, reply: str, since: float) -> list[Path]:
+def _named_new_files(agent: Any, reply: str, since: float,
+                     nameable: set[str] | None = None) -> list[Path]:
     """Files this session wrote during the turn (under
     ``saved/<category>/<session>/``, modified at or after *since*) that the
     reply names by their whole file name — "here's report.docx". Not
     scripts, tools, skills or downloads (:func:`turn_deliverables.named_new_files`)."""
-    return _deliverables.named_new_files(agent, reply, since, _NAMEABLE)
+    return _deliverables.named_new_files(agent, reply, since, _NAMEABLE if nameable is None else nameable)
+
+
+async def collect_turn_media(
+    agent: Any, turn_start_idx: int, reply: str = "", turn_started_at: float = 0.0,
+    already_sent: set[str] | None = None, nameable: set[str] | None = None,
+) -> list[Path]:
+    """What a turn made for the user, in order and without repeats: pictures
+    it generated or took with the phone, audio it spoke, and files this
+    session wrote during the turn that the reply names (*nameable*
+    extensions; WhatsApp's set by default) — none of *already_sent*.
+
+    The session is read before the first await: the next turn may start
+    meanwhile, and this one's state must not leak into it."""
+    from captain_claw.platform_adapter import (
+        effective_turn_start_idx,
+        extract_audio_paths_from_tool_output,
+        extract_image_paths_from_tool_output,
+    )
+
+    session = getattr(agent, "session", None)
+    if session is None:
+        return []
+    start = effective_turn_start_idx(agent, turn_start_idx)
+    found: list[Path] = []
+    for msg in session.messages[start:]:
+        if str(msg.get("role", "")) != "tool":
+            continue
+        tool = str(msg.get("tool_name", "")).strip().lower()
+        content = str(msg.get("content", "") or "")
+        if content.strip().lower().startswith("error"):
+            continue
+        if tool in _DELIVERED_IMAGE_TOOLS:
+            found.extend(extract_image_paths_from_tool_output(content))
+        elif tool in _DELIVERED_AUDIO_TOOLS:
+            found.extend(extract_audio_paths_from_tool_output(content))
+    # Only deliverables: inside this agent's saved/ area, made this turn.
+    found = _deliverables.keep_deliverables(
+        found, _deliverables.saved_root_of(agent), since=turn_started_at)
+    found.extend(await asyncio.to_thread(_named_new_files, agent, reply, turn_started_at, nameable))
+    queue: list[Path] = []
+    seen = set(already_sent or ())
+    for path in found:
+        key = str(Path(path).resolve())
+        if key not in seen:
+            seen.add(key)
+            queue.append(Path(path))
+    return queue
 
 
 async def deliver_turn_media(
@@ -353,11 +401,6 @@ async def deliver_turn_media(
     import logging
 
     from captain_claw.config import get_config
-    from captain_claw.platform_adapter import (
-        effective_turn_start_idx,
-        extract_audio_paths_from_tool_output,
-        extract_image_paths_from_tool_output,
-    )
 
     log = logging.getLogger(__name__)
     try:
@@ -368,33 +411,9 @@ async def deliver_turn_media(
         if not _env("WHATSAPP_ACCESS_TOKEN") or not _env("WHATSAPP_PHONE_NUMBER_ID"):
             log.info("WhatsApp media delivery skipped: no WhatsApp credentials in this agent")
             return []
-        # Everything is read now, before any upload awaits: the next turn may
-        # start meanwhile, and this one's state must not leak into it.
         already = set(already_sent) if already_sent is not None else sent_this_turn(agent)
-        start = effective_turn_start_idx(agent, turn_start_idx)
-        found: list[Path] = []
-        for msg in session.messages[start:]:
-            if str(msg.get("role", "")) != "tool":
-                continue
-            tool = str(msg.get("tool_name", "")).strip().lower()
-            content = str(msg.get("content", "") or "")
-            if content.strip().lower().startswith("error"):
-                continue
-            if tool in _DELIVERED_IMAGE_TOOLS:
-                found.extend(extract_image_paths_from_tool_output(content))
-            elif tool in _DELIVERED_AUDIO_TOOLS:
-                found.extend(extract_audio_paths_from_tool_output(content))
-        # Only deliverables: inside this agent's saved/ area, made this turn.
-        found = _deliverables.keep_deliverables(
-            found, _deliverables.saved_root_of(agent), since=turn_started_at)
-        found.extend(await asyncio.to_thread(_named_new_files, agent, reply, turn_started_at))
-        queue: list[Path] = []
-        seen = set(already)
-        for path in found:
-            key = str(Path(path).resolve())
-            if key not in seen:
-                seen.add(key)
-                queue.append(Path(path))
+        queue = await collect_turn_media(
+            agent, turn_start_idx, reply, turn_started_at, already_sent=already)
         limit = max(0, int(cfg.max_media_per_turn))
         sent: list[str] = []
         failed: list[str] = []

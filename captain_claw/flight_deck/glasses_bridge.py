@@ -27,7 +27,7 @@ import json
 import os
 import secrets
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -182,7 +182,7 @@ def _now_iso() -> str:
 # old file (and ``control`` would re-step it), causing the deck to reload back
 # and forth between recently-opened decks before settling. These are live, fire-
 # once signals — only durable chat-like messages belong in the replay buffer.
-_NO_BACKFILL_TYPES = {"deck_open", "control", "deck_state", "narration"}
+_NO_BACKFILL_TYPES = {"deck_open", "control", "deck_state", "narration", "media"}
 
 
 async def _broadcast(ch: _ChannelState, payload: dict) -> None:
@@ -308,6 +308,12 @@ async def _forward_agent_msg(ch: "_ChannelState", data: dict) -> None:
             await _broadcast(ch, event)
         # We don't echo "user" chat_messages back — mobile already injected its
         # own "user" event for instant local display.
+    elif mtype == "turn_media":
+        # Pictures/audio a device turn made (paths on the agent, fetched via
+        # its /api/media) — only the device bridge acts on these.
+        items = [i for i in (data.get("items") or []) if isinstance(i, dict) and i.get("path")]
+        if items:
+            await _broadcast(ch, {"type": "media", "items": items, "ts": data.get("timestamp") or _now_iso()})
     elif mtype == "narration":
         # Live between-step progress blurbs — forward so the glasses HUD and
         # WhatsApp/Messenger see them during a long task.
@@ -1488,6 +1494,67 @@ _STREAM_FORMAT = "pcm_s16le"
 _STREAM_SAMPLE_RATE = 24000
 
 
+class SonioxTTSError(RuntimeError):
+    """Soniox refused or failed a synthesis (its message is user-readable)."""
+
+
+async def soniox_tts_pcm(
+    text: str, *, language: str = "", voice: str = "", api_key: str = "",
+) -> AsyncIterator[bytes]:
+    """Synthesize *text* with Soniox realtime TTS and yield raw PCM chunks
+    (``pcm_s16le``, mono, ``_STREAM_SAMPLE_RATE`` Hz) as they arrive.
+
+    Language/voice default to ``SONIOX_TTS_LANGUAGE`` / ``SONIOX_TTS_VOICE``.
+    Raises :class:`SonioxTTSError` on a Soniox error envelope; connection
+    errors propagate as-is."""
+    import base64
+    import secrets as _secrets
+
+    import websockets
+
+    api_key = api_key or os.environ.get("SONIOX_API_KEY", "").strip()
+    if not api_key:
+        raise SonioxTTSError("SONIOX_API_KEY not set")
+    stream_id = "g_" + _secrets.token_hex(4)
+    config = {
+        "api_key": api_key,
+        "stream_id": stream_id,
+        "model": os.environ.get("SONIOX_TTS_MODEL", "tts-rt-v1"),
+        "language": language or os.environ.get("SONIOX_TTS_LANGUAGE", "en"),
+        "voice": voice or os.environ.get("SONIOX_TTS_VOICE", "Adrian"),
+        "audio_format": _STREAM_FORMAT,
+        "sample_rate": _STREAM_SAMPLE_RATE,
+    }
+    async with websockets.connect(
+        _SONIOX_TTS_WS_URL,
+        max_size=4 * 1024 * 1024,
+        ping_interval=20,
+        ping_timeout=10,
+    ) as upstream:
+        await upstream.send(json.dumps(config))
+        await upstream.send(json.dumps({
+            "stream_id": stream_id,
+            "text": text,
+            "text_end": True,
+        }))
+        async for raw in upstream:
+            # Soniox sends JSON envelopes; audio is base64 inside.
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8", "ignore")
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            err = msg.get("error_code") or msg.get("error")
+            if err:
+                raise SonioxTTSError(str(msg.get("error_message") or err))
+            audio_b64 = msg.get("audio")
+            if audio_b64:
+                yield base64.b64decode(audio_b64)
+            if msg.get("audio_end") or msg.get("terminated") or msg.get("finished"):
+                return
+
+
 @router.websocket("/glasses/tts-stream")
 async def glasses_tts_stream(ws: WebSocket) -> None:
     """Stream TTS audio from Soniox to the glasses with minimal latency.
@@ -1537,74 +1604,24 @@ async def glasses_tts_stream(ws: WebSocket) -> None:
     language = str(client_msg.get("language", "")).strip() or os.environ.get("SONIOX_TTS_LANGUAGE", "en")
     voice = str(client_msg.get("voice", "")).strip() or os.environ.get("SONIOX_TTS_VOICE", "Adrian")
 
-    import base64
-    import secrets as _secrets
-    import websockets
-
-    stream_id = "g_" + _secrets.token_hex(4)
-    config = {
-        "api_key": api_key,
-        "stream_id": stream_id,
-        "model": os.environ.get("SONIOX_TTS_MODEL", "tts-rt-v1"),
-        "language": language,
-        "voice": voice,
-        "audio_format": _STREAM_FORMAT,
-        "sample_rate": _STREAM_SAMPLE_RATE,
-    }
-
     try:
-        async with websockets.connect(
-            _SONIOX_TTS_WS_URL,
-            max_size=4 * 1024 * 1024,
-            ping_interval=20,
-            ping_timeout=10,
-        ) as upstream:
-            await upstream.send(json.dumps(config))
-            await upstream.send(json.dumps({
-                "stream_id": stream_id,
-                "text": text,
-                "text_end": True,
-            }))
-
-            # Announce format to the browser before binary frames start.
-            await ws.send_text(json.dumps({
-                "type": "info",
-                "format": _STREAM_FORMAT,
-                "sample_rate": _STREAM_SAMPLE_RATE,
-                "channels": 1,
-            }))
-
-            async for raw in upstream:
-                # Soniox sends JSON envelopes; audio is base64 inside.
-                if isinstance(raw, (bytes, bytearray)):
-                    raw = raw.decode("utf-8", "ignore")
-                try:
-                    msg = json.loads(raw)
-                except Exception:
-                    continue
-
-                err = msg.get("error_code") or msg.get("error")
-                if err:
-                    await ws.send_text(json.dumps({
-                        "type": "error",
-                        "message": str(msg.get("error_message") or err),
-                    }))
-                    break
-
-                audio_b64 = msg.get("audio")
-                if audio_b64:
-                    try:
-                        await ws.send_bytes(base64.b64decode(audio_b64))
-                    except WebSocketDisconnect:
-                        return
-
-                if msg.get("audio_end") or msg.get("terminated") or msg.get("finished"):
-                    break
-
-            try:
-                await ws.send_text(json.dumps({"type": "end"}))
-            except Exception:
-                pass
+        chunks = soniox_tts_pcm(text, language=language, voice=voice, api_key=api_key)
+        # Announce format to the browser before binary frames start.
+        await ws.send_text(json.dumps({
+            "type": "info",
+            "format": _STREAM_FORMAT,
+            "sample_rate": _STREAM_SAMPLE_RATE,
+            "channels": 1,
+        }))
+        try:
+            async for chunk in chunks:
+                await ws.send_bytes(chunk)
+        except SonioxTTSError as exc:
+            await ws.send_text(json.dumps({"type": "error", "message": str(exc)}))
+        try:
+            await ws.send_text(json.dumps({"type": "end"}))
+        except Exception:
+            pass
     except WebSocketDisconnect:
         return
     except Exception as exc:

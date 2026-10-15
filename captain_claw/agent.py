@@ -574,12 +574,13 @@ class Agent(
         origin, detail = msg_origin.resolve_turn_origin(user_input, turn_origin, origin_detail)
         self._turn_origin = (origin, detail, str(channel or "") or None)
 
-    def _absorb_surface_block(self, user_input: str) -> tuple[str, bool]:
+    def _absorb_surface_block(self, user_input: str, surface: str | None = None) -> tuple[str, bool]:
         """Take a chat surface's rules block (prepended by Flight Deck to a
-        glasses / WhatsApp / Messenger binding's first message) out of the
-        turn's text, keeping its rules in session metadata: they are rendered
-        on that surface's turns, and the stored message is what the user
-        wrote. Returns (text, had_block)."""
+        glasses / WhatsApp / Messenger / device binding's first message) out
+        of the turn's text, keeping its rules in session metadata: they are
+        rendered on that surface's turns, and the stored message is what the
+        user wrote. Kept per *surface* too, so two bridges on one session
+        don't overwrite each other's rules. Returns (text, had_block)."""
         from captain_claw import msg_origin
 
         block, rest = msg_origin.split_surface_block(user_input)
@@ -587,10 +588,14 @@ class Agent(
             return user_input, False
         rules = msg_origin.surface_rules_text(block)
         if rules and self.session is not None and isinstance(self.session.metadata, dict):
-            self.session.metadata["surface_rules"] = {
-                "text": rules,
-                "seen_at": datetime.now(UTC).isoformat(),
-            }
+            entry = {"text": rules, "seen_at": datetime.now(UTC).isoformat()}
+            self.session.metadata["surface_rules"] = entry
+            if surface:
+                by_surface = self.session.metadata.get("surface_rules_by")
+                if not isinstance(by_surface, dict):
+                    by_surface = {}
+                by_surface[str(surface)] = entry
+                self.session.metadata["surface_rules_by"] = by_surface
         return rest, True
 
     def _hinted_channel(self) -> str | None:
@@ -612,7 +617,8 @@ class Agent(
         channel: str | None = None,
         origin_detail: str | None = None,
     ) -> str:
-        user_input, _had_surface = self._absorb_surface_block(str(user_input or ""))
+        user_input, _had_surface = self._absorb_surface_block(
+            str(user_input or ""), surface=channel or self._hinted_channel())
         self._turn_user_text = user_input
         self._set_turn_origin(
             self._turn_user_text, turn_origin,
@@ -645,7 +651,8 @@ class Agent(
     ) -> AsyncIterator[str]:
         # Not a ContextVar bind: this is an async generator (a set here would
         # leak into the caller between yields).
-        user_input, _had_surface = self._absorb_surface_block(str(user_input or ""))
+        user_input, _had_surface = self._absorb_surface_block(
+            str(user_input or ""), surface=channel or self._hinted_channel())
         self._turn_user_text = user_input
         self._set_turn_origin(
             self._turn_user_text, turn_origin,
