@@ -1,7 +1,7 @@
 // Captain Claw voice client for the M5Stack StickS3.
 //
 //   Front button (A)  hold = talk, release = send · tap = stop speaking / flip picture↔text
-//   Side button  (B)  click = next page · hold = pick agent / settings
+//   Side button  (B)  click = next page · hold = agents, volume, boost, settings
 //   Hold A while switching on (or no Wi-Fi saved) = setup hotspot
 //
 // Talks to Flight Deck's /device/ws (captain_claw/flight_deck/device_bridge.py):
@@ -32,6 +32,8 @@ static bool dimmed = false, screenOff = false;
 static std::vector<String> pickNames, pickSlugs;
 static int pickSel = 0, pickCur = -1;
 static bool pickerLoading = false;
+
+static void addSettingItems();
 
 static constexpr uint32_t kTapMs = 300;      // shorter press = tap, not talk
 static constexpr uint32_t kDimMs = 30000;
@@ -166,8 +168,7 @@ static void onText(const char* payload, size_t len) {
       pickNames.push_back(a["name"] | slug);
       pickSlugs.push_back(slug);
     }
-    pickNames.push_back("Wi-Fi & settings…");
-    pickSlugs.push_back("");
+    addSettingItems();
     pickSel = max(0, pickCur);
     pickerLoading = false;
     if (mode == Mode::Picker) redraw();
@@ -267,12 +268,46 @@ static void connectServer() {
   } else {
     ws.begin(host.c_str(), port, path.c_str(), "");
   }
+  // The library sends "Origin: file://" by default — Flight Deck's origin guard
+  // (rightly) refuses that as a cross-site browser. A device sends no Origin.
+  ws.setExtraHeaders("");
   ws.onEvent(onWs);
   ws.setReconnectInterval(3000);
   ws.enableHeartbeat(15000, 5000, 2);
 }
 
 // ── picker ───────────────────────────────────────────────────────────
+// The agent list ends with three setting rows: volume, boost, Wi-Fi & settings.
+
+static constexpr uint8_t kVolumeSteps[] = {64, 128, 191, 255};  // 25 / 50 / 75 / 100 %
+static constexpr uint8_t kBoostSteps[] = {0, 6, 10};
+static int volumeRow = -1, boostRow = -1, setupRow = -1;
+
+static String volumeLabel() { return "Volume " + String((settings.volume * 100 + 127) / 255) + "%"; }
+static String boostLabel() {
+  return settings.boostDb ? "Boost +" + String(settings.boostDb) + " dB" : String("Boost off");
+}
+
+static void addSettingItems() {
+  volumeRow = pickNames.size();
+  pickNames.push_back(volumeLabel());
+  pickSlugs.push_back("");
+  boostRow = pickNames.size();
+  pickNames.push_back(boostLabel());
+  pickSlugs.push_back("");
+  setupRow = pickNames.size();
+  pickNames.push_back("Wi-Fi & settings…");
+  pickSlugs.push_back("");
+}
+
+// Next step up (wrapping) from the current value.
+template <size_t N>
+static uint8_t nextStep(const uint8_t (&steps)[N], uint8_t now) {
+  for (uint8_t v : steps) {
+    if (v > now) return v;
+  }
+  return steps[0];
+}
 
 static void openPicker() {
   if (!wsUp) {
@@ -293,7 +328,23 @@ static void openPicker() {
 
 static void choosePicked() {
   if (pickerLoading) return;
-  if (pickSel == (int)pickNames.size() - 1) runSetupPortal("Settings");
+  if (pickSel == setupRow) runSetupPortal("Settings");
+  if (pickSel == volumeRow || pickSel == boostRow) {  // change in place, stay in the list
+    if (pickSel == volumeRow) {
+      settings.volume = nextStep(kVolumeSteps, settings.volume);
+      audio::setVolume(settings.volume);
+      pickNames[volumeRow] = volumeLabel();
+    } else {
+      settings.boostDb = nextStep(kBoostSteps, settings.boostDb);
+      audio::setBoost(settings.boostDb);
+      pickNames[boostRow] = boostLabel();
+    }
+    settings.save();
+    pickerOpenedMs = millis();
+    redraw();
+    audio::beep();
+    return;
+  }
   settings.agent = pickSlugs[pickSel];
   settings.save();
   JsonDocument d;
@@ -349,7 +400,7 @@ void setup() {
   ui::brightness(kBright);
   settings.load();
   Serial.printf("[claw] boot %s: %d network(s), server '%s'\n", deviceId().c_str(), settings.netCount, settings.server.c_str());
-  audio::begin(settings.volume);
+  audio::begin(settings.volume, settings.boostDb);
   M5.BtnB.setHoldThresh(800);
 
   M5.update();

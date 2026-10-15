@@ -10,16 +10,21 @@ Server side: `captain_claw/flight_deck/device_bridge.py` (`/device/ws`).
 
 | | Front (A) | Side (B) |
 |---|---|---|
-| hold | talk (release sends) | agents & settings |
+| hold | talk (release sends) | agents, volume, boost, settings |
 | tap / click | stop speaking · flip picture ↔ text | next page · back |
 | in the agent list | choose | move down |
+
+In the side-button list, *Volume* (25/50/75/100%) and *Boost* (off, +6, +10 dB —
+extra speech gain with a soft limiter) change with each front-button press and
+beep at the new level. Above 75% volume on battery the stick may restart on loud
+peaks (M5Stack's note); on USB power it's fine.
 
 Hold the front button while switching on to reopen setup. With no Wi-Fi
 saved, or none in reach for 30 s, setup opens by itself.
 
 ## Setup
 
-1. The stick opens a hotspot `Claw-StickS3-xxxx` (scan the QR code on screen).
+1. The stick opens a hotspot `Captain-StickS3-xxxx` (scan the QR code on screen).
 2. Open http://192.168.4.1 and fill in:
    - one or more Wi-Fi networks (up to 5; it joins whichever is in reach)
    - Flight Deck address: `ws://<mac-ip>:25080` on your network, or `wss://<your deck domain>`

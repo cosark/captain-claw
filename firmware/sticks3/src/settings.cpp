@@ -20,7 +20,8 @@ void Settings::load() {
   agent = p.getString("agent", "");
   lang = p.getString("lang", "");
   speak = p.getBool("speak", true);
-  volume = p.getUChar("vol", 160);
+  volume = p.getUChar("vol", 191);
+  boostDb = p.getUChar("boost", 6);
   sleepMin = p.getUShort("sleep", 15);
   p.end();
 }
@@ -45,6 +46,7 @@ void Settings::save() const {
   p.putString("lang", lang);
   p.putBool("speak", speak);
   p.putUChar("vol", volume);
+  p.putUChar("boost", boostDb);
   p.putUShort("sleep", sleepMin);
   p.end();
 }
