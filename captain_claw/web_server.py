@@ -281,6 +281,9 @@ class WebServer:
             telegram_cfg.enabled and telegram_cfg.bot_token.strip()
         )
         self._telegram_bridge: TelegramBridge | None = None
+        # True when the bridge talks to Flight Deck's shared-bot relay rather
+        # than this agent's own bot (web/telegram.py start_telegram).
+        self._telegram_relay = False
         self._telegram_offset: int | None = None
         self._approved_telegram_users: dict[str, dict[str, object]] = {}
         self._pending_telegram_pairings: dict[str, dict[str, object]] = {}

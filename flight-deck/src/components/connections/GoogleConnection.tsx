@@ -265,6 +265,13 @@ export default function GoogleConnection() {
           </div>
         )}
 
+        {/* The deck's client, set up once by an admin: nothing for this user to fill in. */}
+        {configured && !canManageClient && !connected && (
+          <div className="rounded-md border border-zinc-800 bg-zinc-950/50 px-3 py-2 text-xs text-zinc-400">
+            Your admin already set up Google for everyone on this deck — no client ID or secret
+            needed. Press Connect and sign in with your own Google account.
+          </div>
+        )}
         {/* Not-configured informational banner */}
         {!configured && !canManageClient && (
           <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-xs text-zinc-300">

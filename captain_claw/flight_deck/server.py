@@ -878,6 +878,14 @@ async def lifespan(app: FastAPI):
         set_vastai_manager(_vastai_mgr)
         _register_vastai_wake(_vastai_mgr)
         app.state.vastai_manager = _vastai_mgr
+        # The deck's shared Telegram bot (Admin → Integrations): FD polls it and
+        # relays each user's chat to their agent. Inert until a token is set.
+        try:
+            from captain_claw.flight_deck import telegram_shared as _tg_shared
+
+            await _tg_shared.start(_fd_db)
+        except Exception as _tg_exc:
+            print(f"Flight Deck: shared Telegram bot not started: {_tg_exc}")
     # ── Code-app subprocess runtime ──
     # Lazy-spawn per app on first request; reaper kicks in here.
     from captain_claw.flight_deck.app_runtime import get_runtime as _get_app_runtime
@@ -1087,6 +1095,12 @@ async def lifespan(app: FastAPI):
     except Exception as _exc:
         print(f"Flight Deck: dubina engine init failed: {_exc}")
     yield
+    try:
+        from captain_claw.flight_deck import telegram_shared as _tg_shared
+
+        await _tg_shared.stop()
+    except Exception:
+        pass
     # Stop the scheduler loop first so it doesn't fire mid-shutdown.
     if hasattr(app.state, "scheduler_stop"):
         app.state.scheduler_stop.set()
@@ -1367,6 +1381,7 @@ from captain_claw.flight_deck.gmail_send_routes import router as gmail_send_rout
 from captain_claw.flight_deck.gmail_autoreply_routes import router as gmail_autoreply_router
 from captain_claw.flight_deck.microsoft_oauth_routes import router as microsoft_oauth_router
 from captain_claw.flight_deck.jev_routes import router as jev_router
+from captain_claw.flight_deck.telegram_shared_routes import router as telegram_shared_router
 from captain_claw.flight_deck.codex_oauth_routes import router as codex_oauth_router
 from captain_claw.flight_deck.antigravity_routes import router as antigravity_router
 from captain_claw.flight_deck.games_routes import router as games_router
@@ -1431,6 +1446,7 @@ app.include_router(gmail_send_router)
 app.include_router(gmail_autoreply_router)
 app.include_router(microsoft_oauth_router)
 app.include_router(jev_router)
+app.include_router(telegram_shared_router)
 app.include_router(codex_oauth_router)
 app.include_router(antigravity_router)
 app.include_router(games_router)

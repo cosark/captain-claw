@@ -10,6 +10,11 @@ Its API key is the user's own and lives ONLY here:
   deck has one synthetic user (``local``) that isn't a row in ``users`` (the
   user_settings FK would refuse it), so there the same keys go into
   ``system_settings`` — one key for the deck (``scope: "deck"``).
+* The team key: an admin may share one key with every user (``PUT``/``DELETE
+  /shared-key``, Admin → Integrations), kept in ``system_settings`` as
+  ``jev:shared_api_key`` / ``jev:shared_meta``. A user with no key of their own
+  uses it (``source: "shared"``); their own key, once saved, wins. Not on an
+  auth-disabled deck — its one key is already the deck's.
 * The user routes (Connections → Jev): ``GET /status``, ``PUT``/``DELETE
   /key``, ``POST /test`` and the playground's ``POST /ask``. None of them ever
   returns the key — only :func:`jev_client.key_hint`.
@@ -43,6 +48,7 @@ from pydantic import BaseModel
 
 from captain_claw import jev_client
 from captain_claw.flight_deck import google_oauth_routes as _g
+from captain_claw.flight_deck.admin_routes import require_admin
 from captain_claw.flight_deck.agent_identity import require_agent_caller
 from captain_claw.flight_deck.auth import _LOCAL_USER, _fd_auth_enabled, get_current_user, get_db
 from captain_claw.jev_client import JevAPI, JevError, JevInputError
@@ -54,6 +60,11 @@ router = APIRouter(prefix="/fd/jev", tags=["jev"])
 
 _K_KEY = "jev:api_key"
 _K_META = "jev:meta"
+# The admin's team key (system_settings). Separate names on purpose: an
+# auth-disabled deck keeps ITS key under _K_KEY in system_settings, and that
+# must never turn into a team key if sign-in is switched on later.
+_K_SHARED_KEY = "jev:shared_api_key"
+_K_SHARED_META = "jev:shared_meta"
 
 
 class JevNotConnected(LookupError):  # noqa: N818 — reads as the condition
@@ -113,14 +124,33 @@ async def _erase(owner: str) -> None:
         await db.delete_setting(owner, key)
 
 
+async def _shared_key() -> str:
+    """The admin's team key, or "" (always "" on an auth-disabled deck)."""
+    if _deck_scope():
+        return ""
+    return ((await get_db().get_system_setting(_K_SHARED_KEY)) or "").strip()
+
+
+async def _resolve(owner: str) -> tuple[str, str]:
+    """``(key, source)`` for *owner*: their own key (``"own"``), else the team
+    key an admin shared (``"shared"``), else ``("", "")``."""
+    own = (await _read(owner, _K_KEY)).strip()
+    if own:
+        return own, "own"
+    if owner:
+        shared = await _shared_key()
+        if shared:
+            return shared, "shared"
+    return "", ""
+
+
 async def get_key(owner: str) -> str:
-    """The owner's Jev key, or "" — for Flight Deck's own use only (never
-    returned to a browser or an agent)."""
-    return (await _read(owner, _K_KEY)).strip()
+    """The Jev key *owner* uses (their own, else the team's), or "" — for
+    Flight Deck's own use only (never returned to a browser or an agent)."""
+    return (await _resolve(owner))[0]
 
 
-async def _load_meta(owner: str) -> dict[str, Any]:
-    raw = await _read(owner, _K_META)
+def _parse_meta(raw: str | None) -> dict[str, Any]:
     if not raw:
         return {}
     try:
@@ -130,12 +160,27 @@ async def _load_meta(owner: str) -> dict[str, Any]:
     return meta if isinstance(meta, dict) else {}
 
 
+async def _load_meta(owner: str, source: str | None = None) -> dict[str, Any]:
+    """What Flight Deck knows about the key *owner* uses — the team key's meta
+    when that is the one."""
+    if source is None:
+        source = (await _resolve(owner))[1]
+    if source == "shared":
+        return _parse_meta(await get_db().get_system_setting(_K_SHARED_META))
+    return _parse_meta(await _read(owner, _K_META))
+
+
 async def _update_meta(owner: str, **fields: Any) -> None:
-    """Merge *fields* into the stored meta (only while a key is set)."""
-    if not await get_key(owner):
+    """Merge *fields* into the stored meta of the key *owner* uses (only while
+    one is set)."""
+    key, source = await _resolve(owner)
+    if not key:
         return
-    meta = await _load_meta(owner)
+    meta = await _load_meta(owner, source)
     meta.update(fields)
+    if source == "shared":
+        await get_db().set_system_setting(_K_SHARED_META, json.dumps(meta, ensure_ascii=True))
+        return
     await _write(owner, {_K_META: json.dumps(meta, ensure_ascii=True)})
 
 
@@ -150,10 +195,7 @@ def _model_names(models: list[dict[str, Any]]) -> list[str]:
     return [str(m.get("name")) for m in models if isinstance(m, dict) and m.get("name")]
 
 
-async def status_for_owner(owner: str) -> dict[str, Any]:
-    """JevStatus — never the key itself."""
-    key = await get_key(owner)
-    meta = await _load_meta(owner) if key else {}
+def _key_view(key: str, meta: dict[str, Any]) -> dict[str, Any]:
     models = meta.get("models") if isinstance(meta.get("models"), list) else []
     verified = meta.get("verified")
     verify_error = meta.get("verify_error")
@@ -167,10 +209,29 @@ async def status_for_owner(owner: str) -> dict[str, Any]:
         "verified_at": meta.get("verified_at") or None,
         "updated_at": meta.get("updated_at") or None,
         "models": [str(m) for m in models],
+    }
+
+
+async def status_for_owner(owner: str) -> dict[str, Any]:
+    """JevStatus — never the key itself. ``source`` says whose key it is:
+    ``"own"``, ``"shared"`` (the team key an admin shared) or None."""
+    key, source = await _resolve(owner)
+    meta = await _load_meta(owner, source) if key else {}
+    return {
+        **_key_view(key, meta),
+        "source": source or None,
+        "shared_available": bool(await _shared_key()),
         "default_model": jev_client.DEFAULT_MODEL,
         "auth_enabled": _fd_auth_enabled(),
         "scope": "deck" if _deck_scope() else "user",
     }
+
+
+async def shared_status() -> dict[str, Any]:
+    """The team key, as the admin sees it (never the key itself)."""
+    key = await _shared_key()
+    meta = _parse_meta(await get_db().get_system_setting(_K_SHARED_META)) if key else {}
+    return {**_key_view(key, meta), "available": not _deck_scope()}
 
 
 # ── service (routes, flows, inbound MCP) ────────────────────────────
@@ -356,18 +417,14 @@ async def _key_from_body(request: Request) -> str:
     return key
 
 
-@router.put("/key")
-async def jev_put_key(request: Request, _user: dict = Depends(get_current_user)) -> dict[str, Any]:
-    """Save a key after checking it with Jev. A key Jev refuses is not saved;
-    one Jev couldn't be asked about (network, rate limit, outage) is saved
-    unverified, with a ``warning``."""
-    key = await _key_from_body(request)
-    owner = _g._effective_owner(_user)
+async def _checked_meta(key: str) -> tuple[dict[str, Any], str]:
+    """Ask Jev about *key* before it is saved: ``(meta, warning)``. A key Jev
+    refuses raises a 400 (nothing is saved); one Jev couldn't be asked about
+    (network, rate limit, outage) comes back unverified, with a warning."""
     now = _now()
     meta: dict[str, Any] = {
         "verified": None, "verify_error": None, "verified_at": None, "updated_at": now, "models": [],
     }
-    warning = ""
     try:
         models = await _api(key).models()
     except JevError as exc:
@@ -380,9 +437,19 @@ async def jev_put_key(request: Request, _user: dict = Depends(get_current_user))
                 ),
             ) from None
         meta.update(verified=False, verify_error="unreachable")
-        warning = f"Saved, but couldn't verify it with Jev: {exc}"
-    else:
-        meta.update(verified=True, verified_at=now, models=_model_names(models))
+        return meta, f"Saved, but couldn't verify it with Jev: {exc}"
+    meta.update(verified=True, verified_at=now, models=_model_names(models))
+    return meta, ""
+
+
+@router.put("/key")
+async def jev_put_key(request: Request, _user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    """Save a key after checking it with Jev. A key Jev refuses is not saved;
+    one Jev couldn't be asked about (network, rate limit, outage) is saved
+    unverified, with a ``warning``."""
+    key = await _key_from_body(request)
+    owner = _g._effective_owner(_user)
+    meta, warning = await _checked_meta(key)
     await _write(owner, {_K_KEY: key, _K_META: json.dumps(meta, ensure_ascii=True)})
     out = await status_for_owner(owner)
     if warning:
@@ -392,10 +459,52 @@ async def jev_put_key(request: Request, _user: dict = Depends(get_current_user))
 
 @router.delete("/key")
 async def jev_delete_key(_user: dict = Depends(get_current_user)) -> dict[str, Any]:
-    """Forget this user's key (and what Flight Deck knew about it)."""
+    """Forget this user's key (and what Flight Deck knew about it). With a team
+    key shared, the user falls back to it."""
     owner = _g._effective_owner(_user)
     await _erase(owner)
     return await status_for_owner(owner)
+
+
+# ── admin routes (the team key) ─────────────────────────────────────
+
+
+def _require_team_deck() -> None:
+    if _deck_scope():
+        raise HTTPException(
+            status_code=409,
+            detail="Sign-in is off on this deck, so its one Jev key is already everyone's",
+        )
+
+
+@router.get("/shared")
+async def jev_shared_status(_admin: dict = Depends(require_admin)) -> dict[str, Any]:
+    return await shared_status()
+
+
+@router.put("/shared-key")
+async def jev_put_shared_key(request: Request, _admin: dict = Depends(require_admin)) -> dict[str, Any]:
+    """Share one Jev key with every user who has none of their own."""
+    _require_team_deck()
+    key = await _key_from_body(request)
+    meta, warning = await _checked_meta(key)
+    db = get_db()
+    await db.set_system_setting(_K_SHARED_KEY, key)
+    await db.set_system_setting(_K_SHARED_META, json.dumps(meta, ensure_ascii=True))
+    out = await shared_status()
+    if warning:
+        out["warning"] = warning
+    return out
+
+
+@router.delete("/shared-key")
+async def jev_delete_shared_key(_admin: dict = Depends(require_admin)) -> dict[str, Any]:
+    """Stop sharing the team key (users' own keys are untouched)."""
+    db = get_db()
+    # system_settings has no delete; an empty value reads as "no key".
+    await db.set_system_setting(_K_SHARED_KEY, "")
+    await db.set_system_setting(_K_SHARED_META, "")
+    return await shared_status()
 
 
 @router.post("/test")
