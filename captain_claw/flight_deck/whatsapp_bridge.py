@@ -2472,11 +2472,16 @@ async def _relay_to_waid(waid: str, text: str, payload: dict | None = None) -> N
     it comes as the main chat's mirror, or as the reply itself when the turn
     ran on the main lane. Any other automated result (a mirror with
     ``automation_lane``, an agent cron result marked ``proactive``) is a
-    proactive message, so it honours ``/mute``."""
+    proactive message, so it honours ``/mute``. A ``notice`` (a slash
+    command's answer, the garbled-reply /new hint) goes as plain text — like
+    the bridge's own command replies, never with the audio extra."""
     if isinstance(payload, dict):
         if payload.get("fd_delivers"):
             return
         if (payload.get("automation_lane") or payload.get("proactive")) and is_push_muted(waid):
+            return
+        if payload.get("notice"):
+            await _send_whatsapp_text(waid, text)
             return
     await _send_whatsapp_reply(waid, text)
 

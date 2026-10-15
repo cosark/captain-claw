@@ -29,9 +29,10 @@ if TYPE_CHECKING:
 
 log = get_logger(__name__)
 
-# Commands disabled for Telegram users (per-user sessions, no switching).
-_TG_DISABLED_COMMANDS = frozenset({"/new", "/sessions"})
-_TG_DISABLED_SESSION_SUBCMDS = frozenset({"list", "switch", "load", "new"})
+# Commands disabled for Telegram users: each has ONE session at a time —
+# /new starts a fresh one, but there is no listing or switching back.
+_TG_DISABLED_COMMANDS = frozenset({"/sessions"})
+_TG_DISABLED_SESSION_SUBCMDS = frozenset({"list", "switch", "load"})
 
 
 # ── Lifecycle ────────────────────────────────────────────────────
@@ -145,11 +146,7 @@ async def _tg_get_or_create_agent(server: WebServer, message: TelegramMessage) -
         session = await sm.load_session(session_id)
 
     if session is None:
-        user_info = server._approved_telegram_users.get(user_id_key, {})
-        username = str(user_info.get("username", "")).strip()
-        first_name = str(user_info.get("first_name", "")).strip()
-        label = username or first_name or user_id_key
-        session = await sm.create_session(name=f"tg-{label}")
+        session = await sm.create_session(name=_tg_session_name(server, user_id_key))
         server._telegram_user_sessions[user_id_key] = session.id
         await _tg_save_user_sessions(server)
 
@@ -186,6 +183,40 @@ async def _tg_get_or_create_agent(server: WebServer, message: TelegramMessage) -
         user_id=user_id_key, session_id=session.id, session_name=session.name,
     )
     return agent
+
+
+def _tg_session_name(server: WebServer, user_id_key: str) -> str:
+    """``tg-<username | first name | id>`` — the name of a Telegram user's session."""
+    user_info = server._approved_telegram_users.get(user_id_key, {})
+    username = str(user_info.get("username", "")).strip()
+    first_name = str(user_info.get("first_name", "")).strip()
+    return f"tg-{username or first_name or user_id_key}"
+
+
+async def _tg_new_session(server: WebServer, user_agent: Agent, name: str = "") -> str:
+    """``/new`` on Telegram: the user's agent moves to a fresh session, which
+    becomes their session from now on (also after a restart). The old one is
+    frozen into history first, as on the web."""
+    user_id_key = str(getattr(user_agent, "_user_id", "") or "")
+    if not user_id_key:
+        return "No active session."
+    # The command runs outside the per-user lock: never swap the session
+    # under a turn that is still running.
+    if _tg_get_user_lock(server, user_id_key).locked():
+        return "Still answering your previous message — send /new once the reply is in."
+    user_agent.archive_current_session_to_history()
+    session = await user_agent.session_manager.create_session(
+        name=name.strip() or _tg_session_name(server, user_id_key),
+    )
+    user_agent.session = session
+    user_agent.refresh_session_runtime_flags()
+    user_agent.last_usage = user_agent._empty_usage()
+    user_agent.last_context_window = {}
+    server._telegram_user_sessions[user_id_key] = session.id
+    await _tg_save_user_sessions(server)
+    log.info("Telegram user started a new session",
+             user_id=user_id_key, session_id=session.id, session_name=session.name)
+    return f"New session started: {session.name}. The previous conversation is kept in history."
 
 
 def _tg_get_user_lock(server: WebServer, user_id: str) -> asyncio.Lock:
@@ -343,7 +374,8 @@ async def _handle_telegram_message(server: WebServer, message: TelegramMessage) 
             await _tg_send(
                 server, message.chat_id,
                 "Send any text to chat with your session.\n"
-                "Commands: /clear, /history, /compact, /config, /session, /cron, /basna\n"
+                "Commands: /new, /clear, /history, /compact, /config, /session, /cron, /basna\n"
+                "/new starts a fresh session (the old one is kept in history).\n"
                 "/basna <task> runs a parallel multi-agent research ensemble.\n"
                 "Each Telegram user has a dedicated session.",
                 reply_to_message_id=message.message_id,
@@ -488,8 +520,8 @@ async def execute_telegram_command(
     Returns ``None`` only when the command should fall through to the
     agent (e.g. ``/orchestrate``).
 
-    Each Telegram user operates on their own *user_agent*. Commands that
-    create or switch sessions are disabled.
+    Each Telegram user operates on their own *user_agent*. ``/new`` starts
+    a fresh session; listing and switching sessions are disabled.
     """
     parts = raw.strip().split(None, 1)
     cmd = parts[0].lower()
@@ -501,6 +533,10 @@ async def execute_telegram_command(
         # ── Disabled commands ────────────────────────────────────
         if cmd in _TG_DISABLED_COMMANDS:
             return "Not available on Telegram. Each user has a dedicated session."
+
+        # ── /new ─────────────────────────────────────────────────
+        if cmd in ("/new",):
+            return await _tg_new_session(server, user_agent, args)
 
         # ── /clear ───────────────────────────────────────────────
         if cmd in ("/clear",):
@@ -666,6 +702,9 @@ async def _tg_handle_session_subcommand(
 
     if subcmd in _TG_DISABLED_SESSION_SUBCMDS:
         return "Not available on Telegram. Each user has a dedicated session."
+
+    if subcmd in ("new",):
+        return await _tg_new_session(server, user_agent, subargs)
 
     if subcmd in ("rename",):
         if not subargs:
@@ -964,6 +1003,12 @@ async def _tg_process_with_typing(
 
                 await _tg_send(server, chat_id, response, reply_to_message_id=reply_to_message_id)
 
+                # A reply that came out garbled gets a /new hint (Jev judges,
+                # beside the deliverables and next steps below).
+                from captain_claw import garbled_reply
+
+                garble_task = asyncio.create_task(garbled_reply.is_garbled(response or "", text))
+
                 # Send what the turn made for the user back to Telegram — only
                 # deliverables: files in the agent's saved/ area written this
                 # turn (pictures a tool made, documents the reply names), never
@@ -1038,6 +1083,9 @@ async def _tg_process_with_typing(
                             )
                     except Exception as ns_err:
                         log.debug("Telegram next steps extraction error", error=str(ns_err))
+
+                if await garble_task:
+                    await _tg_send(server, chat_id, garbled_reply.HINT)
 
             server._broadcast({
                 "type": "usage",

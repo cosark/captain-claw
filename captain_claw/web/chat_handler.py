@@ -1478,6 +1478,17 @@ async def _run_agent(
                 asyncio.create_task(_send_device_media(
                     send, agent, _wa_turn_start, str(response or ""), _wa_started_at))
 
+            # A person's reply that came out garbled gets a /new hint (Jev
+            # judges; it runs beside the next-steps call, awaited below so the
+            # hint lands before 'ready').
+            from captain_claw.agent_reasoning_mixin import _is_fd_spawned_worker
+            _garble_task: asyncio.Task | None = None
+            if (automation is None and not is_public and not speaker_key and not no_broadcast
+                    and not _is_fd_spawned_worker()):
+                from captain_claw import garbled_reply as _garbled_reply
+                _garble_task = asyncio.create_task(
+                    _garbled_reply.is_garbled(str(response or ""), flow_text or content))
+
             # Extract and broadcast suggested next steps — skip for FD-spawned
             # workers (Basna/Vatra/Council/Code): they're orchestrated, headless,
             # and have no interactive user to offer follow-ups to (each call is
@@ -1487,7 +1498,6 @@ async def _run_agent(
             # hat: the next message is already written and waiting, so asking
             # the model "what next?" buys nothing and costs a round-trip per
             # queued item. The client sets no_next_steps for those.
-            from captain_claw.agent_reasoning_mixin import _is_fd_spawned_worker
             if get_config().ui.next_steps and not no_next_steps and not _is_fd_spawned_worker():
                 try:
                     steps = await extract_next_steps(agent.provider, response)
@@ -1498,6 +1508,9 @@ async def _run_agent(
                         })
                 except Exception as ns_err:
                     log.debug("Next steps extraction error", error=str(ns_err))
+
+            if _garble_task is not None and await _garble_task:
+                send(_garbled_reply.hint_frame())
 
         # Send updated usage/session info.
         send({

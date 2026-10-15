@@ -380,6 +380,9 @@ class JevToolConfig(BaseModel):
     base_url: str = "https://api.typesafe.ai"
     model: str = "jev-latest"
     timeout: float = 30.0
+    # After a person's chat turn, ask Jev whether the reply came out garbled
+    # and, if so, recommend /new (captain_claw/garbled_reply.py).
+    check_replies: bool = True
 
 
 class TypesenseToolConfig(BaseModel):

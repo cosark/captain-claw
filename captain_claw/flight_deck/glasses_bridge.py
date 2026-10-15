@@ -110,6 +110,10 @@ class _ChannelState:
     # message sent to the currently bound agent. Reset on every rebind so a
     # freshly-picked agent gets the context too.
     context_sent: bool = False
+    # The bound agent's session as last reported (welcome / session_info).
+    # When it changes (/new from any surface, a switch) the new session has
+    # never seen the context block: ``context_sent`` resets.
+    agent_session_id: str = ""
     # External (non-WebSocket) subscribers — each is an async callable that
     # gets every broadcast payload. Used by ``messenger_bridge`` to forward
     # agent replies back out to a Messenger PSID. Failures are isolated:
@@ -286,16 +290,41 @@ async def _agent_pump(ch: _ChannelState, host: str, port: int) -> None:
         backoff = min(backoff * 2, 30.0)
 
 
+def _note_agent_session(ch: "_ChannelState", session: Any) -> None:
+    """Track the agent's session; a different one needs the context block again."""
+    sid = str(session.get("id") or "") if isinstance(session, dict) else ""
+    if not sid:
+        return
+    if ch.agent_session_id and sid != ch.agent_session_id:
+        ch.context_sent = False
+    ch.agent_session_id = sid
+
+
 async def _forward_agent_msg(ch: "_ChannelState", data: dict) -> None:
     """Forward one agent WS message onto the channel bus (only what's useful)."""
     mtype = data.get("type")
-    if mtype == "chat_message":
+    if mtype == "welcome":
+        _note_agent_session(ch, data.get("session"))
+    elif mtype == "session_info":
+        _note_agent_session(ch, data)
+    elif mtype == "command_result":
+        # The answer to a slash command this channel sent (/new, /stop, …):
+        # sent to this socket only, so it is ours — without it a WhatsApp
+        # /new created the session and the person heard nothing back.
+        text = str(data.get("content", "")).strip()
+        if text:
+            await _broadcast(ch, {"type": "agent", "text": text, "notice": True, "ts": _now_iso()})
+    elif mtype == "chat_message":
         if data.get("role", "") == "assistant":
             event = {
                 "type": "agent",
                 "text": str(data.get("content", "")),
                 "ts": data.get("timestamp") or _now_iso(),
             }
+            # A notice next to a reply (the garbled-reply /new hint): plain
+            # text on every surface, never read aloud as an audio reply.
+            if data.get("notice"):
+                event["notice"] = True
             # An automated turn's result mirrored into the main chat: chat
             # bridges treat it as a proactive message. fd_delivers (mirrored
             # or not): Flight Deck sends it out itself, so they skip it.
