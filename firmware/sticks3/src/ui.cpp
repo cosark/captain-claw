@@ -38,14 +38,15 @@ static void drawBar() {
   canvas.setFont(kSmall);
   canvas.setTextDatum(middle_left);
   canvas.setTextColor(TFT_WHITE);
+  // Battery on the far right, state left of it, agent name in what remains.
+  int bx = W - 26, by = 4;
+  int nameRoom = bx - 6 - canvas.textWidth(barState) - 8 - PAD;
   String name = barAgent.length() ? barAgent : String("Captain Claw");
-  while (name.length() > 1 && canvas.textWidth(name) > 120) name.remove(name.length() - 1);
+  while (name.length() > 1 && canvas.textWidth(name) > nameRoom) name.remove(name.length() - 1);
   canvas.drawString(name, PAD, BAR / 2);
 
-  // Battery on the far right, state word left of it.
   int lvl = M5.Power.getBatteryLevel();
   bool chg = M5.Power.isCharging() == m5::Power_Class::is_charging;
-  int bx = W - 26, by = 4;
   canvas.drawRect(bx, by, 20, 9, TFT_LIGHTGREY);
   canvas.fillRect(bx + 20, by + 3, 2, 3, TFT_LIGHTGREY);
   int fill = lvl < 0 ? 0 : max(1, lvl * 18 / 100);
@@ -165,25 +166,44 @@ void showListening(int level, uint32_t elapsedMs) {
   push();
 }
 
-void showThinking(const String& heard, const String& status) {
+static String fit(const String& text, int width) {
+  if (canvas.textWidth(text) <= width) return text;
+  String s = text;
+  while (s.length() > 1 && canvas.textWidth(s + "…") > width) {
+    int cut = s.length() - 1;
+    while (cut > 0 && (uint8_t(s[cut]) & 0xC0) == 0x80) --cut;  // whole UTF-8 characters
+    s.remove(cut);
+  }
+  return s + "…";
+}
+
+void showWorking(const String& heard, const std::vector<String>& activity, const String& status) {
   canvas.fillScreen(TFT_BLACK);
   drawBar();
-  canvas.setFont(kBody);
   canvas.setTextDatum(top_left);
-  int y = BAR + PAD;
-  if (heard.length()) {
+  int y = BAR + 3;
+  if (heard.length()) {  // the end of a long sentence matters most: last two lines
+    canvas.setFont(kBody);
     canvas.setTextColor(TFT_CYAN);
     auto ls = wrap(String("“") + heard + "”", W - 2 * PAD);
-    int maxLines = linesPerPage() - (status.length() ? 2 : 0);
-    int first = max(0, (int)ls.size() - maxLines);  // the end of a long sentence matters most
-    for (int i = first; i < (int)ls.size(); ++i, y += kLine) canvas.drawString(ls[i], PAD, y);
+    int maxLines = activity.empty() ? 5 : 2;
+    for (int i = max(0, (int)ls.size() - maxLines); i < (int)ls.size(); ++i, y += kLine) {
+      canvas.drawString(ls[i], PAD, y);
+    }
+    y += 3;
+  }
+  canvas.setFont(kSmall);
+  constexpr int kSmallLine = 15;
+  int room = (H - 16 - y) / kSmallLine;  // keep the bottom line free
+  int first = max(0, (int)activity.size() - room);
+  for (int i = first; i < (int)activity.size(); ++i, y += kSmallLine) {
+    bool newest = i == (int)activity.size() - 1;
+    canvas.setTextColor(newest ? TFT_WHITE : 0x8410);  // older lines grey
+    canvas.drawString(fit((newest ? "→ " : "   ") + activity[i], W - 2 * PAD), PAD, y);
   }
   if (status.length()) {
-    canvas.setFont(kSmall);
     canvas.setTextColor(TFT_DARKGREY);
-    String s = status;
-    while (s.length() > 1 && canvas.textWidth(s) > W - 2 * PAD) s.remove(s.length() - 1);
-    canvas.drawString(s, PAD, H - 14);
+    canvas.drawString(fit(status, W - 2 * PAD), PAD, H - 14);
   }
   push();
 }

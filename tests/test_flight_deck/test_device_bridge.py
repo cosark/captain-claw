@@ -198,3 +198,44 @@ async def test_auth_off_deck_needs_no_token(monkeypatch):
     monkeypatch.setenv("FD_AUTH_ENABLED", "false")
     user = await db._device_user("")
     assert user and user["id"] == "local"
+
+
+def test_activity_text_is_one_drawable_line():
+    assert db.activity_text("📄 3 of 27 — Reading: a.pdf") == "3 of 27 — Reading: a.pdf"
+    assert db.activity_text("🛡️ Scale guard: redirecting\nfrom read") == "Scale guard: redirecting from read"
+    assert db.activity_text("Calling LLM (deepseek)...") == "Calling LLM (deepseek)…"
+
+
+@pytest.mark.asyncio
+async def test_activity_reaches_the_device_during_its_turn_only():
+    conn = _conn()
+    await conn.on_bus({"type": "activity", "text": "Searching: weather", "tool": "web_search", "phase": "tool"})
+    assert conn.ws.sent == []  # not our turn
+
+    conn.pending = True
+    await conn.on_bus({"type": "status", "status": "Using web_search..."})       # the activity says more
+    await conn.on_bus({"type": "activity", "text": "Searching: weather", "tool": "web_search", "phase": "tool"})
+    await conn.on_bus({"type": "activity", "text": "Searching: weather", "tool": "web_search", "phase": "tool"})
+    await conn.on_bus({"type": "status", "status": "Calling LLM (deepseek-v4-flash)"})
+    await conn.on_bus({"type": "status", "status": "Using playbook: travel"})
+    await conn.on_bus({"type": "activity", "text": "", "phase": "done"})
+    await conn.on_bus({"type": "status", "status": "thinking"})
+    assert [m.get("text") for m in conn.ws.sent if m["type"] == "activity"] == [
+        "Searching: weather", "Calling LLM (deepseek-v4-flash)", "Using playbook: travel"]
+    assert conn.ws.sent[0] == {"type": "activity", "text": "Searching: weather", "tool": "web_search"}
+
+
+@pytest.mark.asyncio
+async def test_agent_thinking_is_forwarded_as_activity():
+    from captain_claw.flight_deck import glasses_bridge as gb
+
+    seen: list = []
+    ch = gb._ChannelState(channel_id="t-activity")
+
+    async def _cb(payload):
+        seen.append(payload)
+
+    ch.callback_subscribers.append(_cb)
+    await gb._forward_agent_msg(ch, {"type": "thinking", "text": "Reading: a.md", "tool": "read", "phase": "tool"})
+    assert seen and seen[0]["type"] == "activity" and seen[0]["text"] == "Reading: a.md"
+    assert not ch.recent  # live only, never replayed

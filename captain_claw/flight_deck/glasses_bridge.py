@@ -182,7 +182,7 @@ def _now_iso() -> str:
 # old file (and ``control`` would re-step it), causing the deck to reload back
 # and forth between recently-opened decks before settling. These are live, fire-
 # once signals — only durable chat-like messages belong in the replay buffer.
-_NO_BACKFILL_TYPES = {"deck_open", "control", "deck_state", "narration", "media"}
+_NO_BACKFILL_TYPES = {"deck_open", "control", "deck_state", "narration", "media", "activity"}
 
 
 async def _broadcast(ch: _ChannelState, payload: dict) -> None:
@@ -314,6 +314,17 @@ async def _forward_agent_msg(ch: "_ChannelState", data: dict) -> None:
         items = [i for i in (data.get("items") or []) if isinstance(i, dict) and i.get("path")]
         if items:
             await _broadcast(ch, {"type": "media", "items": items, "ts": data.get("timestamp") or _now_iso()})
+    elif mtype == "thinking":
+        # What the agent is doing right now — the web app's activity
+        # indicator ("Searching: …", "Reading: …"). Only the device bridge
+        # shows these; other subscribers ignore the type.
+        await _broadcast(ch, {
+            "type": "activity",
+            "text": str(data.get("text", "")),
+            "tool": str(data.get("tool", "")),
+            "phase": str(data.get("phase", "")),
+            "ts": _now_iso(),
+        })
     elif mtype == "narration":
         # Live between-step progress blurbs — forward so the glasses HUD and
         # WhatsApp/Messenger see them during a long task.
