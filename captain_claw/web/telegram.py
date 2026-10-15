@@ -10,7 +10,9 @@ run concurrently.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
 import secrets
 import time
 from datetime import UTC, datetime
@@ -994,14 +996,31 @@ async def _tg_process_with_typing(
                 turn_start_idx = len(user_agent.session.messages) if user_agent.session else 0
                 turn_started_at = time.time()  # what this turn writes counts as a deliverable
                 log.info("Telegram agent.complete() start", user_id=user_id, text_len=len(text))
-                with mail_authority.bound(mail_authority.interactive(text)):
-                    from captain_claw import msg_origin as _msg_origin
+                # Narration goes out live, one message per blurb; the agent
+                # then answers with just its last response instead of folding
+                # every blurb into one long message.
+                narration = _TgNarration(server, chat_id) if _stream_narration() else None
+                user_agent.narration_callback = narration
+                try:
+                    with mail_authority.bound(mail_authority.interactive(text)):
+                        from captain_claw import msg_origin as _msg_origin
 
-                    _msg_origin.hint_turn_provenance(user_agent, channel="telegram")
-                    response = await user_agent.complete(text)
+                        _msg_origin.hint_turn_provenance(user_agent, channel="telegram")
+                        response = await user_agent.complete(text)
+                finally:
+                    user_agent.narration_callback = None
+                    if narration is not None:
+                        await narration.drain()  # the answer always lands last
                 log.info("Telegram agent.complete() done", user_id=user_id, response_len=len(response or ""))
 
                 await _tg_send(server, chat_id, response, reply_to_message_id=reply_to_message_id)
+                # The whole account — narration and answer, as the reply read
+                # before narration went live: the web mirror shows it, and a
+                # document a blurb named still goes out.
+                full_reply = (
+                    "\n\n---\n\n".join([*narration.texts, response or ""])
+                    if narration is not None and narration.texts else response
+                )
 
                 # A reply that came out garbled gets a /new hint (Jev judges,
                 # beside the deliverables and next steps below).
@@ -1023,7 +1042,7 @@ async def _tg_process_with_typing(
                 if user_agent.session and server._telegram_bridge:
                     for img_path in collect_turn_generated_image_paths(
                         user_agent.session, turn_start_idx, saved_root=saved_root_of(user_agent),
-                        since=turn_started_at, agent=user_agent, reply=response or "",
+                        since=turn_started_at, agent=user_agent, reply=full_reply or "",
                     ):
                         try:
                             await server._telegram_bridge.send_photo(
@@ -1036,7 +1055,7 @@ async def _tg_process_with_typing(
                 if user_agent.session and server._telegram_bridge:
                     for doc_path in collect_turn_generated_document_paths(
                         user_agent.session, turn_start_idx, agent=user_agent,
-                        reply=response or "", since=turn_started_at,
+                        reply=full_reply or "", since=turn_started_at,
                     ):
                         try:
                             await server._telegram_bridge.send_document(
@@ -1050,7 +1069,7 @@ async def _tg_process_with_typing(
                 server._broadcast({
                     "type": "chat_message",
                     "role": "assistant",
-                    "content": response,
+                    "content": full_reply,
                 })
 
                 # Extract and send suggested next steps as inline keyboard —
@@ -1123,6 +1142,49 @@ async def _tg_send(
             )
         except Exception as exc:
             log.error("Telegram send failed", error=str(exc))
+
+
+def _stream_narration() -> bool:
+    """Live narration is on unless ``STREAM_NARRATION`` is off — the same
+    switch the WhatsApp lane reads. Off, the blurbs fold into the answer."""
+    return os.environ.get("STREAM_NARRATION", "on").strip().lower() not in ("off", "0", "false", "no")
+
+
+class _TgNarration:
+    """A turn's narration callback: each blurb the model writes beside its
+    tool calls goes to the chat as its own message the moment it is written,
+    like the WhatsApp lane. Only to this chat — the agent's web socket would
+    carry it to Flight Deck's WhatsApp channels too.
+
+    Sends are chained so blurbs arrive in order; ``drain`` waits for them."""
+
+    def __init__(self, server: WebServer, chat_id: int) -> None:
+        self._server = server
+        self._chat_id = chat_id
+        self._tail: asyncio.Task[None] | None = None
+        self.texts: list[str] = []
+
+    def __call__(self, text: str, iteration: int = 0) -> None:
+        text = str(text or "").strip()
+        if not text:
+            return
+        self.texts.append(text)
+        self._tail = asyncio.get_running_loop().create_task(self._send(text, self._tail))
+
+    async def _send(self, text: str, prev: asyncio.Task[None] | None) -> None:
+        if prev is not None:
+            await asyncio.wait({prev})  # done, however it ended
+        await _tg_send(self._server, self._chat_id, text)
+        # A message clears "typing…" until the next heartbeat; put it back.
+        bridge = self._server._telegram_bridge
+        if bridge:
+            with contextlib.suppress(Exception):
+                await bridge.send_chat_action(chat_id=self._chat_id, action="typing")
+
+    async def drain(self) -> None:
+        if self._tail is not None:
+            with contextlib.suppress(Exception):
+                await self._tail
 
 
 async def _tg_load_state(server: WebServer, key: str) -> dict[str, dict[str, object]]:
