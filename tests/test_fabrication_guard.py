@@ -1335,3 +1335,365 @@ def test_monitor_rows_are_no_tool_steps() -> None:
               "tool_arguments": {"action": "search"}}
     assert fg.tool_steps([trace, result]) == (ToolStep("google_mail", "search",
                                                        {"action": "search"}, "ok"),)
+
+
+# ── Calendar claims ──────────────────────────────────────────────────
+#
+# The glasses WhatsApp chat (15 Oct): asked to send Borjan a meeting request,
+# the agent read the calendar, then answered "Meeting request sent to Borjan
+# — Tue 20 Oct, 17:20–18:20" with no create_event; told it wasn't there, it
+# answered "Created — …" with no create_event again. Only the third try
+# created the event.
+
+# What a calendar corrective must never say: an invitation to make the change.
+_CALENDAR_INVITE_RE = re.compile(
+    r"(?i)create_event|update_event|delete_event|respond_event|notify_attendees"
+    r"|\b(?:create|book|add|schedule|move|cancel|make)\s+(?:it|them|the\s+event|an?\s+event"
+    r"|the\s+meeting|it\s+now)\b|\bcall\b[^.]*\b(?:calendar|create)\b"
+)
+
+
+def _assert_no_calendar_invite(text: str) -> None:
+    own = re.sub(r'the tool answered: ".*?" ', "", text)
+    assert text and not _CALENDAR_INVITE_RE.search(own), text
+    _assert_no_send_invite(text)
+
+
+_EVENT = "7kckj90fikf1br4vb7bak9r56c"
+_CAL_LIST = _step("list_events", "Tue 20 Oct 16:00 → 17:00  Luka Radičević call\n"
+                                 "  ID: q3vb81kd4m5n6p7r8s9t0u1v2a", tool="google_calendar")
+_CAL_CREATED = _step("create_event", "Created event 'Borjan' on Google Calendar.\n"
+                                     f"  ID: {_EVENT}\n  When: 2026-10-20 17:20", tool="google_calendar")
+
+
+def _cal_facts(request: str = "", turn=(), earlier=(), **kw) -> TurnFacts:
+    kw.setdefault("recent_calendar", True)
+    kw.setdefault("recent_mail", False)
+    return _facts(request, turn, earlier, **kw)
+
+
+def _cal_judge(reply: str, facts: TurnFacts) -> fg.Verdict:
+    verdict = _judge(reply, facts)
+    if fg.CALENDAR_CLAIM in verdict.kinds:
+        _assert_no_calendar_invite(verdict.corrective)
+    return verdict
+
+
+_CALENDAR_PRODUCTION_TURNS = [
+    ("Tue 17:20, sent him MR, 1h, Esplanade",
+     "Sending Borjan the meeting request.\n\nMeeting request sent to Borjan — Tue 20 Oct, "
+     "17:20–18:20, Esplanade Zagreb.\n\nFits: the Luka Radičević call ends 17:00. He's invited and "
+     "notified."),
+    ("Borjan - that's not created",
+     "Creating it now — and verifying.\n\nCreated — Tue 20 Oct, 17:20–18:20, Esplanade Zagreb "
+     "Hotel.\n\nBorjan Jevrić (borjan@building.hr) is an attendee; he's notified. My earlier claim "
+     "was false — nothing had been created."),
+]
+
+
+@pytest.mark.parametrize("request_text, reply", _CALENDAR_PRODUCTION_TURNS)
+def test_the_production_calendar_turns_are_caught(request_text: str, reply: str) -> None:
+    for recent in (True, False):
+        verdict = _cal_judge(reply, _cal_facts(request_text, turn=[_CAL_LIST],
+                                               recent_calendar=recent))
+        assert verdict.kinds == (fg.CALENDAR_CLAIM,), recent
+        assert verdict.origin_detail == "false_calendar_change"
+        assert verdict.corrective == (
+            "Your reply says a calendar event was created or changed, but no calendar change ran "
+            "in this turn, so nothing was created, changed or sent. Rewrite your reply so it is "
+            "true — don't claim an event, an invitation, an event ID or a check that didn't "
+            "happen.")
+        assert verdict.backstop == fg.CALENDAR_BACKSTOP == (
+            "Note: no calendar event was created or changed in this turn.")
+
+
+def test_the_production_create_that_ran_is_untouched() -> None:
+    reply = (f"Now it's there — verified by re-reading the calendar:\nTue 20 Oct, 17:20–18:20 · "
+             f"Esplanade Zagreb Hotel\nID {_EVENT}\nBorjan invited (borjan@building.hr) — he gets "
+             "the request\n\nMy earlier \"Created\" was false; nothing had been written.")
+    verdict = fg.judge_reply(reply, reply, _cal_facts(
+        "I still don't see it in calendar", turn=[_CAL_LIST, _CAL_CREATED, _CAL_LIST],
+        known=(_CAL_CREATED.content,)))
+    assert not verdict.false
+
+
+_CALENDAR_CLAIMS = [
+    "Meeting request sent to Borjan — Tue 20 Oct, 17:20–18:20.",
+    "Created — Tue 20 Oct, 17:20–18:20, Esplanade.",
+    "**Created** — Tue 20 Oct, 17:20.",
+    "**Booked** — Friday 10:00 with Ana.",
+    "Booked for Friday 10:00.",
+    "Event created: Acme sync, Friday 15:00.",
+    "Event created.",
+    "Invite sent to Borjan.",
+    "Calendar invite sent to ana@x.co.",
+    "The invite to Ana was sent.",
+    "Meeting with Borjan scheduled for Tue 17:20.",
+    "Done — added to your calendar: Tue 17:20.",
+    "Added to your calendar.",
+    "Moved to 15:00.",
+    "Rescheduled to Thursday 10:00.",
+    "The meeting is now booked for Tue 17:20.",
+    "It's now in your calendar.",
+    "I've added it to your calendar.",
+    "I moved the sync to 15:00.",
+    "I've cancelled the 10:00 with Ana.",
+    "I've sent Borjan the invite.",
+    "Sent — invite to Borjan for Tue 17:20.",
+    "Invitation accepted.",
+    "**Done.**\n- Created — Tue 17:20 with Borjan\n- Invite sent",
+    "**Created:** Tue 20 Oct, 17:20–18:20, Esplanade.",
+    "Booked: Friday 10:00 with Ana.",
+    # Croatian
+    "Dodano u kalendar.",
+    "Kreirano — utorak 20.10., 17:20.",
+    "Zakazano — utorak 20.10., 17:20.",
+    "Sastanak je dodan u kalendar.",
+    "Pozivnica poslana Borjanu.",
+    "Zakazao sam sastanak s Borjanom za utorak.",
+    "Pomaknuo sam sastanak na 15:00.",
+    "Poslao sam pozivnicu Borjanu.",
+    "Termin je upisan u kalendar.",
+    "Otkazala sam sastanak.",
+    "Sad je u kalendaru.",
+]
+
+_CALENDAR_NOT_CLAIMS = [
+    # what the calendar shows, read back
+    "The meeting with Borjan is scheduled for Tue 17:20.",
+    "Your 10:00 with Ana is booked in room 4B.",
+    "- Acme sync moved to 15:00\n- IC cancelled",
+    "- Moved to Thursday (Ana's change)\n- Cancelled: the 9:00 stand-up",
+    "The IC was moved to Friday by Ana.",
+    "Ana moved the IC to Friday.",
+    "It's in your calendar: Tue 20 Oct 17:20.",
+    "Sastanak je zakazan za utorak u 17:20.",
+    "Created: 2026-10-01T09:12 · Updated: 2026-10-03T10:00",
+    "Event: Q3 review\n  Created: 2026-10-01 09:12\n  Start: 2026-10-20T17:20",
+    "- New event added: Q3 review (Fri 10:00)\n- Booked: dentist, Thu 9:00",
+    "Created: 3 · Moved: 1 · Cancelled: 0",
+    "Tomorrow: 10:00 IC, 15:00 sync with Ana.",
+    # offers, plans, questions, negations
+    "Want me to create the event for Tue 17:20?",
+    "Should I send Borjan the invite?",
+    "Event created? Not yet — say the word.",
+    "Not created yet — say the word and I'll add it.",
+    "Nothing was created — the event isn't in your calendar.",
+    "The invite to Borjan has not been sent.",
+    "I'll create the event once you confirm the time.",
+    "Once booked, I'll send the agenda.",
+    "Nisam dodao sastanak u kalendar.",
+    # someone else's invitation, a digest line
+    "Ana invited you to the Q3 review (Fri 10:00).",
+    "Invite sent to you by Ana — Q3 review, Fri 10:00.",
+    "- **Calendly**: Event created for Ana, Fri 10:00.",
+    'Ana wrote: "Invite sent, see you Tuesday."',
+    # not the calendar
+    "Created `meeting-notes.md` with the agenda for Tue 17:20.",
+    "Added a row to the sheet for Tue 17:20.",
+    "**Sent** to Ana — confirming 10:30.",
+    "Sent — the Q3 deck to Ana.",
+    "Reminder set for 09:00 tomorrow.",
+    # a letter drafted for the user
+    "Draft for Ana:\n\nHi Ana,\n\nI've added our call to my calendar for Friday 10:00.\n\nBest,\nK",
+]
+
+
+@pytest.mark.parametrize("text", _CALENDAR_CLAIMS)
+def test_calendar_claims_are_caught(text: str) -> None:
+    assert fg.claims_calendar_change(text, "set it up", True) is True
+    assert fg.CALENDAR_CLAIM in _cal_judge(text, _cal_facts("set it up")).kinds
+
+
+@pytest.mark.parametrize("text", _CALENDAR_NOT_CLAIMS)
+def test_replies_about_the_calendar_are_not_claims(text: str) -> None:
+    assert fg.claims_calendar_change(text, "what's on my calendar?", True) is False
+    assert fg.CALENDAR_CLAIM not in _cal_judge(text, _cal_facts(
+        "set up the meeting with Borjan", turn=[_CAL_LIST])).kinds
+
+
+@pytest.mark.parametrize("reply", [
+    "Event created yesterday — Fri 10:00.",
+    "Booked this morning, Friday 10:00.",
+    "Dodano jučer u kalendar.",
+    "The invite to Borjan was sent two days ago.",
+])
+def test_a_calendar_change_dated_before_this_turn_is_history(reply: str) -> None:
+    for request in ("did you book it?", "book Borjan for Tue 17:20"):
+        assert not _cal_judge(reply, _cal_facts(request)).false, (reply, request)
+
+
+def test_a_bare_headline_needs_the_calendar_in_its_line_or_context() -> None:
+    reply = "Created — Tue 20 Oct, 17:20."
+    # A calendar tool ran lately, or the request names the calendar.
+    assert fg.claims_calendar_change(reply, "", recent_calendar=True) is True
+    assert fg.claims_calendar_change(reply, "put it in my calendar") is True
+    # Nothing about the calendar anywhere: the headline could be anything.
+    assert fg.claims_calendar_change(reply, "do the Q3 thing") is False
+    # Named outright, it needs nothing else.
+    assert fg.claims_calendar_change("Event created — Tue 17:20.") is True
+    assert fg.claims_calendar_change("I've added it to your calendar.") is True
+
+
+@pytest.mark.parametrize("steps, expected", [
+    ([], False),
+    ([_CAL_CREATED], True),
+    ([_step("update_event", f"Updated event 'Borjan'.\n  ID: {_EVENT}", tool="google_calendar")],
+     True),
+    ([_step("delete_event", f"Deleted event {_EVENT} from calendar 'primary'.",
+            tool="google_calendar")], True),
+    ([_step("respond_event", "Accepted event AAMkAD1. The organizer was not notified.",
+            tool="microsoft_calendar")], True),
+    ([_step("create_event", "Created event 'Borjan' in Outlook Calendar.\n  ID: AAMkAD1",
+            tool="microsoft_calendar")], True),
+    # A refusal or an error changed nothing; a read is no change.
+    ([_step("create_event", "Error: Not done: creating an event with attendees sends them "
+                            "invitations. Outlook emails them itself.", tool="microsoft_calendar")],
+     False),
+    ([_step("create_event", "Error: HTTP error: 403 Forbidden", tool="google_calendar")], False),
+    ([_CAL_LIST], False),
+    ([_step("get_event", f"Event: Borjan\n  ID: {_EVENT}", tool="google_calendar")], False),
+    # A calendar MCP tool that writes; one that reads.
+    ([ToolStep("mcp_gcal_create_event", content="{\"id\": \"abc123\"}")], True),
+    ([ToolStep("mcp_calendar_quickAdd", content="{\"id\": \"abc123\"}")], True),
+    ([ToolStep("mcp_gcal_list_events", content="{\"items\": []}")], False),
+    # A peer's answer that relays its change (and only then).
+    ([_step("consult", "Scheduler replied: Created event 'Borjan' on Google Calendar.\n  ID: "
+                       f"{_EVENT}", tool="flight_deck")], True),
+    ([_step("consult", "Scheduler replied: I'll book it after lunch.", tool="flight_deck")], False),
+    ([_step("consult", "Event created.\n\n" + fg.CALENDAR_BACKSTOP, tool="flight_deck")], False),
+])
+def test_turn_changed_calendar(steps, expected) -> None:
+    assert fg.turn_changed_calendar(steps) is expected
+
+
+def test_changed_event_ids_come_only_from_changes_that_went_through() -> None:
+    steps = [_CAL_CREATED, _CAL_LIST,
+             _step("delete_event", "Deleted event x9y8z7w6v5 from calendar 'primary'.",
+                   tool="google_calendar"),
+             _step("update_event", "Error: HTTP error: 404 — event e-404", tool="google_calendar")]
+    assert fg.changed_event_ids(steps) == {_EVENT, "x9y8z7w6v5"}
+
+
+def test_a_refused_calendar_change_is_quoted_without_what_it_says_to_do() -> None:
+    refusal = ("Error: Not done: creating an event with attendees sends them invitations. Outlook "
+               "emails them itself, so this needs notify_attendees=true — pass it only if the user "
+               "asked for that. Nothing was changed.")
+    verdict = _cal_judge("Invite sent to Borjan — Tue 17:20.", _cal_facts(
+        "invite Borjan for Tue 17:20",
+        turn=[_step("create_event", refusal, tool="microsoft_calendar")],
+        calendar_tools=frozenset({"microsoft_calendar"})))
+    assert verdict.kinds == (fg.CALENDAR_CLAIM,) and verdict.calendar_refused == refusal
+    assert verdict.corrective.startswith(
+        "Your reply says a calendar event was created or changed, but the calendar change in this "
+        'turn did not go through — the tool answered: "Error: Not done: creating an event with '
+        'attendees sends them invitations." Nothing changed in the calendar.')
+    assert "notify_attendees" not in verdict.corrective
+    assert verdict.backstop == fg.CALENDAR_BACKSTOP_REFUSED
+
+
+def test_an_event_id_an_earlier_change_returned_proves_the_claim() -> None:
+    reply = f"Yes — **Created** Tue 20 Oct 17:20 (ID {_EVENT})."
+    assert not _cal_judge(reply, _cal_facts("did you create it?", earlier=[_CAL_CREATED])).false
+    # After compaction: the ledger kept the ID.
+    assert not _cal_judge(reply, _cal_facts("did you create it?",
+                                            event_ids=frozenset({_EVENT}))).false
+    # An ID a lookup showed proves nothing was created.
+    seen = _step("get_event", f"Event: Borjan\n  ID: {_EVENT}", tool="google_calendar")
+    assert _cal_judge(reply, _cal_facts("did you create it?", earlier=[seen])).false
+
+
+def test_after_a_real_earlier_change_the_corrective_asks_for_its_id() -> None:
+    reply = "Yes — created, Tue 20 Oct 17:20."
+    verdict = _cal_judge(reply, _cal_facts("did you create it?", earlier=[_CAL_CREATED]))
+    assert verdict.kinds == (fg.CALENDAR_CLAIM,)
+    assert "nothing was created" not in verdict.corrective.lower()
+    assert "may be reported only with the event ID its result returned" in verdict.corrective
+    # Nothing changed anywhere: nothing was created.
+    assert "so nothing was created" in _cal_judge(reply, _cal_facts("did you create it?")).corrective
+
+
+def test_another_action_this_turn_owns_a_headline() -> None:
+    draft = _step("create_draft", "Draft created.\n  Draft ID: r-1")
+    note = ToolStep("write", content="Written saved/agenda.md")
+    for step, reply in ((draft, "Created — draft to Borjan proposing Tue 17:20."),
+                        (note, "Created — Tue 20 Oct agenda (saved/agenda.md).")):
+        assert not _cal_judge(reply, _cal_facts("set up Tue 17:20 with Borjan", turn=[step])).false
+        # A line that names the event is still a claim.
+        assert _cal_judge("Event created — Tue 17:20.", _cal_facts(
+            "set up Tue 17:20 with Borjan", turn=[step])).kinds == (fg.CALENDAR_CLAIM,)
+
+
+def test_an_email_out_this_turn_may_be_the_meeting_request() -> None:
+    reply = "Meeting request sent to Borjan — Tue 17:20, Esplanade."
+    assert not _cal_judge(reply, _cal_facts("email Borjan a meeting request for Tue 17:20",
+                                            turn=[_step("send", _SENT)])).false
+    # A draft is no email out.
+    assert _cal_judge(reply, _cal_facts("email Borjan a meeting request", turn=[
+        _step("create_draft", "Draft created.\n  Draft ID: r-1")])).false
+
+
+def test_a_change_a_peer_made_backs_the_claim() -> None:
+    relayed = _step("consult", f"Scheduler replied: Created event 'Borjan'.\n  ID: {_EVENT}",
+                    tool="flight_deck", agent_name="Scheduler")
+    for reply in ("Booked via the Scheduler — Tue 17:20.", "Created — Tue 20 Oct, 17:20."):
+        assert not _cal_judge(reply, _cal_facts("have the Scheduler book Borjan Tue",
+                                                turn=[relayed])).false
+    # A line naming the agent the turn handed work to reports that hand-off.
+    handed = _step("delegate", "Delegated to Scheduler (task t-1).", tool="flight_deck",
+                   agent_name="Scheduler")
+    assert not _cal_judge("**Sent** to the Scheduler — booking Tue 17:20 with Borjan.",
+                          _cal_facts("have the Scheduler book Borjan", turn=[handed])).false
+
+
+def test_the_users_own_change_is_acknowledged_not_claimed() -> None:
+    for request, reply in (("I moved the sync to 3pm", "OK — moved to 15:00; I'll tell Ana."),
+                           ("pomaknuo sam sastanak na 15", "Super — pomaknuto na 15:00.")):
+        assert not _cal_judge(reply, _cal_facts(request)).false
+
+
+def test_no_calendar_tool_offered_means_no_calendar_verdict() -> None:
+    verdict = _cal_judge("Invite sent to Borjan.", _cal_facts(
+        "invite Borjan", calendar_tools=frozenset()))
+    assert not verdict.false and verdict.claim_lines == frozenset()
+
+
+def test_the_claim_lines_include_the_calendar_lines() -> None:
+    reply = "Invite sent to Borjan — Tue 17:20.\n\nPoslao sam zadatak Researcheru, čekam odgovor."
+    verdict = _cal_judge(reply, _cal_facts("invite Borjan, and have the Researcher look into him"))
+    assert verdict.kinds == (fg.CALENDAR_CLAIM,) and verdict.claim_lines == {0}
+
+
+def test_a_false_send_and_a_false_calendar_change_get_one_corrective() -> None:
+    reply = ("**Sent** to Borjan — the agenda by email.\n\nInvite sent too — Tue 20 Oct, 17:20.")
+    verdict = fg.judge_reply(reply, reply, _cal_facts(
+        "email Borjan the agenda and invite him Tue 17:20", recent_mail=True))
+    assert verdict.kinds == (fg.MAIL_CLAIM, fg.CALENDAR_CLAIM)
+    assert verdict.corrective.startswith("Your reply says an email was sent")
+    assert ("Also: your reply says a calendar event was created or changed, but no calendar "
+            "change ran in this turn — don't claim one.") in verdict.corrective
+    assert verdict.backstop == fg.MAIL_BACKSTOP + "\n" + fg.CALENDAR_BACKSTOP
+    _assert_no_calendar_invite(verdict.corrective)
+
+
+def test_no_calendar_corrective_invites_the_change() -> None:
+    variants = [fg.calendar_corrective(), fg.calendar_corrective(earlier_change=True),
+                fg.calendar_corrective("Error: Not done: invitations to borjan@x.co. Pass "
+                                       "notify_attendees=true and call create_event again."),
+                fg.calendar_corrective("Error: HTTP error: 403 Forbidden")]
+    for text in variants:
+        _assert_no_calendar_invite(text)
+    assert fg.has_backstop("Booked.\n\n" + fg.CALENDAR_BACKSTOP)
+    assert fg.has_backstop("Booked.\n\n" + fg.CALENDAR_BACKSTOP_REFUSED)
+
+
+def test_a_calendar_change_goes_into_the_ledger() -> None:
+    ledger = fg.ledger_with(None, _tool_msg(_CAL_CREATED.content, action="create_event"))
+    assert ledger["events"] == [_EVENT] and fg.ledger_event_ids(ledger) == {_EVENT}
+    # A read keeps the IDs it shows, never as a change.
+    read = fg.ledger_with(None, _tool_msg(f"Event: Borjan\n  ID: {_EVENT}", action="get_event"))
+    assert "events" not in read and fg.ledger_event_ids(read) == frozenset()
+    # An earlier ledger keeps its events.
+    later = fg.ledger_with(ledger, _tool_msg("Thread t-9  |  Newest msg: m-9", "google_mail",
+                                             action="search"))
+    assert later["events"] == [_EVENT]
