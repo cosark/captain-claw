@@ -24,7 +24,7 @@ struct Settings {
   uint16_t sleepMin = 15;  // deep sleep after this many idle minutes (0 = never)
   bool femaleVoice = false; // spoken replies: male (Adrian) / female (Emma) on the deck
   bool iconMode = false;    // screen: text stages, or an animated character
-  uint8_t character = 0;    // face::Kind — smiley, bot, captain, bird
+  uint8_t character = 0;    // face::Kind (0 = captain)
   bool cueBeep = true;      // chime before speech starts
   bool cueFlash = true;     // flash the screen before speech starts
   uint8_t cueLeadS = 1;     // the cue comes this many seconds (1 or 2) before speech

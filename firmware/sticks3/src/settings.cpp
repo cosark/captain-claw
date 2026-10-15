@@ -26,6 +26,9 @@ void Settings::load() {
   femaleVoice = p.getBool("female", false);
   iconMode = p.getBool("icons", false);
   character = p.getUChar("char", 0);
+  if (!p.isKey("charv")) {  // v1 numbering: 0 smiley, 1 bot, 2 captain, 3 bird
+    character = character == 1 ? 1 : character == 3 ? 2 : 0;
+  }
   cueBeep = p.getBool("cuebeep", true);
   cueFlash = p.getBool("cueflash", true);
   cueLeadS = constrain(p.getUChar("cuelead", 1), 1, 2);
@@ -57,6 +60,7 @@ void Settings::save() const {
   p.putBool("female", femaleVoice);
   p.putBool("icons", iconMode);
   p.putUChar("char", character);
+  p.putUChar("charv", 2);
   p.putBool("cuebeep", cueBeep);
   p.putBool("cueflash", cueFlash);
   p.putUChar("cuelead", cueLeadS);
