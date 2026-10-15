@@ -21,9 +21,9 @@
 #include "settings.h"
 #include "ui.h"
 
-#define FW_VERSION "0.5.0"
+#define FW_VERSION "0.6.0"
 
-enum class Mode { Idle, Listening, Waiting, Reply, Image, Menu, Agents, Status, Notice };
+enum class Mode { Idle, Listening, Waiting, Reply, Image, Menu, Agents, CharPick, Status, Notice };
 
 static WebSocketsClient ws;
 static WiFiMulti wifiMulti;
@@ -42,6 +42,7 @@ static int menuSel = 0;
 static std::vector<String> agentNames, agentSlugs;
 static int agentSel = 0, agentCur = -1;
 static bool agentsLoading = false;
+static uint8_t charSel = 0;  // character being previewed
 static uint32_t flashStartMs = 0;
 static bool flashing = false;
 static int rttMs = -1;
@@ -154,6 +155,11 @@ static void setBarState() {
     st = "speaking", col = kCyan;
   } else if (mode == Mode::Waiting) {
     st = workLabel(), col = kYellow;
+  } else if (mode == Mode::CharPick) {
+    static char buf[24];
+    snprintf(buf, sizeof(buf), "%d/%d  A=pick", charSel + 1, (int)face::KindCount);
+    ui::setBar(face::name(charSel), buf, kCyan);
+    return;
   } else if (mode == Mode::Menu || mode == Mode::Agents) {
     st = "menu", col = kText;
   } else if (mode == Mode::Status) {
@@ -225,7 +231,7 @@ static String menuLabel(int row) {
     case MBoost: return settings.boostDb ? "Boost +" + String(settings.boostDb) + " dB" : String("Boost off");
     case MVoice: return String("Voice: ") + (settings.femaleVoice ? "female" : "male");
     case MDisplay: return String("Display: ") + (settings.iconMode ? "icons" : "text");
-    case MCharacter: return String("Character: ") + face::name(settings.character);
+    case MCharacter: return String("Character: ") + face::name(settings.character) + " »";
     case MBeep: return String("Beep before speech: ") + (settings.cueBeep ? "on" : "off");
     case MFlash: return String("Flash before speech: ") + (settings.cueFlash ? "on" : "off");
     case MLead: return "Cue lead: " + String(settings.cueLeadS) + " s";
@@ -267,6 +273,17 @@ static void redraw() {
     case Mode::Image: ui::showStoredImage(); break;
     case Mode::Menu: ui::showPicker(menuNames(), menuSel, -1); break;
     case Mode::Agents: ui::showPicker(agentNames, agentSel, agentCur); break;
+    case Mode::CharPick: {
+      // Cycle through the poses so the preview shows everything it does.
+      static const face::Pose poses[] = {face::Pose::Idle, face::Pose::Listening, face::Pose::Thinking,
+                                         face::Pose::Speaking, face::Pose::Sad};
+      uint32_t t = millis();
+      face::Pose pose = poses[(t / 2500) % 5];
+      int lvl = pose == face::Pose::Speaking || pose == face::Pose::Listening
+                    ? 45 + (int)(40 * sinf(t / 90.0f)) : 0;
+      ui::showFace(charSel, pose, lvl);
+      break;
+    }
     case Mode::Status: ui::showPanel("", kText, statusRows()); break;
     case Mode::Notice: break;  // stays until the next event
     case Mode::Idle:
@@ -330,7 +347,11 @@ static void chooseMenuRow() {
       if (wsUp) sendPrefs();
       break;
     case MDisplay: settings.iconMode = !settings.iconMode; break;
-    case MCharacter: settings.character = (settings.character + 1) % face::KindCount; break;
+    case MCharacter:
+      charSel = settings.character;
+      mode = Mode::CharPick;
+      redraw();
+      return;
     case MBeep: settings.cueBeep = !settings.cueBeep; break;
     case MFlash: settings.cueFlash = !settings.cueFlash; break;
     case MLead: settings.cueLeadS = settings.cueLeadS == 1 ? 2 : 1; break;
@@ -493,7 +514,9 @@ static void onText(const char* payload, size_t len) {
     touch();
     ++turns;
     lastReplyMs = millis();
-    ui::setReply(doc["text"] | "");
+    String said = doc["text"] | "";
+    ui::setReply(said);
+    face::setText(said);
     mode = Mode::Reply;
     if (!flashing) redraw();
   } else if (type == "audio_start") {
@@ -665,7 +688,7 @@ void loop() {
   M5.update();
   ws.loop();
   if (WiFi.status() != WL_CONNECTED) wifiMulti.run(0);
-  bool inMenu = mode == Mode::Menu || mode == Mode::Agents || mode == Mode::Status;
+  bool inMenu = mode == Mode::Menu || mode == Mode::Agents || mode == Mode::Status || mode == Mode::CharPick;
 
   // Front button: hold to talk, tap for quick actions; in the menu, choose.
   if (M5.BtnA.wasPressed()) {
@@ -674,6 +697,12 @@ void loop() {
       chooseMenuRow();
     } else if (mode == Mode::Agents) {
       chooseAgent();
+    } else if (mode == Mode::CharPick) {
+      settings.character = charSel;
+      settings.save();
+      mode = Mode::Menu;
+      menuOpenedMs = millis();
+      redraw();
     } else if (mode == Mode::Status) {
       openMenu();
     } else {
@@ -697,12 +726,23 @@ void loop() {
   // Side button: page / next row · hold = menu (hold again = close).
   if (M5.BtnB.wasHold()) {
     touch();
-    if (inMenu) backToMain();
-    else if (mode != Mode::Listening) openMenu();
+    if (mode == Mode::CharPick) {  // back to the menu, keeping the old character
+      mode = Mode::Menu;
+      menuOpenedMs = millis();
+      redraw();
+    } else if (inMenu) {
+      backToMain();
+    } else if (mode != Mode::Listening) {
+      openMenu();
+    }
   } else if (M5.BtnB.wasClicked()) {
     touch();
     if (mode == Mode::Menu) {
       menuSel = (menuSel + 1) % MCount;
+      menuOpenedMs = millis();
+      redraw();
+    } else if (mode == Mode::CharPick) {
+      charSel = (charSel + 1) % face::KindCount;
       menuOpenedMs = millis();
       redraw();
     } else if (mode == Mode::Agents) {
@@ -725,6 +765,7 @@ void loop() {
     }
   }
   if ((mode == Mode::Menu || mode == Mode::Agents) && millis() - menuOpenedMs > 20000) backToMain();
+  if (mode == Mode::CharPick && millis() - menuOpenedMs > 60000) backToMain();
 
   // Keep a round-trip time for the status page.
   if (wsUp && millis() - lastPingMs > 15000) {
@@ -757,18 +798,21 @@ void loop() {
       // Changes at most ~6×/s; the timer (and the icon's dots) once in a while.
       static uint32_t lastSecond = 0;
       uint32_t secs = (millis() - workStartMs) / 1000;
-      if ((workDirty && since > 150) || secs != lastSecond || (settings.iconMode && since > 120)) {
+      if ((workDirty && since > 150) || secs != lastSecond || (settings.iconMode && since > face::frameMs(settings.character))) {
         lastSecond = secs;
         lastDrawMs = millis();
         workDirty = false;
         redraw();
       }
-    } else if (settings.iconMode && mode == Mode::Reply && audio::playing() && since > 60) {
+    } else if (settings.iconMode && mode == Mode::Reply && audio::playing() && since > min<uint32_t>(60, face::frameMs(settings.character))) {
       lastDrawMs = millis();
       setBarState();
       ui::showFace(settings.character, face::Pose::Speaking, audio::outputLevel());
-    } else if (settings.iconMode && mode == Mode::Idle && !ui::hasReply() && since > 150) {
-      lastDrawMs = millis();  // blinking
+    } else if (settings.iconMode && mode == Mode::Idle && !ui::hasReply() && since > face::frameMs(settings.character)) {
+      lastDrawMs = millis();  // blinking, rain, bouncing…
+      redraw();
+    } else if (mode == Mode::CharPick && since > face::frameMs(charSel)) {
+      lastDrawMs = millis();
       redraw();
     } else if ((mode == Mode::Status && since > 1000) || since > 30000) {
       lastDrawMs = millis();  // live status page; battery/health in the bar elsewhere

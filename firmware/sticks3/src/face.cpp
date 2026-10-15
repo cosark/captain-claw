@@ -1,38 +1,47 @@
-#include "face.h"
+// Character dispatch, shared helpers, and the original three (captain, bot, bird).
+#include "face_common.h"
 
 namespace face {
 
-static constexpr uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
-  return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-}
-
-static constexpr uint16_t kBlack = rgb(0, 0, 0);
-static constexpr uint16_t kWhite = rgb(255, 255, 255);
-static constexpr uint16_t kMouth = rgb(110, 20, 30);
-static constexpr uint16_t kTongue = rgb(230, 90, 100);
 static constexpr uint16_t kWave = rgb(90, 200, 255);
 static constexpr uint16_t kDots = rgb(200, 200, 200);
 
+static String spoken;
+static Pose lastPose = Pose::Idle;
+static uint8_t lastKind = 255;
+static uint32_t poseStart = 0;
+
 const char* name(uint8_t kind) {
+  static const char* names[KindCount] = {
+      "Captain", "Bot", "Bird", "Car", "Matrix", "Orc", "Elf", "Dwarf", "C64", "Amiga",
+      "Cat", "Dog", "Dinosaur", "Alien", "Caveman", "HAL 9000", "KITT", "Pac-Man"};
+  return kind < KindCount ? names[kind] : names[0];
+}
+
+void setText(const String& text) { spoken = text; }
+const String& sayText() { return spoken; }
+uint32_t poseAge(uint32_t t) { return t - poseStart; }
+
+uint32_t frameMs(uint8_t kind) {
   switch (kind) {
-    case Bot: return "bot";
-    case Captain: return "captain";
-    case Bird: return "bird";
-    default: return "smiley";
+    case Matrix: case Amiga: case Kitt: case PacMan: case Hal: return 50;
+    default: return 120;
   }
 }
 
-static bool blinking(uint32_t t) { return t % 3600 < 130; }
+bool blinking(uint32_t t) { return t % 3600 < 130; }
 
-// Mouth opening in px for a speaking level, with a little jitter so it moves
-// like speech rather than a meter.
-static int openness(int level, int maxOpen, uint32_t t) {
+int openness(int level, int maxOpen, uint32_t t) {
   if (level < 6) return 0;
   int o = level * maxOpen / 100;
   return constrain(o + (int)((t / 70) % 3) - 1, 1, maxOpen);
 }
 
-// "Sound coming in" arcs left of the character, one per 25% of mic level.
+float wave(uint32_t t, uint32_t periodMs) {
+  return sinf((t % periodMs) * (6.2831853f / periodMs));
+}
+
+// "Sound coming in" arcs left of the character, one per ~30% of mic level.
 static void listenWaves(M5Canvas& c, int x, int y, int level) {
   for (int i = 0; i < 3; ++i) {
     uint16_t col = level > 8 + i * 28 ? kWave : rgb(40, 60, 80);
@@ -47,45 +56,49 @@ static void thinkDots(M5Canvas& c, int x, int y, uint32_t t) {
   for (int i = 0; i < n; ++i) c.fillCircle(x + i * 11, y - i * 5, 3 + i, kDots);
 }
 
-// ── smiley ──────────────────────────────────────────────────────────
-
-static void smiley(M5Canvas& c, Pose pose, int level, uint32_t t, int cx, int cy) {
-  const int R = 44;
-  c.fillCircle(cx, cy, R, rgb(255, 205, 40));
-  int ex = 16, ey = cy - 12, dx = 0, dy = 0;
-  if (pose == Pose::Thinking) dx = 3, dy = -4;
-  if (blinking(t) && pose != Pose::Thinking) {
-    c.fillRect(cx - ex - 5, ey, 10, 3, kBlack);
-    c.fillRect(cx + ex - 5, ey, 10, 3, kBlack);
-  } else {
-    c.fillEllipse(cx - ex + dx, ey + dy, 5, 8, kBlack);
-    c.fillEllipse(cx + ex + dx, ey + dy, 5, 8, kBlack);
+// Screens and machines that show listening/thinking their own way.
+static bool ownsPoses(uint8_t kind) {
+  switch (kind) {
+    case Matrix: case C64: case Amiga: case Hal: case Kitt: case PacMan: case Dinosaur: return true;
+    default: return false;
   }
-  switch (pose) {
-    case Pose::Speaking: {
-      int o = openness(level, 20, t);
-      if (o == 0) {
-        c.fillArc(cx, cy + 4, 20, 23, 30, 150, kBlack);
-      } else {
-        c.fillEllipse(cx, cy + 20, 15, o / 2 + 3, kMouth);
-        if (o > 8) c.fillEllipse(cx, cy + 22 + o / 4, 8, o / 5 + 1, kTongue);
-      }
-      break;
-    }
-    case Pose::Thinking:
-      c.fillCircle(cx + 8, cy + 22, 5, kMouth);
-      break;
-    case Pose::Sad:
-      c.fillArc(cx, cy + 36, 18, 21, 210, 330, kBlack);
-      break;
-    default:
-      c.fillArc(cx, cy + 2, 26, 30, 30, 150, kBlack);
+}
+
+void draw(M5Canvas& c, uint8_t kind, Pose pose, int level, uint32_t t, int cx, int cy) {
+  if (pose != lastPose || kind != lastKind) {
+    lastPose = pose;
+    lastKind = kind;
+    poseStart = t;
+  }
+  switch (kind) {
+    case Bot: drawBot(c, pose, level, t, cx, cy); break;
+    case Bird: drawBird(c, pose, level, t, cx, cy); break;
+    case Car: drawCar(c, pose, level, t, cx, cy); break;
+    case Matrix: drawMatrix(c, pose, level, t, cx, cy); break;
+    case Orc: drawOrc(c, pose, level, t, cx, cy); break;
+    case Elf: drawElf(c, pose, level, t, cx, cy); break;
+    case Dwarf: drawDwarf(c, pose, level, t, cx, cy); break;
+    case C64: drawC64(c, pose, level, t, cx, cy); break;
+    case Amiga: drawAmiga(c, pose, level, t, cx, cy); break;
+    case Cat: drawCat(c, pose, level, t, cx, cy); break;
+    case Dog: drawDog(c, pose, level, t, cx, cy); break;
+    case Dinosaur: drawDinosaur(c, pose, level, t, cx, cy); break;
+    case Alien: drawAlien(c, pose, level, t, cx, cy); break;
+    case Caveman: drawCaveman(c, pose, level, t, cx, cy); break;
+    case Hal: drawHal(c, pose, level, t, cx, cy); break;
+    case Kitt: drawKitt(c, pose, level, t, cx, cy); break;
+    case PacMan: drawPacMan(c, pose, level, t, cx, cy); break;
+    default: drawCaptain(c, pose, level, t, cx, cy);
+  }
+  if (!ownsPoses(kind)) {
+    if (pose == Pose::Listening) listenWaves(c, cx - 70, cy, level);
+    if (pose == Pose::Thinking) thinkDots(c, cx + 52, cy - 30, t);
   }
 }
 
 // ── bot ─────────────────────────────────────────────────────────────
 
-static void bot(M5Canvas& c, Pose pose, int level, uint32_t t, int cx, int cy) {
+void drawBot(M5Canvas& c, Pose pose, int level, uint32_t t, int cx, int cy) {
   const uint16_t body = rgb(150, 160, 175), plate = rgb(30, 36, 48), led = rgb(60, 230, 255);
   c.drawFastVLine(cx, cy - 46, 12, body);
   bool lamp = pose == Pose::Thinking ? (t / 300) % 2 : true;
@@ -114,16 +127,16 @@ static void bot(M5Canvas& c, Pose pose, int level, uint32_t t, int cx, int cy) {
 
 // ── captain ─────────────────────────────────────────────────────────
 
-static void captain(M5Canvas& c, Pose pose, int level, uint32_t t, int cx, int cy) {
+void drawCaptain(M5Canvas& c, Pose pose, int level, uint32_t t, int cx, int cy) {
   const uint16_t skin = rgb(245, 196, 160), beard = rgb(235, 235, 235), navy = rgb(25, 40, 95);
   const uint16_t gold = rgb(240, 190, 40);
   int fy = cy + 8;
   c.fillCircle(cx, fy, 37, skin);
-  c.fillEllipse(cx, fy + 22, 34, 20, beard);        // beard
+  c.fillEllipse(cx, fy + 22, 34, 20, beard);           // beard
   c.fillRoundRect(cx - 40, cy - 48, 80, 28, 9, navy);  // cap crown
-  c.fillRect(cx - 40, cy - 25, 80, 6, kWhite);      // band
-  c.fillEllipse(cx, cy - 18, 43, 6, kBlack);         // visor
-  c.fillCircle(cx, cy - 36, 7, gold);                // badge
+  c.fillRect(cx - 40, cy - 25, 80, 6, kWhite);         // band
+  c.fillEllipse(cx, cy - 18, 43, 6, kBlack);           // visor
+  c.fillCircle(cx, cy - 36, 7, gold);                  // badge
   c.fillCircle(cx, cy - 36, 3, navy);
   int dx = pose == Pose::Thinking ? 3 : 0, dy = pose == Pose::Thinking ? -2 : 0;
   if (blinking(t) && pose != Pose::Thinking) {
@@ -133,8 +146,8 @@ static void captain(M5Canvas& c, Pose pose, int level, uint32_t t, int cx, int c
     c.fillCircle(cx - 13 + dx, fy - 6 + dy, 4, kBlack);
     c.fillCircle(cx + 13 + dx, fy - 6 + dy, 4, kBlack);
   }
-  c.fillCircle(cx, fy + 4, 5, rgb(230, 140, 120));   // nose
-  c.fillEllipse(cx - 10, fy + 12, 11, 4, beard);     // moustache
+  c.fillCircle(cx, fy + 4, 5, rgb(230, 140, 120));     // nose
+  c.fillEllipse(cx - 10, fy + 12, 11, 4, beard);       // moustache
   c.fillEllipse(cx + 10, fy + 12, 11, 4, beard);
   int o = pose == Pose::Speaking ? openness(level, 14, t) : 0;
   if (pose == Pose::Sad) {
@@ -146,7 +159,7 @@ static void captain(M5Canvas& c, Pose pose, int level, uint32_t t, int cx, int c
 
 // ── bird ────────────────────────────────────────────────────────────
 
-static void bird(M5Canvas& c, Pose pose, int level, uint32_t t, int cx, int cy) {
+void drawBird(M5Canvas& c, Pose pose, int level, uint32_t t, int cx, int cy) {
   const uint16_t feather = rgb(70, 160, 240), dark = rgb(40, 100, 190);
   const uint16_t beakTop = rgb(255, 160, 30), beakLow = rgb(230, 110, 20);
   int bx = cx - 6;
@@ -169,17 +182,6 @@ static void bird(M5Canvas& c, Pose pose, int level, uint32_t t, int cx, int cy) 
   c.fillTriangle(beakX, cy + 4, beakX + 20, cy + 4 + o, beakX, cy + 8 + o / 2, beakLow);
   c.fillRect(bx - 12, cy + 41, 3, 8, beakLow);                          // feet
   c.fillRect(bx + 8, cy + 41, 3, 8, beakLow);
-}
-
-void draw(M5Canvas& c, uint8_t kind, Pose pose, int level, uint32_t t, int cx, int cy) {
-  switch (kind) {
-    case Bot: bot(c, pose, level, t, cx, cy); break;
-    case Captain: captain(c, pose, level, t, cx, cy); break;
-    case Bird: bird(c, pose, level, t, cx, cy); break;
-    default: smiley(c, pose, level, t, cx, cy);
-  }
-  if (pose == Pose::Listening) listenWaves(c, cx - 58, cy, level);
-  if (pose == Pose::Thinking) thinkDots(c, cx + 50, cy - 30, t);
 }
 
 }  // namespace face

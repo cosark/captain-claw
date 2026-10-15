@@ -113,9 +113,7 @@ static void handleRoot() {
                          : F("<option value=text selected>Text (stages, activity)</option><option value=icons>Icons (animated character)</option>");
   h += F("</select><label>Character</label><select name=char>");
   for (int k = 0; k < face::KindCount; ++k) {
-    String n = face::name(k);
-    n.setCharAt(0, toupper(n[0]));
-    h += "<option value=" + String(k) + (settings.character == k ? " selected>" : ">") + n + "</option>";
+    h += "<option value=" + String(k) + (settings.character == k ? " selected>" : ">") + face::name(k) + "</option>";
   }
   h += F("</select><label>Sleep after idle minutes (0 = never)</label><input name=sleep type=number min=0 max=240 value=");
   h += String(settings.sleepMin);

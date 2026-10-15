@@ -19,6 +19,11 @@ extra speech gain with a soft limiter) change with each front-button press and
 beep at the new level. Above 75% volume on battery the stick may restart on loud
 peaks (M5Stack's note); on USB power it's fine.
 
+Display → *icons* shows an animated character instead of text: Captain, Bot, Bird, Car,
+Matrix, Orc, Elf, Dwarf, C64, Amiga, Cat, Dog, Dinosaur, Alien, Caveman, HAL 9000, KITT or
+Pac-Man. Menu → *Character »* previews each one cycling through its poses (side button =
+next, front = pick, side hold = back).
+
 Hold the front button while switching on to reopen setup. With no Wi-Fi
 saved, or none in reach for 30 s, setup opens by itself.
 
