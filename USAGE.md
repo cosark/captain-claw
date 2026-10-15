@@ -598,7 +598,7 @@ Smart fallback: tries plain HTTP first, then transparently retries through a hea
 | Parameter | Type | Required | Description |
 |---|---|---|---|
 | `url` | string | yes | URL to fetch |
-| `max_chars` | number | no | Max output chars (default: 100000) |
+| `max_chars` | number | no | Max output chars (default: `tools.web_fetch.max_chars`, 200000 since 0.8.0). The configured value is a floor for a smaller model-passed value, and every value is bounded by 35% of the agent's context window |
 
 ### web_fetch_batch — NEW in 0.5.4
 
@@ -620,7 +620,7 @@ How it works:
   `playwright install chromium` runs in the background; the call returns fast
   content immediately and deep mode works on the next call.
 - **Budgeted.** Caps at 10 URLs/call (extras are returned to the agent to fetch
-  in a follow-up call), 25k chars per URL, 150k total. Tunable under
+  in a follow-up call), 100k chars per URL, 400k total (raised from 25k / 150k in 0.8.0). Tunable under
   `tools.web_fetch` (`batch_max_urls`, `batch_fast_concurrency`,
   `batch_deep_concurrency`, `batch_per_url_max_chars`, `batch_total_max_chars`,
   `batch_min_useful_chars`, `batch_fast_timeout`).
@@ -651,7 +651,7 @@ Fetch a URL and return raw HTML source. Use only when you need the actual HTML m
 
 ### web_search
 
-Search the web via Brave Search API.
+Search the web via Brave Search (default), Tavily, or You.com (NEW in 0.8.0) — pick with `tools.web_search.provider: brave | tavily | youcom`.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
@@ -663,7 +663,7 @@ Search the web via Brave Search API.
 | `freshness` | string | no | Time filter: `pd` (past day), `pw` (past week), `pm` (past month), `py` (past year) |
 | `safesearch` | string | no | `off`, `moderate` (default), `strict` |
 
-Requires `BRAVE_API_KEY` environment variable or `tools.web_search.api_key` in config.
+Brave requires `BRAVE_API_KEY` or `tools.web_search.api_key`; Tavily uses `tools.web_search.tavily_api_key`; You.com uses `tools.web_search.youcom_api_key` or `YDC_API_KEY` (web and news results merged, count clamped to 20).
 
 ### pdf_extract
 
@@ -805,7 +805,7 @@ Google Drive through the Drive API, with your Google connection (under Flight De
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `action` | string | yes | `list`, `search`, `read`, `download`, `info`, `upload`, `create`, `update` |
+| `action` | string | yes | `list`, `search`, `read`, `download`, `info`, `upload`, `create`, `update`; in place (NEW in 0.8.0): `sheet_read`, `sheet_update`, `sheet_append`, `sheet_clear`, `doc_read`, `doc_replace_text`, `doc_append_text`, `doc_insert_text` |
 | `file_id` | string | for file actions | Drive file ID, or the file's full Drive/Docs/Sheets/Slides URL |
 | `folder_id` | string | no | Folder to list or upload into (default: `root`); a folder URL works too |
 | `query` | string | for search | Search text (file name or content) |
@@ -816,6 +816,8 @@ Google Drive through the Drive API, with your Google connection (under Flight De
 | `mime_type` | string | no | For `create`, e.g. `application/vnd.google-apps.document` for a Google Doc |
 | `max_results` | number | no | Results for `list` / `search` (default 20, max 100) |
 | `order_by` | string | no | Sort for `list` / `search` (default `modifiedTime desc`) |
+
+**Editing Google Sheets and Docs in place (NEW in 0.8.0).** The `sheet_*` actions work on an A1 `range` (`Sheet1!B2`, `'Q3 plan'!A1:C10`; `sheet_read` without a range lists the tabs with their first rows) and take `values` (rows; entered as if typed unless `value_input: raw`), `updates` (several ranges at once) and `render` (`values` or `formulas`). The `doc_*` actions take exact text copied from `doc_read`: `doc_replace_text` (`find`, `replace_with`), `doc_append_text` (`text`), `doc_insert_text` (`text` right after `after`), with `tab` for multi-tab Docs. These go through the Sheets v4 and Docs v1 APIs, so **enable the Google Sheets API and Google Docs API** in the deck's Google Cloud project. A whole-file `update` of a native Doc, Sheet or Slides file is refused unless `overwrite: true`; Office files on Drive keep the download → edit → `update` path. `list` / `search` page with `page_token`.
 
 `read` returns a file's contents inline (Google Docs as markdown; PDF and Office files go through the matching extract tool). `download` saves the file locally and returns its absolute path (Google Docs, Sheets and Slides are exported), so a later `read` / `*_extract` call can work on it. Paste a Drive link straight into `file_id` — the ID is taken from the URL. Write actions need a write Drive scope.
 
@@ -844,6 +846,38 @@ Gmail through the Gmail API: `list_messages`, `search`, `read_message`, `get_thr
 **Organizing.** `archive` takes emails out of the Inbox; `move` with `label` files them under that label and keeps their other labels, unlike Gmail's own Move to from a label view (`remove_labels` takes one off, such as the label they were filed under before; `label=INBOX` brings them back); `add_labels` / `remove_labels` take `labels` (names or IDs; INBOX, UNREAD, STARRED, IMPORTANT and the inbox categories work too, so removing UNREAD marks mail read); `create_label` makes a label, and `Parent/Child` nests it. Pass `thread_ids` for whole conversations or `message_ids` for single messages, up to 100 per call; the answer lists what changed, what didn't, and how to undo it. A label that doesn't exist is refused, never created on the fly, and nothing is ever trashed or deleted. Agents organize mail only when asked: an automated turn (a cron job, a delegated task) may do it only when its own instructions ask to organize email, and Autonomous Work only through an action you approve. These actions need the `gmail.modify` scope — under Flight Deck an admin ticks **Gmail (read + modify)** in Connections → Google (every user then reconnects); standalone it is in the default `google_oauth.scopes`, so a config that lists its own scopes must add `https://www.googleapis.com/auth/gmail.modify` and reconnect Google. Without it the tool says so and changes nothing.
 
 **Attachments.** `read_message` and `get_thread` list each email's attachments with a number. The list includes pictures pasted into the body (named `inline-1.png` and so on) and unnamed files such as a scanner's PDF (`attachment-1.pdf`). A named text part that is really the message body (MMS gateways call it `text_0.txt`) stays the body unless the sender marked it as an attachment. `get_attachment` takes the `message_id` and `attachment`: the number, the file name, or `all` for up to 10. A number that isn't on the list is an error, never a guess at a name. Each email's files go in their own folder, `saved/downloads/<session>/mail-<message id>/`, so two emails' `invoice.pdf` never overwrite each other. Two files with the same name in one email become `image.png` and `image (2).png`. A name missing its reader's extension gets one (`Contract v2.1` becomes `Contract v2.1.pdf`), and a long name is shortened without losing it. With `all`, a file that fails to download is reported and the rest are still saved. The result names the tool that reads each file: `pdf_extract`, `docx_extract`, `xlsx_extract`, `pptx_extract`, `image_vision` for pictures (png, jpg, gif, webp, bmp), or `read` for anything else. In eco mode, mentioning an attachment (`attachment`, `prilog`, `privitak`) adds those readers to the tool list. This needs only the `gmail.readonly` scope and counts as a read, so it also works in automated turns. A shared agent's member never overwrites a saved file someone else made. Attachments are inputs, so they are never sent back to WhatsApp or Telegram automatically.
+
+### microsoft_mail — NEW in 0.8.0
+
+Outlook / Microsoft 365 mail through Microsoft Graph, with the agent **owner's** Microsoft connection (see [Microsoft 365](#microsoft-365-outlook-calendar-onedrive--new-in-080)). Hidden until the owner has connected; owner-only (a shared agent's members never get it). It **never sends**: drafts land in the user's Outlook Drafts folder for them to send.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `action` | string | yes | `list_messages`, `search`, `read_message`, `get_thread`, `list_folders`, `create_draft`, `update_draft`, `list_drafts`, `get_attachment`, `archive`, `move`, `create_folder`, `add_categories`, `remove_categories` |
+| `folder` | string | no | Inbox (default), Sent, Drafts, Archive, Deleted, Junk, a folder name, a `Parent/Child` path or an ID; `search` also takes `all` |
+| `query` | string | for search | Outlook search syntax (`from:alice subject:report hasattachments:true received>=2026-01-01`); for `list_drafts`, `to:<address>` or subject words |
+| `message_id` / `message_ids` | string / list | per action | One email, or up to 100 for organizing actions |
+| `thread_id` / `thread_ids` | string / list | per action | A conversation (`get_thread`), or whole conversations for organizing actions |
+| `to`, `cc`, `bcc`, `subject`, `body`, `html_body` | string | for drafts | Draft fields (`update_draft` replaces the body) |
+| `reply_to_message_id`, `reply_all` | string, bool | no | Draft a reply inside the original conversation (quoted, `RE:`) |
+| `draft_id` | string | for update_draft | The draft to revise |
+| `attachments`, `remove_attachments` | list | no | Files to attach (at most 20, 25 MB together; `saved/` or `vfs:` paths work) / attachments to drop |
+| `attachment` | string | for get_attachment | Number from `read_message`, a file name, or `all` |
+| `categories` | list | for categories | Outlook category names |
+| `allow_repeat` | bool | no | Only when the user explicitly wants another copy of an email already drafted or sent |
+| `unread_only`, `focused_only`, `include_body`, `group_by_thread`, `max_results` | | no | Listing filters (default 10 results, max 50; grouped by conversation) |
+
+`create_draft` refuses a repeat — the same recipient and subject already in Drafts, or in Sent Items within `tools.microsoft_mail.repeat_check_days` (default 14; 0 turns the Sent Items check off) — and says so instead of creating a duplicate. Drafts follow the same "write only when asked" rule as `google_mail`, and every draft ends with the user's [agentic signature](#agentic-signature--new-in-080). Organizing (archive, move, folders, categories) needs `Mail.ReadWrite` and follows the same gating as Gmail organizing.
+
+### microsoft_calendar — NEW in 0.8.0
+
+Outlook / Microsoft 365 Calendar: `list_events`, `search_events`, `get_event`, `create_event`, `update_event`, `delete_event`, `respond_event` (accept / decline / tentative, with an optional `comment`), `list_calendars`. Parameters mirror `google_calendar` (`calendar_id`, `event_id`, `summary`, `description`, `location`, `start`, `end`, `timezone`, `attendees`, `reminder_minutes`, `recurrence` as one RRULE, `time_min`, `time_max`, `max_results`), plus `online_meeting` (a Teams link, work/school accounts).
+
+**Outlook emails people itself.** Creating or changing an event with attendees sends invitations or updates, deleting a meeting you organize sends cancellations, and answering an invitation can notify the organizer. Every such call needs `notify_attendees: true`, which the agent may pass only when the user asked to invite / update / cancel / reply in that turn (or an approved action does). Events without attendees never notify anyone.
+
+### microsoft_onedrive — NEW in 0.8.0
+
+OneDrive (and OneDrive for Business / SharePoint files shared with the user): `list`, `search`, `read` (PDF/DOCX/XLSX/PPTX extracted, other Office formats converted, text as text), `info`, `download` (to `saved/downloads/<session>/` by default; a `.pdf` `output_path` on an Office file saves a PDF conversion), `upload` (large files use upload sessions), `create`, `create_folder`, `update`. Address a file by `file_id` (plus `drive_id` when shown), by `path` inside OneDrive (`/Documents/report.docx`), or by pasting a OneDrive/SharePoint share URL into `file_id`. `upload` and `create` never overwrite — a clashing name gets a new one; to change a file, download it, edit the copy, then `update` with `local_path`.
 
 > **Retired: `gws`.** The Google Workspace CLI wrapper (`gws`) is gone. Agents use `google_drive`, `google_calendar` and `google_mail` instead; a `gws` entry left in an old `tools.enabled` list or a stored archetype is dropped when the config loads or the agent is spawned, and a `tools.gws` block in an old `config.yaml` is ignored.
 
@@ -876,7 +910,12 @@ tools:
     base_url: "https://api.typesafe.ai"
     model: "jev-latest"
     timeout: 30                     # seconds per Jev request (429/529/5xx are retried)
+    check_replies: true             # flag garbled chat replies and suggest /new
 ```
+
+**Jev first.** While a key is usable, the system prompt tells the agent to ask Jev whenever a task involves judging content — triage, routing, relevance, claim-vs-source checks, tone/urgency/risk, rubric scores, duplicates, best-of-N, a yes/no check before acting — with one call per piece of content carrying all its questions, and to say when Jev drove a decision. In eco mode `jev` is a core tool, so its schema is always sent (it stays hidden until a key works).
+
+**Garbled-reply check.** After a person's chat turn (web, WhatsApp, Telegram, the glasses HUD), Jev is asked one yes/no question: did the reply come out as unusable garbage (a looping line, token soup, raw tool-call JSON or control tokens, text cut off mid-word)? At p ≥ 0.8 the surface gets one extra notice — *"That reply came out garbled — this session may be overloaded. Send /new to start a fresh session"*. The notice is never written into the session, never spoken, and skipped for automated, public, shared-member and worker turns; no key, a timeout or a Jev error means no notice. Turn it off with `tools.jev.check_replies: false`.
 
 ### todo
 
@@ -1502,6 +1541,13 @@ context:
                                   # injected date/time is always anchored on UTC
                                   # and labelled; set this so day/date reasoning
                                   # (today/tomorrow/this week) uses local time.
+  compaction_summary: digest      # NEW in 0.8.0: "digest" (topic-grouped exchanges, no LLM call)
+                                  # or "model" (the pre-0.8.0 model-written summary)
+  notes_allocator: trim           # NEW in 0.8.0: "trim" drops whole low-priority notes;
+                                  # "capped" cuts each note to its source's share first
+  tool_result_max_chars: 0        # NEW in 0.8.0: cap on one tool result in the session (0 = off)
+  turn_governor: false            # NEW in 0.8.0: in-turn context governor for long single-turn
+                                  # workers (env CLAW_CTX_GOVERNOR); Vatra turns it on for workers
   chunked_processing:
     enabled: false                # master switch (or use auto_threshold)
     auto_threshold: 0             # auto-enable when max_tokens <= this value (0 = off)
@@ -1617,7 +1663,9 @@ tools:
       - "rm -rf *"
       - "sudo *"
   web_fetch:
-    max_chars: 100000
+    max_chars: 200000               # single page (was 100000 before 0.8.0)
+    batch_per_url_max_chars: 100000
+    batch_total_max_chars: 400000
   web_search:
     provider: "brave"
     api_key: ""                   # or BRAVE_API_KEY env var
@@ -1960,9 +2008,12 @@ deep_memory:
   protocol: http                          # http or https
   api_key: ""                             # Typesense API key (or set TYPESENSE_API_KEY)
   collection_name: captain_claw_deep_memory  # collection for deep memory docs
-  embedding_dims: 1536                    # embedding dimensions (match your model)
+  embedding_dims: 0                       # 0 = auto-detect from the embedding provider (recommended)
   auto_embed: true                        # compute embeddings on index
+  min_score: 0.12                         # relevance floor (0..1) for prompt injection
 ```
+
+`embedding_dims` defaults to **0 (auto-detect)** since 0.8.0. Before that it defaulted to 1536 while the default embedder emits 256, so every vector was silently rejected and deep memory ran keyword-only; a hand-set value that disagrees with the provider still turns hybrid search off. Scores are a clean 0..1 (the better of keyword coverage and cosine similarity); raise `min_score` if you switch to a transformer embedder (ollama/litellm).
 
 **How content flows in:**
 - Scale loop `no_file` + `api_call` sink — processed items are indexed automatically
@@ -1980,6 +2031,7 @@ deep_memory:
 - `tags` — optional string array (faceted)
 - `updated_at` — unix timestamp (default sort)
 - `embedding` — optional float array for vector search
+- `owner_id`, `content_hash` — tenant and dedupe fields (added in 0.8.0; existing collections are patched in place)
 
 ### insights
 
@@ -2372,6 +2424,8 @@ Deep memory is designed for content that should persist beyond workspace files a
    Or via environment variable: `TYPESENSE_API_KEY=your-api-key`
 
 3. The collection is auto-created on first use.
+
+**Under Flight Deck (NEW in 0.8.0)** deep memory is a Flight Deck capability: an admin sets the Typesense connection once in **Connections → Typesense (Deep Memory)** (stored in Flight Deck's database, not `config.yaml`; the key is masked on read), and agents hold **no** Typesense key — they reach the archive through Flight Deck, which scopes every search and write to the agent's **owner**. The `typesense` tool is always enabled; with no connection configured it says so. A **Deep Memory** page in Flight Deck browses the archive. Documents indexed before tenancy have no owner and stay invisible to scoped search until the user presses **Claim**. VFS folders can be indexed too, opt-in per project with a `.vfs-index.json` at the user root; a hit's reference is `vfs:<project>/<path>`, which the `read` tool accepts.
 
 ### Usage
 
@@ -4124,7 +4178,7 @@ Flight Deck serves both the React frontend and the FastAPI backend from a single
 | Pinned messages | Pin important chat messages with tags for quick reference |
 | Shared clipboard | Cross-agent clipboard for sharing text snippets between agents |
 | Notification center | Bell icon with unread count, type filters (info/success/warning/error), agent connect/disconnect and pipeline events |
-| Keyboard shortcuts | Cmd/Ctrl+1–4 for views, Cmd+D director, Cmd+J chat, Cmd+K shortcuts overlay, Cmd+[ ] switch chat tabs |
+| Keyboard shortcuts | Cmd+D director, Cmd+J chat, Cmd+K shortcuts overlay, Cmd+\\ simple / full view, Cmd+[ ] switch chat tabs (the Cmd/Ctrl+1–5 page jumps were removed in 0.8.0) |
 | Dark/light theme | Full theme support with toggle in top bar, light mode overrides for all zinc palette and markdown styles |
 | Free-form layout | Drag agent cards freely on the desktop, positions persisted to localStorage |
 | Embedded chat | Collapsible chat panel directly on agent cards |
@@ -4138,14 +4192,14 @@ Flight Deck serves both the React frontend and the FastAPI backend from a single
 | Datastore browser | View agent datastore tables and rows directly from agent cards |
 | Agent groups & tags | Organize agents into teams and roles with color-coded group badges |
 | Trace timeline | Real-time orchestrator observability — Gantt-style span visualization in the chat panel with duration, token usage, phase breakdown (decompose/execute/task/synthesize), and status tracking |
-| Connections page | Unified external-service authentication: Google OAuth (with per-scope picker and sensitivity tiers), ChatGPT (Codex OAuth), centrally-managed MCP servers (HTTP + stdio transport, per-agent allowlists, hot-reload over SSE), and each user's Jev (TypeSafe AI) API key with a "Try it" playground, in a single scrollable, collapsible UI |
+| Connections page | Unified external-service authentication: Google OAuth (with per-scope picker and sensitivity tiers), ChatGPT (Codex OAuth), centrally-managed MCP servers (HTTP + stdio transport, per-agent allowlists, hot-reload over SSE), Microsoft 365 (Entra app + per-user connect), Antigravity, WhatsApp, Typesense deep memory, and each user's Jev (TypeSafe AI) API key with a "Try it" playground — **one tab per connection** since 0.8.0, with status dots, remembered last tab, and state kept while you switch tabs |
 | Agent Folders | Admin-gated `fd-data` cleanup (NEW in 0.6.5) — lists each agent subfolder with on-disk size, file counts, last-modified, and desktop presence (**running / on-desktop / orphaned**); view/download workspace files (HTML in a sandboxed iframe, Markdown with GFM tables) and delete a folder (refused while the agent is still running). Path-sandboxed to direct children of `fd-data`; backend `/fd/agentfs` |
 
 ### Connections
 
 The Connections page lives in the Flight Deck sidebar and manages external-service authentication for the entire fleet. A single Flight Deck instance can serve OAuth tokens to every captain-claw sub-agent it spawns (on the same host or a remote one) via a shared-secret or loopback trust boundary — no need to re-authenticate per agent.
 
-Both connection cards are **collapsible** (click the header to toggle) and the whole page scrolls independently so the scope picker can expand without breaking the layout.
+Since 0.8.0 the page has **one tab per connection** — Google, Microsoft, ChatGPT, Antigravity, MCP Servers (the server list plus *Agent access for Claude*), WhatsApp, Deep memory and Jev — with status dots (green connected, amber configured). Inactive tabs stay mounted, so a sign-in popup's result and a half-typed form survive a tab switch, and the last tab is remembered per browser. Kiosk users get a Connections dialog with Google, Microsoft, MCP Servers and Jev.
 
 #### Google
 
@@ -4253,13 +4307,13 @@ Add an MCP server once in **Connections → MCP servers** and every agent in the
 **Supported transports:**
 
 - **`http`** — Streamable HTTP binding. Required field: `url`. Optional OAuth2 `client_credentials` flow (`client_id`, `client_secret`, `token_endpoint`) and arbitrary extra `headers`. `Mcp-Session-Id` is captured and replayed transparently.
-- **`stdio`** — child process speaking JSON-RPC over stdin/stdout (NDJSON). Required field: `command`. Optional `args` (argv tail) and `env` (extra env vars merged on top of the FD process environment). The de-facto standard for local servers shipped via `npx` / `uvx` (filesystem, sqlite, github, postgres, etc.). The child is spawned lazily on the first request, auto-respawned if it dies, and terminated with SIGTERM (2 s grace) then SIGKILL on close.
+- **`stdio`** — child process speaking JSON-RPC over stdin/stdout (NDJSON). **Admin-only since 0.8.0** (creating, editing, testing, probing or deleting one runs a command on the deck's host). Required field: `command`. Optional `args` (argv tail) and `env` (extra env vars merged on top of the FD process environment). The de-facto standard for local servers shipped via `npx` / `uvx` (filesystem, sqlite, github, postgres, etc.). The child is spawned lazily on the first request, auto-respawned if it dies, and terminated with SIGTERM (2 s grace) then SIGKILL on close.
 
 **Parallel Search example.** For an optional, keyless HTTP search/fetch connection and a runnable smoke test, see [examples/mcp/](examples/mcp/README.md).
 
 **Per-agent allowlists.** Each server carries an optional `allowed_agents: list[str]`. Empty list = every agent in the fleet (the default and the Phase 1 behaviour). Once any slug is listed, only those agents can see, list, or call the server. Restricted servers return HTTP 404 to disallowed agents — same shape as "doesn't exist," so a restricted server's existence is opaque.
 
-Agents identify themselves via the `X-Agent-Slug` header, which `fd_client.flight_deck_headers()` automatically populates from the `FD_AGENT_SLUG` env var (Flight Deck injects this when spawning sub-agents).
+Agents identify themselves with the `X-Agent-Auth` token Flight Deck minted when it spawned them, and the allowlist is checked against the slug in Flight Deck's own records (since 0.8.0 — the `X-Agent-Slug` header alone no longer counts). Agents Flight Deck didn't spawn are refused; Docker agents need an image rebuilt on 0.8.0.
 
 **Hot reload.** Agents subscribe to `GET /fd/mcp/agent/events` (an SSE stream) on boot. Save / edit / delete a server in the admin UI and every entitled agent re-registers proxy tools without a restart. The watcher reconnects forever with exponential backoff capped at 30 s. 25-second `ping` frames keep the connection alive through idle-TCP-killing proxies.
 
@@ -4272,7 +4326,7 @@ Agents identify themselves via the `X-Agent-Slug` header, which `fd_client.fligh
 
 Cancels the upstream call cleanly when the client disconnects mid-stream. The agent's tool execution loop still uses one-shot `/call`; the streaming endpoint is for UIs that want live progress indicators.
 
-**Storage.** A flat JSON file at `~/.captain-claw-fd/mcp_servers.json` (override with `CAPTAIN_CLAW_FD_MCP_PATH`). Writes are atomic (write-tmp + rename) so a crashed Flight Deck never leaves a half-written file. Secrets are masked (`••••••••`) in every UI response — re-submitting a form with a masked secret preserves the stored value.
+**Storage.** A flat JSON file, per Flight Deck instance (since 0.8.0): `CAPTAIN_CLAW_FD_MCP_PATH` if set, else `$CAPTAIN_CLAW_FD_HOME/mcp_servers.json`, else `$FD_DATA_DIR/mcp_servers.json`, else the legacy `~/.captain-claw-fd/mcp_servers.json`. A deck that moves to `FD_DATA_DIR` and wants to keep its servers copies the legacy file there once. Writes are atomic (write-tmp + rename) so a crashed Flight Deck never leaves a half-written file. Secrets are masked (`••••••••`) in every UI response — re-submitting a form with a masked secret preserves the stored value.
 
 **Endpoints (admin — gated by Flight Deck user auth):**
 
@@ -4293,9 +4347,9 @@ Cancels the upstream call cleanly when the client disconnects mid-stream. The ag
 **Environment variables:**
 
 - `FD_URL` — agents call FD's MCP proxy at this base when set. Unset = MCP is disabled in the agent (Phase 1+ design: MCP is exclusively a Flight Deck feature).
-- `FD_AGENT_SLUG` — the agent's own slug; Flight Deck injects this when spawning sub-agents. Used as the `X-Agent-Slug` header for allowlist filtering.
+- `FD_AGENT_SLUG` — the agent's own slug; Flight Deck injects this when spawning sub-agents (sent as `X-Agent-Slug`, informational since 0.8.0 — the allowlist uses the recorded slug behind `X-Agent-Auth`).
 - `FD_AGENT_SHARED_SECRET` — optional shared secret; same one used by Codex / Google.
-- `CAPTAIN_CLAW_FD_MCP_PATH` — override the storage file location (useful for tests).
+- `CAPTAIN_CLAW_FD_MCP_PATH` — override the storage file location (useful for tests); otherwise `CAPTAIN_CLAW_FD_HOME` / `FD_DATA_DIR` decide it per instance.
 
 ### Library (NEW in 0.5.7)
 
@@ -4355,6 +4409,82 @@ Three cross-mode capabilities landed in 0.7.3 for Basna, Vatra, and Code. **All 
 
 **Max parallel agents.** A **Max parallel** input (0 = unlimited) caps how many agent turns run at once — set it low (e.g. 2) for local models so parallel prefills don't exhaust the serving box's memory.
 
+### Flight Deck security hardening — NEW in 0.8.0
+
+0.8.0 makes Flight Deck safe to put in front of a team. Most of it needs no configuration; the parts that do are in [docs/team-deployment.md](docs/team-deployment.md).
+
+- **Host and origin guard.** Every HTTP and WebSocket request must name a host this deck answers to — `localhost`, any IP, this machine's hostnames, `FD_PUBLIC_URL`'s host, `FD_CORS_ORIGINS` hosts, or `FD_ALLOWED_HOSTS` — and a browser request carrying a foreign `Origin` (or a cross-site fetch) is refused. That closes DNS rebinding and "any web page can drive your local deck" on auth-off desktop decks. CORS defaults to the deck's own origins (`FD_CORS_ORIGINS=*` is the explicit legacy opt-out). **A deck reached through its own domain must set `FD_ALLOWED_HOSTS` or `FD_PUBLIC_URL`**, or every request — the SPA, webhooks, OAuth callbacks, inbound MCP — is refused (the log names the setting).
+- **Agents prove who they are.** Code, Hosting, Basna, Vatra and Bat agent routes need a verified bearer, loopback or the agent secret, and take the owner from Flight Deck's own spawn records, never from a body `owner_id`. `/fd/consult-peer` and `/fd/delegate-peer` need the calling agent's own `X-Agent-Auth`, take host/port/token only from Flight Deck's records, and read attachments only from the caller's own workspace. Google, Codex and MCP tokens go only to the agent's owner. Docker agents need `FD_URL` and `FD_AGENT_SHARED_SECRET` in their env, and an image rebuilt on 0.8.0.
+- **Owner-scoped everything.** Port-addressed agent proxies refuse anyone but the agent's owner (admins excepted); scheduler jobs and flows have owners (existing ones become admin-owned and keep firing); stdio MCP servers are admin-only; provider keys never reach the browser (`@system` sentinels resolved at spawn).
+- **Registration is closed** after the first (admin) account — admins add people in **Admin → Users → Add user** (`FD_REGISTRATION_OPEN=1` reopens self-signup).
+- **One deck, one state.** Several decks on one host no longer share MCP servers, code apps or the agent secret — each resolves them from `CAPTAIN_CLAW_FD_HOME`, else `FD_DATA_DIR`, else the legacy `~/.captain-claw-fd`. A deck moving to `FD_DATA_DIR` copies its `mcp_servers.json` there once to keep its servers.
+- **Chat bridges send only deliverables.** Telegram, Slack, Discord and WhatsApp auto-send a file only if this turn wrote it inside the agent's `saved/` area (never a `Path:` line from an email or web page). See [Telegram: Per-User Sessions](#telegram-per-user-sessions).
+
+### Running Flight Deck for a team — NEW in 0.8.0
+
+- **Admin → Users.** Add users (email, password, role), reset a password, and open a user's **Agents** to create (archetype picker), start, stop, restart, configure or remove their agents — every action logged as `admin_act_as`. It is not a login-as: an admin acts on agent-management routes only.
+- **Team tier sets and team keys.** An admin publishes a tier set (**Library → Publish to team**); teammates with no models of their own run on it. Publishing shares the keys as **team keys** — a key on a provider's own endpoint becomes that provider's org key, a gateway key goes into a per-endpoint store — and process agents missing a key get it and restart automatically. A spawn nothing can supply a key for is refused instead of creating a dead agent. Decks that published before 0.8.0 should publish again.
+- **Per-user connections.** Each user connects their own Google and Microsoft accounts, Jev key and WhatsApp nudge number (**Connections**); agents use their owner's. Each user also fills in a **Profile** (see [Owner Profile](#owner-profile)).
+- **Collaboration.** A persistent notification bell (shares, finished runs, sends), team spend by user and run kind in **Admin → Usage**, **Copy to my workspace** for a folder shared with you, and **Duplicate** on shared or built-in archetypes to fork an editable copy.
+- **Shared agents** (`FD_AGENT_SHARING=1`): one agent, several users — see [Shared agents](#shared-agents-a2-members-own-google-deep-memory-files) below.
+- **Agent options.** A gear on each agent opens a tabbed options dialog (General, Instructions, `config.yaml`, `.env`); name and description are stored by Flight Deck, so they survive a browser wipe. Instructions are stored per agent by Flight Deck, so two tabs can't erase each other's.
+
+### The simple layout and kiosk mode — NEW in 0.8.0
+
+**Simple layout.** A chat-first desktop layout: agents on the left (with a **Busy** pill and an on/off **power switch** per agent), the chat in the middle (queue toggleable), the active agent's files and datastore on the right. Switch in from the top bar's columns icon and out from the left header, or with **Cmd/Ctrl+\\**. Both rails collapse and remember it.
+
+**Kiosk.** `captain-claw-fd --simple-chat` (or `FD_SIMPLE_CHAT=1`) locks non-admin users into the simple layout for shared-account machines: no full view, no agent options or start/stop beyond the power switch. They can still start a **New agent** from an archetype picker (models and keys come from their tier set or the team default), manage their own **Connections** (Google, Microsoft, MCP, Jev) in a dialog, edit their **Profile**, and **sign out** cleanly (per-browser queues and plans are purged). Admins get the normal layout. It is a UI lock, not an API boundary. A kiosk deck needs a published team tier set and enough agent slots.
+
+**Removed:** the Cmd/Ctrl+1–5 page-jump shortcuts, for everyone.
+
+### Bat — the stubborn finisher (NEW in 0.8.0)
+
+A new orchestration mode beside Basna, Vatra and Council for work that has to **get finished**: Bat plans, runs checkpointed steps with retries and strategy changes, and keeps going until an **independent done-judge** says the task is genuinely complete. Start a run from the **Bat** page (sidebar, hammer icon), or let an agent start one with the `bat` tool.
+
+- **Durable.** State lives in the deck's `bat.db`; a run survives a Flight Deck restart and is picked up from its last checkpoint.
+- **Honest done.** The judge fails closed: deterministic checks plus a vote panel on a different model, judging the final answer rather than the working notes. A run that completed every step isn't failed by a picky panel.
+- **Safety floor.** Bat workers can't run catastrophic commands — wiping root/home/system directories or whole drives, formatting disks, raw-device writes, power control, fork bombs — enforced at the tool registry for shell, terminal and desktop actions and impossible to widen. Ordinary work (`rm -rf build`, `git reset --hard`) is allowed.
+- **A start gate.** A plan that would send email, spend money or create accounts pauses for your approval; a plain build or research run doesn't. Email goes only through Flight Deck's audited Gmail gate, only for that run, and only with your Email-sending policy on. Real-money spend is off unless the deck sets `FD_BAT_SPEND=1`, you approved a spend plan and set a cap (a software cap, not a card limit). Account sign-ups can read your inbox for verification links; any 2FA code, CAPTCHA or password is asked of you (`ask_human`) — answers are held in memory only.
+- **Workers** keep their full toolset (minus `bat` and `send_mail`), may start Vatra/Basna/Code sub-runs, and run as one generic worker per step or a specialist archetype per step (**Plain / Archetype** toggle).
+- **The Bat page:** compose box (optional spend cap), runs list, a "Bat needs you" banner, and run detail in tabs — Steps, Live agents, Progress, Result, Files. Bell notifications for questions, completion and errors.
+
+`FD_BAT_DISABLED=1` turns Bat off. Set `CLAW_BROWSER_CREDENTIAL_KEY` before letting a run create accounts, or stored credentials fall back to base64 obfuscation. Design notes: [docs/bat-stubborn-loop-plan.md](docs/bat-stubborn-loop-plan.md).
+
+### Vatra in 0.8.0 — long runs that finish
+
+- **Workers run until done.** A connected worker no longer gets cut at ~30 minutes; it gets another slice each time it reaches its budget, until it finishes or you Stop the run or Skip the agent (Basna, Code, flows and plans keep their ceilings). Team planning may take up to 30 minutes, and the Lead may use the planning tier's full output limit (up to 64k).
+- **A full reading toolkit for every worker** — read/glob/grep, web search and fetch, PDF/DOCX/XLSX/PPTX extract, OCR and vision, `summarize_files` — on top of its archetype's tools. Workers run without the scale micro-loop and with a 300-iteration budget; the micro-loop elsewhere now reports "N of T processed" and lists failures instead of skipping files. A worker shell guard refuses `curl`/`wget` that dump a page into context (use `web_fetch`) and shell writes outside the run's folder.
+- **An in-turn context governor.** A worker does its whole job in one long turn, so Vatra now budgets it in real tokens, cuts the chain once and holds it (the prompt cache stays valid), spills big tool results to files the model can `read`/`grep`, folds older tool results into stub files near the window's edge, and de-duplicates fetched pages run-wide through `vfs:<project>/sources/`. Workers read a rule-built **run map** with `vatra(action="map")`.
+- **Long-form deliverables on weak models.** A run can declare its deliverable (target file, ordered parts, one owner per part); parts are assembled by code, and a run whose deliverable is missing, a placeholder, too short or has gaps ends as `error` with the work kept and continuable — never `done` on a pointer note. The `write` tool refuses empty or placeholder content and reads every write back (on by default for every agent; `CLAW_WRITE_GUARD=0` turns it off). Cut-off tool calls are re-issued in pieces. Opt-in levers: the `long_form` quality preset, `strict_deps`, `require_inputs`, the paid `canon_pass` continuity QA, per-role tiers (`role_tiers`), and a per-tier **Weak / fast model** checkbox in the Library. Details: [docs/vatra-run-hardening-plan.md](docs/vatra-run-hardening-plan.md).
+- **Story Integrity Protocol** (`quality.validation: story_integrity`): deterministic checks (chronology, knowledge, provenance, hypothesis scope, quantities, clue payoff) that can block `done`, model passes that only drive revisions, and advisory scores (continuity, plausibility, grounding, craft, integrity grade) in `analysis.scores`. See [docs/story-integrity-protocol.md](docs/story-integrity-protocol.md).
+- **Runs always end.** An unhandled exception persists `status="error"` (continuable, resumable) instead of leaving a run on `running` forever; run state lives until the whole run ends, so reporters, fact-checkers and the done gate see it; a second Approve/Re-plan click gets 409.
+
+### Opt-in Loops & Graphs levers (NEW in 0.8.0)
+
+From the [Loops & Graphs review](LOOPS_AND_GRAPHS_REVIEW.md), six quality-profile flags, all off and in no preset: `parallel_edges` (dependencies are data edges, not writing order, plus a data-edge lint), `flow_ref_lint` (flow compile validates `{{steps.<id>}}` references), `council_tally` (persist the deterministic council vote tally — the read-only `GET /fd/council/sessions/{id}/votes/tally` is always on), `push_deps` (a finished producer's output is pushed into its consumer's prompt), `blast_radius_gate` (with `guards.blast_radius`), and `constraint_learning` (one distilled rule per accepted Code/Vatra run, injected into later planning briefs). With the flags off, behaviour is unchanged.
+
+**Code** also changed by default: an armed ground-truth gate (test suite, acceptance contract, interface check) that is still red vetoes a "clean" triage, unparseable triage fails closed (`unverified`, resumable) instead of passing, and every Code session ends by writing and committing a `HANDOFF.md` (what changed, how to run, how to use, notes) — never overwriting one it didn't write. `POST /fd/code/agent/cancel` lets an external watchdog stop a runaway coding run.
+
+### Basna judge calibration (NEW in 0.8.0)
+
+A thumbs vote on a Basna run no longer overwrites the LLM judge's label — both are kept, the human's wins as the effective `success`, and a muted "judge: …" badge shows when they disagree. **Judge calibration** on the Basna page measures how far the judge can be trusted: agreement against chance, Cohen's kappa with a Landis–Koch band, a confusion matrix, breakdowns by mode, domain and archetype, and exports (`GET /fd/basna/eval/agreement`, `GET /fd/basna/eval/label-pairs?format=jsonl|csv`).
+
+### Google Drive folders in the VFS (NEW in 0.8.0)
+
+**VFS panel → Connect Drive** mounts a Drive folder (My Drive or a Shared Drive, from your own Google account) as a **read-only** VFS project: a tree of lightweight placeholders whose real bytes are fetched on demand, so agents read, extract, OCR and vision-process Drive files as if they were local. `grep` says how many un-cloned files it couldn't search. Turn on **clone to Markdown** to convert the files into real local `.md` (kept in sync by modified time) so they are fully greppable and indexable by deep memory. Per mount: Refresh, clone toggle, Unmount; mounting streams its progress. Agent write tools refuse every read-only link. Project names are matched forgivingly ("claude skills" finds `CLAUDE-SKILLS`), `vfs list_projects` shows a mount's source path, and `glob vfs:**/…` searches every project. A VFS file can also be **exported to your Drive** from the file browser.
+
+### Iskra — village Reports (NEW in 0.8.0)
+
+A **Reports** view beside Map / Board / Letters / Village has a Deep-Researcher narrate how the village worked over a period (today, yesterday, this week, last 7 days, this month, last 30 days, custom) — **Quick** (one pass) or **Deep** (three facet researchers plus a synthesiser). The numbers come from the ledger, never the model. Reports are kept (and saved to an `iskra-reports/` VFS folder) and open in a reader with real typography, Markdown download and fullscreen. Beings also stopped pacing the village: one walk per heartbeat, then they rest until their mind has witnessed the arrival.
+
+### Lupa — the research desk (NEW in 0.8.0, separate app)
+
+`lupa/` holds **Lupa**, a standalone B2B research desk built on Flight Deck's HTTP API (a backend-for-frontend on port 25180 plus its own SPA): commission research in a stream, approve the plan at a gate, read a report with a **receipts** panel (verdict, confirmed/refuted claims, facts ledger, conflicts, cost with ROI), deepen it round by round, subscribe to standing briefs, and get a Basna second opinion. **Kalup**, its Pack Studio, turns a desk description into a publishable vertical desk behind a green ship-gate. It needs Flight Deck with auth on and the **same `FD_JWT_SECRET`**. Setup: [lupa/README.md](lupa/README.md).
+
+### Function × domain archetypes (NEW in 0.8.0, off by default)
+
+With `FD_ARCHETYPE_GRID=1`, an archetype id like `reviewer.legal` composes a function SOP (Reviewer) with a domain overlay (Legal) at spawn, so editing one function or domain updates every variant. Deep-memory writes get `agent:` / `domain:` tags, and a `recall_mode` (`pool`, `domain`, `self`) narrows what an agent recalls within its owner's pool.
+
 ### Lanes — three parallel contexts on one agent (NEW in 0.7.8)
 
 An agent used to hold **one** conversation at a time: one busy flag, one active session, every token broadcast to every client. Lanes give the same process **three rooms** — `A`, `B`, `C` — each with its own session, transcript, queue and busy flag, **running at the same time**. Three id ranges enrich in parallel against the same table instead of one after another.
@@ -4380,7 +4510,7 @@ Queued turns skip the post-turn "suggested next steps" call and the **task rephr
 
 ### The Task Planner — one description becomes a queue (NEW in 0.7.8)
 
-Press **Plan** in the queue header. Describe the whole job once, attach files if it needs them, pick the table, the batch key, rows per task and the target lane — and get back a plan you **read and edit before anything is queued**.
+Press **Plan** in the queue header. Describe the whole job once, attach files if it needs them, pick the table, the batch key, rows per task and the lanes to **distribute** to (one or more; tasks are dealt round-robin so per-lane counts differ by at most one, and `/new` between tasks applies per lane) — and get back a plan you **read and edit before anything is queued**.
 
 **How it works.** The model is never asked for the messages. It returns **one template plus the overall range**, and Flight Deck expands it. A batch message is ~90% standing rules, and a model asked to reproduce them twenty-five times paraphrases, compresses, and eventually drops the clause that looked redundant — `never do +1 on the id!`, say, which corrupts a table. Expanding in Python means every task is byte-identical except its range, one LLM call whether there are three batches or two hundred, and slicing that cannot overlap, gap, or go off by one.
 
@@ -4705,7 +4835,7 @@ The closed-loop autonomy page (sidebar: **Autonomous Work**) where the assistant
 - **Master switch + autonomy level.** `off` / `propose` (default ceiling) / `act_low_risk` / `act`. The level is clamped to `max_autonomy_level` server-side, so you can't grant the loop more authority than the deployment allows.
 - **Arbiter dials.** Heartbeat trigger, daily action cap, concurrent action cap (in-flight work only), quiet hours (UTC), candidate lookback. `arbiter_min_score` controls what the ranker needs to land in the ledger. Proposals awaiting approval have their own cap (`max_pending_proposals`, default 5 — a full queue logs "loop paused") and expire after `proposal_ttl_hours` (default 48; an expired title isn't re-proposed within the lookback).
 - **Judge & learn.** `judge_mode` (auto LLM | human | both), per-kind reliability seed, suppression threshold (proposals stop landing once a kind's weight falls below `suppress_below_weight`).
-- **Trust ladder.** A reversible, low-risk `tool_action` auto-promotes to auto-fire once its learned reliability ≥ `trust_threshold` (default 0.85) over ≥ `trust_min_runs` (default 3). Demotes automatically when the weight falls back. Manual grant overrides this and skips the earning.
+- **Trust ladder.** A reversible, low-risk `tool_action` auto-promotes to auto-fire once its learned reliability ≥ `trust_threshold` (default 0.85) over ≥ `trust_min_runs` (default 3). Demotes automatically when the weight falls back. Manual grant overrides this and skips the earning. **Mail never earns trust (since 0.8.0):** every mail-writing action, including MCP and custom ones, is human-only — proposed, never auto-fired by grant or trust — and old mail trust rows are swept at every Flight Deck start.
 - **Event sources.** Per-user toggles for the FD-side Google **Calendar** and **Gmail** pollers; an automated-sender filter drops no-reply / notification mail before it ever becomes a candidate. Event reconsideration: an event stays `new` until a pass actually produces an action (so a single whiffed beat doesn't drop it forever), bounded by `event_max_surface_attempts`.
 - **Soft-reminder follow-ups.** Beyond *act-now* and *drop*, the arbiter has a third outcome — **`track`** — for soft asks / "waiting on you" items. They land in a per-user follow-up list with a due date; when due, the loop nudges with **escalation** (3d → 2d → 1d) and retires to `stale` after enough nudges (`followup_max_nudges`).
 - **Nudge delivery.** A delivered nudge counts as success (don't LLM-judge nudges — that would suppress good ones). Nudges also fan out to the owner's WhatsApp via `nudge_to_whatsapp`: the numbers in their per-user `notify_waid` (must be on `WHATSAPP_ALLOWED_WAIDS`, at most 3, not already another user's; set it in **Connections → WhatsApp nudges**, which also sends a test — API `GET/PUT /fd/autonomy/whatsapp`, `POST /fd/autonomy/whatsapp/test`. `PUT /fd/autonomy/config` keeps the stored number and ignores a new one; with auth on, a deck-wide `notify_waid` in config.yaml applies to nobody). Unset: a deck without auth pushes to every allowlisted number; with auth on, nothing is pushed (logged as `nudge → whatsapp skipped`). A 30s dedup guard at the outbound chokepoint prevents the same reply being sent twice across native + push.
@@ -4727,7 +4857,9 @@ The closed-loop autonomy page (sidebar: **Autonomous Work**) where the assistant
 - **Learned reliability.** Per-kind / per-tool-action reliability weights (Bayesian; fails count double; seeded at `reliability_seed`).
 - **Recent events.** New / surfaced / acted / ignored — clickable, so you can see what the loop has seen.
 
-**Action catalog (built-in, #1).** Reversible auto-eligible: `note.write`, `calendar.hold`, `mail.draft`, `reminder.schedule`. Human-only (propose for approval, never auto-fire): `mail.send`, `calendar.invite`, `calendar.delete`, `message.send`, `drive.delete`. Plus any custom actions you promote.
+**Action catalog (built-in, #1).** Reversible auto-eligible: `note.write`, `calendar.hold`, `reminder.schedule`. Human-only (propose for approval, never auto-fire): `mail.draft` (since 0.8.0), `mail.send`, `calendar.invite`, `calendar.delete`, `message.send`, `drive.delete`. For email the arbiter prefers a nudge ("X is waiting for a reply — subject") over a draft, and ignores Gmail events older than 48 h.
+
+**Automated turns write mail only when asked (since 0.8.0).** A scheduler job, flow, plan, peer request, Basna/Vatra/Code worker or MCP task may draft or send email only when its own human-written text asks for that email (English and Croatian are recognised); otherwise the mail tool answers `[not-authorized: mail-write]`. A self-scoped job ("email me the summary") may write only to the owner's own or an explicitly named address. Organizing a mailbox is a separate permission the job text must ask for too. The agent logs `legacy cron job may write email` at start for old cron jobs whose text asks for email — review those. Interactive chats keep prompt rules only. Plus any custom actions you promote.
 
 **Webhook push (#2).** A token-gated `POST /fd/events/webhook` accepts an external system pushing an event directly into the spine (sub-minute latency vs the 5-min poll cadence). Disabled unless `FD_EVENTS_WEBHOOK_TOKEN` is set; caller passes it via `X-Webhook-Token` and names the target `user_id` in the body.
 
@@ -5173,7 +5305,7 @@ The Director panel (Cmd+D to toggle) provides a unified overview of all agents:
 
 ### Operations Dashboard
 
-A dedicated view (Cmd+2) for monitoring agent usage and costs:
+A dedicated view for monitoring agent usage and costs:
 
 - **Summary cards** — total tokens, estimated cost, API calls, average latency, data transferred, cache hit rate
 - **Token distribution** — visual bar showing input/output/cache breakdown
@@ -5186,7 +5318,7 @@ Cost estimates use published pricing for Claude, GPT, and Gemini models.
 
 ### Agent Pipelines
 
-Pipelines chain agents together so output from one automatically flows to the next. Located in the Workflows view (Cmd+3):
+Pipelines chain agents together so output from one automatically flows to the next. Located in the Workflows view:
 
 - **Visual pipeline builder** — create named pipelines with step-by-step agent chains
 - **Step editor** — add agents, set optional prompt prefixes per step, reorder steps
@@ -5246,12 +5378,9 @@ Full message content is forwarded without truncation.
 
 | Shortcut | Action |
 |---|---|
-| Cmd/Ctrl+1 | Agent Desktop |
-| Cmd/Ctrl+2 | Operations |
-| Cmd/Ctrl+3 | Workflows |
-| Cmd/Ctrl+4 | Spawn Agent |
 | Cmd/Ctrl+D | Toggle Director |
-| Cmd/Ctrl+J | Toggle Chat Panel |
+| Cmd/Ctrl+J | Toggle Chat Panel / Queue |
+| Cmd/Ctrl+\\ | Simple / Full view (ignored in kiosk mode) |
 | Cmd/Ctrl+K | Toggle Shortcuts Help |
 | Cmd/Ctrl+[ | Previous Chat Tab |
 | Cmd/Ctrl+] | Next Chat Tab |
@@ -5294,8 +5423,22 @@ Flight Deck uses environment variables:
 |---|---|---|
 | `FD_DATA_DIR` | `./fd-data` | Directory for agent data (config, workspace, sessions) |
 | `FD_AUTH_ENABLED` | `false` | Enable JWT-based multi-user authentication |
-| `FD_JWT_SECRET` | (auto-generated) | Secret key for JWT token signing |
+| `FD_JWT_SECRET` | (auto-generated per boot) | Secret key for JWT token signing. Set a fixed value on any shared deck — otherwise every login dies on restart; the inbound MCP OAuth and Lupa need it stable (Lupa's BFF must share it) |
 | `FD_DOCKER_SPAWN` | `true` | Allow Docker container spawning (can be disabled by admin) |
+| `FD_ALLOWED_HOSTS` | (unset) | **NEW in 0.8.0.** Extra host names this deck answers to, comma-separated (`.example.com` / `*.example.com` allow subdomains, `*` turns the check off). `localhost`, IP literals, this machine's hostnames, `FD_PUBLIC_URL`'s host and `FD_CORS_ORIGINS` hosts are always allowed. **A deck reached through its own domain must set this or `FD_PUBLIC_URL`, or every request is refused** |
+| `FD_PUBLIC_URL` | (unset) | The deck's public base URL (`https://claw.example.com`); allowed by the Host guard and used for OAuth redirect/discovery URLs (Google, Microsoft, inbound MCP) |
+| `FD_CORS_ORIGINS` | (deck's own origins) | Extra browser origins allowed to call the deck. Since 0.8.0 the default is no longer `*`; `*` is the explicit legacy opt-out |
+| `FD_LOCKDOWN` | (unset) | `1` = hosted mode: agent shared secret required even from loopback, host-filesystem routes off, `Secure` refresh cookie |
+| `FD_REGISTRATION_OPEN` / `FD_REGISTRATION_DISABLED` | (unset) | Self-registration is closed once the first (admin) account exists; `_OPEN=1` reopens it, `_DISABLED=1` forces it closed. Admins add users in Admin → Users |
+| `FD_COOKIE_SECURE` | (auto) | Force the refresh cookie's `Secure` flag on (`1`) or off (`0`, local http only) |
+| `FD_SIMPLE_CHAT` | (unset) | `1` (or `captain-claw-fd --simple-chat`) = kiosk: non-admins get only the simple chat layout |
+| `CAPTAIN_CLAW_FD_HOME` | (unset) | Per-instance home for MCP servers, code apps and the agent secret (falls back to `FD_DATA_DIR`, then `~/.captain-claw-fd`) |
+| `FD_AGENT_SHARING` | (unset) | `1` = allow sharing an agent with other users (needs auth on) |
+| `FD_ARCHETYPE_GRID` | (unset) | `1` = function × domain archetype grid (`reviewer.legal`) |
+| `FD_BAT_DISABLED` / `FD_BAT_SPEND` | (unset) | Bat is on by default — `FD_BAT_DISABLED=1` turns it off; real-money spend stays off unless `FD_BAT_SPEND=1` |
+| `FD_GMAIL_SEND` / `FD_GMAIL_AUTOREPLY` | (unset) | Deck kill switches: `off` stops all agent Gmail sends / topic auto-replies |
+
+A deck on more than one person's network: see [docs/team-deployment.md](docs/team-deployment.md) for the full checklist (`FD_AUTH_ENABLED`, `FD_JWT_SECRET`, `FD_LOCKDOWN`, `FD_AGENT_SHARED_SECRET`, `FD_GLASSES_BRIDGE_TOKEN`, …).
 
 ### Connection Settings
 
@@ -5347,7 +5490,8 @@ Each Telegram user automatically gets a dedicated session and agent instance:
 - **Isolated sessions** — users cannot see or switch to other users' sessions
 - **Concurrent execution** — different Telegram users can interact simultaneously (no "Agent is busy" blocking between users)
 - **Per-user locks** — requests from the same user are serialized; requests from different users run in parallel
-- **Disabled commands** — `/new` and session switching (`/session list`, `/session switch`, `/session load`, `/session new`) are not available on Telegram
+- **`/new` starts a fresh session** (NEW in 0.8.0) — `/new [name]` (or `/session new`) moves the user to a new session and archives the old one to history; the new one stays theirs after a restart. It is refused while a reply is still running ("send /new once the reply is in").
+- **Disabled commands** — listing and switching sessions (`/sessions`, `/session list`, `/session switch`, `/session load`) are not available on Telegram: each user has one session at a time
 - **Available session commands** — `/clear`, `/history`, `/compact`, `/session info`, `/session rename` operate on the user's own session
 - **Photo attachments** — images sent to the bot are processed through the `image_vision` tool
 - **Generated images**: images that `image_gen`, `termux` or a browser screenshot made this turn are sent back to the user automatically.
@@ -5360,7 +5504,7 @@ Remote users can use: `/help`, `/config`, `/history`, `/compact`, `/models`, `/s
 
 Local-only commands (not available remotely): `/exit`, `/approve user`, `/session run`, `/session procreate`, `/session protect`, `/session export`, `/session queue`, `/monitor`, `/cron add/list/history/pause/resume/remove`.
 
-**Telegram-only restrictions:** `/new` and `/sessions` are disabled. Session switching subcommands (`list`, `switch`, `load`, `new`) are disabled.
+**Telegram-only restrictions:** `/sessions` is disabled, and so are the session switching subcommands (`list`, `switch`, `load`). `/new` works (since 0.8.0) and starts a fresh session for that Telegram user.
 
 ---
 
@@ -5454,6 +5598,25 @@ captain-claw-fd
 - **Hidden system context** is injected to the agent on the first message per binding so the model knows the reply will render on a tiny HUD (concise, lead-with-the-answer, no preamble). Never broadcast to the channel — the user only ever sees their plain text in the mobile log.
 - **Voice is off by default** — explicit tap-to-enable, which also serves as the user gesture for browser autoplay.
 
+### Flight Deck HUD on the glasses (`/hud`) — NEW in 0.8.0
+
+Besides the bridge pages above, Flight Deck now ships a full frontend for the Meta Ray-Ban Display at **`/hud/`**: chat with your running agents (the same conversation as the dashboard, dictation or handwriting through Meta's composer, replies read aloud), read the Markdown files your agents wrote, and browse datastore tables read-only — all driven by swipes and pinches on a 600 × 600 display. It is a separate, lean page (about 150 KB on the wire for the first load, cached by a service worker afterwards). Pair it by opening `/hud/pair` on your phone or computer and typing the code the glasses show. Requirements, pairing, screens and limits: [docs/glasses-hud.md](docs/glasses-hud.md).
+
+---
+
+## StickS3 voice device — NEW in 0.8.0
+
+A pocket push-to-talk client for your agents on an **M5Stack StickS3**: hold the front button, talk, release. Flight Deck transcribes it (Soniox), sends it to one of your running agents, and the stick shows the reply as paged text (č ć š ž đ included), reads it aloud, and shows any picture the agent made. While the agent works, the screen shows what it heard, the agent's live activity lines ("Searching: …", "Reading: …") and a "12s · 3 steps" timer.
+
+- **Server:** `WS /device/ws` on Flight Deck. The stick streams 16 kHz PCM while the button is held; replies come back as text, Soniox TTS audio (24 kHz PCM) and pictures fitted to the screen. Results the agent produces later (a cron job, a nudge) are shown too.
+- **Auth:** a personal access token (Flight Deck → Connections → *Agent access for Claude (MCP)* → Generate token) names the owner; a deck with auth off needs none.
+- **Deck requirements:** `SONIOX_API_KEY` (speech in, voice out). A deck reached through a domain needs that domain in `FD_ALLOWED_HOSTS` or `FD_PUBLIC_URL` (the [origin guard](#flight-deck-security-hardening--new-in-080) refuses unknown hosts).
+- **Setup:** on first boot (or holding the front button while switching on) the stick opens a `Captain-StickS3-xxxx` hotspot; at `http://192.168.4.1` enter up to five Wi-Fi networks, the deck address (`ws://<host>:25080` or `wss://<deck domain>`), the token, and optionally an agent slug, reply language, volume and sleep minutes.
+- **Buttons:** front = hold to talk, tap to stop speaking or flip picture ↔ text; side = agents list, volume (25–100 %), speech **Boost** (+6 / +10 dB with a soft limiter), settings.
+- **Firmware:** PlatformIO in `firmware/sticks3/` — `uv tool install platformio`, then `cd firmware/sticks3 && pio run -t upload`. Details, serial logging and going back to stock firmware: [firmware/sticks3/README.md](firmware/sticks3/README.md).
+
+The StickS3 has no Bluetooth Classic, so audio plays on its own speaker, not on Bluetooth headphones.
+
 ---
 
 ### WhatsApp: automated messages arrive once
@@ -5466,6 +5629,12 @@ Now the copy in the main chat is marked `fd_delivers` whenever Flight Deck deliv
 - **an agent cron result** that Flight Deck routed back to where the session came from.
 
 If Flight Deck stops waiting for a slow turn, the result isn't marked, so it still arrives once through the bridge. A nudge with no number to push to is also left unmarked. Automated results the bridge still relays (plans, cron results Flight Deck didn't route, autonomous actions that aren't nudges) respect `/mute`, the same as pushes.
+
+### WhatsApp: `/new`, reactions and the garbled-reply hint — NEW in 0.8.0
+
+- **`/new` answers.** The agent always started the new session, but its confirmation was dropped and the new session never got the WhatsApp reply rules. Command results now come back as a plain-text notice, and the rules are re-sent whenever the agent's session changes.
+- **Emoji reactions.** A text or voice message that reaches the agent gets a quick emoji reaction (or none) picked by the target agent's own model in a background side call; it never delays the forward. On by default; `WHATSAPP_REACTIONS=off` turns it off, `WHATSAPP_REACTION_TIMEOUT` bounds the call. See [docs/whatsapp-bridge-setup.md](docs/whatsapp-bridge-setup.md).
+- **Garbled replies.** When a reply comes out as unusable output and a Jev key is connected, a notice suggests `/new` (see [jev](#jev)).
 
 ### WhatsApp: files you send
 
@@ -5524,6 +5693,14 @@ Requests are proxied through the Captain Claw agent pool. Each API request gets 
 ## MCP Server
 
 Captain Claw can run as a Model Context Protocol (MCP) server over stdio, allowing external MCP clients — such as Claude Desktop — to interact with the agent. Clients can browse sessions, read conversation history, send messages to the agent, and check agent status.
+
+> **Fleet access over HTTP (NEW in 0.8.0).** Flight Deck also hosts an MCP server at **`/fd/mcp-server`** so Claude Code, Claude Desktop or claude.ai can drive **your whole fleet**: `list_agents`, `send_task` (async, returns a `task_id`), `get_result` (live progress + final answer) and `cancel_task`, scoped to the signed-in user's own agents. claude.ai / Claude Desktop add it as a custom connector (OAuth 2.1 with dynamic client registration + PKCE — sign in with your Flight Deck account); Claude Code uses a personal access token from **Connections → Agent access for Claude (MCP)**:
+>
+> ```bash
+> claude mcp add --transport http captain-fleet https://YOUR-FD-HOST/fd/mcp-server --header "Authorization: Bearer cc_pat_…"
+> ```
+>
+> Needs HTTPS, `FD_PUBLIC_URL` and a stable `FD_JWT_SECRET`. Details in [docs/team-deployment.md](docs/team-deployment.md#connect-claude-to-your-agents-inbound-mcp).
 
 ### Launch
 
@@ -5630,6 +5807,8 @@ OAuth auto-enables when both `client_id` and `client_secret` are set.
 
 The OAuth flow uses PKCE for security. Tokens are stored locally and refresh automatically.
 
+**Under Flight Deck (since 0.8.0) Google is per user.** The OAuth client (ID, secret, project, scopes) is set once by an admin in **Connections → Google** (`POST /fd/google/config` is admin-only); each Flight Deck user connects **their own** Google account, and an agent only ever gets its owner's token. Rotating the client or changing scopes disconnects everyone. After upgrading, each user reconnects once (the primary owner keeps working on the legacy deck-wide token until they do). Drive mounts in the VFS panel likewise use each user's own Drive.
+
 ### Vertex AI
 
 If `project_id` is set, Google OAuth also enables Gemini models via Vertex AI. The `location` field specifies the Vertex AI region (default: `us-central1`).
@@ -5670,6 +5849,47 @@ tools:
 ```
 
 `allow_send` and `allowed_recipients` are ignored under Flight Deck, where the user's policy decides. `google_mail` is the only tool that sends Gmail (the old `gws` CLI wrapper, which could reach Gmail with the same token, is retired). The gate protects against model mistakes and prompt injection; it is not a security boundary against an agent that has a shell tool, which can reach the Google token itself.
+
+**Attaching files.** `create_draft`, `update_draft` and a composed `send` take `attachments` — local paths as the file tools print them (`saved/…`, `vfs:<project>/<path>`); `update_draft` also takes `remove_attachments`. `microsoft_mail` drafts take the same parameters.
+
+### Agentic signature — NEW in 0.8.0
+
+**Connections → Google** (under the recipients list) and **Connections → Microsoft** each have an **Agentic signature** field: plain text (up to 1000 characters) that is added to the end of every email and draft your agents write from that account, so a recipient can tell an agent wrote it. `google_mail` and `microsoft_mail` add it on `create_draft` (replies too) and on `update_draft` with a new body; Flight Deck adds it to every composed Gmail send and to topic auto-replies. HTML bodies get an escaped block inside `</body>`; a body that already ends with the signature is left alone. If Flight Deck doesn't answer, the draft is made without it and the tool says so. Stored per user (`GET`/`PUT /fd/google/gmail-send` → `signature`, `GET`/`PUT /fd/microsoft/mail-signature`).
+
+### Gmail topic auto-replies — NEW in 0.8.0
+
+**Connections → Google → Topic auto-replies** lets one of your agents answer, **with no confirmation**, inbound email that is *only* about one of your narrow topics ("Emails that ask for our office opening hours"). Off by default, its own switch (it works with *agents may send* off), Gmail only, and the engine runs inside Flight Deck — no agent code changes.
+
+- **Topics are narrow by construction.** Up to 10 topics, at most 5 on. Each needs an "Emails that…" description of at least 6 words and an example; catch-all wording ("any", "all emails", "bilo što") is refused. A topic switches on only after a **breadth test** — a dry run on your recent mail that matched at most 25 % of it — and editing what it matches switches it off again.
+- **Who gets a reply.** Only senders whose mail passed Gmail's own authentication; auto-responders, mailing lists, bounces, your own mail, old mail and mail where Reply-To diverges are skipped. Mail that was already in the inbox when you switched it on is never answered. Caps per thread, per sender, a flood brake and a daily limit (default 10, at most 50). A draft or reply of your own in the thread means the engine stays out of that thread for good.
+- **What a reply may say.** The writer can look things up read-only (the topic's folder, insights, playbooks, web search). Before sending, an outbound guard blocks secrets, credentials, card/IBAN/OIB/JMBG numbers, internal hosts and paths, your **never-disclose** terms (up to 50), profile copy, unexpected links, amounts and contacts; a block keeps no text, a hold puts the reply in Flight Deck as a **held card** (Send / Edit & send / Dismiss) — never a Gmail draft. A second judge (Jev, else your balanced/reasoning tier) checks the reply before it goes.
+- **Sends** go to the verified sender only, marked `Auto-Submitted`, with your agentic signature, and appear in your sends list and bell (`origin: autoreply`). Three replies blocked for leaking, a disconnect or a changed Google account switch you off.
+
+Needs `gmail.readonly` (or `gmail.modify`) plus `gmail.send` (or `gmail.compose`) on the OAuth client; users reconnect after an admin adds them. Deck-wide kill switches: `FD_GMAIL_AUTOREPLY=off` (and `FD_GMAIL_SEND=off`, which stops all sending). Tuning: `FD_GMAIL_AUTOREPLY_POLL_SECONDS` (default 30, at least 15) and `FD_GMAIL_AUTOREPLY_CLASSIFY_PER_DAY` (default 200, 20–1000).
+
+### When an agent says it sent something — NEW in 0.8.0
+
+Weak models sometimes answer "**Sent** …" or "Meeting request sent to Borjan — Tue 20 Oct" without calling any tool, complete with made-up Message IDs. A fabrication guard now judges every final reply:
+
+- A claim that an **email went out** is false when no send happened this turn (`google_mail`, `microsoft_mail`, `send_mail`, a mail MCP tool, or a send a peer or lane relayed) and it quotes no Message ID an earlier send returned.
+- A claim that a **calendar event** was created, moved, cancelled, answered or an invitation sent is false when no calendar change went through this turn. Read-backs ("is scheduled for 15:00", "It's in your calendar") are not claims.
+- **Made-up IDs** (mail, calendar, Drive, Graph shaped) that nothing the model was given contained, and **narrated lookups** in a turn that made no tool call, are caught too.
+
+A caught reply is stored as rejected (never replayed to the model) and the agent is asked, at most twice, for a **true** reply — the corrective never tells it to go and make the send or change. Claims written next to tool calls wait until those calls answer. Prompts say only "Email sent." with a Message ID, or "Created event …", proves the action.
+
+---
+
+## Microsoft 365 (Outlook, Calendar, OneDrive) — NEW in 0.8.0
+
+`microsoft_mail`, `microsoft_calendar` and `microsoft_onedrive` are the Microsoft twins of the Google tools, with the same connection model: Flight Deck owns the sign-in, each Flight Deck user connects **their own** Microsoft account (work/school or personal Outlook.com), and an agent only ever gets a short-lived Graph token for its **owner**. Auth-enabled decks only.
+
+1. **Register an app** in Microsoft Entra ID (App registrations → New registration). Add a **Web** redirect URI: `https://<your deck>/fd/microsoft/callback` (or `http://localhost:25080/fd/microsoft/callback`), and create a client secret.
+2. **Connections → Microsoft** (admin): paste the client ID and secret, pick the tenant (`common`, `organizations`, `consumers` or your tenant ID) and the Graph scopes. The default set is `Mail.ReadWrite`, `Calendars.ReadWrite`, `Files.ReadWrite.All` (plus sign-in scopes and `offline_access`); `Mail.Send` is offered but unused — the tools never send. Changing the client, tenant or scopes disconnects everyone.
+3. **Each user** clicks **Connect** on the same card (kiosk users get it in the Connections dialog). Once configured, the Director panel shows a Microsoft traffic light.
+
+The tools stay hidden until the owner has connected and are owner-only (not available to a shared agent's members). Agents draft but never send Outlook mail; calendar changes that would email attendees need `notify_attendees: true` and a human-asked turn (see [microsoft_calendar](#microsoft_calendar--new-in-080)).
+
+Deploy: pull, restart Flight Deck and agents, hard-refresh the browser, then register the app as above.
 
 ---
 
@@ -5802,6 +6022,7 @@ workspace/saved/
 | `GOOGLE_API_KEY` or `GEMINI_API_KEY` | Google / Gemini API key |
 | `OLLAMA_BASE_URL` | Ollama server URL |
 | `BRAVE_API_KEY` | Brave Search API key |
+| `YDC_API_KEY` | You.com Search API key (`tools.web_search.provider: youcom`) |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token |
 | `SLACK_BOT_TOKEN` | Slack bot token |
 | `SLACK_APP_TOKEN` | Slack app token |
@@ -5816,6 +6037,9 @@ workspace/saved/
 | `SENDGRID_API_KEY` | SendGrid API key |
 | `TYPESENSE_API_KEY` | Typesense API key (used by both tool and deep memory) |
 | `JEV_API_KEY` (or `TYPESAFE_API_KEY`) | Jev (TypeSafe AI) API key for the `jev` tool — standalone agents only; under Flight Deck add it in **Connections → Jev** |
+| `SONIOX_API_KEY` | Flight Deck: speech-to-text and TTS for WhatsApp voice notes, the glasses bridge, the HUD and the StickS3 device |
+| `WHATSAPP_REACTIONS` / `WHATSAPP_REACTION_TIMEOUT` | Flight Deck WhatsApp bridge: `off` disables emoji reactions (on by default); timeout in seconds (default 8) |
+| `CLAW_WRITE_GUARD` | `0` turns off the `write` tool's empty/placeholder refusal and read-back check (on by default since 0.8.0) |
 | `FD_JEV_BASE_URL` | Flight Deck: send every user's Jev calls to another Jev-compatible endpoint (a proxy in front of `https://api.typesafe.ai`, or a local stub); default `https://api.typesafe.ai` |
 | `CLAW_BOTPORT_CLIENT__URL` | BotPort WebSocket URL (e.g. `wss://botport.kstevica.com/ws`) |
 | `CLAW_BOTPORT_CLIENT__KEY` | BotPort authentication key |

@@ -335,9 +335,9 @@ simultaneously via the parallel Messenger callback.
 
 ## Future work / known limits
 
-- **Voice notes** are not transcribed yet. Could add via Whisper or a
-  similar STT. Deferred because the WhatsApp on Ray-Ban Display transcribes
-  inbound voice notes natively for the user already.
+- **Voice notes** are transcribed with Soniox (`SONIOX_API_KEY`); the
+  recording is saved and attached to the turn, and a failed transcription is
+  reported with its real cause (see USAGE.md → "WhatsApp: files you send").
 - **Templates / proactive sending** outside the 24-hour service window
   isn't implemented. The bridge reacts; it doesn't initiate.
 - **Mark-as-read** without typing is not separately exposed. We always

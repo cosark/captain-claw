@@ -12,7 +12,8 @@ Flight Deck backend **before** the first teammate logs in.
 | `FD_AUTH_ENABLED` | `true` | Enforces JWT login on every route. Without it FD runs as a synthetic local admin and anyone reaching the port is that admin. |
 | `FD_JWT_SECRET` | a long random string (e.g. `openssl rand -hex 32`) | If unset, a new secret is generated on every boot, so **every session's tokens die on restart**. A fixed secret keeps people logged in and makes tokens forgeable only with the secret. |
 | `FD_LOCKDOWN` | `1` | Disables the host-filesystem surfaces that make no sense off-machine (`/fd/vfs/browse-fs`, `POST /fd/vfs/links`, the auth-less `/fd/projects/*` router) and makes the agent shared-secret mandatory even from loopback (so a same-host TLS proxy can't launder remote callers into "loopback"). Also flips the refresh cookie to `Secure` by default. |
-| `FD_CORS_ORIGINS` | your exact web origin(s), comma-separated (e.g. `https://claw.example.com`) | The default is `*` **with credentials**, which is unsafe for a cookie-bearing app. Pin it to your real origin(s). |
+| `FD_PUBLIC_URL` / `FD_ALLOWED_HOSTS` | your deck's public URL (e.g. `https://claw.example.com`) / its domain(s), comma-separated | Since 0.8.0 Flight Deck refuses any request whose `Host` it doesn't recognise (DNS-rebinding guard). Loopback, IP literals and this machine's hostnames are always allowed; **a deck reached through a domain must list it here**, or the SPA, webhooks, OAuth callbacks and inbound MCP are all refused (the refusal log names the setting). `FD_ALLOWED_HOSTS` takes `.example.com` / `*.example.com` for subdomains. |
+| `FD_CORS_ORIGINS` | only extra origins, if any (e.g. a separate frontend domain) | Since 0.8.0 the default is the deck's own origins (no longer `*`), and every request with a foreign `Origin` is refused. Add an origin only for a frontend served from elsewhere; `*` is the explicit legacy opt-out. |
 | `FD_AGENT_SHARED_SECRET` | a long random string | Agents authenticate to FD's internal `/fd/basna/agent/*`, `/fd/vatra/agent/*`, `/fd/deliver`, and scheduler routes with this. Without it those routes fall back to loopback-only, which a reverse proxy can spoof. |
 | `FD_GLASSES_BRIDGE_TOKEN` | a long random string | Shared secret for the glasses/scheduler bridge. Internal automation (`intentions.py` → scheduler) sends it. Setting it closes the old hole where an unset value let the scheduler accept **every** request. |
 | `FD_COOKIE_SECURE` | `1` (optional) | Forces the refresh cookie to `Secure` regardless of `FD_LOCKDOWN`. With `FD_LOCKDOWN=1` this is already the default; set it explicitly if you terminate TLS elsewhere. Use `0` only for local http development. |
@@ -61,9 +62,16 @@ These are code changes already in this build; the env vars above turn them on.
 ## Collaboration features (0.8.x)
 
 - **Shareable tier sets.** Library → configure a tier set → *Publish to team*
-  (admin). Teammates who never set up models automatically run on it, and API
-  keys are never shared — each tier stores a `@system` sentinel resolved
-  server-side from the org key store. Others can *Duplicate to customize*.
+  (admin). Teammates who never set up models automatically run on it. Keys
+  never reach the browser — each tier stores a `@system` sentinel resolved
+  server-side — but **publishing does share them as team keys**: a key on a
+  provider's own endpoint becomes (or replaces) that provider's org key, and a
+  custom-endpoint (gateway) key goes into a per-endpoint org store. The publish
+  answer lists what was added, updated, left unshared or missing. Process agents
+  with no model key get the team key in their `.env` and are restarted
+  automatically; a spawn nothing can supply a key for is refused (409). Decks
+  that published before 0.8.0 should publish again. Others can *Duplicate to
+  customize*.
 - **Per-user Google Drive.** Each teammate connects their own Google account
   (Connections → Google) and browses/mounts their own Drive — no shared token.
   For a shared reference corpus, mount a Shared-Drive folder with `clonemd=true`

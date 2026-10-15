@@ -70,7 +70,7 @@ cd lupa/api && ../../.venv/bin/python -m pytest tests/ -q
 | `LUPA_PACKS_DIR` | `lupa/packs` | seed packs directory |
 | `LUPA_PORT` / `LUPA_HOST` | `25180` / `0.0.0.0` | bind (use the `lupa-api` script) |
 | `LUPA_BRIEF_TICK_SECONDS` | `60` | standing-brief scheduler tick |
-| `LUPA_FACTORY_POLL_SECONDS` / `LUPA_FACTORY_TIMEOUT_SECONDS` | `2` / `900` | Studio generate/evaluate polling |
+| `LUPA_FACTORY_POLL_SECONDS` / `LUPA_FACTORY_TIMEOUT_SECONDS` | `2` / `2700` | Studio generate/evaluate polling |
 
 Hosted deployments additionally set on **FD**: `FD_LOCKDOWN=1`,
 `FD_CORS_ORIGINS`, `FD_AGENT_SHARED_SECRET`, `FD_GLASSES_BRIDGE_TOKEN`

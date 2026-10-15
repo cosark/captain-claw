@@ -671,7 +671,7 @@ cross_session_retrieval: bool = False  # Config flag
 | `host` | `localhost` | Typesense host |
 | `port` | 8108 | Typesense port |
 | `collection_name` | `captain_claw_deep_memory` | Collection name |
-| `embedding_dims` | 1536 | Vector dimensions |
+| `embedding_dims` | 0 | Vector dimensions; 0 = auto-detect from the embedding provider (since 0.8.0) |
 | `auto_embed` | `true` | Auto-generate embeddings |
 | `layered_summaries` | `true` | Generate L1/L2 for deep memory |
 

@@ -4,7 +4,7 @@
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.7.7-purple)](release-notes/RELEASE_NOTES_0.7.7.md)
+[![Version](https://img.shields.io/badge/version-0.8.0-purple)](release-notes/RELEASE_NOTES_0.8.0.md)
 [![Interface](https://img.shields.io/badge/interface-terminal%20%7C%20web%20UI%20%7C%20desktop-black)](#quick-start)
 [![Models](https://img.shields.io/badge/models-OpenAI%20%7C%20Claude%20%7C%20Gemini%20%7C%20DeepSeek%20%7C%20Ollama%20%7C%20OpenRouter-orange)](#multi-model-support)
 
@@ -14,9 +14,9 @@
 
 ![Flight Deck — spawn a team of specialists, monitor them live, and chat with any one from a single dashboard](docs/screenshots/flight-deck.png)
 
-<p align="center"><strong>6 orchestration modes</strong> &nbsp;·&nbsp; <strong>48 built-in tools</strong> per agent &nbsp;·&nbsp; <strong>6 shared memory layers</strong> &nbsp;·&nbsp; <strong>31 ready-made specialists</strong> &nbsp;·&nbsp; <strong>a full coding pipeline</strong> &nbsp;·&nbsp; <strong>living beings you raise</strong> &nbsp;·&nbsp; <strong>small models that do real work</strong></p>
+<p align="center"><strong>6 orchestration modes</strong> &nbsp;·&nbsp; <strong>51 built-in tools</strong> per agent &nbsp;·&nbsp; <strong>6 shared memory layers</strong> &nbsp;·&nbsp; <strong>31 ready-made specialists</strong> &nbsp;·&nbsp; <strong>a full coding pipeline</strong> &nbsp;·&nbsp; <strong>living beings you raise</strong> &nbsp;·&nbsp; <strong>small models that do real work</strong></p>
 
-A **self-hosted framework for orchestrating fleets of specialist AI agents** — from **ensemble reasoning** (six orchestration modes) to a **full agentic coding pipeline** (plan → independent review → ship). Model-agnostic and local-friendly: connect OpenAI, Anthropic, Google Gemini, DeepSeek, Ollama, or OpenRouter (plus "Sign in with ChatGPT" — no API key), or run 100% local with Ollama. Backed by 48 built-in tools per agent, persistent cross-session memory, and autonomous "dream cycle" cognition.
+A **self-hosted framework for orchestrating fleets of specialist AI agents** — from **ensemble reasoning** (six orchestration modes) to a **full agentic coding pipeline** (plan → independent review → ship). Model-agnostic and local-friendly: connect OpenAI, Anthropic, Google Gemini, DeepSeek, Ollama, or OpenRouter (plus "Sign in with ChatGPT" — no API key), or run 100% local with Ollama. Backed by 51 built-in tools per agent, persistent cross-session memory, and autonomous "dream cycle" cognition.
 
 ### 💻 NEW: Code — an engineering department, not a coding assistant
 
@@ -66,6 +66,18 @@ Captain Claw is **MIT licensed and free forever** — your data stays on your ma
 </p>
 
 [![Star History Chart](https://api.star-history.com/svg?repos=kstevica/captain-claw&type=Date)](https://star-history.com/#kstevica/captain-claw&Date)
+
+## What's New in 0.8.0
+
+**Flight Deck for a team · agents in your inbox, glasses and pocket.** The biggest release since Flight Deck — 75 merged PRs about putting agents in front of other people. **Some defaults change, mostly for security:** a deck reached through its own domain must set `FD_ALLOWED_HOSTS` or `FD_PUBLIC_URL` before upgrading; restart Flight Deck, then every agent.
+
+- **Flight Deck for a team** — every route knows who is calling (owner-scoped proxies, verified agent identity, a Host/Origin guard against DNS rebinding), per-user Google and Microsoft accounts, closed registration with **Admin → Users** to add people and administer their agents, team tier sets that share keys server-side, **shared agents** (one agent, several people, each with their own Google, files and context packs), an owner profile in every prompt, and a **kiosk mode** (`--simple-chat`) on a new chat-first simple layout.
+- **Agents in your inbox** — **Microsoft 365** tools (Outlook mail, Calendar, OneDrive), opt-in audited **Gmail sending**, attachments in and out, mailbox filing, Google Sheets and Docs edited in place, an **agentic signature**, and fully autonomous **topic auto-replies** (off by default, heavily guarded). The `gws` CLI wrapper is retired.
+- **Agents that don't make things up** — no email nobody asked for (mail is human-only in Autonomous Work and automated turns), a **fabrication guard** that catches claimed sends, calendar changes and invented IDs and asks for a true reply, and a Jev check that suggests `/new` when a reply comes out garbled.
+- **More surfaces** — WhatsApp files both ways, reactions and `/new`; **`/new` on Telegram**; a **Flight Deck HUD** for Meta Ray-Ban Display at `/hud`; a push-to-talk **M5Stack StickS3** voice client; and an MCP server at `/fd/mcp-server` so **Claude can drive your fleet**.
+- **Long work that finishes** — **Bat**, a new mode that keeps going until an independent judge says it's done; Vatra workers without a time cap and with an in-turn context governor; long-form deliverables assembled by code with a done gate; a crowded-session **context engine** for weak models; deep memory that finally searches by meaning; and Google Drive folders mounted as VFS projects.
+
+See [RELEASE_NOTES_0.8.0.md](release-notes/RELEASE_NOTES_0.8.0.md).
 
 ## What's New in 0.7.8
 
@@ -419,7 +431,8 @@ captain-claw-fd    # http://0.0.0.0:25080
 - **Agent Council** — Structured multi-agent deliberation. Run brainstorms, debates, reviews, or planning sessions with 2-N agents. Each agent self-scores suitability, chooses actions (answer, challenge, refine, broaden), and responds in moderated rounds. A moderator synthesizes conclusions; all agents vote. Export as markdown minutes.
 - **Fleet Communication** — Agents discover peers automatically. Consult (synchronous ask) or delegate (asynchronous queue) tasks to specialist agents. Shared workspace and file transfer across the fleet.
 - **Director Panel** — Unified overview of all agents. Broadcast messages fleet-wide. Per-agent token/cost analytics, trace timelines, datastore browser, file browser, config editor.
-- **Multi-user Auth** — JWT authentication, admin dashboard, rate limiting, and quotas.
+- **Bat** (0.8.0) — A durable "stubborn finisher": plans, runs checkpointed steps with retries, survives restarts, and stops only when an independent judge says the task is done — behind a hard safety floor and a start gate for email, spending and accounts.
+- **Multi-user Auth & teams** — JWT authentication, admin dashboard, rate limiting, and quotas; owner-scoped routes, per-user Google/Microsoft, team tier sets, shared agents, and a `--simple-chat` kiosk mode (0.8.0).
 - **MCP Connections** — Add Model Context Protocol servers (HTTP or stdio) once and every entitled agent in the fleet picks up their tools — no per-agent config. Phase 2 adds stdio transport for `npx`/`uvx`-shipped servers, per-agent allowlists, hot tool-list reload over SSE, and streaming tool calls.
 
 ### Cognitive Architecture
@@ -480,6 +493,8 @@ Captain Claw runs as a Model Context Protocol server over stdio — Claude Deskt
 captain-claw-mcp    # stdio, configure in claude_desktop_config.json
 ```
 
+**Fleet access for Claude (new in 0.8.0):** Flight Deck itself is an MCP server at `/fd/mcp-server`. Add it to claude.ai or Claude Desktop as a custom connector (OAuth 2.1 — sign in with your Flight Deck account) or to Claude Code with a personal access token, and Claude can list your agents, hand them tasks and read back the results. See [docs/team-deployment.md](docs/team-deployment.md#connect-claude-to-your-agents-inbound-mcp).
+
 ### MCP Client (consume MCP servers via Flight Deck)
 
 The other direction: agents in your fleet call into MCP servers. Add a server once in **Flight Deck → Connections → MCP servers** and every agent the allowlist permits gets the tools auto-registered on boot.
@@ -499,6 +514,7 @@ Three layers of protection that run before, during, and after agent operations:
 - **Input guards** — Validate user intent before the LLM sees it
 - **Script guards** — AST-level analysis of generated code before execution
 - **Output guards** — Validate tool results for hallucinations and safety
+- **Action honesty** (0.8.0) — a fabrication guard rejects replies that claim an email was sent or a calendar event changed when no tool did it, and automated turns may write email only when their own instructions ask for it
 
 Guards support two modes: `stop_suspicious` (block automatically) or `ask_for_approval` (prompt the user).
 
@@ -508,7 +524,7 @@ Mix providers freely — each session independently selects its model.
 
 | Provider | Models |
 |---|---|
-| OpenAI (API key) | GPT-5.4, GPT-5.4-mini, GPT-5.4-nano, o3, o4-mini, gpt-image-1.5 |
+| OpenAI (API key) | GPT-6 family (per-tier reasoning effort), GPT-5.4, GPT-5.4-mini, GPT-5.4-nano, o3, o4-mini, gpt-image-1.5 |
 | OpenAI (Sign in with ChatGPT) | `gpt-5`, `gpt-5-codex`, `gpt-5.1-codex`, `gpt-5.1-codex-mini`, `gpt-5.1-codex-max`, `gpt-5.2-codex`, `gpt-5.3-codex` — billed against your ChatGPT plan, no API key |
 | Anthropic | Claude Opus 4.6, Sonnet 4.6, Haiku 4.5 (with prompt caching) |
 | Google | Gemini 3.1 Pro/Flash, Gemini 2.5 Pro/Flash (API key or OAuth/Vertex) |
@@ -540,9 +556,9 @@ botport                   # Agent-to-agent routing hub
 
 First run starts onboarding automatically. For Ollama, no key needed — set `provider: ollama` in `config.yaml`.
 
-## 47 Built-in Tools
+## 51 Built-in Tools
 
-Shell, file I/O, web fetch/search, browser automation, PDF/DOCX/XLSX/PPTX extraction, image generation (DALL-E), OCR, vision, TTS, STT, email (SMTP/Mailgun/SendGrid), Google Workspace (Drive, Docs, Sheets, Slides, Gmail, Calendar), WhatsApp file delivery, intentions (proactive future actions), desktop automation, screen capture with voice commands, persistent cross-session memory (todos, contacts, scripts, APIs, playbooks), datastore (SQLite tables with protection rules), deep memory (Typesense), Basna (read and start multi-agent ensemble runs), personality system, cron scheduling, BotPort fleet discovery, and Termux (Android).
+Shell, file I/O, web fetch/search, browser automation, PDF/DOCX/XLSX/PPTX extraction, image generation (DALL-E), OCR, vision, TTS, STT, email (SMTP/Mailgun/SendGrid), Google Workspace (Drive, Docs, Sheets, Slides, Gmail, Calendar), Microsoft 365 (Outlook mail, Calendar, OneDrive), Jev calibrated judgments (TypeSafe AI), WhatsApp file delivery, intentions (proactive future actions), desktop automation, screen capture with voice commands, persistent cross-session memory (todos, contacts, scripts, APIs, playbooks), datastore (SQLite tables with protection rules), deep memory (Typesense), Basna (read and start multi-agent ensemble runs), personality system, cron scheduling, BotPort fleet discovery, and Termux (Android).
 
 See [USAGE.md](USAGE.md#tools-reference) for the full reference.
 
@@ -615,6 +631,9 @@ Full reference: [USAGE.md](USAGE.md#configuration-reference) (23 config sections
 
 - **[USAGE.md](USAGE.md)** — Complete reference for all commands, tools, config, and features
 - **[README_DETAILED.md](README_DETAILED.md)** — Extended README with feature-by-feature breakdown
+- **[docs/team-deployment.md](docs/team-deployment.md)** — Running Flight Deck for a team: multi-user security, sharing, team keys, inbound MCP for Claude, Gmail sending
+- **[docs/glasses-hud.md](docs/glasses-hud.md)** — The Flight Deck HUD for Meta Ray-Ban Display smart glasses (`/hud`)
+- **[firmware/sticks3/README.md](firmware/sticks3/README.md)** — The M5Stack StickS3 push-to-talk voice client: setup, buttons, build and flash
 - **[FLOWS.md](FLOWS.md)** — The Flow language reference (triggers, every step type, templating, the value language, scheduling, a cookbook, and worked examples)
 - **[.claude/skills/flow-builder/SKILL.md](.claude/skills/flow-builder/SKILL.md)** — A portable **flow-builder skill** for AI coding assistants (Claude Code, Codex, …): point your agent at it to author/edit/debug flows in the DSL correctly
 

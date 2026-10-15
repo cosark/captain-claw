@@ -19,6 +19,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from captain_claw import __version__
+
 # ---------------------------------------------------------------------------
 # Lazy imports — keep startup fast for stdio handshake
 # ---------------------------------------------------------------------------
@@ -37,7 +39,7 @@ def _utcnow_iso() -> str:
 
 PROTOCOL_VERSION = "2025-03-26"
 SERVER_NAME = "captain-claw"
-SERVER_VERSION = "0.4.21"
+SERVER_VERSION = __version__
 
 # ---------------------------------------------------------------------------
 # Tool definitions (MCP format)
