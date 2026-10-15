@@ -22,15 +22,37 @@ static uint32_t playRate = 24000;
 static bool streamOpen = false, streamEnded = false, started = false;
 static int carry = -1;                    // odd byte waiting for its pair
 
-void begin(uint8_t volume) {
+// Speech boost: gain, then a soft knee above half scale so loud syllables
+// round off instead of clipping (TTS peaks near -3 dBFS, averages ~-20 dBFS).
+static float boostGain = 1.0f;
+
+static inline int16_t shape(int16_t s) {
+  if (boostGain == 1.0f) return s;
+  constexpr float kKnee = 0.5f;
+  float x = s * boostGain * (1.0f / 32768.0f);
+  float a = fabsf(x);
+  if (a > kKnee) a = kKnee + (1.0f - kKnee) * tanhf((a - kKnee) / (1.0f - kKnee));
+  return (int16_t)(copysignf(a, x) * 32767.0f);
+}
+
+void setBoost(uint8_t db) { boostGain = powf(10.0f, db / 20.0f); }
+
+void begin(uint8_t volume, uint8_t boostDb) {
   micBuf = (int16_t*)heap_caps_malloc(kRing * kBlock * sizeof(int16_t), MALLOC_CAP_8BIT);
   playBuf = (int16_t*)heap_caps_malloc(kPlayCap * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   M5.Speaker.setVolume(volume);
+  setBoost(boostDb);
   M5.Speaker.end();
   M5.Mic.end();
 }
 
 void setVolume(uint8_t volume) { M5.Speaker.setVolume(volume); }
+
+void beep() {
+  if (micOn) return;
+  if (!M5.Speaker.isEnabled()) M5.Speaker.begin();
+  M5.Speaker.tone(880, 120, 1);
+}
 
 static void submitNext() {
   int16_t* dst = micBuf + nextBlock * kBlock;
@@ -103,7 +125,7 @@ void playFeed(const uint8_t* data, size_t len) {
   if (!streamOpen || !playBuf) return;
   size_t i = 0;
   if (carry >= 0 && len) {
-    if (writePos < kPlayCap) playBuf[writePos++] = (int16_t)(carry | (data[0] << 8));
+    if (writePos < kPlayCap) playBuf[writePos++] = shape((int16_t)(carry | (data[0] << 8)));
     carry = -1;
     i = 1;
   }
@@ -111,6 +133,9 @@ void playFeed(const uint8_t* data, size_t len) {
   size_t room = kPlayCap - writePos;
   size_t n = min(pairs, room);
   memcpy(playBuf + writePos, data + i, n * 2);  // little-endian on the ESP32 too
+  if (boostGain != 1.0f) {
+    for (size_t k = writePos; k < writePos + n; ++k) playBuf[k] = shape(playBuf[k]);
+  }
   writePos += n;
   if ((len - i) % 2 && n == pairs) carry = data[len - 1];
 }

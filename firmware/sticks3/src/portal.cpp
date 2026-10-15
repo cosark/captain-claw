@@ -83,8 +83,15 @@ static void handleRoot() {
   h += F("\" placeholder='server default, e.g. en or hr'><label>Read replies aloud</label><select name=speak>");
   h += settings.speak ? F("<option value=1 selected>Yes</option><option value=0>No</option>")
                       : F("<option value=1>Yes</option><option value=0 selected>No</option>");
-  h += F("</select><label>Volume (0&ndash;190)</label><input name=vol type=number min=0 max=190 value=");
-  h += String(settings.volume);
+  h += F("</select><label>Volume (%)</label><input name=vol type=number min=0 max=100 value=");
+  h += String((settings.volume * 100 + 127) / 255);
+  h += F("><small>Above 75% on battery the stick may restart on loud peaks.</small>"
+         "<label>Speech boost</label><select name=boost>");
+  for (int db : {0, 6, 10}) {
+    h += "<option value=" + String(db) + (settings.boostDb == db ? " selected>" : ">") +
+         (db ? "+" + String(db) + " dB" : String("Off")) + "</option>";
+  }
+  h += F("</select");
   h += F("><label>Sleep after idle minutes (0 = never)</label><input name=sleep type=number min=0 max=240 value=");
   h += String(settings.sleepMin);
   h += F("><button type=submit>Save &amp; restart</button></form><p><small>Device ");
@@ -119,7 +126,8 @@ static void handleSave() {
   settings.lang = server.arg("lang");
   settings.lang.trim();
   settings.speak = server.arg("speak") != "0";
-  settings.volume = constrain(server.arg("vol").toInt(), 0, 190);
+  settings.volume = constrain(server.arg("vol").toInt(), 0, 100) * 255 / 100;
+  settings.boostDb = constrain(server.arg("boost").toInt(), 0, 10);
   settings.sleepMin = constrain(server.arg("sleep").toInt(), 0, 240);
   settings.save();
 
@@ -141,7 +149,7 @@ void runSetupPortal(const char* reason) {
   WiFi.mode(WIFI_AP_STA);
   scanNetworks();
   String id = deviceId();
-  String ap = "Claw-StickS3-" + id.substring(id.length() - 4);
+  String ap = "Captain-StickS3-" + id.substring(id.length() - 4);
   WiFi.softAP(ap.c_str());
   delay(200);
   dns.start(53, "*", WiFi.softAPIP());

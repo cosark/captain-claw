@@ -8,8 +8,11 @@ namespace audio {
 
 static constexpr uint32_t kMicRate = 16000;
 
-void begin(uint8_t volume);
+void begin(uint8_t volume, uint8_t boostDb);
 void setVolume(uint8_t volume);
+// Extra gain on speech with a soft limiter (peaks are rounded, not clipped).
+void setBoost(uint8_t db);
+void beep();  // short tone at the current volume (feedback for volume changes)
 
 // ── microphone ──
 void micStart();
