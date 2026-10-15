@@ -239,3 +239,24 @@ async def test_agent_thinking_is_forwarded_as_activity():
     await gb._forward_agent_msg(ch, {"type": "thinking", "text": "Reading: a.md", "tool": "read", "phase": "tool"})
     assert seen and seen[0]["type"] == "activity" and seen[0]["text"] == "Reading: a.md"
     assert not ch.recent  # live only, never replayed
+
+
+def test_voice_choice_maps_to_soniox_voices(monkeypatch):
+    monkeypatch.delenv("DEVICE_VOICE_MALE", raising=False)
+    monkeypatch.delenv("DEVICE_VOICE_FEMALE", raising=False)
+    assert db.voice_name("male") == "Adrian"
+    assert db.voice_name("Female") == "Emma"
+    monkeypatch.setenv("DEVICE_VOICE_FEMALE", "Grace")
+    assert db.voice_name("female") == "Grace"
+    assert db.voice_name("Nina") == "Nina"
+    assert db.voice_name("") == ""
+    assert db.voice_name("x;rm -rf/") == "xrm-rf"
+
+
+@pytest.mark.asyncio
+async def test_agent_link_drops_are_a_state():
+    conn = _conn()
+    await conn.on_bus({"type": "status", "status": "agent_reconnecting"})
+    await conn.on_bus({"type": "status", "status": "agent_connected"})
+    states = [m["state"] for m in conn.ws.sent if m["type"] == "state"]
+    assert states == ["agent_offline", "connected"]

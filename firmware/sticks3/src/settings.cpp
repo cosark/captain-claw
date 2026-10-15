@@ -23,6 +23,12 @@ void Settings::load() {
   volume = p.getUChar("vol", 191);
   boostDb = p.getUChar("boost", 6);
   sleepMin = p.getUShort("sleep", 15);
+  femaleVoice = p.getBool("female", false);
+  iconMode = p.getBool("icons", false);
+  character = p.getUChar("char", 0);
+  cueBeep = p.getBool("cuebeep", true);
+  cueFlash = p.getBool("cueflash", true);
+  cueLeadS = constrain(p.getUChar("cuelead", 1), 1, 2);
   p.end();
 }
 
@@ -48,6 +54,12 @@ void Settings::save() const {
   p.putUChar("vol", volume);
   p.putUChar("boost", boostDb);
   p.putUShort("sleep", sleepMin);
+  p.putBool("female", femaleVoice);
+  p.putBool("icons", iconMode);
+  p.putUChar("char", character);
+  p.putBool("cuebeep", cueBeep);
+  p.putBool("cueflash", cueFlash);
+  p.putUChar("cuelead", cueLeadS);
   p.end();
 }
 

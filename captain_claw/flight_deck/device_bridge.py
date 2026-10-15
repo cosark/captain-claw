@@ -2,6 +2,7 @@
 
 One WebSocket per device: ``/device/ws?token=<cc_pat_…>&device=<id>``
 (optional ``agent=<slug|name|port>``, ``lang=<tts language>``, ``speak=0``,
+``voice=male|female|<Soniox voice>``,
 ``sw``/``sh`` = screen size for pictures, default 240×135).
 
 The device records while its button is held and streams the audio here;
@@ -19,11 +20,12 @@ Device → Flight Deck
   text  {"type":"text","text":"…"}               send typed words instead
   text  {"type":"stop"}                          stop playback, clear the queue
   text  {"type":"agents"} / {"type":"select","agent":"<slug>"}
-  text  {"type":"ping"}
+  text  {"type":"prefs","voice":"male|female|<name>","speak":bool}   change voice / speaking live
+  text  {"type":"ping","t":<device ms>}          echoed back (round-trip time)
 
 Flight Deck → device
-  text  {"type":"bound","agent":name,"slug":slug} | {"type":"agents","items":[…],"current":slug}
-  text  {"type":"state","state":"connected|transcribing|thinking|ready"}
+  text  {"type":"bound","agent":name,"slug":slug,"linked":bool} | {"type":"agents","items":[…],"current":slug}
+  text  {"type":"state","state":"connected|agent_offline|transcribing|thinking|ready"}
   text  {"type":"transcript","text":"…"}         what it heard
   text  {"type":"status","text":"…"}             progress narration
   text  {"type":"activity","text":"…","tool":"…"} what the agent is doing (tools, LLM calls)
@@ -31,7 +33,7 @@ Flight Deck → device
   text  {"type":"audio_start","rate":24000} … {"type":"audio_end"}
   bin   0x01 + PCM s16le mono                    audio chunks between those two
   text  {"type":"image","name":"…","w":240,"h":135} then bin 0x02 + baseline JPEG
-  text  {"type":"error","text":"…"} | {"type":"pong"}
+  text  {"type":"error","text":"…"} | {"type":"pong","t":<echoed>}
 
 Auth: a personal access token (Profile → MCP agent access) names the owner;
 the device only ever reaches that owner's agents. With Flight Deck auth off
@@ -183,6 +185,20 @@ def fit_jpeg(blob: bytes, width: int, height: int, quality: int = 85,
         quality -= 10
 
 
+def voice_name(choice: str) -> str:
+    """The Soniox voice for a device's choice: "male"/"female" map to
+    ``DEVICE_VOICE_MALE`` / ``DEVICE_VOICE_FEMALE`` (Adrian / Emma), anything
+    else is taken as a voice name; "" = the deck's ``SONIOX_TTS_VOICE``."""
+    import os
+
+    c = str(choice or "").strip()
+    if c.lower() in ("male", "m"):
+        return os.environ.get("DEVICE_VOICE_MALE", "").strip() or "Adrian"
+    if c.lower() in ("female", "f"):
+        return os.environ.get("DEVICE_VOICE_FEMALE", "").strip() or "Emma"
+    return re.sub(r"[^A-Za-z0-9_-]", "", c)[:32]
+
+
 def _int_param(value: str, default: int, lo: int, hi: int) -> int:
     try:
         return max(lo, min(hi, int(value)))
@@ -246,13 +262,14 @@ def _pick_agent(user_id: str, selector: str) -> dict | None:
 
 class _DeviceConn:
     def __init__(self, ws: WebSocket, user: dict, device_id: str, *, lang: str,
-                 speak: bool, screen: tuple[int, int]) -> None:
+                 speak: bool, screen: tuple[int, int], voice: str = "") -> None:
         self.ws = ws
         self.user = user
         self.user_id = str(user.get("id", ""))
         self.device_id = device_id
         self.lang = lang
         self.speak = speak
+        self.voice = voice_name(voice)
         self.screen = screen
         self.ch: gb._ChannelState | None = None
         self.agent: dict | None = None
@@ -305,7 +322,8 @@ class _DeviceConn:
         ch.callback_subscribers.append(self.on_bus)
         await gb._ensure_agent_binding(ch, str(agent.get("host") or "localhost"), int(agent["port"]))
         self.agent = agent
-        await self.send_json({"type": "bound", "agent": agent.get("name", ""), "slug": agent.get("slug", "")})
+        await self.send_json({"type": "bound", "agent": agent.get("name", ""), "slug": agent.get("slug", ""),
+                              "linked": ch.agent_ws is not None})
         return True
 
     def unbind(self) -> None:
@@ -348,6 +366,7 @@ class _DeviceConn:
             elif status == "agent_connected":
                 await self.send_json({"type": "state", "state": "connected"})
             elif status == "agent_reconnecting":
+                await self.send_json({"type": "state", "state": "agent_offline"})
                 await self.send_json({"type": "status", "text": "Reconnecting to agent…"})
         elif etype == "error":
             if self.pending:
@@ -503,7 +522,7 @@ class _DeviceConn:
                 pass
 
     async def _play_tts(self, text: str) -> None:
-        gen = gb.soniox_tts_pcm(text, language=self.lang)
+        gen = gb.soniox_tts_pcm(text, language=self.lang, voice=self.voice)
         try:
             await self._stream_pcm(gen)
         except gb.SonioxTTSError as exc:
@@ -573,6 +592,7 @@ async def device_ws(ws: WebSocket) -> None:
     lang = re.sub(r"[^A-Za-z-]", "", q.get("lang", "") or "")[:8]
     conn = _DeviceConn(
         ws, user, device_id, lang=lang, speak=q.get("speak", "1") not in ("0", "false", "off"),
+        voice=q.get("voice", ""),
         screen=(_int_param(q.get("sw", ""), 240, 32, 800), _int_param(q.get("sh", ""), 135, 32, 800)),
     )
     conn.start_audio_worker()
@@ -618,8 +638,16 @@ async def device_ws(ws: WebSocket) -> None:
                                       "current": (conn.agent or {}).get("slug", "")})
             elif mtype == "select":
                 await conn.bind(str(obj.get("agent", "")))
+            elif mtype == "prefs":
+                if "voice" in obj:
+                    conn.voice = voice_name(str(obj.get("voice", "")))
+                if "speak" in obj:
+                    conn.speak = bool(obj.get("speak"))
             elif mtype == "ping":
-                await conn.send_json({"type": "pong"})
+                pong = {"type": "pong"}
+                if isinstance(obj.get("t"), (int, float)):
+                    pong["t"] = obj["t"]
+                await conn.send_json(pong)
     except WebSocketDisconnect:
         pass
     except Exception as exc:

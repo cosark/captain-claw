@@ -12,7 +12,8 @@ static constexpr int kLine = 16;
 
 static String barAgent = "";
 static String barState = "";
-static uint32_t barColor = TFT_DARKGREY;
+static uint16_t barColor = TFT_DARKGREY;
+static Health hWifi = Down, hAgent = Down;
 
 static std::vector<String> lines;
 static int page = 0;
@@ -33,34 +34,105 @@ void brightness(uint8_t level) { M5.Display.setBrightness(level); }
 
 static void push() { canvas.pushSprite(0, 0); }
 
-static void drawBar() {
-  canvas.fillRect(0, 0, W, BAR, 0x18E3);  // dark slate
-  canvas.setFont(kSmall);
-  canvas.setTextDatum(middle_left);
-  canvas.setTextColor(TFT_WHITE);
-  // Battery on the far right, state left of it, agent name in what remains.
-  int bx = W - 26, by = 4;
-  int nameRoom = bx - 6 - canvas.textWidth(barState) - 8 - PAD;
-  String name = barAgent.length() ? barAgent : String("Captain Claw");
-  while (name.length() > 1 && canvas.textWidth(name) > nameRoom) name.remove(name.length() - 1);
-  canvas.drawString(name, PAD, BAR / 2);
-
-  int lvl = M5.Power.getBatteryLevel();
-  bool chg = M5.Power.isCharging() == m5::Power_Class::is_charging;
-  canvas.drawRect(bx, by, 20, 9, TFT_LIGHTGREY);
-  canvas.fillRect(bx + 20, by + 3, 2, 3, TFT_LIGHTGREY);
-  int fill = lvl < 0 ? 0 : max(1, lvl * 18 / 100);
-  canvas.fillRect(bx + 1, by + 1, fill, 7, chg ? TFT_GREEN : (lvl >= 0 && lvl < 20 ? TFT_RED : TFT_WHITE));
-
-  canvas.setTextDatum(middle_right);
-  canvas.setTextColor(barColor);
-  canvas.drawString(barState, bx - 6, BAR / 2);
+static uint16_t healthColor(Health h) {
+  return h == Up ? rgb(40, 200, 90) : h == Partial ? rgb(250, 200, 40) : rgb(230, 50, 50);
 }
 
-void setBar(const String& agent, const char* state, uint32_t stateColor) {
+// Battery: green ≥75 %, blue 40–74 %, yellow 20–39 %, red <20 %.
+static uint16_t batteryColor(int pct) {
+  if (pct >= 75) return rgb(40, 200, 90);
+  if (pct >= 40) return rgb(70, 150, 255);
+  if (pct >= 20) return rgb(250, 200, 40);
+  return rgb(230, 50, 50);
+}
+
+// The PMIC is on I2C: read it at most every few seconds, not every frame.
+static int batteryPct(bool* charging) {
+  static int pct = -1;
+  static bool chg = false;
+  static uint32_t at = 0;
+  if (pct < 0 || millis() - at > 5000) {
+    at = millis();
+    pct = M5.Power.getBatteryLevel();
+    chg = M5.Power.isCharging() == m5::Power_Class::is_charging;
+  }
+  *charging = chg;
+  return pct;
+}
+
+// Two colour blocks: W = Wi-Fi, A = agent (green up, yellow partial, red down).
+static int drawHealth(int x, int y) {
+  canvas.setFont(kSmall);
+  canvas.setTextDatum(middle_center);
+  const char* tags[2] = {"W", "A"};
+  Health hs[2] = {hWifi, hAgent};
+  for (int i = 0; i < 2; ++i) {
+    canvas.fillRoundRect(x, y, 14, 12, 3, healthColor(hs[i]));
+    canvas.setTextColor(TFT_BLACK);
+    canvas.drawString(tags[i], x + 7, y + 6);
+    x += 16;
+  }
+  return x;
+}
+
+// Battery icon + percentage, right-aligned at `right`; returns its left edge.
+static int drawBattery(int right, int y) {
+  bool chg = false;
+  int pct = batteryPct(&chg);
+  canvas.setFont(kSmall);
+  canvas.setTextDatum(middle_right);
+  String txt = pct < 0 ? String("--") : String(pct) + "%";
+  uint16_t col = pct < 0 ? TFT_LIGHTGREY : batteryColor(pct);
+  canvas.setTextColor(col);
+  canvas.drawString(txt, right, y + 6);
+  int bx = right - canvas.textWidth(txt) - 22;
+  canvas.drawRect(bx, y + 2, 18, 9, TFT_LIGHTGREY);
+  canvas.fillRect(bx + 18, y + 5, 2, 3, TFT_LIGHTGREY);
+  if (pct > 0) canvas.fillRect(bx + 1, y + 3, max(1, pct * 16 / 100), 7, col);
+  if (chg) {  // a small bolt over the cells
+    canvas.fillTriangle(bx + 10, y + 2, bx + 6, y + 7, bx + 9, y + 7, TFT_WHITE);
+    canvas.fillTriangle(bx + 9, y + 6, bx + 12, y + 6, bx + 8, y + 11, TFT_WHITE);
+  }
+  return bx;
+}
+
+static void drawBar() {
+  canvas.fillRect(0, 0, W, BAR, rgb(24, 28, 36));
+  int x = drawHealth(2, 2) + 3;
+  int left = drawBattery(W - 2, 2);
+  canvas.setFont(kSmall);
+  int stateW = canvas.textWidth(barState);
+  canvas.setTextDatum(middle_right);
+  canvas.setTextColor(barColor);
+  canvas.drawString(barState, left - 5, BAR / 2);
+  int nameRoom = left - 5 - stateW - 6 - x;
+  String name = barAgent.length() ? barAgent : String("Captain Claw");
+  while (name.length() > 1 && canvas.textWidth(name) > nameRoom) name.remove(name.length() - 1);
+  canvas.setTextDatum(middle_left);
+  canvas.setTextColor(TFT_WHITE);
+  if (nameRoom > 12) canvas.drawString(name, x, BAR / 2);
+}
+
+void setBar(const String& agent, const char* state, uint16_t stateColor) {
   barAgent = agent;
   barState = state ? state : "";
   barColor = stateColor;
+}
+
+void setHealth(Health wifi, Health agent) {
+  hWifi = wifi;
+  hAgent = agent;
+}
+
+static String fit(const String& text, int width) {
+  if (canvas.textWidth(text) <= width) return text;
+  String s = text;
+  while (s.length() > 1 && canvas.textWidth(s + "…") > width) {
+    int cut = s.length() - 1;
+    while (cut > 0 && (uint8_t(s[cut]) & 0xC0) == 0x80) --cut;  // whole UTF-8 characters
+    s.remove(cut);
+  }
+  return s + "…";
 }
 
 // Word-wrap UTF-8 text to the body width (long words break between characters).
@@ -131,7 +203,7 @@ void showSetup(const char* reason, const char* apName, const char* ip) {
   push();
 }
 
-void showMessage(const char* title, const String& body, uint32_t color) {
+void showMessage(const char* title, const String& body, uint16_t color) {
   canvas.fillScreen(TFT_BLACK);
   drawBar();
   canvas.setFont(kBody);
@@ -164,17 +236,6 @@ void showListening(int level, uint32_t elapsedMs) {
   canvas.fillRect(PAD, H - 12, W - 2 * PAD, 6, 0x2104);
   canvas.fillRect(PAD, H - 12, bar, 6, level > 85 ? TFT_ORANGE : TFT_GREEN);
   push();
-}
-
-static String fit(const String& text, int width) {
-  if (canvas.textWidth(text) <= width) return text;
-  String s = text;
-  while (s.length() > 1 && canvas.textWidth(s + "…") > width) {
-    int cut = s.length() - 1;
-    while (cut > 0 && (uint8_t(s[cut]) & 0xC0) == 0x80) --cut;  // whole UTF-8 characters
-    s.remove(cut);
-  }
-  return s + "…";
 }
 
 void showWorking(const String& heard, const std::vector<String>& activity, const String& status) {
@@ -211,7 +272,6 @@ void showWorking(const String& heard, const std::vector<String>& activity, const
 void setReply(const String& text) {
   lines = wrap(text, W - 2 * PAD - 4);
   page = 0;
-  showReply();
 }
 
 bool hasReply() { return !lines.empty(); }
@@ -246,12 +306,42 @@ bool nextPage() {
   return page != 0;
 }
 
-void showImage(const uint8_t* jpg, size_t len) {
+void showPanel(const char* title, uint16_t titleColor, const std::vector<Row>& rows) {
+  canvas.fillScreen(TFT_BLACK);
+  drawBar();
+  canvas.setTextDatum(top_left);
+  int y = BAR + 3;
+  if (title && *title) {
+    canvas.setFont(kBody);
+    canvas.setTextColor(titleColor);
+    canvas.drawString(title, PAD, y);
+    y += kLine + 2;
+  }
+  canvas.setFont(kSmall);
+  constexpr int kRow = 14, kLabelW = 50;
+  for (const Row& r : rows) {
+    if (y > H - kRow + 1) break;
+    canvas.setTextColor(rgb(140, 150, 165));
+    canvas.drawString(r.label, PAD, y);
+    canvas.setTextColor(r.color);
+    canvas.drawString(fit(r.value, W - PAD - kLabelW - PAD), PAD + kLabelW, y);
+    y += kRow;
+  }
+  push();
+}
+
+void showFace(uint8_t kind, face::Pose pose, int level) {
+  canvas.fillScreen(TFT_BLACK);
+  drawBar();
+  face::draw(canvas, kind, pose, level, millis(), W / 2, BAR + (H - BAR) / 2 + 1);
+  push();
+}
+
+void storeImage(const uint8_t* jpg, size_t len) {
   if (imgBuf) free(imgBuf);
   imgBuf = (uint8_t*)ps_malloc(len);
   imgLen = imgBuf ? len : 0;
   if (imgBuf) memcpy(imgBuf, jpg, len);
-  showStoredImage();
 }
 
 bool hasImage() { return imgLen > 0; }
@@ -260,6 +350,10 @@ void showStoredImage() {
   if (!imgLen) return;
   canvas.fillScreen(TFT_BLACK);
   canvas.drawJpg(imgBuf, imgLen, 0, 0, W, H);
+  // Keep health + battery in sight over the picture.
+  canvas.fillRoundRect(W - 92, 0, 92, 15, 4, rgb(0, 0, 0));
+  drawHealth(W - 90, 1);
+  drawBattery(W - 2, 1);
   push();
 }
 
@@ -275,9 +369,16 @@ void showPicker(const std::vector<String>& names, int selected, int current) {
     int y = BAR + PAD + i * kLine;
     if (idx == selected) canvas.fillRect(0, y - 1, W, kLine, 0x3186);
     canvas.setTextColor(idx == current ? TFT_GREEN : TFT_WHITE);
-    canvas.drawString((idx == current ? "● " : "  ") + names[idx], PAD, y);
+    canvas.drawString(fit((idx == current ? "● " : "  ") + names[idx], W - 2 * PAD), PAD, y);
   }
   push();
+}
+
+void flashFrame(bool on) {
+  if (on) {
+    canvas.fillScreen(TFT_WHITE);
+    push();
+  }
 }
 
 }  // namespace ui

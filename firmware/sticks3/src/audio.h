@@ -13,6 +13,7 @@ void setVolume(uint8_t volume);
 // Extra gain on speech with a soft limiter (peaks are rounded, not clipped).
 void setBoost(uint8_t db);
 void beep();  // short tone at the current volume (feedback for volume changes)
+void cue();   // two-tone "about to speak" chime
 
 // ── microphone ──
 void micStart();
@@ -24,11 +25,15 @@ void micStop(void (*sink)(const int16_t* samples, size_t count));
 bool micActive();
 
 // ── speaker (one stream at a time, PCM s16le mono) ──
-void playBegin(uint32_t rate);             // a new stream (drops any old one)
+// A new stream (drops any old one); sound starts no earlier than holdMs from
+// now — room for the beep/flash cue before speech.
+void playBegin(uint32_t rate, uint32_t holdMs = 0);
 void playFeed(const uint8_t* data, size_t len);
 void playEnd();                            // no more data for this stream
 void playStop();                           // stop now, drop everything
 void playPoll();                           // keep the speaker fed; call from loop()
 bool playing();                            // a stream is buffered or sounding
+bool sounding();                           // the speaker is actually outputting it
+int outputLevel();                         // 0..100 loudness of what's sounding now
 
 }  // namespace audio

@@ -5,6 +5,7 @@
 #include <WebServer.h>
 #include <WiFi.h>
 
+#include "face.h"
 #include "settings.h"
 #include "ui.h"
 
@@ -92,7 +93,31 @@ static void handleRoot() {
          (db ? "+" + String(db) + " dB" : String("Off")) + "</option>";
   }
   h += F("</select");
-  h += F("><label>Sleep after idle minutes (0 = never)</label><input name=sleep type=number min=0 max=240 value=");
+  h += F("><label>Voice</label><select name=voice>");
+  h += settings.femaleVoice ? F("<option value=male>Male</option><option value=female selected>Female</option>")
+                            : F("<option value=male selected>Male</option><option value=female>Female</option>");
+  h += F("</select><label>Before speaking</label><select name=cue>");
+  struct { const char* v; const char* label; bool on; } cues[] = {
+      {"both", "Beep + flash", settings.cueBeep && settings.cueFlash},
+      {"beep", "Beep only", settings.cueBeep && !settings.cueFlash},
+      {"flash", "Flash only", !settings.cueBeep && settings.cueFlash},
+      {"none", "Nothing", !settings.cueBeep && !settings.cueFlash}};
+  for (auto& c : cues) {
+    h += String("<option value=") + c.v + (c.on ? " selected>" : ">") + c.label + "</option>";
+  }
+  h += F("</select><label>Cue comes</label><select name=lead>");
+  h += settings.cueLeadS == 2 ? F("<option value=1>1 s before speech</option><option value=2 selected>2 s before speech</option>")
+                              : F("<option value=1 selected>1 s before speech</option><option value=2>2 s before speech</option>");
+  h += F("</select><h2>Screen</h2><label>Show</label><select name=display>");
+  h += settings.iconMode ? F("<option value=text>Text (stages, activity)</option><option value=icons selected>Icons (animated character)</option>")
+                         : F("<option value=text selected>Text (stages, activity)</option><option value=icons>Icons (animated character)</option>");
+  h += F("</select><label>Character</label><select name=char>");
+  for (int k = 0; k < face::KindCount; ++k) {
+    String n = face::name(k);
+    n.setCharAt(0, toupper(n[0]));
+    h += "<option value=" + String(k) + (settings.character == k ? " selected>" : ">") + n + "</option>";
+  }
+  h += F("</select><label>Sleep after idle minutes (0 = never)</label><input name=sleep type=number min=0 max=240 value=");
   h += String(settings.sleepMin);
   h += F("><button type=submit>Save &amp; restart</button></form><p><small>Device ");
   h += deviceId();
@@ -129,6 +154,13 @@ static void handleSave() {
   settings.volume = constrain(server.arg("vol").toInt(), 0, 100) * 255 / 100;
   settings.boostDb = constrain(server.arg("boost").toInt(), 0, 10);
   settings.sleepMin = constrain(server.arg("sleep").toInt(), 0, 240);
+  settings.femaleVoice = server.arg("voice") == "female";
+  String cue = server.arg("cue");
+  settings.cueBeep = cue == "both" || cue == "beep";
+  settings.cueFlash = cue == "both" || cue == "flash";
+  settings.cueLeadS = server.arg("lead") == "2" ? 2 : 1;
+  settings.iconMode = server.arg("display") == "icons";
+  settings.character = constrain(server.arg("char").toInt(), 0, face::KindCount - 1);
   settings.save();
 
   server.send(200, "text/html; charset=utf-8",
