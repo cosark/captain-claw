@@ -10,7 +10,7 @@ Server side: `captain_claw/flight_deck/device_bridge.py` (`/device/ws`).
 
 | | Front (A) | Side (B) |
 |---|---|---|
-| hold | talk (release sends) | agents, volume, boost, settings |
+| hold | talk (release sends) | menu (hold again closes) |
 | tap / click | stop speaking · flip picture ↔ text | next page · back |
 | in the agent list | choose | move down |
 

@@ -20,6 +20,8 @@ static int16_t* playBuf = nullptr;
 static size_t writePos = 0, playPos = 0;  // in samples
 static uint32_t playRate = 24000;
 static bool streamOpen = false, streamEnded = false, started = false;
+static uint32_t holdUntilMs = 0;
+static uint32_t soundStartMs = 0;         // when the first segment went to the speaker
 static int carry = -1;                    // odd byte waiting for its pair
 
 // Speech boost: gain, then a soft knee above half scale so loud syllables
@@ -52,6 +54,13 @@ void beep() {
   if (micOn) return;
   if (!M5.Speaker.isEnabled()) M5.Speaker.begin();
   M5.Speaker.tone(880, 120, 1);
+}
+
+void cue() {
+  if (micOn) return;
+  if (!M5.Speaker.isEnabled()) M5.Speaker.begin();
+  M5.Speaker.tone(1046, 110, 1, true);   // C6
+  M5.Speaker.tone(1568, 160, 1, false);  // then G6
 }
 
 static void submitNext() {
@@ -108,7 +117,7 @@ void micStop(void (*sink)(const int16_t*, size_t)) {
 
 bool micActive() { return micOn; }
 
-void playBegin(uint32_t rate) {
+void playBegin(uint32_t rate, uint32_t holdMs) {
   playStop();
   if (micOn) micStop([](const int16_t*, size_t) {});
   M5.Mic.end();
@@ -119,6 +128,7 @@ void playBegin(uint32_t rate) {
   streamOpen = true;
   streamEnded = false;
   started = false;
+  holdUntilMs = millis() + holdMs;
 }
 
 void playFeed(const uint8_t* data, size_t len) {
@@ -143,7 +153,7 @@ void playFeed(const uint8_t* data, size_t len) {
 void playEnd() { streamEnded = true; }
 
 void playStop() {
-  if (M5.Speaker.isEnabled()) M5.Speaker.stop();
+  if (M5.Speaker.isEnabled()) M5.Speaker.stop(0);
   streamOpen = false;
   streamEnded = false;
   started = false;
@@ -155,9 +165,11 @@ void playPoll() {
   size_t avail = writePos - playPos;
   size_t queued = M5.Speaker.isPlaying(0);
   if (!started) {
+    if ((int32_t)(millis() - holdUntilMs) < 0) return;  // the cue plays first
     // Buffer a little first so a slow network doesn't stutter the start.
     if (avail < playRate * 3 / 10 && !streamEnded) return;
     started = true;
+    soundStartMs = millis();
   }
   if (queued < 2 && avail > 0 && (avail >= playRate / 10 || streamEnded)) {
     size_t n = min(avail, (size_t)(playRate / 2));
@@ -170,5 +182,20 @@ void playPoll() {
 }
 
 bool playing() { return streamOpen; }
+
+bool sounding() { return streamOpen && started; }
+
+int outputLevel() {
+  // Where the speaker is now, assuming it has played without gaps since it
+  // started (good enough to move a mouth).
+  if (!sounding() || !playBuf) return 0;
+  size_t at = (size_t)((millis() - soundStartMs) * (uint64_t)playRate / 1000);
+  if (at >= playPos) return 0;
+  size_t win = playRate / 50;  // 20 ms
+  size_t from = at > win ? at - win : 0;
+  int peak = 0;
+  for (size_t i = from; i < at; i += 2) peak = max(peak, abs((int)playBuf[i]));
+  return min(100, peak * 100 / 20000);
+}
 
 }  // namespace audio

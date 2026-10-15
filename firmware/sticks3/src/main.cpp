@@ -1,7 +1,8 @@
 // Captain Claw voice client for the M5Stack StickS3.
 //
 //   Front button (A)  hold = talk, release = send · tap = stop speaking / flip picture↔text
-//   Side button  (B)  click = next page · hold = agents, volume, boost, settings
+//                     in the menu: choose / change the row
+//   Side button  (B)  click = next page / next row · hold = menu (hold again = close)
 //   Hold A while switching on (or no Wi-Fi saved) = setup hotspot
 //
 // Talks to Flight Deck's /device/ws (captain_claw/flight_deck/device_bridge.py):
@@ -15,15 +16,19 @@
 #include <esp_sleep.h>
 
 #include "audio.h"
+#include "face.h"
 #include "portal.h"
 #include "settings.h"
 #include "ui.h"
 
-enum class Mode { Idle, Listening, Waiting, Reply, Image, Picker, Notice };
+#define FW_VERSION "0.5.0"
+
+enum class Mode { Idle, Listening, Waiting, Reply, Image, Menu, Agents, Status, Notice };
 
 static WebSocketsClient ws;
 static WiFiMulti wifiMulti;
 static bool wsUp = false;
+static bool agentLinked = false;  // Flight Deck's link to the agent is up
 static Mode mode = Mode::Idle;
 static String agentName, agentSlug;
 static String heard, statusLine;
@@ -31,18 +36,25 @@ static std::vector<String> activity;  // what the agent is doing, oldest first
 static int toolSteps = 0;
 static uint32_t workStartMs = 0;
 static bool workDirty = false;
-static uint32_t recStartMs = 0, lastActivityMs = 0, lastDrawMs = 0, pickerOpenedMs = 0;
+static uint32_t recStartMs = 0, lastActivityMs = 0, lastDrawMs = 0, menuOpenedMs = 0;
 static bool dimmed = false, screenOff = false;
-static std::vector<String> pickNames, pickSlugs;
-static int pickSel = 0, pickCur = -1;
-static bool pickerLoading = false;
-
-static void addSettingItems();
+static int menuSel = 0;
+static std::vector<String> agentNames, agentSlugs;
+static int agentSel = 0, agentCur = -1;
+static bool agentsLoading = false;
+static uint32_t flashStartMs = 0;
+static bool flashing = false;
+static int rttMs = -1;
+static uint32_t lastPingMs = 0, lastReplyMs = 0, turns = 0;
 
 static constexpr uint32_t kTapMs = 300;      // shorter press = tap, not talk
 static constexpr uint32_t kDimMs = 30000;
 static constexpr uint32_t kOffMs = 60000;
 static constexpr uint8_t kBright = 128;
+static constexpr uint32_t kFlashMs = 700;    // white / normal, every 100 ms
+static constexpr uint16_t kGreen = ui::rgb(40, 200, 90), kRed = ui::rgb(230, 50, 50);
+static constexpr uint16_t kYellow = ui::rgb(250, 200, 40), kCyan = ui::rgb(60, 210, 240);
+static constexpr uint16_t kOrange = ui::rgb(255, 150, 40), kText = ui::rgb(230, 230, 230);
 
 // ── helpers ──────────────────────────────────────────────────────────
 
@@ -81,7 +93,38 @@ static void sendType(const char* type) {
   sendJson(d);
 }
 
-// "working 12s · 3 steps" while the agent runs.
+static void sendPrefs() {
+  JsonDocument d;
+  d["type"] = "prefs";
+  d["voice"] = settings.femaleVoice ? "female" : "male";
+  d["speak"] = settings.speak;
+  sendJson(d);
+}
+
+static String serverHost() {
+  String h = settings.server;
+  int p = h.indexOf("://");
+  if (p >= 0) h = h.substring(p + 3);
+  int slash = h.indexOf('/');
+  return slash < 0 ? h : h.substring(0, slash);
+}
+
+static String uptime() {
+  uint32_t m = millis() / 60000;
+  return m >= 60 ? String(m / 60) + "h " + String(m % 60) + "m" : String(m) + "m";
+}
+
+static ui::Health wifiHealth() {
+  if (WiFi.status() != WL_CONNECTED) return ui::Down;
+  return WiFi.RSSI() < -80 ? ui::Partial : ui::Up;
+}
+
+static ui::Health agentHealth() {
+  if (!wsUp) return ui::Down;
+  return agentLinked ? ui::Up : ui::Partial;
+}
+
+// "12s · 3 steps" while the agent runs.
 static const char* workLabel() {
   static char buf[32];
   uint32_t secs = (millis() - workStartMs) / 1000;
@@ -100,37 +143,218 @@ static void startWork() {
 }
 
 static void setBarState() {
-  const char* st = !wsUp ? "offline" : audio::playing() ? "speaking"
-                 : mode == Mode::Listening ? "listening" : mode == Mode::Waiting ? workLabel() : "ready";
-  uint32_t col = !wsUp ? TFT_RED : mode == Mode::Listening ? TFT_RED
-               : audio::playing() ? TFT_CYAN : TFT_GREEN;
+  ui::setHealth(wifiHealth(), agentHealth());
+  const char* st;
+  uint16_t col;
+  if (!wsUp) {
+    st = "offline", col = kRed;
+  } else if (mode == Mode::Listening) {
+    st = "listening", col = kRed;
+  } else if (audio::playing()) {
+    st = "speaking", col = kCyan;
+  } else if (mode == Mode::Waiting) {
+    st = workLabel(), col = kYellow;
+  } else if (mode == Mode::Menu || mode == Mode::Agents) {
+    st = "menu", col = kText;
+  } else if (mode == Mode::Status) {
+    st = "status", col = kText;
+  } else {
+    st = agentLinked ? "ready" : "no agent", col = agentLinked ? kGreen : kYellow;
+  }
   ui::setBar(agentName, st, col);
 }
+
+// ── status page / idle panel ─────────────────────────────────────────
+
+static std::vector<ui::Row> statusRows() {
+  std::vector<ui::Row> rows;
+  bool wifiOk = WiFi.status() == WL_CONNECTED;
+  rows.push_back({"Wi-Fi", wifiOk ? WiFi.SSID() + "  " + String(WiFi.RSSI()) + " dBm" : String("not connected"),
+                  wifiOk ? (WiFi.RSSI() < -80 ? kYellow : kGreen) : kRed});
+  rows.push_back({"IP", wifiOk ? WiFi.localIP().toString() : String("-"), kText});
+  rows.push_back({"Deck", serverHost() + (wsUp ? (rttMs >= 0 ? "  " + String(rttMs) + " ms" : String("  ok")) : String("  offline")),
+                  wsUp ? kGreen : kRed});
+  rows.push_back({"Agent", (agentName.length() ? agentName : String("none")) + (agentLinked ? "" : "  (waiting)"),
+                  agentLinked ? kGreen : (wsUp ? kYellow : kRed)});
+  int pct = M5.Power.getBatteryLevel();
+  int mv = M5.Power.getBatteryVoltage();
+  bool chg = M5.Power.isCharging() == m5::Power_Class::is_charging;
+  rows.push_back({"Battery", String(pct) + "%  " + String(mv / 1000.0f, 2) + " V" + (chg ? "  charging" : ""),
+                  pct >= 40 ? kGreen : pct >= 20 ? kYellow : kRed});
+  rows.push_back({"Voice", String(settings.femaleVoice ? "female" : "male") + "  vol " +
+                               String((settings.volume * 100 + 127) / 255) + "%" +
+                               (settings.boostDb ? "  +" + String(settings.boostDb) + " dB" : String("")) +
+                               (settings.speak ? "" : "  muted"),
+                  kText});
+  rows.push_back({"Usage", String(turns) + " turn" + (turns == 1 ? "" : "s") +
+                               (lastReplyMs ? "  last " + String((millis() - lastReplyMs) / 60000) + "m ago" : String("")) +
+                               "  up " + uptime(),
+                  kText});
+  rows.push_back({"Device", deviceId() + "  fw " FW_VERSION "  " + String(ESP.getFreePsram() / 1024) + "k free", kText});
+  return rows;
+}
+
+static void showIdle() {
+  if (settings.iconMode) {
+    ui::showFace(settings.character, agentLinked ? face::Pose::Idle : face::Pose::Sad, 0);
+    return;
+  }
+  bool ok = wsUp && agentLinked && WiFi.status() == WL_CONNECTED;
+  std::vector<ui::Row> rows;
+  rows.push_back({"Stick", ok ? String("ready — hold front button") : String("not ready"), ok ? kGreen : kYellow});
+  bool wifiOk = WiFi.status() == WL_CONNECTED;
+  rows.push_back({"Wi-Fi", wifiOk ? WiFi.SSID() : String("not connected"), wifiOk ? kGreen : kRed});
+  rows.push_back({"Deck", wsUp ? serverHost() : String("connecting…"), wsUp ? kGreen : kRed});
+  rows.push_back({"Agent", agentLinked ? agentName : (wsUp ? String("waiting for agent") : String("-")),
+                  agentLinked ? kGreen : kYellow});
+  ui::showPanel(ok ? "All good" : "Getting ready", ok ? kGreen : kYellow, rows);
+}
+
+// ── menu ─────────────────────────────────────────────────────────────
+
+enum MenuRow { MStatus, MAgent, MVolume, MBoost, MVoice, MDisplay, MCharacter, MBeep, MFlash, MLead, MSetup, MCount };
+
+static constexpr uint8_t kVolumeSteps[] = {64, 128, 191, 255};  // 25 / 50 / 75 / 100 %
+static constexpr uint8_t kBoostSteps[] = {0, 6, 10};
+
+static String menuLabel(int row) {
+  switch (row) {
+    case MStatus: return "Status";
+    case MAgent: return "Agent: " + (agentName.length() ? agentName : String("none")) + " »";
+    case MVolume: return "Volume " + String((settings.volume * 100 + 127) / 255) + "%";
+    case MBoost: return settings.boostDb ? "Boost +" + String(settings.boostDb) + " dB" : String("Boost off");
+    case MVoice: return String("Voice: ") + (settings.femaleVoice ? "female" : "male");
+    case MDisplay: return String("Display: ") + (settings.iconMode ? "icons" : "text");
+    case MCharacter: return String("Character: ") + face::name(settings.character);
+    case MBeep: return String("Beep before speech: ") + (settings.cueBeep ? "on" : "off");
+    case MFlash: return String("Flash before speech: ") + (settings.cueFlash ? "on" : "off");
+    case MLead: return "Cue lead: " + String(settings.cueLeadS) + " s";
+    default: return "Wi-Fi & settings…";
+  }
+}
+
+static std::vector<String> menuNames() {
+  std::vector<String> names;
+  for (int i = 0; i < MCount; ++i) names.push_back(menuLabel(i));
+  return names;
+}
+
+template <size_t N>
+static uint8_t nextStep(const uint8_t (&steps)[N], uint8_t now) {
+  for (uint8_t v : steps) {
+    if (v > now) return v;
+  }
+  return steps[0];
+}
+
+static void backToMain();
 
 static void redraw() {
   setBarState();
   switch (mode) {
-    case Mode::Listening: ui::showListening(0, millis() - recStartMs); break;
-    case Mode::Waiting: ui::showWorking(heard, activity, statusLine); break;
-    case Mode::Reply: ui::showReply(); break;
+    case Mode::Listening:
+      if (settings.iconMode) ui::showFace(settings.character, face::Pose::Listening, 0);
+      else ui::showListening(0, millis() - recStartMs);
+      break;
+    case Mode::Waiting:
+      if (settings.iconMode) ui::showFace(settings.character, face::Pose::Thinking, 0);
+      else ui::showWorking(heard, activity, statusLine);
+      break;
+    case Mode::Reply:
+      if (settings.iconMode && audio::playing()) ui::showFace(settings.character, face::Pose::Speaking, audio::outputLevel());
+      else ui::showReply();
+      break;
     case Mode::Image: ui::showStoredImage(); break;
-    case Mode::Picker: ui::showPicker(pickNames, pickSel, pickCur); break;
+    case Mode::Menu: ui::showPicker(menuNames(), menuSel, -1); break;
+    case Mode::Agents: ui::showPicker(agentNames, agentSel, agentCur); break;
+    case Mode::Status: ui::showPanel("", kText, statusRows()); break;
     case Mode::Notice: break;  // stays until the next event
     case Mode::Idle:
-      if (ui::hasReply()) {
-        ui::showReply();
-      } else {
-        ui::showMessage(wsUp ? "Hold the front button" : "Connecting…",
-                        wsUp ? String("and talk. Release to send.") : settings.server);
-      }
+      if (ui::hasReply()) ui::showReply();
+      else showIdle();
       break;
   }
 }
 
-static void notice(const char* title, const String& body, uint32_t color) {
+static void notice(const char* title, const String& body, uint16_t color) {
   mode = Mode::Notice;
   setBarState();
   ui::showMessage(title, body, color);
+}
+
+static void backToMain() {
+  mode = ui::hasReply() ? Mode::Reply : Mode::Idle;
+  redraw();
+}
+
+static void openMenu() {
+  menuSel = 0;
+  menuOpenedMs = millis();
+  mode = Mode::Menu;
+  redraw();
+}
+
+static void chooseMenuRow() {
+  menuOpenedMs = millis();
+  switch (menuSel) {
+    case MStatus:
+      mode = Mode::Status;
+      redraw();
+      return;
+    case MAgent:
+      if (!wsUp) {
+        notice("Offline", "Can't list agents until the stick is connected.", kRed);
+        return;
+      }
+      agentNames = {"Loading agents…"};
+      agentSlugs = {""};
+      agentSel = 0;
+      agentCur = -1;
+      agentsLoading = true;
+      mode = Mode::Agents;
+      sendType("agents");
+      redraw();
+      return;
+    case MSetup:
+      runSetupPortal("Settings");
+    case MVolume:
+      settings.volume = nextStep(kVolumeSteps, settings.volume);
+      audio::setVolume(settings.volume);
+      break;
+    case MBoost:
+      settings.boostDb = nextStep(kBoostSteps, settings.boostDb);
+      audio::setBoost(settings.boostDb);
+      break;
+    case MVoice:
+      settings.femaleVoice = !settings.femaleVoice;
+      if (wsUp) sendPrefs();
+      break;
+    case MDisplay: settings.iconMode = !settings.iconMode; break;
+    case MCharacter: settings.character = (settings.character + 1) % face::KindCount; break;
+    case MBeep: settings.cueBeep = !settings.cueBeep; break;
+    case MFlash: settings.cueFlash = !settings.cueFlash; break;
+    case MLead: settings.cueLeadS = settings.cueLeadS == 1 ? 2 : 1; break;
+  }
+  settings.save();
+  redraw();
+  if (menuSel == MVolume || menuSel == MBoost) audio::beep();
+  if (menuSel == MBeep && settings.cueBeep) audio::cue();
+}
+
+static void chooseAgent() {
+  if (agentsLoading) return;
+  if (agentSel == (int)agentNames.size() - 1) {  // "« Back"
+    mode = Mode::Menu;
+    redraw();
+    return;
+  }
+  settings.agent = agentSlugs[agentSel];
+  settings.save();
+  JsonDocument d;
+  d["type"] = "select";
+  d["agent"] = settings.agent;
+  sendJson(d);
+  backToMain();
 }
 
 // ── microphone → server ──────────────────────────────────────────────
@@ -141,9 +365,10 @@ static void micSink(const int16_t* samples, size_t count) {
 
 static void startTalking() {
   if (!wsUp) {
-    notice("Offline", "Not connected to Flight Deck yet.", TFT_RED);
+    notice("Offline", "Not connected to Flight Deck yet.", kRed);
     return;
   }
+  flashing = false;
   audio::micStart();  // also stops any playback
   JsonDocument d;
   d["type"] = "rec_start";
@@ -162,10 +387,43 @@ static void stopTalking(bool send) {
     statusLine = "Transcribing…";
     startWork();
     mode = Mode::Waiting;
+    redraw();
   } else {
-    mode = ui::hasReply() ? Mode::Reply : Mode::Idle;
+    backToMain();
   }
-  redraw();
+}
+
+// ── speech cue: beep + flash, then the speech ────────────────────────
+
+static void startSpeech(uint32_t rate) {
+  bool cue = settings.cueBeep || settings.cueFlash;
+  audio::playBegin(rate, cue ? settings.cueLeadS * 1000UL : 0);
+  touch();
+  if (settings.cueBeep) audio::cue();
+  if (settings.cueFlash) {
+    M5.Display.setBrightness(255);
+    flashing = true;
+    flashStartMs = millis();
+  }
+}
+
+static void pollFlash() {
+  if (!flashing) return;
+  uint32_t el = millis() - flashStartMs;
+  static int lastPhase = -1;
+  int phase = el / 100;
+  if (el >= kFlashMs) {
+    flashing = false;
+    lastPhase = -1;
+    ui::brightness(kBright);
+    redraw();
+    return;
+  }
+  if (phase != lastPhase) {
+    lastPhase = phase;
+    if (phase % 2 == 0) ui::flashFrame(true);
+    else redraw();
+  }
 }
 
 // ── server → device ──────────────────────────────────────────────────
@@ -178,26 +436,32 @@ static void onText(const char* payload, size_t len) {
   if (type == "bound") {
     agentName = doc["agent"] | "";
     agentSlug = doc["slug"] | "";
-    if (mode == Mode::Picker || mode == Mode::Idle || mode == Mode::Notice) mode = ui::hasReply() ? Mode::Reply : Mode::Idle;
-    redraw();
+    agentLinked = doc["linked"] | true;
+    if (mode == Mode::Agents || mode == Mode::Idle || mode == Mode::Notice) backToMain();
+    else redraw();
   } else if (type == "agents") {
-    pickNames.clear();
-    pickSlugs.clear();
-    pickCur = -1;
+    agentNames.clear();
+    agentSlugs.clear();
+    agentCur = -1;
     String current = doc["current"] | "";
     for (JsonObject a : doc["items"].as<JsonArray>()) {
       String slug = a["slug"] | "";
-      if (slug == current) pickCur = pickNames.size();
-      pickNames.push_back(a["name"] | slug);
-      pickSlugs.push_back(slug);
+      if (slug == current) agentCur = agentNames.size();
+      agentNames.push_back(a["name"] | slug);
+      agentSlugs.push_back(slug);
     }
-    addSettingItems();
-    pickSel = max(0, pickCur);
-    pickerLoading = false;
-    if (mode == Mode::Picker) redraw();
+    agentNames.push_back("« Back");
+    agentSlugs.push_back("");
+    agentSel = max(0, agentCur);
+    agentsLoading = false;
+    if (mode == Mode::Agents) redraw();
   } else if (type == "state") {
     String st = doc["state"] | "";
-    if (st == "transcribing") {
+    if (st == "connected") {
+      agentLinked = true;
+    } else if (st == "agent_offline") {
+      agentLinked = false;
+    } else if (st == "transcribing") {
       statusLine = "Transcribing…";
     } else if (st == "thinking") {
       statusLine = "Thinking…";
@@ -208,7 +472,7 @@ static void onText(const char* payload, size_t len) {
     } else if (st == "ready" && mode == Mode::Waiting) {
       mode = ui::hasReply() ? Mode::Reply : Mode::Idle;
     }
-    if (mode == Mode::Waiting || mode == Mode::Idle || st == "ready") redraw();
+    if (mode != Mode::Listening && !flashing) redraw();
   } else if (type == "transcript") {
     heard = doc["text"] | "";
     statusLine = "Thinking…";
@@ -227,18 +491,21 @@ static void onText(const char* payload, size_t len) {
     }
   } else if (type == "reply") {
     touch();
-    String text = doc["text"] | "";
+    ++turns;
+    lastReplyMs = millis();
+    ui::setReply(doc["text"] | "");
     mode = Mode::Reply;
-    setBarState();
-    ui::setReply(text);
+    if (!flashing) redraw();
   } else if (type == "audio_start") {
-    audio::playBegin(doc["rate"] | 24000);
+    startSpeech(doc["rate"] | 24000);
     setBarState();
   } else if (type == "audio_end") {
     audio::playEnd();
+  } else if (type == "pong") {
+    if (doc["t"].is<uint32_t>()) rttMs = millis() - doc["t"].as<uint32_t>();
   } else if (type == "error") {
     touch();
-    notice("Hmm", doc["text"] | "Something went wrong.", TFT_ORANGE);
+    notice("Hmm", doc["text"] | "Something went wrong.", kOrange);
   }
 }
 
@@ -248,8 +515,11 @@ static void onBinary(const uint8_t* data, size_t len) {
     audio::playFeed(data + 1, len - 1);
   } else if (data[0] == 0x02) {
     touch();
-    ui::showImage(data + 1, len - 1);
-    mode = Mode::Image;
+    ui::storeImage(data + 1, len - 1);
+    if (!(settings.iconMode && audio::playing())) {
+      mode = Mode::Image;
+      if (!flashing) redraw();
+    }
   }
 }
 
@@ -258,12 +528,15 @@ static void onWs(WStype_t type, uint8_t* payload, size_t length) {
     case WStype_CONNECTED:
       Serial.println("[claw] flight deck connected");
       wsUp = true;
+      rttMs = -1;
+      sendPrefs();
       redraw();
       break;
     case WStype_DISCONNECTED:
       if (wsUp) {
         Serial.println("[claw] flight deck disconnected");
         wsUp = false;
+        agentLinked = false;
         if (audio::micActive()) audio::micStop([](const int16_t*, size_t) {});
         audio::playStop();
         if (mode == Mode::Listening || mode == Mode::Waiting) mode = ui::hasReply() ? Mode::Reply : Mode::Idle;
@@ -296,6 +569,7 @@ static void connectServer() {
   if (settings.token.length()) path += "&token=" + urlEncode(settings.token);
   if (settings.agent.length()) path += "&agent=" + urlEncode(settings.agent);
   if (settings.lang.length()) path += "&lang=" + urlEncode(settings.lang);
+  path += String("&voice=") + (settings.femaleVoice ? "female" : "male");
   if (!settings.speak) path += "&speak=0";
 
   if (tls) {
@@ -309,85 +583,6 @@ static void connectServer() {
   ws.onEvent(onWs);
   ws.setReconnectInterval(3000);
   ws.enableHeartbeat(15000, 5000, 2);
-}
-
-// ── picker ───────────────────────────────────────────────────────────
-// The agent list ends with three setting rows: volume, boost, Wi-Fi & settings.
-
-static constexpr uint8_t kVolumeSteps[] = {64, 128, 191, 255};  // 25 / 50 / 75 / 100 %
-static constexpr uint8_t kBoostSteps[] = {0, 6, 10};
-static int volumeRow = -1, boostRow = -1, setupRow = -1;
-
-static String volumeLabel() { return "Volume " + String((settings.volume * 100 + 127) / 255) + "%"; }
-static String boostLabel() {
-  return settings.boostDb ? "Boost +" + String(settings.boostDb) + " dB" : String("Boost off");
-}
-
-static void addSettingItems() {
-  volumeRow = pickNames.size();
-  pickNames.push_back(volumeLabel());
-  pickSlugs.push_back("");
-  boostRow = pickNames.size();
-  pickNames.push_back(boostLabel());
-  pickSlugs.push_back("");
-  setupRow = pickNames.size();
-  pickNames.push_back("Wi-Fi & settings…");
-  pickSlugs.push_back("");
-}
-
-// Next step up (wrapping) from the current value.
-template <size_t N>
-static uint8_t nextStep(const uint8_t (&steps)[N], uint8_t now) {
-  for (uint8_t v : steps) {
-    if (v > now) return v;
-  }
-  return steps[0];
-}
-
-static void openPicker() {
-  if (!wsUp) {
-    runSetupPortal("Settings");
-  }
-  pickNames.clear();
-  pickSlugs.clear();
-  pickNames.push_back("Loading agents…");
-  pickSlugs.push_back("");
-  pickSel = 0;
-  pickCur = -1;
-  pickerLoading = true;
-  pickerOpenedMs = millis();
-  mode = Mode::Picker;
-  sendType("agents");
-  redraw();
-}
-
-static void choosePicked() {
-  if (pickerLoading) return;
-  if (pickSel == setupRow) runSetupPortal("Settings");
-  if (pickSel == volumeRow || pickSel == boostRow) {  // change in place, stay in the list
-    if (pickSel == volumeRow) {
-      settings.volume = nextStep(kVolumeSteps, settings.volume);
-      audio::setVolume(settings.volume);
-      pickNames[volumeRow] = volumeLabel();
-    } else {
-      settings.boostDb = nextStep(kBoostSteps, settings.boostDb);
-      audio::setBoost(settings.boostDb);
-      pickNames[boostRow] = boostLabel();
-    }
-    settings.save();
-    pickerOpenedMs = millis();
-    redraw();
-    audio::beep();
-    return;
-  }
-  settings.agent = pickSlugs[pickSel];
-  settings.save();
-  JsonDocument d;
-  d["type"] = "select";
-  d["agent"] = settings.agent;
-  sendJson(d);
-  mode = ui::hasReply() ? Mode::Reply : Mode::Idle;
-  redraw();
 }
 
 // ── power ────────────────────────────────────────────────────────────
@@ -404,7 +599,7 @@ static void goToSleep() {
 }
 
 static void handleIdlePower() {
-  if (mode == Mode::Listening || audio::playing()) {
+  if (mode == Mode::Listening || audio::playing() || flashing) {
     lastActivityMs = millis();
     return;
   }
@@ -434,7 +629,8 @@ void setup() {
   ui::begin();
   ui::brightness(kBright);
   settings.load();
-  Serial.printf("[claw] boot %s: %d network(s), server '%s'\n", deviceId().c_str(), settings.netCount, settings.server.c_str());
+  Serial.printf("[claw] boot %s fw %s: %d network(s), server '%s'\n", deviceId().c_str(), FW_VERSION,
+                settings.netCount, settings.server.c_str());
   audio::begin(settings.volume, settings.boostDb);
   M5.BtnB.setHoldThresh(800);
 
@@ -443,8 +639,9 @@ void setup() {
     runSetupPortal(settings.configured() ? "Setup" : "First-time setup");
   }
 
-  ui::setBar("", "wi-fi…", TFT_YELLOW);
-  ui::showMessage("Connecting to Wi-Fi", settings.nets[0].ssid, TFT_WHITE);
+  ui::setHealth(ui::Down, ui::Down);
+  ui::setBar("", "wi-fi…", kYellow);
+  ui::showMessage("Connecting to Wi-Fi", settings.nets[0].ssid, kText);
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(deviceId().c_str());
   for (int i = 0; i < settings.netCount; ++i) {
@@ -458,7 +655,8 @@ void setup() {
     }
   }
   Serial.printf("[claw] wifi %s ip %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-  ui::showMessage("Wi-Fi connected", WiFi.SSID() + "  " + WiFi.localIP().toString(), TFT_GREEN);
+  ui::setHealth(wifiHealth(), ui::Down);
+  ui::showMessage("Wi-Fi connected", WiFi.SSID() + "  " + WiFi.localIP().toString(), kGreen);
   connectServer();
   lastActivityMs = millis();
 }
@@ -467,12 +665,17 @@ void loop() {
   M5.update();
   ws.loop();
   if (WiFi.status() != WL_CONNECTED) wifiMulti.run(0);
+  bool inMenu = mode == Mode::Menu || mode == Mode::Agents || mode == Mode::Status;
 
-  // Front button: hold to talk, tap for quick actions.
+  // Front button: hold to talk, tap for quick actions; in the menu, choose.
   if (M5.BtnA.wasPressed()) {
     touch();
-    if (mode == Mode::Picker) {
-      choosePicked();
+    if (mode == Mode::Menu) {
+      chooseMenuRow();
+    } else if (mode == Mode::Agents) {
+      chooseAgent();
+    } else if (mode == Mode::Status) {
+      openMenu();
     } else {
       bool wasSpeaking = audio::playing();
       startTalking();
@@ -491,28 +694,45 @@ void loop() {
     }
   }
 
-  // Side button: page / back · hold = agents & settings.
+  // Side button: page / next row · hold = menu (hold again = close).
   if (M5.BtnB.wasHold()) {
     touch();
-    if (mode != Mode::Listening) openPicker();
+    if (inMenu) backToMain();
+    else if (mode != Mode::Listening) openMenu();
   } else if (M5.BtnB.wasClicked()) {
     touch();
-    if (mode == Mode::Picker) {
-      if (!pickerLoading) pickSel = (pickSel + 1) % pickNames.size();
+    if (mode == Mode::Menu) {
+      menuSel = (menuSel + 1) % MCount;
+      menuOpenedMs = millis();
       redraw();
-    } else if (mode == Mode::Image) {
-      mode = ui::hasReply() ? Mode::Reply : Mode::Idle;
+    } else if (mode == Mode::Agents) {
+      if (!agentsLoading) agentSel = (agentSel + 1) % agentNames.size();
+      menuOpenedMs = millis();
       redraw();
+    } else if (mode == Mode::Status || mode == Mode::Image || mode == Mode::Notice) {
+      backToMain();
     } else if (mode == Mode::Reply) {
-      ui::nextPage();
-    } else if (mode == Mode::Notice || mode == Mode::Idle) {
-      mode = ui::hasReply() ? Mode::Reply : Mode::Idle;
+      if (audio::playing() && settings.iconMode) {
+        audio::playStop();  // the character gives way to the text
+        sendType("stop");
+        redraw();
+      } else {
+        ui::nextPage();
+      }
+    } else if (mode == Mode::Idle) {
+      mode = Mode::Status;
       redraw();
     }
   }
-  if (mode == Mode::Picker && millis() - pickerOpenedMs > 20000) {
-    mode = ui::hasReply() ? Mode::Reply : Mode::Idle;
-    redraw();
+  if ((mode == Mode::Menu || mode == Mode::Agents) && millis() - menuOpenedMs > 20000) backToMain();
+
+  // Keep a round-trip time for the status page.
+  if (wsUp && millis() - lastPingMs > 15000) {
+    lastPingMs = millis();
+    JsonDocument d;
+    d["type"] = "ping";
+    d["t"] = millis();
+    sendJson(d);
   }
 
   // Keep the mic stream and the speaker fed.
@@ -521,25 +741,39 @@ void loop() {
     if (millis() - lastDrawMs > 80) {
       lastDrawMs = millis();
       setBarState();
-      ui::showListening(level, millis() - recStartMs);
+      if (settings.iconMode) ui::showFace(settings.character, face::Pose::Listening, level);
+      else ui::showListening(level, millis() - recStartMs);
     }
     if (millis() - recStartMs > 110000) stopTalking(true);  // the server caps at 120 s
   }
-  if (mode == Mode::Waiting) {
-    static uint32_t lastSecond = 0;
-    uint32_t secs = (millis() - workStartMs) / 1000;
-    if ((workDirty && millis() - lastDrawMs > 150) || secs != lastSecond) {
-      lastSecond = secs;
-      lastDrawMs = millis();
-      workDirty = false;
-      redraw();
-    }
-  }
+  pollFlash();
   bool wasPlaying = audio::playing();
   audio::playPoll();
-  if (wasPlaying != audio::playing() && (mode == Mode::Reply || mode == Mode::Idle)) {
-    setBarState();
-    ui::showReply();
+  if (wasPlaying != audio::playing() && (mode == Mode::Reply || mode == Mode::Idle) && !flashing) redraw();
+
+  if (!flashing && !screenOff) {
+    uint32_t since = millis() - lastDrawMs;
+    if (mode == Mode::Waiting) {
+      // Changes at most ~6×/s; the timer (and the icon's dots) once in a while.
+      static uint32_t lastSecond = 0;
+      uint32_t secs = (millis() - workStartMs) / 1000;
+      if ((workDirty && since > 150) || secs != lastSecond || (settings.iconMode && since > 120)) {
+        lastSecond = secs;
+        lastDrawMs = millis();
+        workDirty = false;
+        redraw();
+      }
+    } else if (settings.iconMode && mode == Mode::Reply && audio::playing() && since > 60) {
+      lastDrawMs = millis();
+      setBarState();
+      ui::showFace(settings.character, face::Pose::Speaking, audio::outputLevel());
+    } else if (settings.iconMode && mode == Mode::Idle && !ui::hasReply() && since > 150) {
+      lastDrawMs = millis();  // blinking
+      redraw();
+    } else if ((mode == Mode::Status && since > 1000) || since > 30000) {
+      lastDrawMs = millis();  // live status page; battery/health in the bar elsewhere
+      if (mode != Mode::Listening && mode != Mode::Notice && mode != Mode::Image) redraw();
+    }
   }
 
   handleIdlePower();
