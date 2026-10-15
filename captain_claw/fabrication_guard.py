@@ -7,20 +7,25 @@ narrates searches it never ran. The agent loop
 (:mod:`captain_claw.agent_orchestration_mixin`) gathers what the turn did into
 :class:`TurnFacts` and asks :func:`judge_reply` about each reply before it
 ships; the :class:`Verdict` says whether the reply is false, what to tell the
-model, and the line to append once the retries are spent. Three checks, one
+model, and the line to append once the retries are spent. Four checks, one
 decision:
 
 * A mail claim (:func:`claims_mail_sent`) with no email out this turn — no
   send that answered "Email sent.", no send relayed by a peer — and no quoted
   Message ID an earlier send returned.
+* A calendar claim (:func:`claims_calendar_change`: "Meeting request sent to
+  Borjan", "Created — Tue 17:20") with no calendar change this turn — no
+  create / update / delete / respond that answered without an error, none
+  relayed by a peer — and no quoted event ID an earlier change returned.
 * A made-up ID (:func:`fabricated_ids`): a mail / calendar / drive / Graph
   style ID nothing the model was given ever held.
 * A narrated lookup (:func:`narrated_lookups`): a turn that made no tool call
   whose reply still says "Searching for the thread…", "Checked the calendar —".
 
 The corrective only ever asks the model to make its reply true. It never asks
-for a send: whether the user wanted one is theirs to say, and a second copy
-or an email nobody asked for is worse than a false "Sent". A flagged reply
+for a send or a calendar change: whether the user wanted one is theirs to
+say, and a second copy, an email or an invitation nobody asked for is worse
+than a false "Sent". A flagged reply
 costs a full-context call, so the claim detector lets ambiguous lines pass: a
 digest of other people's mail or of the user's own sends, a letter drafted for
 the user, a file, picture or voice note delivered to the chat, a calendar
@@ -55,6 +60,7 @@ MAX_FABRICATION_RETRIES = 2
 # Verdict kinds, in the order they lead a corrective; each is also the
 # ``origin_detail`` of the rejected reply and its corrective.
 MAIL_CLAIM = "false_mail_send"        # says an email went out; none did this turn
+CALENDAR_CLAIM = "false_calendar_change"  # says the calendar changed; it did not this turn
 NARRATED_LOOKUP = "narrated_lookup"   # no tool call, yet narrates lookups
 FABRICATED_ID = "fabricated_id"       # quotes a tool-style ID nothing showed
 
@@ -615,6 +621,365 @@ def _acts_elsewhere(step: ToolStep) -> bool:
     return not (step.action and _READ_ACTION_RE.match(step.action))
 
 
+# ── Calendar claims ──────────────────────────────────────────────────
+#
+# The calendar twin of the mail claim: "Meeting request sent to Borjan — Tue
+# 20 Oct, 17:20–18:20", "Created — Tue 20 Oct, 17:20", "I've added it to your
+# calendar", "Pomaknuo sam sastanak na 15:00" in a turn whose calendar tool
+# changed nothing. Anchored and filtered like the mail forms (a line, a
+# sentence or a "Done —" lead-in; not negated, questioned, attributed, quoted,
+# dated before this turn, or in a letter drafted for the user). What a
+# calendar shows, read back — "The sync is scheduled for 15:00", "the IC was
+# moved by Ana", "It's in your calendar" — is not a change: only the agent's
+# own voice, a headline, or "now …" counts.
+
+CALENDAR_TOOLS = frozenset({"google_calendar", "microsoft_calendar"})
+CALENDAR_WRITE_ACTIONS = frozenset({
+    "create_event", "update_event", "delete_event", "respond_event"})
+
+# A calendar MCP proxy tool ("mcp_<server>_<tool>"), and the ones that change
+# the calendar ("create_event", "quickAdd", "respond_to_event").
+_MCP_CALENDAR_HINT = re.compile(r"(?i)calendar|gcal|event|meeting|booking|schedul")
+_MCP_CALENDAR_WRITE_RE = re.compile(
+    r"(?:^|_)(?:create|insert|add|quick_?add|update|patch|edit|modify|move|reschedule|delete|remove"
+    r"|cancel|respond|accept|decline|book|schedule)(?:_|$)"
+)
+
+
+def is_calendar_tool(name: str) -> bool:
+    name = str(name or "").strip().lower()
+    return name in CALENDAR_TOOLS or (name.startswith("mcp_")
+                                      and bool(_MCP_CALENDAR_HINT.search(name)))
+
+
+def calendar_tools_in(tools: Iterable[str]) -> frozenset[str]:
+    """The calendar tools among *tools* (see :func:`is_calendar_tool`)."""
+    return frozenset(t for t in tools if is_calendar_tool(t))
+
+
+def _snake(name: str) -> str:
+    snake = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", name or "")
+    return re.sub(r"[^A-Za-z0-9]+", "_", snake).strip("_").lower()
+
+
+def _calendar_writes(steps: Iterable[ToolStep]) -> list[ToolStep]:
+    """The calendar calls in *steps* that change it (answered or refused)."""
+    return [s for s in steps
+            if (s.name in CALENDAR_TOOLS and s.action in CALENDAR_WRITE_ACTIONS)
+            or (s.name.startswith("mcp_") and is_calendar_tool(s.name)
+                and bool(_MCP_CALENDAR_WRITE_RE.search(_snake(s.name[4:]))))]
+
+
+# A peer's answer that relays its calendar change ("Created event 'X' on
+# Google Calendar.", "Event created", "Invite sent to …").
+_RELAYED_CALENDAR_RE = re.compile(
+    r"(?i)\b(?:created|updated|deleted|accepted|declined)\s+event\b"
+    r"|\b(?:event|meeting|invit\w*)\s+(?:was\s+|has\s+been\s+)?"
+    r"(?:created|updated|moved|sent|booked)\b"
+)
+
+
+def _relays_calendar_change(step: ToolStep) -> bool:
+    return (_is_handoff(step) and not has_backstop(step.content)
+            and bool(_RELAYED_CALENDAR_RE.search(step.content)))
+
+
+def turn_changed_calendar(steps: Sequence[ToolStep]) -> bool:
+    """Whether the calendar changed in *steps*: a calendar create / update /
+    delete / respond call that answered without an error, or a peer this run
+    asked reports its change."""
+    return (any(s.ok for s in _calendar_writes(steps))
+            or any(_relays_calendar_change(s) for s in steps))
+
+
+def turn_refused_calendar(steps: Sequence[ToolStep]) -> str:
+    """The answer of the last calendar change in *steps* that did not go
+    through (a refusal, an error), or "" when none failed."""
+    refused = ""
+    for step in _calendar_writes(steps):
+        if not step.ok:
+            refused = step.content or "Error: the calendar call returned nothing."
+    return refused
+
+
+# The event IDs a create / update answers with ("  ID: …"), and the one a
+# delete or an answer to an invitation names ("Deleted event X …").
+_EVENT_ID_LINE_RE = re.compile(r"(?m)^[ \t]*ID:[ \t]*([A-Za-z0-9][\w=+/-]{2,})")
+_EVENT_ACTED_ID_RE = re.compile(
+    r"\b(?:Accepted|Declined|Tentatively accepted|Deleted) event "
+    r"([A-Za-z0-9][\w=+/-]{2,}?)(?=[.\s]|$)")
+
+
+def changed_event_ids(steps: Iterable[ToolStep]) -> frozenset[str]:
+    """The IDs of events a calendar change in *steps* went through on."""
+    ids: set[str] = set()
+    for step in _calendar_writes(steps):
+        if step.ok:
+            ids.update(_EVENT_ID_LINE_RE.findall(step.content))
+            ids.update(_EVENT_ACTED_ID_RE.findall(step.content))
+    return frozenset(ids)
+
+
+# What makes a reply, a request or a line about the calendar.
+_CALENDAR_WORDS_RE = re.compile(
+    r"(?i)\b(?:calendars?|events?|meetings?|invites?|invitations?|attendees?|guests?|appointments?"
+    r"|bookings?|reschedul\w*|kalendar\w*|doga[đd]aj\w*|sastan\w*|termin\w*|pozivnic\w*"
+    r"|sudionik\w*)\b"
+)
+# Words that name the calendar or an event outright: with another action
+# this turn (a draft, a file, a hand-off), only these make a claim.
+_CALENDAR_NAMED_RE = re.compile(
+    r"(?i)\b(?:calendars?|events?|meetings?|appointments?|kalendar\w*|doga[đd]aj\w*|sastan\w*"
+    r"|termin\w*)\b"
+)
+# What an invitation is called, for a "Sent …" line: without it, "sent" is mail's.
+_INVITE_RE = re.compile(r"(?i)\binvit\w*|\bmeeting\s+requests?\b|\bpozivnic\w*|\bpoziv\b")
+# A date or a time: "17:20", "5pm", "Tue", "20 Oct", "sutra", "20.10.".
+_WHEN_RE = re.compile(
+    r"(?i)\b\d{1,2}[:.]\d{2}\b|\b\d{1,2}\s*(?:am|pm)\b"
+    r"|\b(?:monday|mon|tuesday|tues?|wednesday|thursday|thu(?:rs?)?|friday|fri|saturday|sunday)\b"
+    r"|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}\b"
+    r"|\b\d{1,2}(?:st|nd|rd|th)?\.?\s+"
+    r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b"
+    r"|\b(?:today|tomorrow|tonight|danas|sutra|prekosutra|ponedjelj\w*|utor\w*|srijed\w*"
+    r"|[čc]etvrt(?:ak|ka|kom)|pet(?:ak|ka|kom)|subot\w*|nedjelj\w*)\b"
+    r"|\b\d{1,2}\.\s?\d{1,2}\."
+)
+
+_CAL_NOUN = (
+    r"(?:(?:calendar|google|outlook|teams|zoom)\s+)?"
+    r"(?:event|meeting(?:\s+(?:request|invite|invitation))?|invite|invitation|appointment|booking"
+    r"|calendar\s+(?:entry|hold|block|item)|hold|call)"
+    r"|doga[đd]aj|sastanak|termin|pozivnic[aeu]|poziv"
+)
+# Made this turn whether bare or after "is" / "was" / "has been".
+_CAL_MADE = (
+    r"created|added|set\s+up|put\s+in|placed|sent"
+    r"|kreiran[aoie]?|dodan[aoie]?|napravljen[aoie]?|upisan[aoie]?|poslan[aoie]?|stavljen[aoie]?"
+)
+# These also say what a calendar shows ("is scheduled for 15:00", "je
+# zakazan"): bare, "now …" or "has been …" only.
+_CAL_BOOKED = r"booked|scheduled|reserved|zakazan[aoie]?|rezerviran[aoie]?"
+# And these as often report someone else's change ("was moved by Ana", "je
+# otkazan"): bare or "now …" only.
+_CAL_CHANGED = (
+    r"moved|rescheduled|updated|changed|cancell?ed|deleted|removed|accepted|declined"
+    r"|pomaknut[aoie]?|premje[šs]ten[aoie]?|preba[čc]en[aoie]?|a[žz]uriran[aoie]?"
+    r"|promijenjen[aoie]?|otkazan[aoie]?|obrisan[aoie]?|izbrisan[aoie]?|uklonjen[aoie]?"
+    r"|prihva[ćc]en[aoie]?|odbijen[aoie]?"
+)
+# An invitation or a meeting request "sent": an email out this turn may be it.
+_CAL_SENT_RE = re.compile(r"(?i)\b(?:sent|poslan\w*|posla(?:o|la))\b")
+# Mail the user got, someone else's change, a routine.
+_CAL_NOT_AFTER = (
+    r"(?!\s+(?:to\s+(?:you|me|us)\b|by\b|from\b|od\b|every\b|each\b|automatically\b|daily\b"
+    r"|weekly\b|svak\w*|automatsk\w*))"
+)
+# Who or when, between the event and its verb ("with Borjan", "to Ana", "za
+# utorak") — never across a copula or a negation: "The meeting with Ana is
+# scheduled for 15:00" says what the calendar shows.
+_WHO_SPAN = (r"(?:(?!\b(?:is|are|was|were|has|have|had|je|su|got|not|never|nije|nisu|nisam)\b"
+             r"|n't\b)[^\n.,]){1,40}?")
+# "Meeting request sent to Borjan", "Event created.", "The invite to Ana was
+# sent", "Termin je upisan u kalendar", "The meeting is now booked".
+_CAL_NAMED_CLAIM_RE = re.compile(
+    rf"""(?imx){_START}{_PAD}
+    (?:(?:the|my|this|that|your|a|an|new|taj|ovaj|novi)\s+){{0,2}}
+    (?:{_CAL_NOUN})\s+
+    (?:(?:with|to|for|s|sa|za)\s+{_WHO_SPAN}\s+|(?-i:[A-ZČĆŽŠĐ])[\w-]*\s+)?
+    (?:
+      (?:(?:is|are|was|were|has\s+been|have\s+been|got|je|su)\s+(?:now\s+|sada?\s+)?)?
+      (?P<made>{_CAL_MADE})
+     |(?P<now>(?:has\s+been|have\s+been|is\s+now|are\s+now|je\s+sada?)\s+)?(?P<booked>{_CAL_BOOKED})
+     |(?P<now2>(?:is\s+now|are\s+now|je\s+sada?)\s+)?(?P<changed>{_CAL_CHANGED})
+    )\b{_CAL_NOT_AFTER}
+    """
+)
+# A headline verb: "**Created** — Tue 20 Oct, 17:20", "Moved to 15:00.",
+# "Booked for Friday 10:00", "Sent — invite to Borjan", "Dodano u kalendar".
+# Not a label ("Created: 2026-10-01", "Updated (2)") or "Created by Ana".
+_CAL_BARE_CLAIM_RE = re.compile(
+    rf"""(?imx){_START}{_PAD}(?:now\s+)?
+    (?P<verb>created|added|booked|scheduled|rescheduled|moved|cancell?ed|deleted|invited|set\s+up
+      |placed|sent|kreiran[oa]?|dodan[oa]?|zakazan[oa]?|upisan[oa]?|pomaknut[oa]?|premje[šs]ten[oa]?
+      |preba[čc]en[oa]?|otkazan[oa]?|obrisan[oa]?|pozvan[aoi]?|rezervirano|poslan[oaie]?)\b
+    (?!\**\s*:)(?!\**\s*\(\d){_CAL_NOT_AFTER}
+    """
+)
+# The same verb as a label, when a date or a time follows: "**Created:** Tue
+# 20 Oct, 17:20". An event's own fields ("Created: 2026-10-01T09:12") are not.
+_CAL_LABEL_CLAIM_RE = re.compile(
+    r"(?im)^[^\w\n]{0,6}(?P<verb>created|booked|scheduled|added|moved|rescheduled|kreirano"
+    r"|zakazano|dodano|pomaknuto)\**[ \t]*:\**[ \t]*(?![^\n]*\d{4}-\d{2}-\d{2})(?=[^\n]*\S)"
+)
+# Of those, the verbs a digest uses for what the calendar shows ("- Moved to
+# Thu", "- Cancelled", "- Booked for 10:00"): not a claim in a list item.
+_CAL_SETTLED_VERB_RE = re.compile(
+    r"(?i)^(?:booked|scheduled|rescheduled|moved|cancell?ed|deleted|zakazan|pomaknut|premje[šs]ten"
+    r"|preba[čc]en|otkazan|obrisan|rezervirano)"
+)
+# The agent's own voice: "I've added it to your calendar", "I moved the sync
+# to 15:00", "Zakazao sam sastanak", "Poslao sam pozivnicu Borjanu".
+_CAL_I_CLAIM_RE = re.compile(
+    r"""(?imx)
+    \bi(?:'ve|\s+have|\s+just|\s+already)?\s+(?:just\s+|now\s+|already\s+|also\s+)?
+    (?P<verb>created|added|booked|scheduled|rescheduled|moved|cancell?ed|deleted|removed|set\s+up
+      |put|placed|sent|invited|accepted|declined|updated|blocked|reserved)\b
+    |\b(?P<hr>(?:kreira|doda|zakaza|upisa|stavi|napravi|pomaknu|premjesti|prebaci|otkaza|obrisa
+       |izbrisa|posla|pozva|prihvati|odbi|a[žz]urira|rezervira|blokira)(?:o|la)\s+sam
+     |sam\s+(?:kreira|doda|zakaza|upisa|stavi|napravi|pomaknu|premjesti|prebaci|otkaza|obrisa
+       |izbrisa|posla|pozva|prihvati|odbi|a[žz]urira|rezervira|blokira)(?:o|la))\b
+    """
+)
+# "It's now in your calendar", "Now it's there", "Sad je u kalendaru".
+_CAL_NOW_CLAIM_RE = re.compile(
+    r"(?i)\bnow\s+(?:it'?s\s+|it\s+is\s+)?(?:in|on)\s+(?:your|the|both)\s+calendars?\b"
+    r"|\b(?:it'?s|it\s+is|that'?s|is|are)\s+now\s+(?:in|on)\s+(?:your|the|both)\s+calendars?\b"
+    r"|\b(?:in|on)\s+(?:your|the)\s+calendars?\s+now\b"
+    r"|\bnow\s+it'?s\s+there\b"
+    r"|\bsada?\s+je\s+u\s+(?:tvom\s+|va[šs]em\s+)?kalendar\w*"
+)
+# What a headline or first-person verb did when it was not the calendar:
+# "Created `report.md`", "Added a row to the sheet", "Scheduled the job".
+_CAL_OTHER_TARGET_RE = re.compile(
+    r"(?i)^[^\w`\n]*(?:`[^`\n]+\.[a-z0-9]{2,5}`|[\w.-]+\.(?:pdf|docx?|xlsx?|pptx?|png|jpe?g|gif"
+    r"|webp|md|csv|txt|zip|html?|mp3|mp4|ogg)\b"
+    r"|(?:(?:it|them|him|her|ana|\w+)\s+)?(?:(?:to|in|into|on|for|na|u)\s+)?"
+    r"(?:(?:the|a|an|your|my|new|that|this|one|another)\s+){0,2}"
+    r"(?:sheet|spreadsheet|doc|document|file|folder|draft|reminder|task|to-?do|job|cron|note|label"
+    r"|filter|contact|row|tab|list|page|repo|branch|issue|ticket|card|footer|signature|blocker"
+    r"|e-?mail|mail|reply|message|post|tablic\w*|dokument\w*|datotek\w*|podsjetnik\w*|zadatak"
+    r"|nacrt\w*|mejl\w*|poruk\w*)s?\b)"
+)
+# A change dated before this turn, right after the verb: "created yesterday",
+# "booked this morning", "dodan jučer". (A date or a time after it is the
+# event's: "Booked for 20 Oct", "Zakazano 20.10.")
+_CAL_EARLIER_AFTER_RE = re.compile(
+    r"(?i)^[\s,*—–-]*(?:already\s+)?(?:this\s+morning|yesterday|earlier(?:\s+today)?"
+    r"|last\s+(?:week|night|time|month)|" + _AGO + r"|jučer|jucer|prekjučer|ranije|jutros"
+    r"|prošl\w+\s+tjed\w+|prije\s+(?:\d+|dva|dvije|tri|par|nekoliko)\s+\w+)\b"
+)
+# The user reports their own change: "I moved the sync to 3pm", "dodao sam
+# termin" — an acknowledgement is no claim of the agent's.
+_USER_CAL_RE = re.compile(
+    r"(?i)\bi(?:'ve|\s+have|\s+just|\s+already)?\s+(?:just\s+|already\s+)?"
+    r"(?:created|added|booked|scheduled|rescheduled|moved|cancell?ed|deleted|accepted|declined"
+    r"|invited|sent\s+(?:the\s+|an?\s+)?(?:invite|invitation|meeting\s+request))\b"
+    r"|\b(?:kreira|doda|zakaza|upisa|pomaknu|premjesti|otkaza|obrisa|prihvati|odbi|pozva)(?:o|la)"
+    r"\s+sam\b"
+)
+
+
+@dataclass(frozen=True)
+class _CalendarClaim:
+    line_index: int
+    earlier: bool
+    send: bool        # an invitation "sent": an email out this turn may be it
+
+
+def _find_calendar_claims(
+    text: str, *, request: str = "", recent: bool = False, strict: bool = False,
+) -> list[_CalendarClaim]:
+    """The places *text* says the calendar was changed.
+
+    The forms that name an event ("Meeting request sent to Borjan", "Event
+    created") and "now in your calendar" always count; a headline verb
+    ("Created — Tue 20 Oct, 17:20", "Moved to 15:00") and the first-person
+    forms count when their line or sentence names the calendar, or carries a
+    date or a time and the reply or the request is about the calendar (or a
+    calendar tool ran lately). *strict* (something else was done this turn):
+    only the ones that name an event or the calendar outright.
+    """
+    if not text:
+        return []
+    text = _LETTER_RE.sub(lambda m: re.sub(r"[^\n]", " ", m.group()), text)
+    context = recent or bool(_CALENDAR_WORDS_RE.search(text)
+                             or _CALENDAR_WORDS_RE.search(request or ""))
+    patterns: list[re.Pattern[str]] = [_CAL_NAMED_CLAIM_RE, _CAL_NOW_CLAIM_RE, _CAL_I_CLAIM_RE]
+    if not strict:
+        patterns += [_CAL_BARE_CLAIM_RE, _CAL_LABEL_CLAIM_RE]
+    claims: list[_CalendarClaim] = []
+    seen: set[int] = set()
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            start = match.start()
+            while start < match.end() and not text[start].isalnum():
+                start += 1
+            if start in seen or _CLAIM_NEGATED_RE.search(text[max(0, start - 30):start]):
+                continue
+            line_start, line_end = _line_bounds(text, start)
+            line = text[line_start:line_end]
+            head = text[line_start:start]
+            if head.strip() and ":" in head and _ATTRIBUTED_RE.match(line):
+                continue
+            if head.count('"') % 2 or head.count("“") > head.count("”"):
+                continue
+            if _is_question(text, match.end()):
+                continue
+            _before, sentence = _sentence_at(text, start)
+            send = bool(_CAL_SENT_RE.search(match.group()))
+            after = text[match.end():line_end]
+            in_list = bool(_LIST_ITEM_RE.match(line))
+            # A digest's labelled item ("- New event added: Q3 review").
+            if in_list and re.match(r"\**[ \t]*:", after):
+                continue
+            if pattern is _CAL_NOW_CLAIM_RE:
+                if not _CALENDAR_NAMED_RE.search(sentence):
+                    continue
+            elif pattern is _CAL_NAMED_CLAIM_RE:
+                if strict and not _CALENDAR_NAMED_RE.search(match.group()):
+                    continue
+                if in_list and ((match.group("booked") and not match.group("now"))
+                                or (match.group("changed") and not match.group("now2"))):
+                    continue
+            else:
+                # A headline or first-person verb: what it did must be the
+                # calendar's, and "sent" an invitation (else it is mail's).
+                if _CAL_OTHER_TARGET_RE.match(after):
+                    continue
+                scope = sentence if pattern is _CAL_I_CLAIM_RE else line
+                if send and not _INVITE_RE.search(scope):
+                    continue
+                if strict and not _CALENDAR_NAMED_RE.search(scope):
+                    continue
+                if not (_CALENDAR_WORDS_RE.search(scope)
+                        or (context and _WHEN_RE.search(scope))):
+                    continue
+                if (pattern is not _CAL_I_CLAIM_RE and in_list
+                        and _CAL_SETTLED_VERB_RE.match(match.group("verb"))):
+                    continue
+                if pattern is _CAL_LABEL_CLAIM_RE and not _WHEN_RE.search(line):
+                    continue
+            seen.add(start)
+            claims.append(_CalendarClaim(
+                line_index=text.count("\n", 0, line_start),
+                earlier=bool(_CAL_EARLIER_AFTER_RE.search(after)
+                             or _EARLIER_BEFORE_RE.search(head)),
+                send=send,
+            ))
+    return claims
+
+
+def claims_calendar_change(
+    text: str, request: str = "", recent_calendar: bool = False, *, strict: bool = False,
+) -> bool:
+    """Whether *text* says a calendar event was created, changed, sent or
+    answered (see :func:`_find_calendar_claims`)."""
+    return bool(_find_calendar_claims(text, request=request, recent=recent_calendar,
+                                      strict=strict))
+
+
+def _acts_off_calendar(step: ToolStep) -> bool:
+    """A successful action this turn that is not the calendar's: a draft or
+    a send, a file, a hand-off, a sheet edit. "Created — …" after one is
+    about that."""
+    if is_calendar_tool(step.name) or not step.ok:
+        return False
+    if step.name in MAIL_TOOLS or _is_mcp_mail_write(step.name):
+        return not (step.action and _READ_ACTION_RE.match(step.action))
+    return _delivers_to_chat(step) or _acts_elsewhere(step)
+
+
 # ── Made-up IDs ──────────────────────────────────────────────────────
 
 # Text the model quotes rather than says: fenced code, blockquotes and quoted
@@ -837,25 +1202,32 @@ def outside_text(msg: Mapping[str, Any]) -> str:
 def ledger_with(ledger: Any, msg: Mapping[str, Any]) -> dict[str, list[str]] | None:
     """*ledger* with the IDs *msg* shows added (and, for a mail send that went
     out — here, or in the run a lane note, a delegated result or a peer's
-    answer relays — the Message IDs it returned), or None when nothing is
-    new."""
+    answer relays — the Message IDs it returned; for a calendar change that
+    went through, its event IDs), or None when nothing is new."""
     if not isinstance(msg, Mapping) or not is_outside_message(msg):
         return None
     found = ledger_ids(outside_text(msg))[:_LEDGER_PER_MESSAGE]
-    sent = sorted(sent_message_ids(tool_steps([msg])) | (
+    steps = tool_steps([msg])
+    sent = sorted(sent_message_ids(steps) | (
         relayed_sent_ids([str(msg.get("content", "") or "")]) if is_relay_message(msg)
         else frozenset()))
-    if not found and not sent:
+    events = sorted(changed_event_ids(steps))
+    if not found and not sent and not events:
         return None
     old = ledger if isinstance(ledger, Mapping) else {}
     ids = [str(i) for i in (old.get("ids") or []) if isinstance(i, str)]
     sent_ids = [str(i) for i in (old.get("sent") or []) if isinstance(i, str)]
-    have, have_sent = set(ids), set(sent_ids)
+    event_ids = [str(i) for i in (old.get("events") or []) if isinstance(i, str)]
+    have, have_sent, have_events = set(ids), set(sent_ids), set(event_ids)
     new_ids = [i for i in dict.fromkeys(found) if i not in have]
     new_sent = [i for i in sent if i not in have_sent]
-    if not new_ids and not new_sent:
+    new_events = [i for i in events if i not in have_events]
+    if not new_ids and not new_sent and not new_events:
         return None
-    return {"ids": (ids + new_ids)[-_LEDGER_IDS:], "sent": (sent_ids + new_sent)[-_LEDGER_SENT:]}
+    updated = {"ids": (ids + new_ids)[-_LEDGER_IDS:], "sent": (sent_ids + new_sent)[-_LEDGER_SENT:]}
+    if event_ids or new_events:
+        updated["events"] = (event_ids + new_events)[-_LEDGER_SENT:]
+    return updated
 
 
 def ledger_with_all(
@@ -883,6 +1255,13 @@ def ledger_sent_ids(ledger: Any) -> frozenset[str]:
     if not isinstance(ledger, Mapping):
         return frozenset()
     return frozenset(str(i) for i in (ledger.get("sent") or []) if isinstance(i, str))
+
+
+def ledger_event_ids(ledger: Any) -> frozenset[str]:
+    """The event IDs earlier calendar changes returned, as the ledger kept them."""
+    if not isinstance(ledger, Mapping):
+        return frozenset()
+    return frozenset(str(i) for i in (ledger.get("events") or []) if isinstance(i, str))
 
 
 # ── Narrated lookups ─────────────────────────────────────────────────
@@ -1214,6 +1593,12 @@ class TurnFacts:
     recent_mail: bool = False
     # The mail tools this turn offers: none, no mail check.
     mail_tools: frozenset[str] = MAIL_TOOLS
+    # Event IDs earlier calendar changes returned (the ledger's), a calendar
+    # tool ran in the last few turns, and the calendar tools this turn
+    # offers: none, no calendar check.
+    event_ids: frozenset[str] = frozenset()
+    recent_calendar: bool = False
+    calendar_tools: frozenset[str] = CALENDAR_TOOLS
     # Everything the model could have read an ID in (tool results, people's
     # and automated messages, lane notes, summaries, the request it was sent,
     # the ID ledger); never its own words, a rejected reply or a corrective.
@@ -1228,12 +1613,13 @@ class TurnFacts:
 @dataclass(frozen=True)
 class Verdict:
     """:func:`judge_reply`'s answer. ``kinds`` is empty for a reply that may
-    ship; ``claim_lines`` are the lines that report an email as sent (true or
-    not), for the checks that run after this one."""
+    ship; ``claim_lines`` are the lines that report an email as sent or a
+    calendar change (true or not), for the checks that run after this one."""
 
     kinds: tuple[str, ...] = ()
     claim_lines: frozenset[int] = frozenset()
     refused: str = ""
+    calendar_refused: str = ""
     narrated: tuple[str, ...] = ()
     fabricated: tuple[str, ...] = ()
     corrective: str = ""
@@ -1251,6 +1637,9 @@ class Verdict:
 
 MAIL_BACKSTOP = "Note: no email was sent in this turn."
 MAIL_BACKSTOP_REFUSED = "Note: no email was sent in this turn — the send was refused."
+CALENDAR_BACKSTOP = "Note: no calendar event was created or changed in this turn."
+CALENDAR_BACKSTOP_REFUSED = ("Note: no calendar event was created or changed in this turn — the "
+                             "change was refused.")
 LOOKUP_BACKSTOP = "Note: the searches and checks described above did not run."
 _ID_BACKSTOP_TAIL = " returned by any tool."
 # The lookups a corrective may point at, read-only, when the turn offers them.
@@ -1273,8 +1662,8 @@ _QUOTE_CHARS = 200
 def has_backstop(text: str) -> bool:
     """Whether *text* already carries a backstop line."""
     text = text or ""
-    return (MAIL_BACKSTOP.rstrip(".") in text or LOOKUP_BACKSTOP in text
-            or (_ID_BACKSTOP_TAIL in text and "Note: `" in text))
+    return (MAIL_BACKSTOP.rstrip(".") in text or CALENDAR_BACKSTOP.rstrip(".") in text
+            or LOOKUP_BACKSTOP in text or (_ID_BACKSTOP_TAIL in text and "Note: `" in text))
 
 
 def _quote(text: str) -> str:
@@ -1320,6 +1709,27 @@ def mail_corrective(refused: str = "", earlier_send: bool = False) -> str:
     return ("Your reply says an email was sent, but no send ran in this turn, so nothing was "
             "sent. Rewrite your reply so it is true — don't claim a send, a Message ID, a search "
             "or a check that didn't happen.")
+
+
+def calendar_corrective(refused: str = "", earlier_change: bool = False) -> str:
+    """What the model is told about a reply that says the calendar changed
+    when it did not. Like the mail one, it asks for a true reply, never for
+    the change. *earlier_change*: the session holds a real change, which the
+    reply may be about."""
+    if refused:
+        return ("Your reply says a calendar event was created or changed, but the calendar change "
+                "in this turn did not go through — the tool answered: "
+                f'"{_first_sentence(refused)}" Nothing changed in the calendar. Rewrite your reply '
+                "so it is true: say plainly that it was not done, and why.")
+    if earlier_change:
+        return ("Your reply says a calendar event was created or changed, but no calendar change "
+                "ran in this turn. A change made in an earlier turn may be reported only with the "
+                "event ID its result returned; otherwise don't claim an event, an invitation, an "
+                "event ID or a check that didn't happen.")
+    return ("Your reply says a calendar event was created or changed, but no calendar change ran "
+            "in this turn, so nothing was created, changed or sent. Rewrite your reply so it is "
+            "true — don't claim an event, an invitation, an event ID or a check that didn't "
+            "happen.")
 
 
 def lookup_corrective(narrated: Sequence[str], tools: Iterable[str] = ()) -> str:
@@ -1392,18 +1802,56 @@ def _mail_claim(
     return lines, True, turn_refused_send(steps), bool(proven)
 
 
+def _calendar_claim(
+    reply: str, request: str, facts: TurnFacts,
+) -> tuple[frozenset[int], bool, str, bool]:
+    """(the lines that report a calendar change, whether the report is
+    false, the refusal of this turn's change, whether the session holds a
+    real change) — see :func:`judge_reply`."""
+    if not facts.calendar_tools or not reply.strip():
+        return frozenset(), False, "", False
+    steps = facts.turn_steps
+    # Something else was done (a draft, a file, a hand-off): a headline
+    # "Created —" is about that; only a line naming the event counts.
+    strict = any(_acts_off_calendar(s) for s in steps)
+    claims = _find_calendar_claims(reply, request=request, recent=facts.recent_calendar,
+                                   strict=strict)
+    agents = [p for p in (_name_re(s.arguments.get("agent_name")) for s in steps if _is_handoff(s))
+              if p]
+    if agents:
+        reply_lines = reply.split("\n")
+        claims = [c for c in claims if not any(p.search(reply_lines[c.line_index]) for p in agents)]
+    # An email out this turn may be the meeting request the reply says went.
+    if turn_sent_mail(steps):
+        claims = [c for c in claims if not c.send]
+    lines = frozenset(c.line_index for c in claims)
+    claims = [c for c in claims if not c.earlier]
+    if not claims or _USER_CAL_RE.search(request) or turn_changed_calendar(steps):
+        return lines, False, "", False
+    # An event ID a change returned (in any turn): the claim is about that
+    # event.
+    proven = changed_event_ids(facts.session_steps) | facts.event_ids
+    if any(_quotes_message_id(token, reply) for token in proven):
+        return lines, False, "", False
+    earlier = bool(proven) or any(s.ok for s in _calendar_writes(facts.session_steps))
+    return lines, True, turn_refused_calendar(steps), earlier
+
+
 def judge_reply(raw: str, reply: str, facts: TurnFacts) -> Verdict:
     """One decision for a reply, every check together.
 
     *raw* is the reply as the model wrote it, *reply* what would ship (the
     model-written lane notes cut): the ID check reads *raw* (a forged lane
-    note is where made-up IDs sat), the mail and lookup checks *reply*.
+    note is where made-up IDs sat), the mail, calendar and lookup checks
+    *reply*.
 
     False when *reply* says an email went out and none did this turn (nor a
     peer relayed one), unless it quotes a Message ID an earlier send returned
-    (not as a thread's);
-    when it narrates lookups in a turn that made no tool call (not on a how-to
-    question); when *raw* quotes an ID nothing the model was given held.
+    (not as a thread's); when it says the calendar changed and no calendar
+    change went through this turn, unless it quotes an event ID an earlier
+    change returned; when it narrates lookups in a turn that made no tool
+    call (not on a how-to question); when *raw* quotes an ID nothing the
+    model was given held.
 
     One corrective: the leading kind's, then one "Also:" sentence for each
     other kind. The backstop has a line per kind; an ID line names only IDs
@@ -1412,11 +1860,13 @@ def judge_reply(raw: str, reply: str, facts: TurnFacts) -> Verdict:
     raw, reply = str(raw or ""), str(reply or "")
     request = strip_automated_prefix(facts.request or "")
     lines, mail_false, refused, earlier_send = _mail_claim(reply, request, facts)
+    cal_lines, cal_false, cal_refused, earlier_change = _calendar_claim(reply, request, facts)
+    lines |= cal_lines
     narrated = (narrated_lookups(reply, has_pasted_content(request))
                 if facts.no_tool_call and not _HOW_TO_RE.match(request) else ())
     fabricated = () if facts.known is None else fabricated_ids(raw, facts.known, request)
     kinds = tuple(kind for kind, on in (
-        (MAIL_CLAIM, mail_false), (NARRATED_LOOKUP, bool(narrated)),
+        (MAIL_CLAIM, mail_false), (CALENDAR_CLAIM, cal_false), (NARRATED_LOOKUP, bool(narrated)),
         (FABRICATED_ID, bool(fabricated)),
     ) if on)
     if not kinds:
@@ -1426,6 +1876,17 @@ def judge_reply(raw: str, reply: str, facts: TurnFacts) -> Verdict:
     if mail_false:
         parts.append(mail_corrective(refused, earlier_send))
         backstop.append(MAIL_BACKSTOP_REFUSED if refused else MAIL_BACKSTOP)
+    if cal_false:
+        if not parts:
+            parts.append(calendar_corrective(cal_refused, earlier_change))
+        elif cal_refused:
+            parts.append("Also: your reply says the calendar changed, but the calendar change in "
+                         "this turn did not go through — the tool answered: "
+                         f'"{_first_sentence(cal_refused)}" Say so plainly.')
+        else:
+            parts.append("Also: your reply says a calendar event was created or changed, but no "
+                         "calendar change ran in this turn — don't claim one.")
+        backstop.append(CALENDAR_BACKSTOP_REFUSED if cal_refused else CALENDAR_BACKSTOP)
     if narrated:
         parts.append(lookup_corrective(narrated, facts.tools) if not parts else
                      f"Also: your reply describes lookups ({_lookup_quotes(narrated)}) that never "
@@ -1439,8 +1900,9 @@ def judge_reply(raw: str, reply: str, facts: TurnFacts) -> Verdict:
         if shipped:
             backstop.append(id_backstop(shipped))
     return Verdict(
-        kinds=kinds, claim_lines=lines, refused=refused, narrated=narrated,
-        fabricated=fabricated, corrective=" ".join(parts), backstop="\n".join(backstop),
+        kinds=kinds, claim_lines=lines, refused=refused, calendar_refused=cal_refused,
+        narrated=narrated, fabricated=fabricated, corrective=" ".join(parts),
+        backstop="\n".join(backstop),
     )
 
 

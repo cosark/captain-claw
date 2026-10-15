@@ -9,7 +9,7 @@ validation have been moved to ``AgentCompletionMixin``.
 
 import asyncio
 import json
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 
 from captain_claw.agent_scale_detection_mixin import _build_scale_advisory
 from captain_claw.agent_stuck import (
@@ -852,11 +852,26 @@ class AgentOrchestrationMixin:
 
     @staticmethod
     def _claims_send(text: str, user_input: str, offered: frozenset[str]) -> bool:
-        """Text written next to tool calls reads as a send claim: it is held
-        until the calls answer and judged then (:meth:`_settle_held_claim`),
-        when they are stored and count as this turn's mail."""
-        return bool(text and offered & fabrication_guard.MAIL_TOOLS
-                    and fabrication_guard.claims_mail_sent(text, user_input, True))
+        """Text written next to tool calls reads as a send claim or a calendar
+        change: it is held until the calls answer and judged then
+        (:meth:`_settle_held_claim`), when they are stored and count as this
+        turn's mail and calendar work."""
+        if not text:
+            return False
+        return bool(
+            (offered & fabrication_guard.MAIL_TOOLS
+             and fabrication_guard.claims_mail_sent(text, user_input, True))
+            or (fabrication_guard.calendar_tools_in(offered)
+                and fabrication_guard.claims_calendar_change(text, user_input, True))
+        )
+
+    def _recent_tool_use(self, used: Callable[[str], bool]) -> bool:
+        """A tool *used* names ran in the last few turns."""
+        return any(
+            used(str(_tc.get("name") or (_tc.get("function") or {}).get("name", "")))
+            for _m in (self.session.messages if self.session else [])[-40:]
+            for _tc in (_m.get("tool_calls") or [])
+        )
 
     def _judge_reply(
         self, raw: str, text: str, turn_start_idx: int, user_input: str,
@@ -867,7 +882,7 @@ class AgentOrchestrationMixin:
         *text* as it would ship, *offered* the tools this turn offers. *held*:
         text written next to tool calls — only its mail claim is judged."""
         if held and not self._claims_send(text, user_input, offered):
-            return fabrication_guard.Verdict()   # no send claimed: nothing to hold
+            return fabrication_guard.Verdict()   # nothing claimed: nothing to hold
         messages = self.session.messages if self.session else []
         turn = getattr(self, "_turn_origin", None)
         facts = fabrication_guard.TurnFacts(
@@ -877,13 +892,11 @@ class AgentOrchestrationMixin:
             sent_ids=fabrication_guard.ledger_sent_ids(self._id_ledger()),
             relayed=tuple(str(msg.get("content") or "") for msg in messages
                           if fabrication_guard.is_relay_message(msg)),
-            recent_mail=any(
-                (_tc.get("name") or (_tc.get("function") or {}).get("name", ""))
-                in fabrication_guard.MAIL_TOOLS
-                for _m in messages[-40:]
-                for _tc in (_m.get("tool_calls") or [])
-            ),
+            recent_mail=self._recent_tool_use(fabrication_guard.MAIL_TOOLS.__contains__),
             mail_tools=offered & fabrication_guard.MAIL_TOOLS,
+            event_ids=fabrication_guard.ledger_event_ids(self._id_ledger()),
+            recent_calendar=self._recent_tool_use(fabrication_guard.is_calendar_tool),
+            calendar_tools=fabrication_guard.calendar_tools_in(offered),
             # A turn offered no tool is not judged for IDs or lookups.
             known=tuple(self._outside_texts()) if offered and not held else None,
             # A delegated result carries another agent's lookups.
@@ -916,6 +929,7 @@ class AgentOrchestrationMixin:
             kinds=",".join(verdict.kinds),
             backstop=self._fabrication_retry_count >= MAX_FABRICATION_RETRIES,
             refused=bool(verdict.refused),
+            calendar_refused=bool(verdict.calendar_refused),
             narrated=list(verdict.narrated),
             made_up_ids=list(verdict.fabricated),
             preview=text[:160],
@@ -2436,10 +2450,11 @@ class AgentOrchestrationMixin:
                 log.info("Tool calls detected", count=len(response.tool_calls), calls=response.tool_calls)
                 # Capture intermediate text emitted alongside tool calls.
                 _tc_text = str(response.content or "").strip()
-                # A send claimed next to other calls ("**Sent** to Roger.
-                # Adding the blocker." + a calendar call) is judged once the
-                # calls have answered; until then it is not narrated, folded
-                # into the answer or stored with the calls.
+                # A send or a calendar change claimed next to other calls
+                # ("**Sent** to Roger. Adding the blocker." + a calendar call,
+                # "Created — Tue 17:20. Verifying it landed." + a lookup) is
+                # judged once the calls have answered; until then it is not
+                # narrated, folded into the answer or stored with the calls.
                 _held_claim = (_tc_text if self._claims_send(_tc_text, user_input, _offered_tools)
                                else "")
                 if _tc_text and not _held_claim:
@@ -3192,8 +3207,10 @@ class AgentOrchestrationMixin:
                     response.content = _without_lane_note
             _stall_resp_text = str(response.content or "")
             # ── Made-up tool work gate ────────────────────────────
-            # The reply says an email went out, but none did this turn; quotes
-            # a mail / calendar / drive ID no tool returned (read on the raw
+            # The reply says an email went out, but none did this turn; says
+            # the calendar changed ("Meeting request sent to Borjan", "Created
+            # — Tue 17:20"), but no calendar change went through; quotes a
+            # mail / calendar / drive ID no tool returned (read on the raw
             # reply); or, in a turn that made no tool call, narrates lookups
             # ("Searching for the thread…", "Checked the calendar —"). A weak
             # model answers "**Sent** to …" — often with an invented ID —
@@ -3201,8 +3218,8 @@ class AgentOrchestrationMixin:
             # exemption below: a long false reply is still false. One budget
             # for every kind, apart from the stall one; the false reply is
             # stored as rejected so later turns never replay it as an example.
-            # The corrective only asks for a true reply — never a send — and
-            # no tool_choice is forced.
+            # The corrective only asks for a true reply — never a send or a
+            # calendar change — and no tool_choice is forced.
             _fab_verdict = fabrication_guard.Verdict()
             if not response.tool_calls:
                 _fab_verdict = self._judge_reply(
@@ -3232,11 +3249,12 @@ class AgentOrchestrationMixin:
                 str(k).split("|", 1)[0] in ("flight_deck", "consult_peer")
                 for k in getattr(self, "_turn_tool_call_counts", {})
             )
-            # Lines that report an email are the gate's above: the delegation
-            # corrective would point the model at flight_deck. When the
-            # request itself asks for a hand-off, a line is the email's only
-            # if it names mail itself ("Poslao sam mail Ani", not "Poslao sam
-            # zadatak Researcheru").
+            # Lines that report an email or a calendar change are the gate's
+            # above: the delegation corrective would point the model at
+            # flight_deck. When the request itself asks for a hand-off, a line
+            # is the gate's only if it names mail or the calendar itself
+            # ("Poslao sam mail Ani", "Poslao sam pozivnicu Ani", not "Poslao
+            # sam zadatak Researcheru").
             _handoff_asked = _claims_delegation(user_input)
             _false_claim = (
                 not response.tool_calls
@@ -3244,7 +3262,8 @@ class AgentOrchestrationMixin:
                 and _claims_delegation("\n".join(
                     _line for _i, _line in enumerate(_stall_resp_text.split("\n"))
                     if _i not in _fab_verdict.claim_lines or (
-                        _handoff_asked and not fabrication_guard.claims_mail_sent(_line))
+                        _handoff_asked and not fabrication_guard.claims_mail_sent(_line)
+                        and not fabrication_guard.claims_calendar_change(_line))
                 ))
             )
             # False web-research claim: the reply says it searched/fetched the

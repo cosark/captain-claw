@@ -455,7 +455,8 @@ def _correctives(agent: Agent, detail: str | None = None) -> list[dict]:
     found = [m for m in agent.session.messages
              if m["role"] == "user" and m.get("origin") == "corrective"
              and m.get("origin_detail") in (
-                 (detail,) if detail else ("false_mail_send", "narrated_lookup", "fabricated_id"))]
+                 (detail,) if detail else ("false_mail_send", "false_calendar_change",
+                                           "narrated_lookup", "fabricated_id"))]
     for m in found:
         own = re.sub(r'the tool answered: ".*?" Nothing was sent\.', "", m["content"])
         assert not _SEND_INVITE_RE.search(own), m["content"]
@@ -1720,3 +1721,243 @@ async def test_a_follow_up_quoting_the_threads_id_is_no_send(_human_turn):
 
     assert mail.actions == ["send"] and result.startswith("Not sent yet")
     assert len(_mail_correctives(agent)) == 1
+
+
+# ── Calendar changes nobody made ─────────────────────────────────────
+#
+# The glasses WhatsApp chat (15 Oct): asked to send Borjan a meeting request,
+# the agent looked at the calendar and answered "Meeting request sent to
+# Borjan — …" without create_event; told it wasn't there, it answered
+# "Created — …" without create_event again.
+
+_CAL_EVENT = "7kckj90fikf1br4vb7bak9r56c"
+_CAL_CORRECTIVE_LEAD = ("Your reply says a calendar event was created or changed, but no calendar "
+                        "change ran in this turn")
+
+
+class _StubCalendarTool(Tool):
+    """google_calendar that records its calls and answers like the real tool."""
+
+    name = "google_calendar"
+    description = "Google Calendar"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string"},
+            "summary": {"type": "string"},
+            "start": {"type": "string"},
+            "attendees": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["action"],
+    }
+
+    def __init__(self, *, refusal: str = ""):
+        self.actions: list[str] = []
+        self.refusal = refusal
+
+    async def execute(self, action: str = "", **kwargs: Any) -> ToolResult:
+        self.actions.append(action)
+        if action == "create_event" and self.refusal:
+            return ToolResult(success=False, error=self.refusal)
+        if action == "create_event":
+            return ToolResult(success=True, content=(
+                f"Created event 'Borjan' on Google Calendar.\n  ID: {_CAL_EVENT}\n"
+                "  When: 2026-10-20 17:20 → 18:20"))
+        if action in ("list_events", "search_events"):
+            return ToolResult(success=True, content=(
+                "2026-10-20 16:00 → 17:00  Luka Radičević call\n  ID: q3vb81kd4m5n6p7r8s9t0u1v2a"))
+        return ToolResult(success=True, content="ok")
+
+
+def _calendar_agent(responses: list[LLMResponse], tool: _StubCalendarTool | None = None):
+    agent, provider, mail = _mail_agent(responses)
+    calendar = tool or _StubCalendarTool()
+    agent.tools.register(calendar)
+    return agent, provider, calendar
+
+
+def _create_call(call_id: str = "e1", content: str = "") -> LLMResponse:
+    return LLMResponse(content=content, tool_calls=[ToolCall(
+        id=call_id, name="google_calendar",
+        arguments={"action": "create_event", "summary": "Borjan", "start": "2026-10-20T17:20",
+                   "attendees": ["borjan@building.hr"]})])
+
+
+_CALENDAR_TURNS = [
+    ("Tue 17:20, sent him MR, 1h, Esplanade",
+     "Meeting request sent to Borjan — Tue 20 Oct, 17:20–18:20, Esplanade Zagreb.\n\nFits: the "
+     "Luka Radičević call ends 17:00. He's invited and notified."),
+    ("Borjan - that's not created",
+     "Creating it now — and verifying.\n\nCreated — Tue 20 Oct, 17:20–18:20, Esplanade Zagreb "
+     "Hotel.\n\nBorjan Jevrić (borjan@building.hr) is an attendee; he's notified."),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_text, reply", _CALENDAR_TURNS)
+async def test_the_production_false_calendar_changes_get_one_corrective(
+        _human_turn, request_text, reply):
+    done = f"Created — Tue 20 Oct, 17:20–18:20 (ID {_CAL_EVENT}); Borjan is on it."
+    agent, provider, calendar = _calendar_agent([
+        _call("google_calendar", action="list_events"),
+        LLMResponse(content=reply),
+        _create_call(),
+        LLMResponse(content=done),
+    ])
+
+    result = await agent.complete(request_text)
+
+    assert calendar.actions == ["list_events", "create_event"]
+    assert result.startswith(done)
+    assert len(provider.calls) == 4
+    correctives = _correctives(agent)
+    assert [m["origin_detail"] for m in correctives] == ["false_calendar_change"]
+    assert correctives[0]["content"].startswith(_CAL_CORRECTIVE_LEAD)
+    assert "create_event" not in correctives[0]["content"]
+    # The reply as written is stored as rejected, never replayed later.
+    rejected = _by_detail(agent, "false_calendar_change", "assistant")
+    assert [m["content"] for m in rejected] == [reply] and rejected[0]["origin"] == "rejected"
+    assert getattr(provider, "_tool_choice_override", None) is None
+
+
+@pytest.mark.asyncio
+async def test_a_real_first_try_create_is_untouched(_human_turn):
+    reply = f"**Created** — Tue 20 Oct, 17:20–18:20, Esplanade (ID {_CAL_EVENT}). Borjan invited."
+    agent, provider, calendar = _calendar_agent([
+        _call("google_calendar", action="list_events"), _create_call(), LLMResponse(content=reply),
+    ])
+
+    result = await agent.complete("Tue 17:20, send him MR, 1h, Esplanade")
+
+    assert calendar.actions == ["list_events", "create_event"]
+    assert result.startswith(reply) and "no calendar event" not in result
+    assert len(provider.calls) == 3 and _correctives(agent) == []
+
+
+@pytest.mark.asyncio
+async def test_a_model_that_keeps_claiming_gets_the_calendar_backstop_line(_human_turn):
+    reply = "Created — Tue 20 Oct, 17:20–18:20, Esplanade."
+    agent, provider, calendar = _calendar_agent([
+        _call("google_calendar", action="list_events")] + [LLMResponse(content=reply)] * 3)
+
+    result = await agent.complete("put Borjan in for Tue 17:20")
+
+    assert calendar.actions == ["list_events"]
+    assert result.startswith(reply)
+    assert result.rstrip().endswith("Note: no calendar event was created or changed in this turn.")
+    assert len(_correctives(agent, "false_calendar_change")) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_calendar_claim_next_to_a_lookup_is_held_and_checked(_human_turn):
+    claim = "Created — Tue 20 Oct, 17:20–18:20.\n\nVerifying it landed."
+    truthful = "Not created yet — Tue 17:20 is free. Want me to create it?"
+    agent, provider, calendar = _calendar_agent([
+        _call("google_calendar", content=claim, action="list_events"),
+        LLMResponse(content=truthful),
+    ])
+    narrated: list[str] = []
+    agent.narration_callback = lambda text, iteration: narrated.append(text)
+
+    result = await agent.complete("Borjan - that's not created")
+
+    assert calendar.actions == ["list_events"]
+    assert result.startswith(truthful) and "Verifying it landed" not in result
+    assert narrated == []
+    msgs = agent.session.messages
+    assert next(m for m in msgs if m.get("tool_calls"))["content"] == ""
+    result_at = next(i for i, m in enumerate(msgs) if m.get("tool_name") == "google_calendar")
+    rejected_at = next(i for i, m in enumerate(msgs) if m.get("origin") == "rejected")
+    assert msgs[rejected_at]["content"] == claim
+    assert result_at < rejected_at and msgs[rejected_at + 1].get("origin") == "corrective"
+    assert len(_correctives(agent, "false_calendar_change")) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_calendar_claim_next_to_its_own_create_stands_once_it_went_through(_human_turn):
+    claim = "Booked — Tue 20 Oct, 17:20 with Borjan."
+    agent, provider, calendar = _calendar_agent([
+        _create_call(content=claim),
+        LLMResponse(content=f"ID {_CAL_EVENT}."),
+    ])
+    narrated: list[str] = []
+    agent.narration_callback = lambda text, iteration: narrated.append(text)
+
+    await agent.complete("book Borjan Tue 17:20")
+
+    assert calendar.actions == ["create_event"]
+    assert narrated == [claim] and _correctives(agent) == []
+
+
+@pytest.mark.asyncio
+async def test_a_refused_create_gets_a_corrective_that_quotes_the_refusal(_human_turn):
+    refusal = "HTTP error: Client error '403 Forbidden' for url 'https://www.googleapis.com/x'"
+    agent, provider, calendar = _calendar_agent([
+        _create_call(),
+        LLMResponse(content="Invite sent to Borjan — Tue 17:20."),
+        LLMResponse(content="Not created — Google answered 403 Forbidden."),
+    ], tool=_StubCalendarTool(refusal=refusal))
+
+    result = await agent.complete("invite Borjan for Tue 17:20")
+
+    assert calendar.actions == ["create_event"]
+    assert result.startswith("Not created — Google answered 403 Forbidden.")
+    correctives = _correctives(agent, "false_calendar_change")
+    assert len(correctives) == 1
+    assert correctives[0]["content"].startswith(
+        "Your reply says a calendar event was created or changed, but the calendar change in this "
+        "turn did not go through — the tool answered: \"Error: HTTP error:")
+
+
+@pytest.mark.asyncio
+async def test_a_croatian_invite_claim_gets_the_calendar_corrective_not_the_delegation_one(
+        _human_turn):
+    agent, provider, calendar = _calendar_agent([
+        LLMResponse(content="Poslao sam pozivnicu Borjanu."),
+        _create_call(),
+        LLMResponse(content=f"Pozivnica je poslana Borjanu — ID {_CAL_EVENT}."),
+    ])
+
+    result = await agent.complete("pošalji Borjanu pozivnicu za utorak 17:20")
+
+    assert calendar.actions == ["create_event"]
+    assert result.startswith(f"Pozivnica je poslana Borjanu — ID {_CAL_EVENT}.")
+    correctives = [m["content"] for m in agent.session.messages
+                   if m["role"] == "user" and m.get("origin") == "corrective"]
+    assert len(correctives) == 1 and correctives[0].startswith(_CAL_CORRECTIVE_LEAD)
+
+
+@pytest.mark.asyncio
+async def test_a_calendar_digest_is_not_a_change_claim(_human_turn):
+    reply = ("Tomorrow:\n- 10:00 IC\n- Acme sync moved to 15:00 (Ana's change)\n- 9:00 stand-up "
+             "cancelled\n\nThe meeting with Borjan is scheduled for Tue 17:20.")
+    agent, provider, calendar = _calendar_agent([
+        _call("google_calendar", action="list_events"), LLMResponse(content=reply),
+    ])
+
+    result = await agent.complete("what's on my calendar tomorrow?")
+
+    assert result.startswith(reply) and len(provider.calls) == 2 and _correctives(agent) == []
+
+
+@pytest.mark.asyncio
+async def test_an_event_a_compaction_dropped_still_backs_its_id(_human_turn):
+    from captain_claw.fabrication_guard import ID_LEDGER_KEY, ledger_event_ids
+
+    reply = f"Yes — created Tue 20 Oct 17:20 (ID {_CAL_EVENT})."
+    agent, provider, calendar = _calendar_agent([
+        _create_call(), LLMResponse(content="Booked."), LLMResponse(content=reply),
+    ])
+    await agent.complete("book Borjan Tue 17:20")
+    ledger = agent.session.metadata.get(ID_LEDGER_KEY)
+    assert ledger_event_ids(ledger) == {_CAL_EVENT}
+    # Compaction: the tool result is gone; the ledger keeps the change.
+    agent.session.messages = [{
+        "role": "assistant", "content": "Conversation summary of earlier messages (compacted "
+        "memory):\nBorjan booked for Tue.", "tool_name": "compaction_summary",
+        "origin": "system_note", "origin_detail": "compaction",
+    }]
+
+    result = await agent.complete("did you actually create it?")
+
+    assert result.startswith(reply) and _correctives(agent) == []
