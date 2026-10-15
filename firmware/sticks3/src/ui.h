@@ -20,7 +20,9 @@ void setBar(const String& agent, const char* state, uint32_t stateColor);
 
 // Conversation views.
 void showListening(int level, uint32_t elapsedMs);
-void showThinking(const String& heard, const String& status);
+// While the agent works: what it heard, its latest activity lines (oldest
+// first), and the last narration / phase line at the bottom.
+void showWorking(const String& heard, const std::vector<String>& activity, const String& status);
 void setReply(const String& text);  // wraps into pages, shows page 1
 void showReply();                   // redraw the current page
 bool nextPage();                    // false when it wrapped back to page 1

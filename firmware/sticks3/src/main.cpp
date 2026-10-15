@@ -27,6 +27,10 @@ static bool wsUp = false;
 static Mode mode = Mode::Idle;
 static String agentName, agentSlug;
 static String heard, statusLine;
+static std::vector<String> activity;  // what the agent is doing, oldest first
+static int toolSteps = 0;
+static uint32_t workStartMs = 0;
+static bool workDirty = false;
 static uint32_t recStartMs = 0, lastActivityMs = 0, lastDrawMs = 0, pickerOpenedMs = 0;
 static bool dimmed = false, screenOff = false;
 static std::vector<String> pickNames, pickSlugs;
@@ -77,9 +81,27 @@ static void sendType(const char* type) {
   sendJson(d);
 }
 
+// "working 12s · 3 steps" while the agent runs.
+static const char* workLabel() {
+  static char buf[32];
+  uint32_t secs = (millis() - workStartMs) / 1000;
+  if (toolSteps) {
+    snprintf(buf, sizeof(buf), "%lus · %d step%s", (unsigned long)secs, toolSteps, toolSteps == 1 ? "" : "s");
+  } else {
+    snprintf(buf, sizeof(buf), "working %lus", (unsigned long)secs);
+  }
+  return buf;
+}
+
+static void startWork() {
+  activity.clear();
+  toolSteps = 0;
+  workStartMs = millis();
+}
+
 static void setBarState() {
   const char* st = !wsUp ? "offline" : audio::playing() ? "speaking"
-                 : mode == Mode::Listening ? "listening" : mode == Mode::Waiting ? "…" : "ready";
+                 : mode == Mode::Listening ? "listening" : mode == Mode::Waiting ? workLabel() : "ready";
   uint32_t col = !wsUp ? TFT_RED : mode == Mode::Listening ? TFT_RED
                : audio::playing() ? TFT_CYAN : TFT_GREEN;
   ui::setBar(agentName, st, col);
@@ -89,7 +111,7 @@ static void redraw() {
   setBarState();
   switch (mode) {
     case Mode::Listening: ui::showListening(0, millis() - recStartMs); break;
-    case Mode::Waiting: ui::showThinking(heard, statusLine); break;
+    case Mode::Waiting: ui::showWorking(heard, activity, statusLine); break;
     case Mode::Reply: ui::showReply(); break;
     case Mode::Image: ui::showStoredImage(); break;
     case Mode::Picker: ui::showPicker(pickNames, pickSel, pickCur); break;
@@ -138,6 +160,7 @@ static void stopTalking(bool send) {
   if (send) {
     heard = "";
     statusLine = "Transcribing…";
+    startWork();
     mode = Mode::Waiting;
   } else {
     mode = ui::hasReply() ? Mode::Reply : Mode::Idle;
@@ -178,7 +201,10 @@ static void onText(const char* payload, size_t len) {
       statusLine = "Transcribing…";
     } else if (st == "thinking") {
       statusLine = "Thinking…";
-      if (mode != Mode::Waiting && mode != Mode::Listening) mode = Mode::Waiting;
+      if (mode != Mode::Waiting && mode != Mode::Listening) {
+        startWork();  // a typed or resent turn: no recording came first
+        mode = Mode::Waiting;
+      }
     } else if (st == "ready" && mode == Mode::Waiting) {
       mode = ui::hasReply() ? Mode::Reply : Mode::Idle;
     }
@@ -186,10 +212,19 @@ static void onText(const char* payload, size_t len) {
   } else if (type == "transcript") {
     heard = doc["text"] | "";
     statusLine = "Thinking…";
-    if (mode == Mode::Waiting) redraw();
+    workDirty = true;
   } else if (type == "status") {
     statusLine = doc["text"] | "";
-    if (mode == Mode::Waiting) redraw();
+    workDirty = true;
+  } else if (type == "activity") {
+    String line = doc["text"] | "";
+    String tool = doc["tool"] | "";
+    if (line.length()) {
+      activity.push_back(line);
+      if (activity.size() > 8) activity.erase(activity.begin());
+      if (tool.length() && tool != "progress") ++toolSteps;
+      workDirty = true;
+    }
   } else if (type == "reply") {
     touch();
     String text = doc["text"] | "";
@@ -489,6 +524,16 @@ void loop() {
       ui::showListening(level, millis() - recStartMs);
     }
     if (millis() - recStartMs > 110000) stopTalking(true);  // the server caps at 120 s
+  }
+  if (mode == Mode::Waiting) {
+    static uint32_t lastSecond = 0;
+    uint32_t secs = (millis() - workStartMs) / 1000;
+    if ((workDirty && millis() - lastDrawMs > 150) || secs != lastSecond) {
+      lastSecond = secs;
+      lastDrawMs = millis();
+      workDirty = false;
+      redraw();
+    }
   }
   bool wasPlaying = audio::playing();
   audio::playPoll();

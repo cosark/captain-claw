@@ -26,6 +26,7 @@ Flight Deck → device
   text  {"type":"state","state":"connected|transcribing|thinking|ready"}
   text  {"type":"transcript","text":"…"}         what it heard
   text  {"type":"status","text":"…"}             progress narration
+  text  {"type":"activity","text":"…","tool":"…"} what the agent is doing (tools, LLM calls)
   text  {"type":"reply","text":"…","proactive":bool}
   text  {"type":"audio_start","rate":24000} … {"type":"audio_end"}
   bin   0x01 + PCM s16le mono                    audio chunks between those two
@@ -143,6 +144,20 @@ def screen_text(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", out).strip()
 
 
+# Emoji and symbol marks the device font can't draw (agent activity uses a few).
+_NO_GLYPH = re.compile("[\U0001F000-\U0001FFFF\u2600-\u27BF\uFE0F\u200D]")
+# Runtime statuses that are turn bookkeeping, not activity worth showing.
+_QUIET_STATUSES = {"", "thinking", "ready", "idle", "done", "completed", "agent_connected",
+                   "agent_reconnecting", "subscribed"}
+
+
+def activity_text(text: str, limit: int = 120) -> str:
+    """An activity line as the device shows it: one line, no emoji, "…"."""
+    out = _NO_GLYPH.sub("", str(text or "")).replace("\n", " ")
+    out = re.sub(r"\.\.\.$", "…", re.sub(r"\s{2,}", " ", out).strip())
+    return out[:limit]
+
+
 def fit_jpeg(blob: bytes, width: int, height: int, quality: int = 85,
              max_bytes: int = MAX_JPEG_BYTES) -> bytes:
     """Any picture as a baseline JPEG of exactly width×height (letterboxed on
@@ -248,6 +263,7 @@ class _DeviceConn:
         # A device turn is open from our send until the agent says "ready".
         self.pending = False
         self.last_reply_at = 0.0
+        self._last_activity = ""
         self._audio_q: asyncio.Queue = asyncio.Queue()
         self._audio_task: asyncio.Task | None = None
         self._audio_worker: asyncio.Task | None = None
@@ -315,8 +331,15 @@ class _DeviceConn:
         elif etype == "narration":
             if self.pending and ev.get("text"):
                 await self.send_json({"type": "status", "text": str(ev["text"])[:200]})
+        elif etype == "activity":
+            if self.pending and ev.get("phase") != "done":
+                await self._send_activity(str(ev.get("text", "")), str(ev.get("tool", "")))
         elif etype == "status":
             status = str(ev.get("status", ""))
+            # "Using <tool>..." duplicates the tool's activity line (which says more).
+            tool_start = status.startswith("Using ") and status.endswith("...")
+            if self.pending and status.strip().lower() not in _QUIET_STATUSES and not tool_start:
+                await self._send_activity(status, "")
             if status == "thinking" and self.pending:
                 await self.send_json({"type": "state", "state": "thinking"})
             elif status == "ready" and self.pending:
@@ -341,6 +364,13 @@ class _DeviceConn:
                     self._spawn(self._send_image(item))
                 elif kind == "audio":
                     await self._audio_q.put(("file", item))
+
+    async def _send_activity(self, text: str, tool: str) -> None:
+        line = activity_text(text)
+        if not line or line == self._last_activity:
+            return
+        self._last_activity = line
+        await self.send_json({"type": "activity", "text": line, "tool": tool})
 
     # ── device → agent ──
     async def send_to_agent(self, text: str) -> None:
@@ -368,6 +398,7 @@ class _DeviceConn:
                 await self.send_json({"type": "error", "text": f"Send failed: {exc}"})
                 return
         self.pending = True
+        self._last_activity = ""
         await self.send_json({"type": "state", "state": "thinking"})
 
     async def finish_recording(self) -> None:
