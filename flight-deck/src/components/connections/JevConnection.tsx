@@ -305,6 +305,9 @@ export default function JevConnection() {
 
   const keySet = !!status?.key_set
   const deckScope = status?.scope === 'deck'
+  // The team key an admin shared, in use because this user has none of their own.
+  const teamKey = status?.source === 'shared'
+  const ownKey = keySet && !teamKey
 
   const onSave = async (e: FormEvent) => {
     e.preventDefault()
@@ -346,7 +349,9 @@ export default function JevConnection() {
     const ok = window.confirm(
       deckScope
         ? "Remove this deck's Jev API key?\n\nEvery agent, flow and MCP client on this deck loses Jev until a key is added again."
-        : 'Remove your Jev API key?\n\nYour agents, flows and MCP clients lose Jev until you add a key again.',
+        : status?.shared_available
+          ? 'Remove your Jev API key?\n\nYour agents, flows and MCP clients switch to the team key your admin shared.'
+          : 'Remove your Jev API key?\n\nYour agents, flows and MCP clients lose Jev until you add a key again.',
     )
     if (!ok) return
     setBusy('remove'); setNotice(null)
@@ -389,7 +394,7 @@ export default function JevConnection() {
   } else if (keySet) {
     statusPill = (
       <span className={`${pill} bg-emerald-500/15 text-emerald-600 dark:text-emerald-500 border-emerald-500/30`}>
-        <Check className="h-3 w-3" /> Connected
+        <Check className="h-3 w-3" /> Connected{teamKey ? ' · team key' : ''}
       </span>
     )
   } else {
@@ -464,7 +469,8 @@ export default function JevConnection() {
           <form onSubmit={onSave} className="space-y-2">
             <label htmlFor={keyId} className="block text-xs font-medium text-zinc-400">
               API key
-              {keySet && <span className="ml-2 text-[10px] text-emerald-600 dark:text-emerald-500">(saved)</span>}
+              {ownKey && <span className="ml-2 text-[10px] text-emerald-600 dark:text-emerald-500">(saved)</span>}
+              {teamKey && <span className="ml-2 text-[10px] text-emerald-600 dark:text-emerald-500">(team key shared by your admin)</span>}
             </label>
             <div className="relative">
               <input
@@ -473,9 +479,11 @@ export default function JevConnection() {
                 value={keyDraft}
                 onChange={(e) => setKeyDraft(e.target.value)}
                 placeholder={
-                  keySet
-                    ? `•••• saved (${status.key_hint || '····'}) — paste a new key to replace`
-                    : 'Paste your Jev API key'
+                  teamKey
+                    ? 'Using the team key — paste a key of your own to use it instead'
+                    : keySet
+                      ? `•••• saved (${status.key_hint || '····'}) — paste a new key to replace`
+                      : 'Paste your Jev API key'
                 }
                 autoComplete="off"
                 spellCheck={false}
@@ -515,7 +523,7 @@ export default function JevConnection() {
                   Test
                 </button>
               )}
-              {keySet && (
+              {ownKey && (
                 <button
                   type="button"
                   onClick={onRemove}
@@ -530,11 +538,11 @@ export default function JevConnection() {
 
             {keySet && (
               <div className="text-[11px] leading-snug text-zinc-500">
-                Key <code className="text-zinc-300">{status.key_hint || '····'}</code>
+                {teamKey ? 'Team key' : 'Key'} <code className="text-zinc-300">{status.key_hint || '····'}</code>
                 {status.verified === true
                   ? <> · verified{status.verified_at ? ` ${when(status.verified_at)}` : ''}</>
                   : status.verified === false && status.verify_error === 'refused'
-                    ? <> · <span className="text-red-600 dark:text-red-400">Jev refused it</span> — it may have been revoked; paste a new key above.</>
+                    ? <> · <span className="text-red-600 dark:text-red-400">Jev refused it</span> — it may have been revoked; {teamKey ? 'tell your admin, or paste a key of your own above.' : 'paste a new key above.'}</>
                     : status.verified === false
                       ? <> · not verified — Jev couldn't be reached to check it. Test checks it again.</>
                       : <> · not checked yet</>}
@@ -547,7 +555,11 @@ export default function JevConnection() {
             <div className="text-[11px] leading-snug text-zinc-500">
               {deckScope
                 ? "Sign-in is off on this deck, so the key belongs to the deck: every agent, flow and MCP client on it uses it."
-                : 'Your own key: your agents, flows and MCP clients use it. Every other Flight Deck user adds their own.'}{' '}
+                : teamKey
+                  ? 'Your admin shared a team key, so your agents, flows and MCP clients can use Jev without a key of your own. Save your own key to use it instead.'
+                  : status.shared_available
+                    ? 'Your own key: your agents, flows and MCP clients use it instead of the team key your admin shared.'
+                    : 'Your own key: your agents, flows and MCP clients use it. Every other Flight Deck user adds their own.'}{' '}
               Get one at{' '}
               <a
                 href="https://console.typesafe.ai/keys"

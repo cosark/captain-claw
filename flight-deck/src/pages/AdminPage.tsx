@@ -15,10 +15,27 @@ import {
   Save,
   Check,
   Bot,
+  Plug,
 } from 'lucide-react'
 import { useAuthStore } from '../stores/authStore'
 import { UserAgentsDialog } from '../components/agents/UserAgentsDialog'
 import { DeckProfileDefaults } from '../components/profile/DeckProfileDefaults'
+import { SharedTelegramBotAdmin } from '../components/admin/SharedTelegramBotAdmin'
+import { SharedCredentialsAdmin } from '../components/admin/SharedCredentialsAdmin'
+import { ADMIN_TAB_KEY } from '../services/sharedIntegrations'
+
+type AdminTab = 'users' | 'usage' | 'plans' | 'settings' | 'integrations'
+
+// Other pages may open Admin on a given tab (Connections → Telegram sends an
+// admin to Integrations, see ADMIN_TAB_KEY); otherwise it opens on Users.
+function takeRequestedTab(): AdminTab {
+  try {
+    const t = sessionStorage.getItem(ADMIN_TAB_KEY)
+    sessionStorage.removeItem(ADMIN_TAB_KEY)
+    if (t === 'usage' || t === 'plans' || t === 'settings' || t === 'integrations') return t
+  } catch { /* storage blocked */ }
+  return 'users'
+}
 
 // ── Types ──
 
@@ -543,7 +560,7 @@ function PlanCard({
 
 export function AdminPage() {
   const currentUser = useAuthStore((s) => s.user)
-  const [tab, setTab] = useState<'users' | 'usage' | 'plans' | 'settings'>('users')
+  const [tab, setTab] = useState<AdminTab>(takeRequestedTab)
   const [users, setUsers] = useState<UserInfo[]>([])
   const [totalUsers, setTotalUsers] = useState(0)
   const [plans, setPlans] = useState<Record<string, PlanLimits>>({})
@@ -556,6 +573,8 @@ export function AdminPage() {
   const [costRollup, setCostRollup] = useState<CostRollup | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  // Bumped by Refresh: the Integrations cards load on their own and reload on it.
+  const [refreshTick, setRefreshTick] = useState(0)
 
   const loadUsers = useCallback(async () => {
     try {
@@ -601,6 +620,7 @@ export function AdminPage() {
   }
 
   const refresh = () => {
+    setRefreshTick((t) => t + 1)
     setLoading(true)
     Promise.all([loadUsers(), loadUsage()]).finally(() => setLoading(false))
   }
@@ -683,6 +703,17 @@ export function AdminPage() {
           >
             <Settings2 className="h-4 w-4" />
             Settings
+          </button>
+          <button
+            onClick={() => setTab('integrations')}
+            className={`flex items-center gap-2 px-4 py-2.5 text-sm border-b-2 transition-colors ${
+              tab === 'integrations'
+                ? 'border-violet-500 text-zinc-100'
+                : 'border-transparent text-zinc-500 hover:text-zinc-300'
+            }`}
+          >
+            <Plug className="h-4 w-4" />
+            Integrations
           </button>
         </div>
 
@@ -883,6 +914,16 @@ export function AdminPage() {
             `loading`: it loads on its own, and a Refresh must not unmount it
             and drop a long unsaved draft. */}
         {tab === 'settings' && <DeckProfileDefaults />}
+
+        {/* Set up once, used by everyone: the team Telegram bot (with its
+            access requests) and the shared Google / Microsoft / Jev credentials.
+            They load on their own, like the profile defaults above. */}
+        {tab === 'integrations' && (
+          <div className="space-y-4">
+            <SharedTelegramBotAdmin refreshTick={refreshTick} />
+            <SharedCredentialsAdmin refreshTick={refreshTick} />
+          </div>
+        )}
 
         {/* Plans tab */}
         {!loading && tab === 'plans' && (

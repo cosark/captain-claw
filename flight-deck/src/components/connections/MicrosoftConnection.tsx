@@ -203,6 +203,13 @@ export default function MicrosoftConnection() {
           </div>
         )}
 
+        {/* The deck's client, set up once by an admin: nothing for this user to fill in. */}
+        {configured && !canManageClient && !connected && (
+          <div className="rounded-md border border-zinc-800 bg-zinc-950/50 px-3 py-2 text-xs text-zinc-400">
+            Your admin already set up Microsoft for everyone on this deck — no client ID or secret
+            needed. Press Connect and sign in with your own Microsoft account.
+          </div>
+        )}
         {!configured && !canManageClient && (
           <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-xs text-zinc-300">
             <div className="font-medium text-amber-600 mb-0.5">Microsoft isn't set up on this deck yet</div>

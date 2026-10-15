@@ -40,17 +40,45 @@ _TG_DISABLED_SESSION_SUBCMDS = frozenset({"list", "switch", "load"})
 # ── Lifecycle ────────────────────────────────────────────────────
 
 
+def _shared_bot_relay(server: WebServer) -> tuple[str, dict[str, str]] | None:
+    """Flight Deck's shared-bot relay for this agent — ``(api_base_url,
+    headers)`` — or None outside Flight Deck (or with ``telegram.shared_bot``
+    off). The relay speaks the Bot API, so the bridge and everything below run
+    unchanged; it only hands this agent its own owner's chats, and only once an
+    admin approved them (Connections → Telegram). Until then its polls stay empty."""
+    if not getattr(server.config.telegram, "shared_bot", True):
+        return None
+    from captain_claw import fd_client
+
+    base = fd_client.pinned_flight_deck_url()
+    if not base:
+        return None
+    headers = fd_client.agent_identity_headers(base)
+    if not headers.get("X-Agent-Auth"):
+        return None
+    return f"{base}/fd/telegram-relay", headers
+
+
 async def start_telegram(server: WebServer) -> None:
-    """Initialize and start Telegram polling + worker if configured."""
-    if not server._telegram_enabled:
-        return
+    """Initialize and start Telegram polling + worker if configured.
+
+    The agent's own bot when it has one (``telegram.enabled`` + a token);
+    otherwise, under Flight Deck, the deck's shared bot through FD's relay."""
     token = server.config.telegram.bot_token.strip()
-    if not token:
-        log.info("Telegram enabled but bot_token is empty; skipping in web mode.")
-        return
-    server._telegram_bridge = TelegramBridge(
-        token=token, api_base_url=server.config.telegram.api_base_url,
-    )
+    if server._telegram_enabled and token:
+        server._telegram_bridge = TelegramBridge(
+            token=token, api_base_url=server.config.telegram.api_base_url,
+        )
+    else:
+        relay = _shared_bot_relay(server)
+        if relay is None:
+            if server.config.telegram.enabled:
+                log.info("Telegram enabled but bot_token is empty; skipping in web mode.")
+            return
+        base, headers = relay
+        # The path's token is a placeholder: FD knows the agent by its headers.
+        server._telegram_bridge = TelegramBridge(token="shared", api_base_url=base, headers=headers)
+        server._telegram_relay = True
     if server.agent:
         server._approved_telegram_users = await _tg_load_state(
             server, "telegram_approved_users"
@@ -63,6 +91,9 @@ async def start_telegram(server: WebServer) -> None:
         await _tg_save_state(server)
     server._telegram_poll_task = asyncio.create_task(_telegram_poll_loop(server))
     server._telegram_worker_task = asyncio.create_task(_telegram_worker(server))
+    if getattr(server, "_telegram_relay", False):
+        log.info("Telegram: listening on Flight Deck's shared bot (relay).")
+        return
     log.info("Telegram bridge started in web mode (long polling).")
     print("  Telegram integration active (long polling).")
 
@@ -87,6 +118,7 @@ async def _telegram_poll_loop(server: WebServer) -> None:
     """Background Telegram long-polling loop."""
     assert server._telegram_bridge is not None
     poll_timeout = max(1, int(server.config.telegram.poll_timeout_seconds))
+    failures = 0
     while True:
         try:
             updates = await server._telegram_bridge.get_updates(
@@ -103,8 +135,18 @@ async def _telegram_poll_loop(server: WebServer) -> None:
         except asyncio.CancelledError:
             break
         except Exception as exc:
+            if getattr(server, "_telegram_relay", False):
+                # Flight Deck restarting, or this agent not (yet) known to it:
+                # back off quietly instead of logging every two seconds.
+                failures += 1
+                if failures in (1, 10) or failures % 100 == 0:
+                    log.warning("Shared Telegram relay unreachable", error=str(exc), attempts=failures)
+                await asyncio.sleep(min(60.0, 2.0 * failures))
+                continue
             log.error("Telegram poll error", error=str(exc))
             await asyncio.sleep(2.0)
+        else:
+            failures = 0
 
 
 async def _telegram_worker(server: WebServer) -> None:
@@ -248,9 +290,13 @@ async def _handle_telegram_message(server: WebServer, message: TelegramMessage) 
                 pass
 
         user_id_key = str(message.user_id)
-        if user_id_key not in server._approved_telegram_users:
-            await _tg_pair_unknown_user(server, message)
-            return
+        if not _tg_is_approved(server, user_id_key):
+            if not getattr(server, "_telegram_relay", False):
+                await _tg_pair_unknown_user(server, message)
+                return
+            await _tg_admit_relay_user(
+                server, message.user_id, message.chat_id, message.username, message.first_name,
+            )
 
         # Resolve per-user agent (creates on first use).
         user_agent = await _tg_get_or_create_agent(server, message)
@@ -451,8 +497,12 @@ async def _handle_telegram_callback_query(server: WebServer, cbq: TelegramCallba
 
     try:
         user_id_key = str(cbq.user_id)
-        if user_id_key not in server._approved_telegram_users:
-            return
+        if not _tg_is_approved(server, user_id_key):
+            if not getattr(server, "_telegram_relay", False):
+                return
+            await _tg_admit_relay_user(
+                server, cbq.user_id, cbq.chat_id, cbq.username, cbq.first_name,
+            )
 
         # Decode the action from callback_data.
         # We store a key like "ns:0", "ns:1", etc. and look up the full
@@ -1267,10 +1317,38 @@ def _tg_generate_pairing_token(server: WebServer) -> str:
             return token
 
 
+def _tg_is_approved(server: WebServer, user_id_key: str) -> bool:
+    """Approved to talk to this agent. Someone admitted through Flight Deck's
+    shared bot counts only there — never on a bot of the agent's own."""
+    info = server._approved_telegram_users.get(user_id_key)
+    if info is None:
+        return False
+    return getattr(server, "_telegram_relay", False) or info.get("via") != "shared_bot"
+
+
+async def _tg_admit_relay_user(
+    server: WebServer, user_id: int, chat_id: int, username: str, first_name: str,
+) -> None:
+    """Shared bot: Flight Deck relays only the chats an admin approved for this
+    agent's owner, so whoever reaches us through it is admitted without the
+    agent's own pairing step."""
+    server._approved_telegram_users[str(user_id)] = {
+        "user_id": int(user_id),
+        "chat_id": int(chat_id),
+        "username": str(username or "").strip(),
+        "first_name": str(first_name or "").strip(),
+        "approved_at": datetime.now(UTC).isoformat(),
+        "token": "",
+        "via": "shared_bot",
+    }
+    await _tg_save_state(server)
+    log.info("Telegram user admitted via Flight Deck's shared bot", user_id=user_id)
+
+
 async def _tg_pair_unknown_user(server: WebServer, message: TelegramMessage) -> None:
     _tg_cleanup_expired(server)
     user_id_key = str(message.user_id)
-    if user_id_key in server._approved_telegram_users:
+    if _tg_is_approved(server, user_id_key):
         return
     existing_token = ""
     for token, payload in server._pending_telegram_pairings.items():

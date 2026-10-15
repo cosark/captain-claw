@@ -1,5 +1,5 @@
 import { useState, type ComponentType, type ReactNode } from 'react'
-import { Plug, Mail, LayoutGrid, Sparkles, MessageCircle, Database, Scale } from 'lucide-react'
+import { Plug, Mail, LayoutGrid, Sparkles, MessageCircle, Database, Scale, Send } from 'lucide-react'
 import GoogleConnection from '../components/connections/GoogleConnection'
 import MicrosoftConnection from '../components/connections/MicrosoftConnection'
 import CodexConnection from '../components/connections/CodexConnection'
@@ -9,13 +9,15 @@ import MCPAgentAccess from '../components/connections/MCPAgentAccess'
 import TypesenseConnection from '../components/connections/TypesenseConnection'
 import WhatsAppNudgeConnection from '../components/connections/WhatsAppNudgeConnection'
 import JevConnection from '../components/connections/JevConnection'
+import TelegramConnection from '../components/connections/TelegramConnection'
+import type { MyTelegram } from '../services/sharedIntegrations'
 import { useGoogleAuthStore } from '../stores/googleAuthStore'
 import { useMicrosoftAuthStore } from '../stores/microsoftAuthStore'
 import { useCodexAuthStore } from '../stores/codexAuthStore'
 import { useMCPStore } from '../stores/mcpStore'
 import { useJevStore } from '../stores/jevStore'
 
-type TabId = 'google' | 'microsoft' | 'codex' | 'antigravity' | 'mcp' | 'jev' | 'whatsapp' | 'typesense'
+type TabId = 'google' | 'microsoft' | 'telegram' | 'codex' | 'antigravity' | 'mcp' | 'jev' | 'whatsapp' | 'typesense'
 
 interface TabDef {
   id: TabId
@@ -28,6 +30,8 @@ interface TabDef {
 const TABS: TabDef[] = [
   { id: 'google', label: 'Google', icon: Mail },
   { id: 'microsoft', label: 'Microsoft', icon: LayoutGrid },
+  // The deck's shared bot — a person's own link to it, so the kiosk shows it too.
+  { id: 'telegram', label: 'Telegram', icon: Send },
   { id: 'codex', label: 'ChatGPT', icon: Sparkles, deckOnly: true },
   { id: 'antigravity', label: 'Antigravity', icon: Sparkles, deckOnly: true },
   { id: 'mcp', label: 'MCP Servers', icon: Plug },
@@ -51,7 +55,7 @@ function saveTab(id: TabId): void {
 // A small dot on the tab for the connections whose state is already loaded:
 // green connected, amber configured but not connected (Google / Microsoft) or
 // a Jev key saved but not verified.
-function useTabDots(): Partial<Record<TabId, 'on' | 'pending'>> {
+function useTabDots(telegram: MyTelegram | null): Partial<Record<TabId, 'on' | 'pending'>> {
   const google = useGoogleAuthStore((s) => s.status)
   const microsoft = useMicrosoftAuthStore((s) => s.status)
   const codex = useCodexAuthStore((s) => s.status)
@@ -65,6 +69,9 @@ function useTabDots(): Partial<Record<TabId, 'on' | 'pending'>> {
     codex: codex?.connected && !codex.stale ? 'on' : undefined,
     mcp: mcpServers > 0 ? 'on' : undefined,
     jev: jev?.key_set ? (jev.verified === false ? 'pending' : 'on') : undefined,
+    telegram: telegram?.link && telegram.link.status !== 'rejected'
+      ? (telegram.link.status === 'approved' && telegram.link.linked ? 'on' : 'pending')
+      : undefined,
   }
 }
 
@@ -80,7 +87,8 @@ export default function ConnectionsPage({ kiosk = false }: { kiosk?: boolean }) 
     const saved = savedTab()
     return (tabs.find((t) => t.id === saved)?.id) ?? tabs[0].id
   })
-  const dots = useTabDots()
+  const [telegram, setTelegram] = useState<MyTelegram | null>(null)
+  const dots = useTabDots(telegram)
 
   const select = (id: TabId) => {
     setActive(id)
@@ -156,6 +164,7 @@ export default function ConnectionsPage({ kiosk = false }: { kiosk?: boolean }) 
 
         {panel('google', <GoogleConnection />)}
         {panel('microsoft', <MicrosoftConnection />)}
+        {panel('telegram', <TelegramConnection onStatus={setTelegram} />)}
         {panel('codex', <CodexConnection />)}
         {panel('antigravity', <AntigravityConnection />)}
         {panel('mcp', <><MCPConnection /><MCPAgentAccess /></>)}

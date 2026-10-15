@@ -830,6 +830,10 @@ class TelegramConfig(BaseModel):
     api_base_url: str = "https://api.telegram.org"
     poll_timeout_seconds: int = 25
     pairing_ttl_minutes: int = 30
+    # Under Flight Deck, an agent with no bot of its own answers its owner on
+    # the deck's shared team bot once an admin approved that (Connections →
+    # Telegram). Off: this agent never uses the shared bot.
+    shared_bot: bool = True
 
 
 class WhatsAppConfig(BaseModel):

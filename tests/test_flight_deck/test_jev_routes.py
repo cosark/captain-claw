@@ -185,7 +185,7 @@ class TestKey:
             "key_set": False, "key_hint": "", "verified": None, "verify_error": None,
             "verified_at": None,
             "updated_at": None, "models": [], "default_model": "jev-latest",
-            "auth_enabled": True, "scope": "user",
+            "auth_enabled": True, "scope": "user", "source": None, "shared_available": False,
         }
 
     async def test_save_verifies_and_status_never_returns_the_key(self, db, jev):
@@ -731,3 +731,85 @@ class TestMcp:
         result = self._call(c, headers, "jev_ask", {"state": "x", "questions": []})
         assert result["isError"] is True and "at least one question" in result["content"][0]["text"]
         assert jev.requests == []
+
+
+# ── the team key (an admin shares one key) ──────────────────────────
+
+
+async def _share(key=KEY_DECK):
+    from captain_claw.flight_deck.auth import get_db
+
+    await get_db().set_system_setting(jr._K_SHARED_KEY, key)
+    await get_db().set_system_setting(jr._K_SHARED_META, json.dumps({"verified": True}))
+
+
+class TestTeamKey:
+    async def test_admin_shares_a_key_that_users_without_their_own_use(self, db, jev):
+        c = _client()
+        r = c.put("/fd/jev/shared-key", headers=_bearer(ALICE, "admin"), json={"api_key": KEY_DECK})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["key_set"] is True and body["verified"] is True
+        assert body["key_hint"] == "····dddd" and KEY_DECK not in r.text
+        assert await jr.get_key(BOB) == KEY_DECK
+        status = c.get("/fd/jev/status", headers=_bearer(BOB))
+        assert status.json()["source"] == "shared" and status.json()["key_set"] is True
+        assert status.json()["shared_available"] is True and KEY_DECK not in status.text
+        # Nothing was written into Bob's own settings.
+        assert await db.get_setting(BOB, jr._K_KEY) is None
+        assert await db.get_setting(BOB, jr._K_META) is None
+
+    async def test_own_key_wins_and_removing_it_falls_back(self, db, jev):
+        await _share()
+        await _save(BOB, KEY_BOB)
+        c = _client()
+        assert await jr.get_key(BOB) == KEY_BOB
+        assert c.get("/fd/jev/status", headers=_bearer(BOB)).json()["source"] == "own"
+        r = c.delete("/fd/jev/key", headers=_bearer(BOB))
+        assert r.json()["source"] == "shared" and await jr.get_key(BOB) == KEY_DECK
+
+    async def test_only_admins_manage_the_team_key(self, db, jev):
+        c = _client()
+        assert c.put("/fd/jev/shared-key", headers=_bearer(BOB),
+                     json={"api_key": KEY_DECK}).status_code == 403
+        assert c.get("/fd/jev/shared", headers=_bearer(BOB)).status_code == 403
+        await _share()
+        assert c.delete("/fd/jev/shared-key", headers=_bearer(BOB)).status_code == 403
+        assert await jr.get_key(BOB) == KEY_DECK
+
+    async def test_stop_sharing(self, db, jev):
+        await _share()
+        r = _client().delete("/fd/jev/shared-key", headers=_bearer(ALICE, "admin"))
+        assert r.status_code == 200 and r.json()["key_set"] is False
+        assert await jr.get_key(BOB) == ""
+
+    async def test_refused_team_key_is_not_saved(self, db, jev):
+        r = _client().put("/fd/jev/shared-key", headers=_bearer(ALICE, "admin"),
+                          json={"api_key": "jev_wrong_key_123"})
+        assert r.status_code == 400 and await jr.get_key(BOB) == ""
+
+    async def test_agent_asks_with_the_team_key_billed_to_its_owner(self, db, jev, agents):
+        await _share()
+        body = jev_client.build_request("state text", QUESTIONS)
+        r = _client().post("/fd/jev/agent/ask", headers={"X-Agent-Auth": "tok-bob"}, json=body)
+        assert r.status_code == 200, r.text
+        assert KEY_DECK not in r.text
+        (sent,) = _asks(jev)
+        assert sent["auth"] == f"Bearer {KEY_DECK}"
+        (logged,) = await _jev_calls(db, BOB)
+        assert logged["source"] == "agent"
+
+    async def test_a_refusal_marks_the_team_key_not_the_user(self, db, jev):
+        await _share()
+        jev.fail = 401
+        r = _client().post("/fd/jev/test", headers=_bearer(BOB))
+        assert r.status_code == 400
+        assert await db.get_setting(BOB, jr._K_META) is None
+        assert (await jr.shared_status())["verify_error"] == "refused"
+
+    async def test_no_team_key_on_an_auth_disabled_deck(self, db, jev, monkeypatch):
+        await _share()
+        monkeypatch.setenv("FD_AUTH_ENABLED", "false")
+        assert await jr.get_key(auth._LOCAL_USER["id"]) == ""
+        r = _client().put("/fd/jev/shared-key", json={"api_key": KEY_DECK})
+        assert r.status_code == 409

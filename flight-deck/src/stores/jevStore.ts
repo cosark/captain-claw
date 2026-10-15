@@ -21,6 +21,10 @@ export interface JevStatus {
   default_model: string
   auth_enabled: boolean
   scope: 'user' | 'deck'
+  // Whose key is in use: the user's own, or the team key an admin shared
+  // (Admin → Integrations) — used while the user has none of their own.
+  source: 'own' | 'shared' | null
+  shared_available: boolean
 }
 
 export interface JevModel {

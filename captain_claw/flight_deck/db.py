@@ -791,6 +791,29 @@ class FlightDeckDB:
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (agent_ref, alias)
             );
+            -- The deck's shared Telegram bot (telegram_shared.py): one row per
+            -- Flight Deck user who asked for it — which of their agents gets
+            -- their Telegram messages, whether an admin approved it, and the
+            -- Telegram account the one-time link_code bound to it.
+            CREATE TABLE IF NOT EXISTS telegram_links (
+                user_id       TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                agent_slug    TEXT NOT NULL DEFAULT '',
+                agent_name    TEXT NOT NULL DEFAULT '',
+                status        TEXT NOT NULL DEFAULT 'pending',
+                link_code     TEXT NOT NULL DEFAULT '',
+                tg_user_id    TEXT NOT NULL DEFAULT '',
+                tg_username   TEXT NOT NULL DEFAULT '',
+                tg_first_name TEXT NOT NULL DEFAULT '',
+                requested_at  TEXT NOT NULL,
+                decided_at    TEXT,
+                decided_by    TEXT NOT NULL DEFAULT '',
+                linked_at     TEXT,
+                updated_at    TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_links_tg
+                ON telegram_links(tg_user_id) WHERE tg_user_id != '';
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_links_code
+                ON telegram_links(link_code) WHERE link_code != '';
         """)
         # Lightweight migrations: add columns introduced after a table first shipped.
         for table, col, ddl in [
@@ -2838,6 +2861,81 @@ class FlightDeckDB:
             "by_kind": [dict(r) for r in by_kind],
             "total_usd": round(total, 6),
         }
+
+    # ── Shared Telegram bot links (telegram_shared.py) ─────────────────
+
+    _TELEGRAM_LINK_FIELDS = frozenset({
+        "agent_slug", "agent_name", "status", "link_code", "tg_user_id",
+        "tg_username", "tg_first_name", "decided_at", "decided_by", "linked_at",
+    })
+
+    async def get_telegram_link(self, user_id: str) -> dict | None:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT * FROM telegram_links WHERE user_id = ?", (user_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def get_telegram_link_by_code(self, link_code: str) -> dict | None:
+        if not link_code:
+            return None
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT * FROM telegram_links WHERE link_code = ?", (link_code,),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def list_telegram_links(self) -> list[dict]:
+        """Every link, with the requesting user's email and name."""
+        assert self._db is not None
+        rows = await self._db.execute_fetchall(
+            "SELECT l.*, u.email AS user_email, u.display_name AS user_name"
+            " FROM telegram_links l JOIN users u ON u.id = l.user_id"
+            " ORDER BY l.requested_at",
+        )
+        return [dict(r) for r in rows]
+
+    async def create_telegram_link(
+        self, user_id: str, agent_slug: str, agent_name: str, link_code: str,
+    ) -> dict:
+        """A fresh pending request (replaces whatever the user had before)."""
+        assert self._db is not None
+        now = _utcnow()
+        await self._db.execute(
+            "INSERT OR REPLACE INTO telegram_links (user_id, agent_slug, agent_name,"
+            " status, link_code, requested_at, updated_at)"
+            " VALUES (?, ?, ?, 'pending', ?, ?, ?)",
+            (user_id, agent_slug, agent_name, link_code, now, now),
+        )
+        await self._db.commit()
+        return await self.get_telegram_link(user_id) or {}
+
+    async def update_telegram_link(self, user_id: str, **fields: Any) -> dict | None:
+        assert self._db is not None
+        bad = set(fields) - self._TELEGRAM_LINK_FIELDS
+        if bad:
+            raise ValueError(f"telegram_links column not writable: {sorted(bad)!r}")
+        if fields:
+            cols = ", ".join(f"{k} = ?" for k in fields)
+            await self._db.execute(
+                f"UPDATE telegram_links SET {cols}, updated_at = ? WHERE user_id = ?",
+                (*fields.values(), _utcnow(), user_id),
+            )
+            await self._db.commit()
+        return await self.get_telegram_link(user_id)
+
+    async def delete_telegram_link(self, user_id: str) -> bool:
+        assert self._db is not None
+        cur = await self._db.execute("DELETE FROM telegram_links WHERE user_id = ?", (user_id,))
+        await self._db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def list_admin_ids(self) -> list[str]:
+        assert self._db is not None
+        rows = await self._db.execute_fetchall("SELECT id FROM users WHERE role = 'admin'")
+        return [str(r["id"]) for r in rows]
 
     # ── Notifications (persistent in-app bell) ─────────────────────────
 

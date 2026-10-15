@@ -90,10 +90,18 @@ class TelegramCallbackQuery:
 class TelegramBridge:
     """Telegram Bot API helper."""
 
-    def __init__(self, token: str, api_base_url: str = "https://api.telegram.org"):
+    def __init__(
+        self,
+        token: str,
+        api_base_url: str = "https://api.telegram.org",
+        *,
+        headers: dict[str, str] | None = None,
+    ):
         self.token = token.strip()
         self.api_base_url = (api_base_url or "https://api.telegram.org").rstrip("/")
-        self._client = httpx.AsyncClient(timeout=40.0)
+        # ``headers``: Flight Deck's agent headers when this bridge talks to the
+        # deck's shared-bot relay instead of Telegram (see web/telegram.py).
+        self._client = httpx.AsyncClient(timeout=40.0, headers=headers or None)
 
     @property
     def enabled(self) -> bool:
