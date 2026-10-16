@@ -411,8 +411,20 @@ class ScreenCaptureTool(Tool):
                     ),
                 )
 
-        # If a prompt was provided, chain into vision analysis.
+        # The agent's own model sees images: hand it the capture itself.
         effective_prompt = str(prompt or "").strip()
+        if kwargs.get("_look_inline"):
+            return ToolResult(
+                success=True,
+                content=(
+                    f"Screenshot captured and saved.\nPath: {path}\n"
+                    "The screenshot is attached below — look at it directly."
+                    + (f" Answer from it: {effective_prompt}" if effective_prompt else "")
+                ),
+                images=[str(path)],
+            )
+
+        # If a prompt was provided, chain into vision analysis.
         if effective_prompt:
             try:
                 from captain_claw.tools.image_ocr import ImageVisionTool

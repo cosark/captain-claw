@@ -1353,9 +1353,13 @@ class PinchTabTool(Tool):
         with open(filepath, "wb") as f:
             f.write(data)
 
+        # The agent's own model sees images: the screenshot rides on its next call.
+        look = bool(kwargs.get("_look_inline"))
         return ToolResult(
             success=True,
-            content=f"Screenshot saved: {filepath} ({len(data)} bytes)",
+            content=f"Screenshot saved: {filepath} ({len(data)} bytes)"
+            + ("\nThe screenshot is attached below — look at it directly." if look else ""),
+            images=[filepath] if look else [],
         )
 
     async def _pdf(self, **kwargs: Any) -> ToolResult:

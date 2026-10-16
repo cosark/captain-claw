@@ -197,16 +197,19 @@ async def test_image_vision_hands_the_picture_to_the_agents_own_model(tmp_path, 
 async def test_image_vision_called_inside_another_tool_still_describes(tmp_path, vision_config,
                                                                        monkeypatch):
     """Only the model's own call looks inline; screen_capture / desktop_action /
-    video_vision call image_vision for a description and keep getting one."""
+    video_vision call image_vision for a description and keep getting one —
+    from the agent's own model (through its provider) when it sees images."""
     import litellm
 
     pic = _picture(tmp_path / "p.png")
-    agent = _agent(_Stub())
+    provider = _Stub([LLMResponse(content="a blue rectangle")])
+    agent = _agent(provider)
 
     def _backend(**kwargs):
-        raise RuntimeError("vision backend reached")
+        raise AssertionError("litellm called directly")
 
     monkeypatch.setattr(litellm, "completion", _backend)
     result = await ImageVisionTool().execute(path=pic, prompt="describe", _agent=agent)
-    assert result.success is False and "vision backend reached" in (result.error or "")
+    assert result.success and "a blue rectangle" in result.content
     assert not result.images
+    assert len(provider.calls) == 1 and provider.calls[0][-1].images

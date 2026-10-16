@@ -537,12 +537,16 @@ class VideoVisionTool(Tool):
 
         # ── Phase 2: per-frame vision (the slow part) ──────────────────────
         # Describe each frame (with nearby transcript) — limited concurrency.
-        # If THIS agent has no vision model, image_vision would fall back to the
-        # text chat model and reject the image. In that case, delegate frame
-        # description to a multimodal peer (same path as the WhatsApp image flow).
+        # A configured vision model, or THIS agent's own model when it sees
+        # images (image_vision then asks it through its provider). Otherwise
+        # image_vision would fall back to the text chat model and reject the
+        # image, so delegate frame description to a multimodal peer (same path
+        # as the WhatsApp image flow).
         from captain_claw.tools.image_ocr import ImageVisionTool
         ivt = ImageVisionTool()
-        has_local_vision = ivt._find_model() is not None
+        _sees = getattr(agent_obj, "sees_images", None)
+        sees_itself = callable(_sees) and bool(_sees())
+        has_local_vision = ivt._find_model() is not None or sees_itself
         vision_peer = None if has_local_vision else _find_vision_peer(kwargs)
         delegating = vision_peer is not None
         fdt = fd_url = None
@@ -556,7 +560,9 @@ class VideoVisionTool(Tool):
         sem = asyncio.Semaphore(_PEER_FRAME_CONCURRENCY if delegating else _FRAME_CONCURRENCY)
         half = max(interval / 2.0, 1.5)
         log.info("video_vision: frame vision path",
-                 mode=("peer:" + vision_peer if delegating else ("local" if has_local_vision else "local-fallback")))
+                 mode=("peer:" + vision_peer if delegating
+                       else "local" if ivt._find_model() is not None
+                       else "self" if sees_itself else "local-fallback"))
 
         total = len(frames)
         frame_label = f" via {vision_peer}" if delegating else ""

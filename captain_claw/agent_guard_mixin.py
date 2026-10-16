@@ -13,6 +13,12 @@ from captain_claw.logging import get_logger
 
 log = get_logger(__name__)
 
+# Tools that hand a picture to an agent whose own model sees images
+# (``_look_inline``): it rides on the next call as an image part.
+_SHOWS_PICTURES_TOOLS = frozenset({
+    "image_vision", "image_ocr", "browser", "pinchtab", "screen_capture", "cv",
+})
+
 # A context-note block inside a prompt message (body in group 1). Notes in the
 # body are separated by blank lines; quoted block markers inside notes are
 # defused when the block is built, so the first END marker closes it.
@@ -691,10 +697,11 @@ class AgentGuardMixin:
             arguments = {**arguments, "_session": _session}
         # Pass agent ref so tools can access fallback attributes (e.g. _fd_url)
         arguments = {**arguments, "_agent": self}
-        # The model asked to look at an image and sees images itself: the tool
-        # hands it the picture instead of a second model's description. Only
-        # here — tools calling image_vision internally still get a description.
-        if name in ("image_vision", "image_ocr"):
+        # The model sees images itself: tools that look at or make a picture
+        # (image_vision, screenshots, cv outputs) hand it the picture instead
+        # of a second model's description. Only here — a tool calling another
+        # internally (desktop_action, video_vision) still gets a description.
+        if name in _SHOWS_PICTURES_TOOLS:
             _sees = getattr(self, "sees_images", None)
             if callable(_sees) and _sees():
                 arguments = {**arguments, "_look_inline": True}
