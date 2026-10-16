@@ -13,7 +13,9 @@
 #include <WebSocketsClient.h>
 #include <WiFi.h>
 #include <WiFiMulti.h>
+#include <driver/gpio.h>
 #include <esp_sleep.h>
+#include <esp_timer.h>
 
 #include "audio.h"
 #include "face.h"
@@ -21,7 +23,7 @@
 #include "settings.h"
 #include "ui.h"
 
-#define FW_VERSION "0.6.3"
+#define FW_VERSION "0.6.4"
 
 enum class Mode { Idle, Listening, Waiting, Reply, Image, Menu, Agents, CharPick, Status, Notice };
 
@@ -669,6 +671,26 @@ static void handleIdlePower() {
   if (idle > settings.powerOffS * 1000UL) goToSleep();
 }
 
+// Both buttons are sampled every 20 ms off the main loop, so any press (or a
+// held button) counts as activity even when a loop pass is slow — drawing,
+// TLS, saving settings — and a quick click would slip between two passes.
+static volatile uint32_t buttonSeenMs = 0;
+
+static void sampleButtons(void*) {
+  if (gpio_get_level(GPIO_NUM_11) == 0 || gpio_get_level(GPIO_NUM_12) == 0) buttonSeenMs = millis();
+}
+
+static void noteButtonActivity() {
+  uint32_t seen = buttonSeenMs;
+  if ((int32_t)(seen - lastActivityMs) > 0) {
+    lastActivityMs = seen;
+    if (dimmed && !screenOff) {  // brighten back; a dark screen wakes on the press itself
+      ui::brightness(kBright);
+      dimmed = false;
+    }
+  }
+}
+
 // ── setup / loop ─────────────────────────────────────────────────────
 
 void setup() {
@@ -685,6 +707,11 @@ void setup() {
                 settings.netCount, settings.server.c_str());
   audio::begin(settings.volume, settings.boostDb);
   M5.BtnB.setHoldThresh(800);
+  esp_timer_create_args_t sampler = {};
+  sampler.callback = sampleButtons;
+  sampler.name = "buttons";
+  esp_timer_handle_t samplerTimer;
+  if (esp_timer_create(&sampler, &samplerTimer) == ESP_OK) esp_timer_start_periodic(samplerTimer, 20000);
 
   M5.update();
   if (M5.BtnA.isPressed() || !settings.configured()) {
@@ -715,6 +742,7 @@ void setup() {
 
 void loop() {
   M5.update();
+  noteButtonActivity();
   ws.loop();
   if (WiFi.status() != WL_CONNECTED) wifiMulti.run(0);
   bool inMenu = mode == Mode::Menu || mode == Mode::Agents || mode == Mode::Status || mode == Mode::CharPick;
@@ -864,6 +892,7 @@ void loop() {
     }
   }
 
+  noteButtonActivity();
   handleIdlePower();
   delay(1);
 }
