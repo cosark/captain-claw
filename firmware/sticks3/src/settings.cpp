@@ -32,6 +32,7 @@ void Settings::load() {
   cueBeep = p.getBool("cuebeep", true);
   cueFlash = p.getBool("cueflash", true);
   cueLeadS = constrain(p.getUChar("cuelead", 1), 1, 2);
+  textSize = min<uint8_t>(p.getUChar("tsize", 0), 2);
   p.end();
 }
 
@@ -64,6 +65,7 @@ void Settings::save() const {
   p.putBool("cuebeep", cueBeep);
   p.putBool("cueflash", cueFlash);
   p.putUChar("cuelead", cueLeadS);
+  p.putUChar("tsize", textSize);
   p.end();
 }
 

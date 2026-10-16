@@ -111,6 +111,13 @@ static void handleRoot() {
   h += F("</select><h2>Screen</h2><label>Show</label><select name=display>");
   h += settings.iconMode ? F("<option value=text>Text (stages, activity)</option><option value=icons selected>Icons (animated character)</option>")
                          : F("<option value=text selected>Text (stages, activity)</option><option value=icons>Icons (animated character)</option>");
+  h += F("</select><label>Text size</label><select name=tsize>");
+  {
+    const char* sizes[] = {"Small", "Medium", "Large"};
+    for (int k = 0; k < 3; ++k) {
+      h += "<option value=" + String(k) + (settings.textSize == k ? " selected>" : ">") + sizes[k] + "</option>";
+    }
+  }
   h += F("</select><label>Character</label><select name=char>");
   for (int k = 0; k < face::KindCount; ++k) {
     h += "<option value=" + String(k) + (settings.character == k ? " selected>" : ">") + face::name(k) + "</option>";
@@ -159,6 +166,7 @@ static void handleSave() {
   settings.cueLeadS = server.arg("lead") == "2" ? 2 : 1;
   settings.iconMode = server.arg("display") == "icons";
   settings.character = constrain(server.arg("char").toInt(), 0, face::KindCount - 1);
+  settings.textSize = constrain(server.arg("tsize").toInt(), 0, 2);
   settings.save();
 
   server.send(200, "text/html; charset=utf-8",

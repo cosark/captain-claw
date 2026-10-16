@@ -21,7 +21,7 @@
 #include "settings.h"
 #include "ui.h"
 
-#define FW_VERSION "0.6.0"
+#define FW_VERSION "0.6.1"
 
 enum class Mode { Idle, Listening, Waiting, Reply, Image, Menu, Agents, CharPick, Status, Notice };
 
@@ -218,7 +218,7 @@ static void showIdle() {
 
 // ── menu ─────────────────────────────────────────────────────────────
 
-enum MenuRow { MStatus, MAgent, MVolume, MBoost, MVoice, MDisplay, MCharacter, MBeep, MFlash, MLead, MSetup, MCount };
+enum MenuRow { MStatus, MAgent, MVolume, MBoost, MVoice, MDisplay, MTextSize, MCharacter, MBeep, MFlash, MLead, MSetup, MCount };
 
 static constexpr uint8_t kVolumeSteps[] = {64, 128, 191, 255};  // 25 / 50 / 75 / 100 %
 static constexpr uint8_t kBoostSteps[] = {0, 6, 10};
@@ -231,6 +231,10 @@ static String menuLabel(int row) {
     case MBoost: return settings.boostDb ? "Boost +" + String(settings.boostDb) + " dB" : String("Boost off");
     case MVoice: return String("Voice: ") + (settings.femaleVoice ? "female" : "male");
     case MDisplay: return String("Display: ") + (settings.iconMode ? "icons" : "text");
+    case MTextSize: {
+      static const char* sizes[] = {"small", "medium", "large"};
+      return String("Text size: ") + sizes[settings.textSize];
+    }
     case MCharacter: return String("Character: ") + face::name(settings.character) + " »";
     case MBeep: return String("Beep before speech: ") + (settings.cueBeep ? "on" : "off");
     case MFlash: return String("Flash before speech: ") + (settings.cueFlash ? "on" : "off");
@@ -347,6 +351,10 @@ static void chooseMenuRow() {
       if (wsUp) sendPrefs();
       break;
     case MDisplay: settings.iconMode = !settings.iconMode; break;
+    case MTextSize:
+      settings.textSize = (settings.textSize + 1) % 3;
+      ui::setTextSize(settings.textSize);
+      break;
     case MCharacter:
       charSel = settings.character;
       mode = Mode::CharPick;
@@ -652,6 +660,7 @@ void setup() {
   ui::begin();
   ui::brightness(kBright);
   settings.load();
+  ui::setTextSize(settings.textSize);
   Serial.printf("[claw] boot %s fw %s: %d network(s), server '%s'\n", deviceId().c_str(), FW_VERSION,
                 settings.netCount, settings.server.c_str());
   audio::begin(settings.volume, settings.boostDb);
