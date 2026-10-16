@@ -21,7 +21,7 @@
 #include "settings.h"
 #include "ui.h"
 
-#define FW_VERSION "0.6.1"
+#define FW_VERSION "0.6.2"
 
 enum class Mode { Idle, Listening, Waiting, Reply, Image, Menu, Agents, CharPick, Status, Notice };
 
@@ -43,6 +43,7 @@ static std::vector<String> agentNames, agentSlugs;
 static int agentSel = 0, agentCur = -1;
 static bool agentsLoading = false;
 static uint8_t charSel = 0;  // character being previewed
+static int statusPage = 0, statusPages = 1;
 static uint32_t flashStartMs = 0;
 static bool flashing = false;
 static int rttMs = -1;
@@ -163,7 +164,10 @@ static void setBarState() {
   } else if (mode == Mode::Menu || mode == Mode::Agents) {
     st = "menu", col = kText;
   } else if (mode == Mode::Status) {
-    st = "status", col = kText;
+    static char buf[16];
+    if (statusPages > 1) snprintf(buf, sizeof(buf), "status %d/%d", statusPage + 1, statusPages);
+    else snprintf(buf, sizeof(buf), "status");
+    st = buf, col = kText;
   } else {
     st = agentLinked ? "ready" : "no agent", col = agentLinked ? kGreen : kYellow;
   }
@@ -288,7 +292,17 @@ static void redraw() {
       ui::showFace(charSel, pose, lvl);
       break;
     }
-    case Mode::Status: ui::showPanel("", kText, statusRows()); break;
+    case Mode::Status: {
+      auto rows = statusRows();
+      int n = ui::showPanel("", kText, rows, statusPage);
+      if (n != statusPages || statusPage >= n) {  // the bar showed a stale "x/y"
+        statusPages = n;
+        statusPage = min(statusPage, n - 1);
+        setBarState();
+        ui::showPanel("", kText, rows, statusPage);
+      }
+      break;
+    }
     case Mode::Notice: break;  // stays until the next event
     case Mode::Idle:
       if (ui::hasReply()) ui::showReply();
@@ -319,6 +333,7 @@ static void chooseMenuRow() {
   menuOpenedMs = millis();
   switch (menuSel) {
     case MStatus:
+      statusPage = 0;
       mode = Mode::Status;
       redraw();
       return;
@@ -758,7 +773,14 @@ void loop() {
       if (!agentsLoading) agentSel = (agentSel + 1) % agentNames.size();
       menuOpenedMs = millis();
       redraw();
-    } else if (mode == Mode::Status || mode == Mode::Image || mode == Mode::Notice) {
+    } else if (mode == Mode::Status) {
+      if (statusPage + 1 < statusPages) {
+        ++statusPage;
+        redraw();
+      } else {
+        backToMain();  // after the last page
+      }
+    } else if (mode == Mode::Image || mode == Mode::Notice) {
       backToMain();
     } else if (mode == Mode::Reply) {
       if (audio::playing() && settings.iconMode) {
@@ -769,6 +791,7 @@ void loop() {
         ui::nextPage();
       }
     } else if (mode == Mode::Idle) {
+      statusPage = 0;
       mode = Mode::Status;
       redraw();
     }

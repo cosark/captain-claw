@@ -152,10 +152,11 @@ static String fit(const String& text, int width) {
   return s + "…";
 }
 
-// Word-wrap UTF-8 text to the body width (long words break between characters).
-static std::vector<String> wrap(const String& text, int width) {
+// Word-wrap UTF-8 text to `width` (long words break between characters), in
+// `font` — the reading font when none is given.
+static std::vector<String> wrap(const String& text, int width, const lgfx::U8g2font* font = nullptr) {
   std::vector<String> out;
-  canvas.setFont(ts().body);
+  canvas.setFont(font ? font : ts().body);
   int start = 0;
   const int n = text.length();
   while (start <= n) {
@@ -327,28 +328,98 @@ bool nextPage() {
   return page != 0;
 }
 
-void showPanel(const char* title, uint16_t titleColor, const std::vector<Row>& rows) {
+// Panels (status page, idle health) follow the text size too: compact rows
+// with the label beside the value for small/medium, label above the value
+// for large. Values wrap; a row never splits across pages.
+struct PanelSize {
+  const lgfx::U8g2font* font;
+  int line;
+};
+static const PanelSize kPanelSizes[] = {
+    {&fonts::efontJA_12, 14},  // small (the original)
+    {&fonts::efontJA_16, 18},  // medium
+    {&fonts::efontJA_24, 26},  // large
+};
+
+int showPanel(const char* title, uint16_t titleColor, const std::vector<Row>& rows, int page) {
+  const PanelSize& ps = kPanelSizes[sizeIdx];
+  const bool stacked = sizeIdx == 2;
+  const uint16_t labelColor = rgb(140, 150, 165);
+  const int top = BAR + 3;
+  const int bottom = H - 2;
+  // Title (only on the first page) in the reading font.
+  int titleH = 0;
+  if (title && *title) titleH = ts().line + 2;
+  // Label column for side-by-side rows.
+  canvas.setFont(ps.font);
+  int labelW = 0;
+  if (!stacked) {
+    for (const Row& r : rows) labelW = max(labelW, (int)canvas.textWidth(r.label));
+    labelW += 8;
+  }
+  const int valueW = stacked ? W - 2 * PAD : W - 2 * PAD - labelW;
+  // Lay the rows out into pages.
+  struct Laid {
+    std::vector<String> lines;
+    int h;
+  };
+  std::vector<Laid> laid;
+  for (const Row& r : rows) {
+    Laid l{wrap(r.value.length() ? r.value : String("-"), valueW, ps.font), 0};
+    l.h = (int)l.lines.size() * ps.line + (stacked ? 14 : 0) + (stacked ? 4 : 0);
+    laid.push_back(l);
+  }
+  std::vector<int> pageStart{0};
+  int y = top + titleH;
+  for (int i = 0; i < (int)laid.size(); ++i) {
+    if (y + laid[i].h > bottom && i > pageStart.back()) {
+      pageStart.push_back(i);
+      y = top;
+    }
+    y += laid[i].h;
+  }
+  const int pages = pageStart.size();
+  page = constrain(page, 0, pages - 1);
+
   canvas.fillScreen(TFT_BLACK);
   drawBar();
   canvas.setTextDatum(top_left);
-  int y = BAR + 3;
-  if (title && *title) {
-    canvas.setFont(kBody);
+  y = top;
+  if (page == 0 && titleH) {
+    canvas.setFont(ts().body);
     canvas.setTextColor(titleColor);
     canvas.drawString(title, PAD, y);
-    y += kLine + 2;
+    y += titleH;
   }
-  canvas.setFont(kSmall);
-  constexpr int kRow = 14, kLabelW = 50;
-  for (const Row& r : rows) {
-    if (y > H - kRow + 1) break;
-    canvas.setTextColor(rgb(140, 150, 165));
-    canvas.drawString(r.label, PAD, y);
+  int end = page + 1 < pages ? pageStart[page + 1] : (int)laid.size();
+  for (int i = pageStart[page]; i < end; ++i) {
+    const Row& r = rows[i];
+    if (stacked) {
+      canvas.setFont(kSmall);
+      canvas.setTextColor(labelColor);
+      canvas.drawString(r.label, PAD, y);
+      y += 14;
+    } else {
+      canvas.setFont(ps.font);
+      canvas.setTextColor(labelColor);
+      canvas.drawString(r.label, PAD, y);
+    }
+    canvas.setFont(ps.font);
     canvas.setTextColor(r.color);
-    canvas.drawString(fit(r.value, W - PAD - kLabelW - PAD), PAD + kLabelW, y);
-    y += kRow;
+    for (const String& line : laid[i].lines) {
+      if (y + ps.line > bottom + 2) break;  // a row taller than a page: cut it
+      canvas.drawString(line, stacked ? PAD : PAD + labelW, y);
+      y += ps.line;
+    }
+    if (stacked) y += 4;
+  }
+  if (pages > 1) {  // page dots, bottom right
+    for (int k = 0; k < pages; ++k) {
+      canvas.fillCircle(W - 6 - (pages - 1 - k) * 8, H - 5, 2, k == page ? TFT_WHITE : rgb(70, 70, 80));
+    }
   }
   push();
+  return pages;
 }
 
 void showFace(uint8_t kind, face::Pose pose, int level) {

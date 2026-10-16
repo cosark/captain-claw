@@ -37,7 +37,9 @@ struct Row {
   String value;
   uint16_t color;
 };
-void showPanel(const char* title, uint16_t titleColor, const std::vector<Row>& rows);
+// Draws page `page` of the rows (in the chosen text size); returns the page
+// count. The title shows on the first page only.
+int showPanel(const char* title, uint16_t titleColor, const std::vector<Row>& rows, int page = 0);
 
 // Conversation views (text mode).
 void showListening(int level, uint32_t elapsedMs);
