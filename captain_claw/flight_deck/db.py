@@ -224,6 +224,30 @@ class FlightDeckDB:
                 PRIMARY KEY (user_id, key)
             );
 
+            -- Account applications while self-registration is closed. The
+            -- applicant names who recommended them; an admin approves (the
+            -- account is created with the password they chose — the hash is
+            -- cleared from here once decided) or rejects. One pending
+            -- application per email.
+            CREATE TABLE IF NOT EXISTS waitlist (
+                id             TEXT PRIMARY KEY,
+                email          TEXT NOT NULL,
+                display_name   TEXT NOT NULL DEFAULT '',
+                password_hash  TEXT NOT NULL DEFAULT '',
+                referrer_name  TEXT NOT NULL DEFAULT '',
+                referrer_email TEXT NOT NULL DEFAULT '',
+                cohort         TEXT NOT NULL DEFAULT '',
+                status         TEXT NOT NULL DEFAULT 'pending',
+                created_at     TEXT NOT NULL,
+                decided_at     TEXT NOT NULL DEFAULT '',
+                decided_by     TEXT NOT NULL DEFAULT '',
+                user_id        TEXT NOT NULL DEFAULT ''
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_waitlist_pending_email
+                ON waitlist(email) WHERE status = 'pending';
+            CREATE INDEX IF NOT EXISTS idx_waitlist_status
+                ON waitlist(status, created_at);
+
             CREATE TABLE IF NOT EXISTS chat_sessions (
                 id         TEXT PRIMARY KEY,
                 user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -890,6 +914,82 @@ class FlightDeckDB:
         async with self._db.execute("SELECT COUNT(*) FROM users") as cur:
             row = await cur.fetchone()
             return row[0] if row else 0
+
+    # ── Waitlist ─────────────────────────────────────────────────────
+
+    async def create_waitlist_entry(
+        self, *, email: str, display_name: str, password_hash: str,
+        referrer_name: str, referrer_email: str, cohort: str,
+    ) -> dict:
+        """A pending application. Raises ``sqlite3.IntegrityError`` when this
+        email already has one pending."""
+        eid = _uuid()
+        now = _utcnow()
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT INTO waitlist (id, email, display_name, password_hash, referrer_name,"
+            " referrer_email, cohort, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+            (eid, email.lower().strip(), display_name, password_hash, referrer_name,
+             referrer_email.lower().strip(), cohort, now),
+        )
+        await self._db.commit()
+        return {"id": eid, "email": email.lower().strip(), "status": "pending", "created_at": now}
+
+    async def get_waitlist_entry(self, entry_id: str) -> dict | None:
+        assert self._db is not None
+        async with self._db.execute("SELECT * FROM waitlist WHERE id = ?", (entry_id,)) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def get_pending_waitlist_entry(self, email: str) -> dict | None:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT * FROM waitlist WHERE email = ? AND status = 'pending'",
+            (email.lower().strip(),),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def list_waitlist(self, status: str | None = None, limit: int = 500) -> list[dict]:
+        """Newest first; *status* None = every application. Never the hash."""
+        assert self._db is not None
+        cols = ("id, email, display_name, referrer_name, referrer_email, cohort, status,"
+                " created_at, decided_at, decided_by, user_id")
+        if status:
+            sql, args = (f"SELECT {cols} FROM waitlist WHERE status = ?"
+                         " ORDER BY created_at DESC LIMIT ?", (status, limit))
+        else:
+            sql, args = f"SELECT {cols} FROM waitlist ORDER BY created_at DESC LIMIT ?", (limit,)
+        async with self._db.execute(sql, args) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def count_waitlist(self, status: str = "pending") -> int:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT COUNT(*) FROM waitlist WHERE status = ?", (status,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+    async def decide_waitlist_entry(
+        self, entry_id: str, status: str, decided_by: str, user_id: str = "",
+    ) -> bool:
+        """Move a pending application to *status* (approved | rejected) and drop
+        its password hash. False when it was not pending (already decided)."""
+        assert self._db is not None
+        cur = await self._db.execute(
+            "UPDATE waitlist SET status = ?, decided_at = ?, decided_by = ?, user_id = ?,"
+            " password_hash = '' WHERE id = ? AND status = 'pending'",
+            (status, _utcnow(), decided_by, user_id, entry_id),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    async def delete_waitlist_entry(self, entry_id: str) -> bool:
+        assert self._db is not None
+        cur = await self._db.execute("DELETE FROM waitlist WHERE id = ?", (entry_id,))
+        await self._db.commit()
+        return cur.rowcount > 0
 
     # ── Refresh sessions ─────────────────────────────────────────────
 
