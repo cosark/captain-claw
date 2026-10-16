@@ -1535,6 +1535,13 @@ class AgentToolLoopMixin:
                                 data_in_context=_data_in_context,
                             )
 
+                if result.success and result.images:
+                    # Pictures for the agent's own model: picked into the next
+                    # call as image parts (agent_context_mixin._build_messages).
+                    from captain_claw.llm.vision import tool_image_marker
+
+                    _result_content = "\n".join(
+                        [_result_content] + [tool_image_marker(p) for p in result.images])
                 self._add_session_message(
                     role="tool",
                     content=_result_content,

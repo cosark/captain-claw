@@ -278,6 +278,22 @@ class _BaseImageLLMTool(Tool):
                 error=f"Unsupported image format '{file_path.suffix}'. Supported: {', '.join(sorted(_IMAGE_EXTENSIONS))}",
             )
 
+        # The calling agent's own model sees images: give it the picture to look
+        # at. OCR keeps a dedicated OCR/vision model when one is configured.
+        if kwargs.get("_look_inline") and (
+            self._config_key == "image_vision" or self._find_model() is None
+        ):
+            ask = str(prompt or "").strip()
+            task = (f"Answer from it: {ask}" if ask else
+                    "Transcribe all of its text." if self._config_key == "image_ocr" else
+                    "Describe what you see.")
+            log.info("%s: picture attached for the agent's own model", self.name, path=str(file_path))
+            return ToolResult(
+                success=True,
+                content=f"{file_path.name} is attached below — look at it directly. {task}",
+                images=[str(file_path)],
+            )
+
         model_cfg = self._find_model()
         used_fallback = False
         if model_cfg is None:

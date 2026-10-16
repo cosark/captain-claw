@@ -141,6 +141,9 @@ class ToolResult(BaseModel):
     content: str = ""
     error: str | None = None
     system_hint: str | None = None
+    # Image files for the agent's own model to look at (when it sees
+    # images): the tool loop adds a ``[Tool image: <path>]`` marker per path.
+    images: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _normalize_failure_error(self) -> "ToolResult":

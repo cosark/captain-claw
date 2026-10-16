@@ -38,6 +38,9 @@ class ModelConfig(BaseModel):
         reasoning_level: str = ""  # "", "low", "medium", "high"
         description: str = ""  # what tasks this model is best for
         model_type: str = "llm"  # llm, image, video, audio, multimodal
+        # Whether this model sees images inline (see `vision` below); unset
+        # = decided as for the main model with "auto".
+        vision: bool | str | None = None
 
     provider: str = "ollama"
     model: str = "minimax-m2.5:cloud"
@@ -46,6 +49,12 @@ class ModelConfig(BaseModel):
     api_key: str = ""
     base_url: str = ""
     tokens_per_minute: int = 0  # 0 = unlimited (no rate limiting)
+    # Does this model see images? "on": the turn's pictures go to it inline as
+    # image parts; "off": they are described by a separate vision model (an
+    # allowed model with model_type "vision") or a multimodal peer; "auto":
+    # on for model families known to be multimodal (captain_claw/llm/vision.py)
+    # and for Ollama. A model that refuses image input falls back by itself.
+    vision: bool | str = "auto"
     allowed: list[AllowedModelConfig] = Field(default_factory=list)
 
 
@@ -65,6 +74,23 @@ class ChunkedProcessingConfig(BaseModel):
     chunk_overlap_tokens: int = 200  # continuity overlap between sequential chunks
     max_chunks: int = 12  # safety cap to prevent runaway splitting
     combine_strategy: str = "summarize"  # summarize | concatenate
+
+
+class InlineImagesConfig(BaseModel):
+    """Pictures sent inline to a model that sees images (``model.vision``).
+
+    Only the current turn's images go: the user's attachments first, then the
+    newest pictures tools returned. Earlier turns keep their path markers as
+    text; ``image_vision`` on a path shows it again.
+    """
+
+    max_images_per_call: int = 4
+    max_tool_images: int = 2  # a browser loop keeps only its newest screenshots
+    max_pixels: int = 1280  # longest edge after downscaling
+    jpeg_quality: int = 85
+    # Images take at most this share of the context window; a turn whose
+    # picture doesn't fit is described by the vision-model fallback instead.
+    max_share: float = 0.3
 
 
 class ContextConfig(BaseModel):
@@ -100,6 +126,7 @@ class ContextConfig(BaseModel):
     # each note to its source's share, so one large note can't crowd out the
     # rest.
     notes_allocator: str = "trim"
+    inline_images: InlineImagesConfig = Field(default_factory=InlineImagesConfig)
 
 
 class MemoryEmbeddingsConfig(BaseModel):

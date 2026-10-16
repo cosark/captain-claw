@@ -54,6 +54,7 @@ class AgentContextGovernorMixin:
     _CALIBRATION_MAX = 2.0
     _CALIBRATION_ALPHA = 0.5
     _CALIBRATION_STEP = 0.05   # the ratio moves the budget only in 5% steps
+    _CALIBRATION_IMAGE_SHARE = 0.25  # calls with more image tokens than this don't calibrate
     _FOLD_HIGH = 0.80          # fold when the real input would pass 80% of the window …
     _FOLD_LOW = 0.50           # … down to 50%
     _NUDGE_AT = 0.70           # ask for notes before the fold comes
@@ -117,6 +118,11 @@ class AgentContextGovernorMixin:
         the ratio. Samples a server can't have meant (reported input far below
         the estimate — cache not reported, or a different request) are skipped."""
         if estimated < 2_000 or provider_input <= 0:
+            return
+        # Image tokens are an estimate that differs per model: a call they
+        # dominate says little about the text ratio.
+        _window = getattr(self, "last_context_window", None) or {}
+        if int(_window.get("image_tokens", 0) or 0) > self._CALIBRATION_IMAGE_SHARE * estimated:
             return
         sample = provider_input / estimated
         if not (0.5 <= sample <= 3.0):
@@ -409,8 +415,20 @@ class AgentContextGovernorMixin:
         est = int(window.get("estimated_input_tokens", 0) or 0)
         replays = self._replays_reasoning()
         added = 0
+        from captain_claw.config import get_config
+        from captain_claw.llm.vision import tool_image_count, typical_image_tokens
+
+        _image_cost = 0
         for msg in self.session.messages[last_count:]:
             added += self._wire_token_count(msg)   # counts reasoning when it is replayed
+            if str(msg.get("role", "")) == "tool" and "[Tool image:" in str(msg.get("content", "")):
+                if not _image_cost:
+                    _image_cost = typical_image_tokens(
+                        get_config().context.inline_images.max_pixels,
+                        str(getattr(self.provider, "provider", "") or ""),
+                        str(getattr(self.provider, "model", "") or ""),
+                    )
+                added += _image_cost * tool_image_count(str(msg.get("content", "")))
             if (not replays and str(msg.get("role", "")) == "assistant"
                     and msg.get("reasoning_content")):
                 added += self._ensure_reasoning_token_count(msg)

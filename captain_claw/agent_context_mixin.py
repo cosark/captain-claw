@@ -3335,6 +3335,13 @@ class AgentContextMixin:
         project_block = self._build_project_block()
         cognitive_self_awareness_block = self._build_cognitive_self_awareness_block()
         cognitive_mode_block = self._build_cognitive_mode_block()
+        # How attached pictures are seen: inline by a model that sees images,
+        # otherwise through image_vision / a multimodal peer.
+        _sees = getattr(self, "sees_images", None)
+        attached_image_policy_block = self.instructions.load(
+            "section_image_policy_sees.md" if callable(_sees) and _sees()
+            else "section_image_policy_tool.md"
+        )
 
         from captain_claw import __version__, __build_date__
 
@@ -3362,6 +3369,7 @@ class AgentContextMixin:
             reflection_block=reflection_block,
             cognitive_self_awareness_block=cognitive_self_awareness_block,
             cognitive_mode_block=cognitive_mode_block,
+            attached_image_policy_block=attached_image_policy_block,
             system_info_block=system_info_block,
             extra_read_dirs_block=extra_read_dirs_block,
             tool_list_block=tool_list_block,
@@ -3928,7 +3936,8 @@ class AgentContextMixin:
         defused too, so the block always ends where it says it does.
         """
         body = "\n\n".join(text.strip() for _, text in notes if text and text.strip())
-        body = body.replace("[Attached image:", "[Earlier image:")
+        body = body.replace("[Attached image:", "[Earlier image:").replace(
+            "[Tool image:", "[Earlier tool image:")
         body = _NESTED_BLOCK_MARKER_RE.sub(lambda m: "(" + m.group(1), body)
         return f"[INTERNAL CONTEXT — {lead}]\n{body}\n[END INTERNAL CONTEXT]"
 
@@ -4466,7 +4475,9 @@ class AgentContextMixin:
             _packs_ok = bool(_pack_access.packs_allowed(self))
         except Exception:
             _packs_ok = False
-        _sp_key = (bool(getattr(self, "planning_enabled", False)), _packs_ok)
+        _sees_images = getattr(self, "sees_images", None)
+        _sees_images = bool(_sees_images()) if callable(_sees_images) else False
+        _sp_key = (bool(getattr(self, "planning_enabled", False)), _packs_ok, _sees_images)
         _sp_cache = getattr(self, "_turn_system_prompt", None)
         if (
             isinstance(_sp_cache, tuple)
@@ -4757,6 +4768,36 @@ class AgentContextMixin:
                 candidate_messages[_pos] = _plain
             else:
                 candidate_messages[_pos] = self._with_lane_notes(_notes, _plain)
+
+        # ── Inline images ────────────────────────────────────────────
+        # A model that sees images gets the current turn's pictures as image
+        # parts (llm/vision.py); their tokens come off the history budget
+        # before anything else is fitted. Earlier turns keep only their path
+        # markers — the model's own reply already says what it saw there.
+        _image_plan = None
+        _turn_from = first_turn_pos if first_turn_pos is not None else turn_anchor_pos
+        if _sees_images and _turn_from is not None:
+            from captain_claw.llm.vision import plan_inline_images
+
+            _img_cfg = cfg.context.inline_images
+            _image_plan = plan_inline_images(
+                [(_pos, str(candidate_messages[_pos].get("content", "") or ""))
+                 for _pos in range(_turn_from, len(candidate_messages))],
+                max_images=int(_img_cfg.max_images_per_call),
+                max_tool_images=int(_img_cfg.max_tool_images),
+                max_pixels=int(_img_cfg.max_pixels),
+                jpeg_quality=int(_img_cfg.jpeg_quality),
+                token_cap=max(1, min(int(context_budget * float(_img_cfg.max_share)),
+                                     history_budget // 2)),
+                provider=str(getattr(self.provider, "provider", "") or ""),
+                model=str(getattr(self.provider, "model", "") or ""),
+            )
+            history_budget = max(0, history_budget - _image_plan.tokens)
+            # On the messages themselves (copies), not by position: the
+            # context block is inserted ahead of the turn's message below.
+            for _pos, _imgs in _image_plan.images.items():
+                candidate_messages[_pos] = {**candidate_messages[_pos], "_inline_images": _imgs}
+        _image_tokens = _image_plan.tokens if _image_plan is not None else 0
 
         # ── Context notes ────────────────────────────────────────────
         # Background notes (memory, insights, todos, workspace map, …) go in
@@ -5057,6 +5098,11 @@ class AgentContextMixin:
                 continue
             if pos in _marker_pos:
                 msg = {**msg, "reasoning_content": _REASONING_OMITTED}
+            if _image_plan is not None and pos == turn_anchor_pos and _image_plan.skipped_attached:
+                _names = ", ".join(os.path.basename(p) for p in _image_plan.skipped_attached)
+                msg = {**msg, "content": (
+                    f"{msg.get('content', '')}\n(Not shown to you: {_names} — over this request's "
+                    "image limit or unreadable. Call image_vision on its path to look at it.)")}
             if (
                 pos == turn_anchor_pos
                 and background_pos is not None
@@ -5119,6 +5165,7 @@ class AgentContextMixin:
                     # ignore the field.
                     reasoning_content=msg.get("reasoning_content"),
                     cache_breakpoint=bool(msg.get("_cache_breakpoint")),
+                    images=msg.get("_inline_images") or None,
                 )
             )
 
@@ -5162,8 +5209,9 @@ class AgentContextMixin:
         sections["env_note"] = int(getattr(self, "_turn_env_tokens", 0) or 0) if env_note else 0
         sections["reasoning_prior"] = reasoning_prior
         sections["reasoning_current"] = reasoning_current
+        sections["images"] = _image_tokens
         # Governed: the gate feedback appended after this build is sent too.
-        prompt_tokens = system_tokens + used_tokens + (_reserve if _governed else 0)
+        prompt_tokens = system_tokens + used_tokens + (_reserve if _governed else 0) + _image_tokens
         self.last_context_window = {
             "context_budget_tokens": context_budget,
             "system_tokens": system_tokens,
@@ -5189,6 +5237,10 @@ class AgentContextMixin:
             "reasoning_echo_steps": len(_echo_pos),
             "reasoning_marked_steps": len(_marker_pos),
             "tool_schema_tokens_budgeted": _tool_schema_tokens,
+            # Pictures sent inline to a model that sees them, and what they cost.
+            "inline_images": _image_plan.count if _image_plan is not None else 0,
+            "image_tokens": _image_tokens,
+            "images_not_sent": len(_image_plan.skipped) if _image_plan is not None else 0,
             # The recall decision, and whether its card made it into the block.
             "topic_recall": (
                 {**self._last_topic_recall, "sent": "topic_recall" in _note_kinds}

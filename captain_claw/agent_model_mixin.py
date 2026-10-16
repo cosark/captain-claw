@@ -77,6 +77,79 @@ class AgentModelMixin:
             self._refresh_runtime_model_details(source="config")
         return dict(self._runtime_model_details)
 
+    def _vision_switch(self) -> Any:
+        """The configured vision switch for the model in use: its allowed-model
+        entry's ``vision`` when set, else ``model.vision`` while the agent runs
+        the configured model, else auto."""
+        cfg = get_config()
+        try:
+            details = self.get_runtime_model_details()
+        except Exception:
+            details = {}
+        model_id = str(details.get("id") or "").strip()
+        if model_id and model_id != "default":
+            for item in cfg.model.allowed:
+                if str(getattr(item, "id", "") or "").strip() == model_id:
+                    value = getattr(item, "vision", None)
+                    if value is not None:
+                        return value
+                    break
+        provider = getattr(self, "provider", None)
+        running = str(getattr(provider, "model", "") or "").strip().lower()
+        configured = str(cfg.model.model or "").strip().lower()
+        if configured and (running == configured or running.endswith("/" + configured)):
+            return getattr(cfg.model, "vision", "auto")
+        return "auto"
+
+    def sees_images(self) -> bool:
+        """Whether this agent's own model gets pictures inline (llm/vision.py):
+        it can see them, and one fits the window's share for images — a small
+        local model's pictures are described by the vision-model fallback."""
+        provider = getattr(self, "provider", None)
+        if provider is None:
+            return False
+        from captain_claw.llm.vision import resolve_sees_images
+
+        sees = resolve_sees_images(
+            str(getattr(provider, "provider", "") or ""),
+            str(getattr(provider, "model", "") or ""),
+            str(getattr(provider, "base_url", "") or ""),
+            self._vision_switch(),
+        ) and self._inline_image_fits()
+        try:
+            # The Ollama converter inlines the picked images only, not markers;
+            # a refused picture is described by this agent's fallback.
+            provider.sees_images = sees
+            provider.describe_refused_images = self._describe_refused_images
+        except Exception:
+            pass
+        return sees
+
+    async def _describe_refused_images(self, paths: list[str]) -> str:
+        """What the vision-model fallback (a separate vision model, else a
+        multimodal peer) says about pictures this agent's model refused."""
+        from captain_claw.web.chat_handler import _prefix_image_analysis
+
+        return (await _prefix_image_analysis(self, "", list(paths), lambda _event: None)).strip()
+
+    def _context_window_tokens(self) -> int:
+        """The context window a request has: config, capped by the provider's."""
+        budget = max(1, int(get_config().context.max_tokens))
+        provider_ctx = int(getattr(getattr(self, "provider", None), "num_ctx", 0) or 0)
+        return provider_ctx if 0 < provider_ctx < budget else budget
+
+    def _inline_image_fits(self) -> bool:
+        """Whether one picture at the inline size fits the window's image share."""
+        from captain_claw.llm.vision import typical_image_tokens
+
+        cfg = get_config().context.inline_images
+        provider = getattr(self, "provider", None)
+        one = typical_image_tokens(
+            cfg.max_pixels, str(getattr(provider, "provider", "") or ""),
+            str(getattr(provider, "model", "") or ""),
+        )
+        return one <= self._context_window_tokens() * float(cfg.max_share)
+
     def get_allowed_models(self) -> list[dict[str, Any]]:
         """Return allowed model selections from config.
 
