@@ -1978,14 +1978,29 @@ class WebServer:
         if not image:
             return web.json_response({"success": False, "error": "missing 'image' path"}, status=400)
         try:
+            if not self.agent.sees_images():
+                # The agent's model can't see it: a vision model or a multimodal
+                # peer describes it, as for a chat attachment.
+                from captain_claw.web.chat_handler import describe_images_without_vision
+
+                [(_path, desc)] = await describe_images_without_vision(self.agent, [image], prompt)
+                if desc is None:
+                    return web.json_response({"success": False, "error": (
+                        "this agent's model doesn't see images and it has no vision model "
+                        "or multimodal peer")}, status=503)
+                if desc.startswith("(automatic analysis failed"):
+                    return web.json_response({"success": False, "error": desc}, status=500)
+                # image_vision heads its answer with "image_vision results from …:".
+                if desc.startswith("image_vision results from ") and "\n\n" in desc:
+                    desc = desc.split("\n\n", 1)[1]
+                return web.json_response({"success": True, "content": desc.strip()})
             from captain_claw.llm import Message
             msgs = [
                 Message(role="system", content=(
                     "You are a vision assistant. Describe or answer based ONLY on the "
                     "attached image. Use no other context, memory, or tools."
                 )),
-                Message(role="user", content=f"{prompt}\n[Attached image: {image}]",
-                        images=[image] if self.agent.sees_images() else None),
+                Message(role="user", content=f"{prompt}\n[Attached image: {image}]", images=[image]),
             ]
             resp = await self.agent.provider.complete(msgs)
             content = str(getattr(resp, "content", "") or "").strip()

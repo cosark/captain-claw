@@ -16,6 +16,10 @@ from __future__ import annotations
 import io
 import mimetypes
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import time
 import unicodedata
 from collections import OrderedDict
@@ -201,12 +205,12 @@ def human_size(n: int) -> str:
 
 
 def to_jpeg(data: bytes) -> bytes | None:
-    """A HEIC/HEIF/TIFF/AVIF picture as JPEG bytes, or None when Pillow
-    (with pillow-heif for HEIC) can't read it."""
+    """A HEIC/HEIF/TIFF/AVIF picture as JPEG bytes, or None when neither Pillow
+    (with pillow-heif for HEIC) nor, on macOS, ``sips`` can read it."""
     try:
         from PIL import Image
     except Exception:
-        return None
+        return _sips_to_jpeg(data)
     try:
         import pillow_heif  # type: ignore[import-not-found]
         pillow_heif.register_heif_opener()
@@ -220,7 +224,24 @@ def to_jpeg(data: bytes) -> bytes | None:
             rgb.save(out, format="JPEG", quality=90)
             return out.getvalue()
     except Exception:
+        return _sips_to_jpeg(data)
+
+
+def _sips_to_jpeg(data: bytes) -> bytes | None:
+    """macOS reads HEIC/HEIF itself: convert with ``sips`` when Pillow has no
+    HEIF plugin. None elsewhere, or when it can't."""
+    sips = shutil.which("sips") if sys.platform == "darwin" else None
+    if not sips:
         return None
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = Path(tmp) / "picture", Path(tmp) / "picture.jpg"
+        src.write_bytes(data)
+        try:
+            subprocess.run([sips, "-s", "format", "jpeg", str(src), "--out", str(dst)],
+                           capture_output=True, timeout=30, check=False)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return dst.read_bytes() if dst.is_file() and dst.stat().st_size else None
 
 
 def sticker_png(data: bytes) -> bytes | None:

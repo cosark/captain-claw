@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING, Any, BinaryIO
 from aiohttp import web
 
 from captain_claw.config import get_config
+# Pictures stored as JPEG on upload — the WhatsApp bridge's set.
+from captain_claw.flight_deck.whatsapp_inbound import CONVERTIBLE_EXTS as CONVERTIBLE_PICTURE_EXTS
 from captain_claw.logging import get_logger
 
 if TYPE_CHECKING:
@@ -113,6 +115,25 @@ async def stream_field_to_file(field: Any, fh: BinaryIO) -> int:
     if buf:
         await asyncio.to_thread(fh.write, bytes(buf))
     return total
+
+
+async def picture_as_jpeg(path: Path) -> tuple[Path, int] | None:
+    """Store a picture vision models can't read as it is (HEIC from an iPhone,
+    AVIF, TIFF) as a JPEG beside it — as the WhatsApp bridge does — and remove
+    the original. ``(jpeg path, size)``, or None when this host can't convert it
+    (HEIC needs pillow-heif, or macOS)."""
+    from captain_claw.flight_deck.whatsapp_inbound import to_jpeg
+
+    data = await asyncio.to_thread(path.read_bytes)
+    jpeg = await asyncio.to_thread(to_jpeg, data)
+    if not jpeg:
+        log.info("Picture kept as uploaded — no converter on this host", path=str(path))
+        return None
+    dest, fh = await asyncio.to_thread(open_unique_upload, path.parent, path.stem, ".jpg")
+    with fh:
+        await asyncio.to_thread(fh.write, jpeg)
+    await asyncio.to_thread(path.unlink, True)
+    return dest, len(jpeg)
 
 
 async def save_upload_field(field: Any, dest_dir: Path, safe_stem: str, ext: str) -> tuple[Path, int]:
@@ -299,6 +320,13 @@ async def upload_file(server: WebServer, request: web.Request) -> web.Response:
         dest_path, size = await save_upload_field(file_field, dest_dir, safe_stem, ext)
         if size == 0:
             return web.json_response({"error": "Empty file"}, status=400)
+
+        # A picture vision models can't read as it is becomes a JPEG, so the
+        # agent's own model or its vision fallback can see it.
+        if ext in CONVERTIBLE_PICTURE_EXTS:
+            converted = await picture_as_jpeg(dest_path)
+            if converted is not None:
+                dest_path, size = converted
 
         # If zip file, extract contents preserving folder structure — into a
         # folder named after this upload's unique name, so two zips never merge.

@@ -63,8 +63,10 @@ class _SessionManager:
 
 
 @pytest.fixture
-def sees(request):
+def sees(request, tmp_path, monkeypatch):
     """Config for an agent whose model sees images (param False: it doesn't)."""
+    monkeypatch.setattr(vision, "_REJECTED_STORE", tmp_path / "vision_rejected.json")
+    monkeypatch.setattr(vision, "_rejected_loaded", False)
     vision._VISION_REJECTED.clear()
     old_cfg = get_config().model_copy(deep=True)
     cfg = old_cfg.model_copy(deep=True)

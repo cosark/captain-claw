@@ -27,7 +27,9 @@ from captain_claw.llm import vision  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def _fresh_vision_state():
+def _fresh_vision_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(vision, "_REJECTED_STORE", tmp_path / "vision_rejected.json")
+    monkeypatch.setattr(vision, "_rejected_loaded", False)
     vision._VISION_REJECTED.clear()
     vision._ENCODE_CACHE.clear()
     yield

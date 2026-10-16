@@ -21,9 +21,11 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import math
 import mimetypes
 import re
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -60,9 +62,17 @@ _KNOWN_VISION_RE = re.compile(
 )
 _TEXT_ONLY_NAME_RE = re.compile(r"text-?only|textonly", re.IGNORECASE)
 
-# provider|base_url|model of models whose server refused image input this
-# process (see the self-heal in llm/__init__.py). Never sent one again.
-_VISION_REJECTED: set[str] = set()
+# provider|base_url|model → when its server refused image input (the self-heal
+# in llm/__init__.py). Not sent images again for a day: kept in
+# ~/.captain-claw/vision_rejected.json so an agent restart doesn't pay the
+# refused call again, and forgotten after _REJECTED_TTL so a server that gains
+# vision (llama.cpp restarted with its mmproj, a model swapped under the same
+# name) is tried again. An explicit `vision: on` doesn't clear it — that is how
+# local models are configured; delete the file to retry sooner.
+_VISION_REJECTED: dict[str, float] = {}
+_REJECTED_TTL = 24 * 3600.0
+_REJECTED_STORE: Path | None = None  # None → ~/.captain-claw/vision_rejected.json
+_rejected_loaded = False
 
 
 def _bare_model(provider: str, model: str) -> str:
@@ -82,16 +92,67 @@ def _vision_key(provider: str, model: str, base_url: str) -> str:
     ))
 
 
+def _rejected_store() -> Path:
+    if _REJECTED_STORE is not None:
+        return _REJECTED_STORE
+    from captain_claw.config import _HOME_DIR
+
+    return _HOME_DIR / "vision_rejected.json"
+
+
+def _read_rejected() -> dict[str, float]:
+    """The stored refusals still within the TTL."""
+    try:
+        data = json.loads(_rejected_store().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    now = time.time()
+    if not isinstance(data, dict):
+        return {}
+    return {str(key): float(when) for key, when in data.items()
+            if isinstance(when, (int, float)) and now - float(when) < _REJECTED_TTL}
+
+
+def _load_rejected() -> None:
+    global _rejected_loaded
+    if not _rejected_loaded:
+        _rejected_loaded = True
+        for key, when in _read_rejected().items():
+            _VISION_REJECTED.setdefault(key, when)
+
+
+def _save_rejected() -> None:
+    """Write the refusals, merged with what other agents on this home stored."""
+    path = _rejected_store()
+    merged = {**_read_rejected(), **_VISION_REJECTED}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(merged, indent=0, sort_keys=True), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        log.debug("Could not store the image-input refusal", error=str(exc))
+
+
 def remember_vision_rejected(provider: str, model: str, base_url: str = "") -> None:
-    key = _vision_key(provider, model, base_url)
-    if key not in _VISION_REJECTED:
-        _VISION_REJECTED.add(key)
-        log.warning("Model refused image input; using the text fallback from now on",
-                    provider=provider, model=model, base_url=base_url or None)
+    if vision_rejected(provider, model, base_url):
+        return
+    _VISION_REJECTED[_vision_key(provider, model, base_url)] = time.time()
+    _save_rejected()
+    log.warning("Model refused image input; using the text fallback for a day",
+                provider=provider, model=model, base_url=base_url or None)
 
 
 def vision_rejected(provider: str, model: str, base_url: str = "") -> bool:
-    return _vision_key(provider, model, base_url) in _VISION_REJECTED
+    _load_rejected()
+    key = _vision_key(provider, model, base_url)
+    when = _VISION_REJECTED.get(key)
+    if when is None:
+        return False
+    if time.time() - when >= _REJECTED_TTL:
+        _VISION_REJECTED.pop(key, None)
+        return False
+    return True
 
 
 def normalize_vision_switch(value: Any) -> str:

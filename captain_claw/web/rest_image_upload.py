@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from typing import TYPE_CHECKING
 
 from aiohttp import web
@@ -9,7 +11,9 @@ from aiohttp import web
 from captain_claw.config import get_config
 from captain_claw.logging import get_logger
 from captain_claw.web.rest_file_upload import (
+    CONVERTIBLE_PICTURE_EXTS,
     first_file_field,
+    picture_as_jpeg,
     sanitize_upload_name,
     save_upload_field,
     upload_session_id,
@@ -45,9 +49,10 @@ async def upload_image(server: WebServer, request: web.Request) -> web.Response:
         original_name = file_field.filename or "image.png"
         safe_stem, ext = sanitize_upload_name(original_name)
 
-        if ext not in _IMAGE_EXTENSIONS:
+        if ext not in _IMAGE_EXTENSIONS and ext not in CONVERTIBLE_PICTURE_EXTS:
             return web.json_response(
-                {"error": f"Unsupported image type '{ext}'. Allowed: {', '.join(sorted(_IMAGE_EXTENSIONS))}"},
+                {"error": f"Unsupported image type '{ext}'. Allowed: "
+                          f"{', '.join(sorted(_IMAGE_EXTENSIONS | CONVERTIBLE_PICTURE_EXTS))}"},
                 status=400,
             )
 
@@ -58,6 +63,16 @@ async def upload_image(server: WebServer, request: web.Request) -> web.Response:
         dest_path, size = await save_upload_field(file_field, dest_dir, safe_stem, ext)
         if size == 0:
             return web.json_response({"error": "Empty file"}, status=400)
+        # HEIC / AVIF / TIFF are stored as JPEG, so a vision model can read them.
+        if ext in CONVERTIBLE_PICTURE_EXTS:
+            converted = await picture_as_jpeg(dest_path)
+            if converted is None:
+                await asyncio.to_thread(dest_path.unlink, True)
+                return web.json_response(
+                    {"error": f"Can't convert '{ext}' on this host (HEIC needs pillow-heif)."},
+                    status=400,
+                )
+            dest_path, size = converted
 
         log.info(
             "Image uploaded",
