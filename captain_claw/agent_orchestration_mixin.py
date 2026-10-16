@@ -17,7 +17,7 @@ from captain_claw.agent_stuck import (
     MSG_RETRIES_EXHAUSTED,
     MSG_STUCK,
 )
-from captain_claw import fabrication_guard, mail_authority, msg_origin
+from captain_claw import fabrication_guard, jev_progress, mail_authority, msg_origin
 from captain_claw.config import get_config
 from captain_claw.exceptions import GuardBlockedError, LLMAPIError, LLMError
 from captain_claw.llm import Message, is_reasoning_backfill_placeholder
@@ -1933,7 +1933,32 @@ class AgentOrchestrationMixin:
                     or bool(completion_feedback)
                     or bool(completion_requirements)
                 )
-                if recent_progress and remaining_work and soft_turn_iterations < hard_turn_iterations:
+                can_extend = soft_turn_iterations < hard_turn_iterations
+                extend = recent_progress and remaining_work and can_extend
+                # That rule stops an ordinary request (no plan, no
+                # requirements) at the soft limit even while the agent is
+                # plainly working — Jev reads the turn's steps and judges.
+                jev_p: float | None = None
+                if not extend and can_extend and self.session and await jev_progress.ready():
+                    self._emit_thinking(
+                        "Step budget used up — asking Jev whether the work is still moving",
+                        tool="progress", phase="tool",
+                    )
+                    jev_p = await jev_progress.progress_probability(
+                        user_input,
+                        self.session.messages[turn_start_idx:],
+                        steps_used=iteration,
+                        step_budget=soft_turn_iterations,
+                    )
+                    extend = jev_p is not None and jev_p >= jev_progress.THRESHOLD
+                jev_lines = (
+                    f"\njudge=jev\np_progressing={jev_p:.2f}" if jev_p is not None else ""
+                )
+                jev_data = (
+                    {"judge": "jev", "p_progressing": round(jev_p, 3)}
+                    if jev_p is not None else {}
+                )
+                if extend:
                     previous_limit = soft_turn_iterations
                     soft_turn_iterations = min(hard_turn_iterations, soft_turn_iterations + extension_step)
                     self._emit_tool_output(
@@ -1943,12 +1968,14 @@ class AgentOrchestrationMixin:
                             "previous_limit": previous_limit,
                             "new_limit": soft_turn_iterations,
                             "hard_limit": hard_turn_iterations,
+                            **jev_data,
                         },
                         (
                             "step=iteration_budget_extended\n"
                             f"previous_limit={previous_limit}\n"
                             f"new_limit={soft_turn_iterations}\n"
                             f"hard_limit={hard_turn_iterations}"
+                            f"{jev_lines}"
                         ),
                     )
                 else:
@@ -1960,6 +1987,7 @@ class AgentOrchestrationMixin:
                             "hard_limit": hard_turn_iterations,
                             "recent_progress": recent_progress,
                             "remaining_work": remaining_work,
+                            **jev_data,
                         },
                         (
                             "step=iteration_budget_exhausted\n"
@@ -1967,6 +1995,7 @@ class AgentOrchestrationMixin:
                             f"hard_limit={hard_turn_iterations}\n"
                             f"recent_progress={recent_progress}\n"
                             f"remaining_work={remaining_work}"
+                            f"{jev_lines}"
                         ),
                     )
                     self._set_runtime_status("waiting")
@@ -3511,9 +3540,19 @@ class AgentOrchestrationMixin:
                 return finish(final_text, success=finish_success)
             continue
 
-        # Hard iteration cap reached
+        # Hard iteration cap reached (the soft limit grew all the way to it,
+        # so the budget check above never stopped the turn): ship what the
+        # turn has, as the budget stop does.
         self._set_runtime_status("waiting")
-        return finish("Max iterations reached. Could not complete the request.", success=False)
+        _partial_hard = await _salvage_partial_result("Iteration budget exhausted")
+        if _partial_hard:
+            return finish(
+                "⚠️ I wasn't able to fully complete this request "
+                "(iteration budget exhausted), but here's what I "
+                f"have so far:\n\n{_partial_hard}",
+                success=False,
+            )
+        return finish(MSG_BUDGET_EXHAUSTED, success=False)
 
     # ------------------------------------------------------------------
     # stream() — streaming wrapper

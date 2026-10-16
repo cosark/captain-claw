@@ -383,6 +383,9 @@ class JevToolConfig(BaseModel):
     # After a person's chat turn, ask Jev whether the reply came out garbled
     # and, if so, recommend /new (captain_claw/garbled_reply.py).
     check_replies: bool = True
+    # When a turn runs out of steps, ask Jev whether the agent is still making
+    # progress and, if so, extend the step budget (captain_claw/jev_progress.py).
+    check_progress: bool = True
 
 
 class TypesenseToolConfig(BaseModel):
