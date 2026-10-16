@@ -673,14 +673,16 @@ class ToolsConfig(BaseModel):
     # hides them from agents until that account is actually connected (in
     # Flight Deck), so there's no harm in having them permanently enabled.
     # Jev likewise: hidden until a key is usable (the owner's in Flight Deck,
-    # or tools.jev.api_key / JEV_API_KEY standalone).
+    # or tools.jev.api_key / JEV_API_KEY standalone). image_vision is how an
+    # agent looks at a picture (attached, downloaded, or one it saw earlier);
+    # an archetype that left it out had no way to see an image at all.
     _ALWAYS_ENABLED: frozenset[str] = frozenset({
         "read", "write", "edit", "personality", "botport", "playbooks",
         "browser", "datastore", "direct_api", "cron",
         "google_drive", "google_calendar", "google_mail",
         "microsoft_onedrive", "microsoft_calendar", "microsoft_mail",
         "jev",
-        "whatsapp_send_file", "intentions", "video_vision", "cv", "topics",
+        "whatsapp_send_file", "intentions", "image_vision", "video_vision", "cv", "topics",
         "history", "vfs",
         # Deep memory is reached through Flight Deck, which owns the Typesense
         # connection and the credentials — so from an agent's side the archive

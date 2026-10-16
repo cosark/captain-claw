@@ -113,3 +113,40 @@ def test_multiple_images_each_analyzed():
 
     assert "First image." in out and "Second image." in out
     assert agent._execute_tool_with_guard.await_count == 2
+
+
+def test_nothing_described_points_to_image_vision_instead_of_forbidding_it():
+    """No vision model or peer: the agent's own image_vision (which falls back to
+    its own model) is the one way left to look — the footer must not forbid it."""
+    agent = _agent()
+    with patch("captain_claw.tools.image_ocr.ImageVisionTool") as ivt_cls, \
+         patch("captain_claw.tools.video_vision._find_vision_peer", return_value=None):
+        ivt_cls.return_value._find_model.return_value = None
+        out = _run(ch._prefix_image_analysis(agent, "what is this?", ["/x/i.png"], lambda m: None))
+
+    assert "Call image_vision on the image path" in out
+    assert "Do NOT re-describe via image_vision" not in out
+    assert "were described above by a vision model" not in out
+    assert out.endswith("what is this?")
+
+
+def test_a_failed_analysis_also_points_to_image_vision():
+    agent = _agent()
+    agent._execute_tool_with_guard = AsyncMock(
+        return_value=ToolResult(success=False, error="model unavailable")
+    )
+    with patch("captain_claw.tools.image_ocr.ImageVisionTool") as ivt_cls:
+        ivt_cls.return_value._find_model.return_value = object()
+        out = _run(ch._prefix_image_analysis(agent, "hi", ["/x/i.png"], lambda m: None))
+
+    assert "automatic analysis failed: model unavailable" in out
+    assert "Call image_vision on the image path" in out
+    assert "Do NOT re-describe via image_vision" not in out
+
+
+def test_image_vision_is_always_enabled():
+    """An archetype's tool list that leaves image_vision out still gets it —
+    without it an agent had no way to look at a picture at all."""
+    from captain_claw.config import ToolsConfig
+
+    assert "image_vision" in ToolsConfig(enabled=["read", "web_search"]).enabled

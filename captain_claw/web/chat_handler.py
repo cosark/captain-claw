@@ -1119,18 +1119,30 @@ async def _prefix_image_analysis(
     from pathlib import Path as _Path
 
     blocks: list[str] = []
+    described = 0
     for ip, desc in await describe_images_without_vision(agent, image_paths, _DESCRIBE_PROMPT, send):
-        if desc is None:
-            desc = (
-                "(could not be analyzed — this session has no vision model or multimodal "
-                "peer, so the image can't be seen here. Tell the user that plainly; do NOT "
-                "guess what it shows.)"
+        if desc is None or desc.startswith("(automatic analysis failed"):
+            desc = desc or (
+                "(not described automatically — this session has no vision model or "
+                "multimodal peer.)"
             )
+        else:
+            described += 1
         blocks.append(f"[Automatic analysis of attached image {_Path(ip).name}]\n{desc}")
 
     if not blocks:
         return content
     analysis = "\n\n".join(blocks)
+    if not described:
+        # Nothing could describe it here — the agent's own image_vision may still
+        # (it falls back to the agent's model). Never forbid the one tool left.
+        return (
+            f"{analysis}\n\n---\n"
+            "Call image_vision on the image path to look at it. If that fails too, tell "
+            "the user plainly that you can't see the image here; do NOT guess what it "
+            "shows, and do NOT convert it to another format to get around this.\n\n"
+            f"{content}"
+        )
     return (
         f"{analysis}\n\n---\n"
         "The attached image(s) were described above by a vision model (the description "
