@@ -39,7 +39,8 @@ saved, or none in reach for 30 s, setup opens by itself.
    - Flight Deck address: `ws://<mac-ip>:25080` on your network, or `wss://<your deck domain>`
    - access token: Flight Deck → Connections → *Agent access for Claude (MCP)* → Generate token
      (not needed on a deck with auth off)
-   - optional: agent slug, spoken-reply language (`en`, `hr`, …), volume, sleep minutes
+   - optional: agent slug, spoken-reply language (`en`, `hr`, …), volume, screen-off (5/10/15 s)
+     and power-off (15/30/60 s) timeouts
 3. Save — the stick restarts and connects.
 
 The deck needs `SONIOX_API_KEY` (speech in, voice out). A deck reached

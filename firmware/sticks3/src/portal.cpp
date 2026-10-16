@@ -122,9 +122,17 @@ static void handleRoot() {
   for (int k = 0; k < face::KindCount; ++k) {
     h += "<option value=" + String(k) + (settings.character == k ? " selected>" : ">") + face::name(k) + "</option>";
   }
-  h += F("</select><label>Sleep after idle minutes (0 = never)</label><input name=sleep type=number min=0 max=240 value=");
-  h += String(settings.sleepMin);
-  h += F("><button type=submit>Save &amp; restart</button></form><p><small>Device ");
+  h += F("</select><h2>Power</h2><label>Screen off when idle</label><select name=scroff>");
+  for (int s : {5, 10, 15}) {
+    h += "<option value=" + String(s) + (settings.screenOffS == s ? " selected>" : ">") + String(s) + " s</option>";
+  }
+  h += F("</select><label>Power off when idle</label><select name=pwroff>");
+  for (int s : {15, 30, 60}) {
+    h += "<option value=" + String(s) + (settings.powerOffS == s ? " selected>" : ">") + String(s) + " s</option>";
+  }
+  h += F("</select><small>Power off = deep sleep; the front button wakes it (a few seconds to reconnect)."
+         " Never while it's listening, speaking or waiting for the agent.</small>"
+         "<button type=submit>Save &amp; restart</button></form><p><small>Device ");
   h += deviceId();
   h += F("</small></p></body></html>");
   server.send(200, "text/html; charset=utf-8", h);
@@ -158,7 +166,9 @@ static void handleSave() {
   settings.speak = server.arg("speak") != "0";
   settings.volume = constrain(server.arg("vol").toInt(), 0, 100) * 255 / 100;
   settings.boostDb = constrain(server.arg("boost").toInt(), 0, 10);
-  settings.sleepMin = constrain(server.arg("sleep").toInt(), 0, 240);
+  int so = server.arg("scroff").toInt(), po = server.arg("pwroff").toInt();
+  settings.screenOffS = (so == 5 || so == 10) ? so : 15;
+  settings.powerOffS = (po == 15 || po == 30) ? po : 60;
   settings.femaleVoice = server.arg("voice") == "female";
   String cue = server.arg("cue");
   settings.cueBeep = cue == "both" || cue == "beep";

@@ -21,7 +21,7 @@
 #include "settings.h"
 #include "ui.h"
 
-#define FW_VERSION "0.6.2"
+#define FW_VERSION "0.6.3"
 
 enum class Mode { Idle, Listening, Waiting, Reply, Image, Menu, Agents, CharPick, Status, Notice };
 
@@ -50,8 +50,7 @@ static int rttMs = -1;
 static uint32_t lastPingMs = 0, lastReplyMs = 0, turns = 0;
 
 static constexpr uint32_t kTapMs = 300;      // shorter press = tap, not talk
-static constexpr uint32_t kDimMs = 30000;
-static constexpr uint32_t kOffMs = 60000;
+static constexpr uint32_t kDimLeadMs = 2000;  // dims this long before the screen goes off
 static constexpr uint8_t kBright = 128;
 static constexpr uint32_t kFlashMs = 700;    // white / normal, every 100 ms
 static constexpr uint16_t kGreen = ui::rgb(40, 200, 90), kRed = ui::rgb(230, 50, 50);
@@ -222,7 +221,8 @@ static void showIdle() {
 
 // ── menu ─────────────────────────────────────────────────────────────
 
-enum MenuRow { MStatus, MAgent, MVolume, MBoost, MVoice, MDisplay, MTextSize, MCharacter, MBeep, MFlash, MLead, MSetup, MCount };
+enum MenuRow { MStatus, MAgent, MVolume, MBoost, MVoice, MDisplay, MTextSize, MCharacter, MBeep, MFlash, MLead,
+               MScreenOff, MPowerOff, MSetup, MCount };
 
 static constexpr uint8_t kVolumeSteps[] = {64, 128, 191, 255};  // 25 / 50 / 75 / 100 %
 static constexpr uint8_t kBoostSteps[] = {0, 6, 10};
@@ -243,6 +243,8 @@ static String menuLabel(int row) {
     case MBeep: return String("Beep before speech: ") + (settings.cueBeep ? "on" : "off");
     case MFlash: return String("Flash before speech: ") + (settings.cueFlash ? "on" : "off");
     case MLead: return "Cue lead: " + String(settings.cueLeadS) + " s";
+    case MScreenOff: return "Screen off: " + String(settings.screenOffS) + " s";
+    case MPowerOff: return "Power off: " + String(settings.powerOffS) + " s";
     default: return "Wi-Fi & settings…";
   }
 }
@@ -378,6 +380,8 @@ static void chooseMenuRow() {
     case MBeep: settings.cueBeep = !settings.cueBeep; break;
     case MFlash: settings.cueFlash = !settings.cueFlash; break;
     case MLead: settings.cueLeadS = settings.cueLeadS == 1 ? 2 : 1; break;
+    case MScreenOff: settings.screenOffS = settings.screenOffS == 5 ? 10 : settings.screenOffS == 10 ? 15 : 5; break;
+    case MPowerOff: settings.powerOffS = settings.powerOffS == 15 ? 30 : settings.powerOffS == 30 ? 60 : 15; break;
   }
   settings.save();
   redraw();
@@ -644,24 +648,25 @@ static void goToSleep() {
   esp_deep_sleep_start();
 }
 
+// "Nothing happening" = no button, no new reply, and not listening, speaking,
+// flashing or waiting for the agent: then the screen goes off, later the
+// stick powers off (deep sleep; the front button wakes it).
 static void handleIdlePower() {
-  if (mode == Mode::Listening || audio::playing() || flashing) {
+  if (mode == Mode::Listening || mode == Mode::Waiting || audio::playing() || flashing) {
     lastActivityMs = millis();
     return;
   }
   uint32_t idle = millis() - lastActivityMs;
-  if (!dimmed && idle > kDimMs) {
+  uint32_t offMs = settings.screenOffS * 1000UL;
+  if (!dimmed && idle > offMs - min(offMs / 2, kDimLeadMs)) {
     ui::brightness(24);
     dimmed = true;
   }
-  if (!screenOff && idle > kOffMs) {
+  if (!screenOff && idle > offMs) {
     ui::brightness(0);
     screenOff = true;
   }
-  if (settings.sleepMin && idle > settings.sleepMin * 60000UL && mode != Mode::Waiting &&
-      !M5.Power.isCharging()) {
-    goToSleep();
-  }
+  if (idle > settings.powerOffS * 1000UL) goToSleep();
 }
 
 // ── setup / loop ─────────────────────────────────────────────────────
@@ -713,11 +718,16 @@ void loop() {
   ws.loop();
   if (WiFi.status() != WL_CONNECTED) wifiMulti.run(0);
   bool inMenu = mode == Mode::Menu || mode == Mode::Agents || mode == Mode::Status || mode == Mode::CharPick;
+  // On a dark screen a press only wakes it — except the front button on the
+  // main screen, which starts talking right away.
+  bool dark = screenOff;
 
   // Front button: hold to talk, tap for quick actions; in the menu, choose.
   if (M5.BtnA.wasPressed()) {
     touch();
-    if (mode == Mode::Menu) {
+    if (dark && inMenu) {
+      // woken only
+    } else if (mode == Mode::Menu) {
       chooseMenuRow();
     } else if (mode == Mode::Agents) {
       chooseAgent();
@@ -748,7 +758,9 @@ void loop() {
   }
 
   // Side button: page / next row · hold = menu (hold again = close).
-  if (M5.BtnB.wasHold()) {
+  if (dark && (M5.BtnB.wasHold() || M5.BtnB.wasClicked())) {
+    touch();  // woken only
+  } else if (M5.BtnB.wasHold()) {
     touch();
     if (mode == Mode::CharPick) {  // back to the menu, keeping the old character
       mode = Mode::Menu;

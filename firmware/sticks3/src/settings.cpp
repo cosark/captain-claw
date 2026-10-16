@@ -22,7 +22,10 @@ void Settings::load() {
   speak = p.getBool("speak", true);
   volume = p.getUChar("vol", 191);
   boostDb = p.getUChar("boost", 6);
-  sleepMin = p.getUShort("sleep", 15);
+  screenOffS = p.getUChar("scroff", 15);
+  powerOffS = p.getUChar("pwroff", 60);
+  if (screenOffS != 5 && screenOffS != 10 && screenOffS != 15) screenOffS = 15;
+  if (powerOffS != 15 && powerOffS != 30 && powerOffS != 60) powerOffS = 60;
   femaleVoice = p.getBool("female", false);
   iconMode = p.getBool("icons", false);
   character = p.getUChar("char", 0);
@@ -57,7 +60,8 @@ void Settings::save() const {
   p.putBool("speak", speak);
   p.putUChar("vol", volume);
   p.putUChar("boost", boostDb);
-  p.putUShort("sleep", sleepMin);
+  p.putUChar("scroff", screenOffS);
+  p.putUChar("pwroff", powerOffS);
   p.putBool("female", femaleVoice);
   p.putBool("icons", iconMode);
   p.putUChar("char", character);
