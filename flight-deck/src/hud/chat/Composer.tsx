@@ -17,10 +17,17 @@
 //   - Enter sends only for physical typing (desktop / phone keyboard): on the
 //     glasses Enter on the field is the pinch that opens the composer.
 // The app stays usable without the composer (next-step chips, WebMCP).
+//
+// Off the glasses (the Android app, a phone or desktop browser) there is no
+// system composer: `change` is the blur a tap / click on another control
+// caused, and a phone's soft keyboard types with 'Unidentified' keydowns, so
+// it never counts as typing — the guard would swallow that very tap (Send
+// needing two). There the guard only runs for a field that still has focus,
+// and a press on Send keeps focus in the field (the keyboard stays up).
 
 import { useCallback, useEffect, useLayoutEffect, useRef } from 'react'
-import type { KeyboardEvent as ReactKeyboardEvent } from 'react'
-import { IS_GLASSES } from '../device'
+import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent } from 'react'
+import { IS_GLASSES, PRESS } from '../device'
 import { focusEl, pinFocus, quietActivations } from '../focus'
 import { Btn } from '../ui'
 import { chat, useHudChat } from './chatStore'
@@ -75,6 +82,8 @@ export function Composer(props: {
     const onCommit = () => {
       // A desktop blur-change after typing, or the wearer already moved on.
       if (navSinceFocus.current || Date.now() - typedAt.current < TYPING_WINDOW_MS) return
+      // Off the glasses: the field lost focus to a tap / click — let it through.
+      if (!IS_GLASSES && field !== document.activeElement) return
       // The pinch that closed the composer must not press what gets focus.
       quietActivations(COMPOSER_GUARD_MS)
       // After React re-rendered with the new text (Send enabled).
@@ -135,20 +144,26 @@ export function Composer(props: {
     if (props.onArrowUp()) e.preventDefault()
   }
 
+  // Off the glasses a press on Send must not take focus from the field: the
+  // soft keyboard stays up, and no blur-change runs before the click.
+  const onWrapMouseDown = IS_GLASSES ? undefined : (e: ReactMouseEvent<HTMLDivElement>) => {
+    if (document.activeElement === fieldRef.current && (e.target as Element).closest('.hud-composer-send')) e.preventDefault()
+  }
+
   const hint = !connected ? (closed ? 'Disconnected' : 'Connecting…')
     : busy ? 'Waiting for reply…'
-      : staged ? 'Written by Meta AI — not sent. Pinch Send to send it.'
+      : staged ? `Written by Meta AI — not sent. ${PRESS} Send to send it.`
         : ''
 
   return (
-    <div className="hud-composer-wrap" ref={wrapRef} onKeyDown={onWrapKeyDown}>
+    <div className="hud-composer-wrap" ref={wrapRef} onKeyDown={onWrapKeyDown} onMouseDown={onWrapMouseDown}>
       <div className="hud-composer">
         <textarea
           ref={fieldRef}
           className="hud-composer-field"
           rows={1}
           maxLength={4000}
-          placeholder="Pinch to write or speak…"
+          placeholder={`${PRESS} to write or speak…`}
           aria-label="Message"
           data-autofocus=""
           value={draft}

@@ -4,7 +4,8 @@
 // focusable reading blocks (HudMarkdown blocks). Up/Down walk the blocks (a
 // tall block is read page by page by the focus engine); Left/Right turn a
 // whole page and put focus on the first block that starts on it, so the next
-// Up/Down continues from what is on screen.
+// Up/Down continues from what is on screen. Off the glasses a sideways finger
+// swipe turns the page too.
 //
 // A cached copy is shown at once; unless the file list was fetched moments
 // ago, the list is re-checked in the background and a newer version replaces
@@ -12,9 +13,10 @@
 
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { HudApiError, type HudAgent, type HudFile } from '../api'
+import { IS_GLASSES } from '../device'
 import { FOCUSABLE_SELECTOR, focusEl } from '../focus'
 import { formatSize, relTime } from '../format'
-import { useAutoFocus, useNow } from '../hooks'
+import { useAutoFocus, useHorizontalSwipe, useNow } from '../hooks'
 import { splitMarkdown } from '../markdown/chunks'
 import { HudMarkdown } from '../markdown/HudMarkdown'
 import { htmlText } from '../markdown/rehypeHud'
@@ -49,7 +51,7 @@ interface FileState {
 
 function describeError(e: unknown): { error: string; retry: boolean } {
   if (e instanceof HudApiError) {
-    if (e.status === 413) return { error: 'Too large to show on the glasses (over 1 MB)', retry: false }
+    if (e.status === 413) return { error: `Too large to show ${IS_GLASSES ? 'on the glasses' : 'here'} (over 1 MB)`, retry: false }
     if (e.status === 404) return { error: 'File not found. It may have been moved or deleted.', retry: true }
     if (e.status === 0 && e.message === 'Timed out') return { error: TIMED_OUT, retry: true }
     if (e.message) return { error: e.message, retry: true }
@@ -189,7 +191,7 @@ export function FileScreen({ agent, fileKey, name }: { agent: HudAgent; fileKey:
     if (!shown) return null
     if (!/\S/.test(shown.body)) return 'This file is empty.'
     if (/^\s*</.test(shown.body) && !htmlText(shown.body).length) {
-      return "Nothing to show: this file only holds HTML the glasses don't display."
+      return `Nothing to show: this file only holds HTML ${IS_GLASSES ? "the glasses don't" : "this view doesn't"} display.`
     }
     return null
   }, [shown])
@@ -230,6 +232,11 @@ export function FileScreen({ agent, fileKey, name }: { agent: HudAgent; fileKey:
     document.addEventListener('keydown', onKey, true)
     return () => document.removeEventListener('keydown', onKey, true)
   }, [loaded])
+
+  useHorizontalSwipe(scrollRef, (dir) => {
+    const scroller = scrollRef.current
+    if (scroller && scroller.isConnected) turnPage(scroller, dir)
+  }, loaded)
 
   useAutoFocus(loaded || st.error !== null)
 

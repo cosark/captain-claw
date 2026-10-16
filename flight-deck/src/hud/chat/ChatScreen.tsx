@@ -13,6 +13,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { FocusEvent } from 'react'
 import type { HudAgent } from '../api'
+import { PRESS } from '../device'
 import { focusEl } from '../focus'
 import { truncate } from '../format'
 import { useAutoFocus, useNow } from '../hooks'
@@ -306,7 +307,7 @@ export function ChatScreen({ agent }: { agent: HudAgent }) {
     >
       <div className="hud-chat-log" ref={logRef} onFocus={onLogFocus}>
         {shown.length === 0 ? (
-          <p className="hud-chat-empty">Ask {agent.name} anything. Pinch the field below to write or speak.</p>
+          <p className="hud-chat-empty">Ask {agent.name} anything. {PRESS} the field below to write or speak.</p>
         ) : null}
         {earlier ? (
           <div className="hud-actions hud-chat-earlier">

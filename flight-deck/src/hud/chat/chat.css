@@ -201,6 +201,8 @@
 }
 .hud-composer-field::-webkit-scrollbar { display: none; }
 .hud-composer-field::placeholder { color: var(--text-3); opacity: 1; }
+/* Touch: no ring (hud.css), so the field being typed in shows by its border. */
+.hud-touch .hud-composer-field:focus { border-color: var(--focus); }
 
 .hud-composer-send { flex: none; }
 

@@ -357,6 +357,16 @@ Lumen).
 | **INMO Air 3** | Normal dashboard; we haven't tested it | Full Android with a 1920 × 1080 viewport, so the dashboard fits. Its own input is a ring, the temple touchpad or voice, so pair a Bluetooth keyboard or mouse for the dashboard, or try `https://<your-host>/hud/`. |
 | **RayNeo X3 Pro** | Try the HUD; we haven't tested it | A 640 × 480 display with temple-touchpad or ring input. How that input reaches web pages is unknown (on Android, probably arrow keys and Enter), and no browser has been reviewed for it. If one is available, open `https://<your-host>/hud/` (or `/?ui=hud`): the small viewport and arrow-key input suit the HUD better than the dashboard. |
 
+## Android app
+
+The HUD also runs on Android phones, in the **Captain Claw** app
+(`android/hud/`): a WebView shell that loads `<your deck>/hud/` from the deck,
+so it needs no server changes and gets every HUD update with Flight Deck.
+There the HUD signs in with email first, is driven by touch (taps, swipes,
+Prev / Next chips, no focus rings) and reads replies aloud with Android's
+text-to-speech. Build, install, first run and sign-in:
+[android-app.md](android-app.md).
+
 ## Deployment checklist
 
 Meta's glasses only load web apps from a **public HTTPS URL**: no HTTP, no LAN
@@ -391,7 +401,7 @@ changed `flight-deck/src/hud`, see [Building the HUD](#building-the-hud).
 | Path | What |
 |---|---|
 | `flight-deck/hud.html` | The entry page: `mrbd-web-app-capable`, description, PNG icons, manifest link, first-paint style |
-| `flight-deck/src/hud/main.tsx` | Mounts `HudApp` and registers the service worker. No `StrictMode`: its dev double effects would open two chat sockets and two pairings. |
+| `flight-deck/src/hud/main.tsx` | Mounts `HudApp` and registers the service worker (not in the Android app, which always loads the deck's current HUD). No `StrictMode`: its dev double effects would open two chat sockets and two pairings. |
 | `HudApp.tsx` | Startup (auth status → refresh → pairing or the app), token keep-alive, routes to screens, attaches chat, registers WebMCP. `/hud/pair` renders the approval page. |
 | `router.ts` | History router. Routes live in the query string, e.g. `/hud/?v=agent&a=…&t=chat`. |
 | `focus.ts`, `hooks.ts` | D-pad focus engine; `useActivate`, `useAutoFocus` |
@@ -400,7 +410,7 @@ changed `flight-deck/src/hud`, see [Building the HUD](#building-the-hud).
 | `agents/`, `chat/`, `files/`, `data/`, `auth/` | The screens: agent list; chat, composer and chat store; file list and reader; tables → rows → record; pairing, email login and `/hud/pair` |
 | `markdown/` | `react-markdown` + `remark-gfm`, plus a small rehype pass that turns embedded HTML into plain text, turns wide tables into cards and makes blocks focusable. Large files are split into pieces that parse on their own and are rendered progressively. |
 | `webmcp.ts` | The three WebMCP tools |
-| `device.ts` | Host detection (`meta-display`, `rokid-lumen`) and the device label sent with pairing |
+| `device.ts` | Host detection (`meta-display`, `rokid-lumen`, and the Android app `android-app`, which is not glasses), `IS_TOUCH` for touch phones, and the device label sent with pairing. Touch-only behaviour is gated on it, so the glasses are unaffected. |
 | `captain_claw/flight_deck/hud_routes.py` | `/hud`, `/hud/{rest}`, the manifest, the service worker, `/fd/hud/config`, the `/` redirect, and the middleware that gzips `/hud*` and `/assets/*` and marks hashed assets immutable |
 | `captain_claw/flight_deck/auth_routes.py` | The `/fd/auth/pair/*` endpoints |
 

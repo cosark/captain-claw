@@ -72,6 +72,15 @@ input:focus {
   background: rgba(95, 227, 255, 0.07);
 }
 
+/* Touch (the Android app, a phone browser — never glasses; focus.ts sets the
+   class): the finger shows what was pressed, so a tapped control and a
+   screen's auto-focused first stop get no ring. A hardware arrow / Tab key
+   brings the rings back. */
+.hud-touch [tabindex="0"]:focus,
+.hud-touch textarea:focus,
+.hud-touch input:focus,
+.hud-touch .hud-block:focus { box-shadow: none; }
+
 /* ── Screen frame ── */
 
 .hud-screen {
