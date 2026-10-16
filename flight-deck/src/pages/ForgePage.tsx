@@ -9,7 +9,7 @@ import { useOnboardingStore } from '../stores/onboardingStore'
 import { HelpHint } from '../components/common/HelpHint'
 import { spawnAgent, spawnProcess, type SpawnConfig } from '../services/docker'
 import { updateArchetype, type ArchetypeInput } from '../services/archetypes'
-import { useTierConfig, PROVIDERS, TIER_ORDER, DEFAULT_TOOLS, type Archetype } from '../services/tierConfig'
+import { useTierConfig, tierVision, PROVIDERS, TIER_ORDER, DEFAULT_TOOLS, type Archetype } from '../services/tierConfig'
 
 // ── Types ──
 
@@ -453,6 +453,7 @@ export function ForgePage() {
         max_context: maxContext,
         provider_api_key: apiKey,
         base_url: baseUrl,
+        vision: tierVision(tc),
         botport_enabled: false,
         botport_url: '',
         botport_instance_name: '',

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Cpu, Check, Loader2, Pencil, KeyRound } from 'lucide-react'
+import { Cpu, Check, Loader2, Pencil, KeyRound, Eye } from 'lucide-react'
 import { useAuthStore, refreshAccessToken } from '../../stores/authStore'
 
 interface ModelSelectorProps {
@@ -12,7 +12,15 @@ interface ModelInfo {
   provider: string
   model: string
   api_key: string
+  // Does the model see images itself (model.vision): 'auto' | 'on' | 'off'
+  vision: string
 }
+
+const VISION_OPTIONS = [
+  { value: 'auto', label: 'Auto — known multimodal models' },
+  { value: 'on', label: 'On — the model sees images itself' },
+  { value: 'off', label: 'Off — a vision model describes them' },
+]
 
 const KNOWN_PROVIDERS = [
   'ollama', 'anthropic', 'openai', 'gemini', 'groq', 'mistral',
@@ -21,19 +29,19 @@ const KNOWN_PROVIDERS = [
 ]
 
 function parseModelFromYaml(yaml: string): ModelInfo {
-  const info: ModelInfo = { provider: '', model: '', api_key: '' }
+  const info: ModelInfo = { provider: '', model: '', api_key: '', vision: 'auto' }
   // Simple YAML parser for the model section
   const lines = yaml.split('\n')
   let inModel = false
   for (const line of lines) {
     const trimmed = line.trimStart()
-    // Check if we're entering/leaving the model section
-    if (/^model\s*:/.test(trimmed)) {
+    // Entering/leaving the top-level model section — judged on the raw line:
+    // its keys are indented, the next section's key is not.
+    if (/^model\s*:/.test(line)) {
       inModel = true
       continue
     }
-    if (inModel && trimmed.length > 0 && !trimmed.startsWith(' ') && !trimmed.startsWith('\t') && !trimmed.startsWith('#')) {
-      // Left the model section (new top-level key)
+    if (inModel && trimmed.length > 0 && !/^[\s#]/.test(line)) {
       inModel = false
     }
     if (!inModel) continue
@@ -46,6 +54,12 @@ function parseModelFromYaml(yaml: string): ModelInfo {
 
     const keyMatch = trimmed.match(/^\s*api_key\s*:\s*["']?([^"'#]*)/)
     if (keyMatch) info.api_key = keyMatch[1].trim()
+
+    const visionMatch = trimmed.match(/^vision\s*:\s*["']?([^"'\s#]+)/)
+    if (visionMatch) {
+      const v = visionMatch[1].toLowerCase()
+      info.vision = ['true', 'on', 'yes'].includes(v) ? 'on' : ['false', 'off', 'no'].includes(v) ? 'off' : 'auto'
+    }
   }
   return info
 }
@@ -80,6 +94,8 @@ export function ModelSelector({ kind, identifier, onModelChange }: ModelSelector
   const [showApiKey, setShowApiKey] = useState(false)
   const [originalProvider, setOriginalProvider] = useState('')
   const [originalModel, setOriginalModel] = useState('')
+  const [vision, setVision] = useState('auto')
+  const [originalVision, setOriginalVision] = useState('auto')
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
@@ -95,6 +111,8 @@ export function ModelSelector({ kind, identifier, onModelChange }: ModelSelector
       setApiKey(info.api_key)
       setOriginalProvider(info.provider)
       setOriginalModel(info.model)
+      setVision(info.vision)
+      setOriginalVision(info.vision)
     } catch {
       // Silently fail — card still works
     } finally {
@@ -120,12 +138,14 @@ export function ModelSelector({ kind, identifier, onModelChange }: ModelSelector
       } else if (showApiKey && apiKey.trim()) {
         body.api_key = apiKey.trim()
       }
+      if (vision !== originalVision) body.vision = vision
       await fdFetch<{ ok: boolean }>(`/agent-model/${kind}/${identifier}`, {
         method: 'PUT',
         body: JSON.stringify(body),
       })
       setOriginalProvider(provider.trim())
       setOriginalModel(model.trim())
+      setOriginalVision(vision)
       setEditing(false)
       setShowApiKey(false)
       setSaved(true)
@@ -141,6 +161,7 @@ export function ModelSelector({ kind, identifier, onModelChange }: ModelSelector
   const handleCancel = () => {
     setProvider(originalProvider)
     setModel(originalModel)
+    setVision(originalVision)
     setApiKey('')
     setShowApiKey(false)
     setEditing(false)
@@ -166,6 +187,11 @@ export function ModelSelector({ kind, identifier, onModelChange }: ModelSelector
               <span className="text-zinc-500">{originalProvider}</span>
               <span className="text-zinc-600 mx-1">/</span>
               <span className="text-zinc-300">{originalModel || '—'}</span>
+              {originalVision === 'on' && (
+                <span title="Sees images itself" className="ml-1.5 inline-flex items-center gap-0.5 text-[10px] text-sky-400">
+                  <Eye className="h-3 w-3" />vision
+                </span>
+              )}
             </>
           ) : (
             <span className="text-zinc-600 italic">No model override set</span>
@@ -217,6 +243,21 @@ export function ModelSelector({ kind, identifier, onModelChange }: ModelSelector
           />
         </div>
       </div>
+
+      {/* Vision */}
+      {provider.trim() !== 'antigravity-cli' && (
+        <div>
+          <label className="text-[10px] text-zinc-500 uppercase tracking-wider mb-0.5 block">Vision</label>
+          <select
+            value={vision}
+            onChange={(e) => setVision(e.target.value)}
+            title="Does this model see images itself? Local Qwen builds need On."
+            className="w-full rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-200 focus:border-violet-500/50 focus:outline-none"
+          >
+            {VISION_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+          </select>
+        </div>
+      )}
 
       {/* API Key toggle + input */}
       {provider.trim() === 'antigravity-cli' ? <p className="text-xs text-zinc-400">Local Google sign-in. Text only; no API key or extra credits. See Connections.</p> : <div>

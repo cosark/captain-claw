@@ -3,7 +3,7 @@ import {
   MessagesSquare, Search, Rocket, Loader2, Crown, Gauge, MonitorUp, Monitor,
   Trash2, MessageSquare, Check, AlertTriangle, Plus, X,
 } from 'lucide-react'
-import { useTierConfig, type Archetype } from '../services/tierConfig'
+import { useTierConfig, tierVision, type Archetype } from '../services/tierConfig'
 import { spawnProcess, type SpawnConfig } from '../services/docker'
 import { useProcessStore } from '../stores/processStore'
 import { useChatStore } from '../stores/chatStore'
@@ -111,6 +111,7 @@ export function QuickChatPage() {
       max_context: tc.input_ctx > 0 ? tc.input_ctx : 0,
       provider_api_key: tc.api_key,
       base_url: tc.base_url,
+      vision: tierVision(tc),
       botport_enabled: false,
       botport_url: '',
       botport_instance_name: '',
