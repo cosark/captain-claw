@@ -911,11 +911,14 @@ tools:
     model: "jev-latest"
     timeout: 30                     # seconds per Jev request (429/529/5xx are retried)
     check_replies: true             # flag garbled chat replies and suggest /new
+    check_progress: true            # when a turn runs out of steps, let Jev decide whether to extend
 ```
 
 **Jev first.** While a key is usable, the system prompt tells the agent to ask Jev whenever a task involves judging content — triage, routing, relevance, claim-vs-source checks, tone/urgency/risk, rubric scores, duplicates, best-of-N, a yes/no check before acting — with one call per piece of content carrying all its questions, and to say when Jev drove a decision. In eco mode `jev` is a core tool, so its schema is always sent (it stays hidden until a key works).
 
 **Garbled-reply check.** After a person's chat turn (web, WhatsApp, Telegram, the glasses HUD), Jev is asked one yes/no question: did the reply come out as unusable garbage (a looping line, token soup, raw tool-call JSON or control tokens, text cut off mid-word)? At p ≥ 0.8 the surface gets one extra notice — *"That reply came out garbled — this session may be overloaded. Send /new to start a fresh session"*. The notice is never written into the session, never spoken, and skipped for automated, public, shared-member and worker turns; no key, a timeout or a Jev error means no notice. Turn it off with `tools.jev.check_replies: false`.
+
+**Progress check.** When a turn uses up its step budget, the loop's own rule extends it only if the last few steps made new tool calls *and* a plan or requirement says work remains — so a plain request stops even while the agent is plainly working. Before stopping, Jev reads the request and the turn's recent steps (narration, each tool call and a slice of its result) and answers one yes/no question: is the agent still making real progress? At p ≥ 0.6 the budget grows by one more block of steps, never past the turn's hard ceiling, and Jev is asked again when that runs out; otherwise the turn stops and ships what it has, as before. The `completion_gate` entry shows `judge=jev` and `p_progressing`. The stagnation detector (six steps with nothing new) still runs, so a yes can't keep a looping agent alive. Skipped for shared-member turns; no key, a timeout (15 s) or a Jev error means the usual stop. Turn it off with `tools.jev.check_progress: false`.
 
 ### todo
 
