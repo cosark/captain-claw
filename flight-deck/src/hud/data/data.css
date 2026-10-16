@@ -120,3 +120,6 @@
   font-size: var(--fs-sm);
   line-height: 1.4;
 }
+
+/* Record ‹ Prev / Next › (off the glasses), in the screen footer. */
+.hud-data-steps { margin: 0; }

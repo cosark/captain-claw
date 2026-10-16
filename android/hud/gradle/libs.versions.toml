@@ -1,0 +1,17 @@
+[versions]
+agp = "9.1.1"
+activity = "1.12.4"
+core = "1.17.0"
+lifecycle = "2.10.0"
+webkit = "1.15.0"
+junit = "4.13.2"
+
+[libraries]
+androidx-activity-ktx = { module = "androidx.activity:activity-ktx", version.ref = "activity" }
+androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "core" }
+androidx-lifecycle-runtime-ktx = { module = "androidx.lifecycle:lifecycle-runtime-ktx", version.ref = "lifecycle" }
+androidx-webkit = { module = "androidx.webkit:webkit", version.ref = "webkit" }
+junit = { module = "junit:junit", version.ref = "junit" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }

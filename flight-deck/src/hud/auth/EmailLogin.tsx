@@ -13,11 +13,15 @@
 // autofill or a soft keyboard leave no printable keydown) is an ordinary
 // blur commit: it fires between that press and its click, so muting there
 // would swallow the tap on Sign in.
+//
+// Off the glasses (the Android app signs in here first, a phone or desktop
+// browser) the fields sit in a real <form> and Sign in submits it, so
+// autofill and password managers see a login form and its submission.
 
 import { useEffect, useRef, useState } from 'react'
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { loginUser } from '../../stores/authStore'
-import { IS_GLASSES } from '../device'
+import { hasAppSettings, IS_GLASSES, openAppSettings } from '../device'
 import { focusEl, pinFocus, quietActivations } from '../focus'
 import { useAutoFocus } from '../hooks'
 import { Btn, ScreenFrame } from '../ui'
@@ -57,6 +61,7 @@ export function EmailLogin(props: {
   const [error, setError] = useState<string | null>(null)
   const emailRef = useRef<HTMLInputElement>(null)
   const passwordRef = useRef<HTMLInputElement>(null)
+  const formRef = useRef<HTMLFormElement>(null)
   /** Last printable keydown in a field (a physical keyboard is present). */
   const typedAt = useRef(0)
   /** The wearer moved focus themselves since a field got focus. */
@@ -135,6 +140,13 @@ export function EmailLogin(props: {
     }
   }
 
+  /** Sign in — through the form's submit event where there is a form. */
+  const commit = () => {
+    const form = formRef.current
+    if (form) form.requestSubmit()
+    else void submit()
+  }
+
   const onFieldKeyDown = (e: ReactKeyboardEvent<HTMLInputElement>) => {
     if (e.key.length === 1) typedAt.current = Date.now()
     if (e.key !== 'Enter' || e.shiftKey || e.altKey || e.ctrlKey || e.metaKey || e.nativeEvent.isComposing) return
@@ -143,11 +155,11 @@ export function EmailLogin(props: {
     e.preventDefault()
     const passwordEl = passwordRef.current
     if (e.currentTarget === emailRef.current && passwordEl && !passwordEl.value) focusEl(passwordEl)
-    else void submit()
+    else commit()
   }
 
-  return (
-    <ScreenFrame title="Sign in with email" subtitle="Captain Claw" className="hud-login-screen">
+  const fields = (
+    <>
       <label className="hud-field">
         <span className="hud-field-label">Email</span>
         <input
@@ -199,19 +211,32 @@ export function EmailLogin(props: {
           />
         )}
       </label>
+    </>
+  )
+
+  return (
+    <ScreenFrame title="Sign in with email" subtitle="Captain Claw" className="hud-login-screen">
+      {IS_GLASSES ? fields : (
+        <form ref={formRef} className="hud-login-form" noValidate onSubmit={(e) => { e.preventDefault(); void submit() }}>
+          {fields}
+        </form>
+      )}
       {error ? <div className="hud-login-error" role="alert">{error}</div> : null}
       <div className="hud-actions">
-        <Btn variant="primary" fk={SUBMIT_FK} onActivate={() => { void submit() }} disabled={busy}>
+        <Btn variant="primary" fk={SUBMIT_FK} onActivate={commit} disabled={busy}>
           {busy ? 'Signing in…' : 'Sign in'}
         </Btn>
         {props.onUsePairing ? (
           <Btn variant="ghost" fk="login-pair" onActivate={props.onUsePairing}>Use a pairing code instead</Btn>
         ) : null}
+        {hasAppSettings() ? <Btn variant="ghost" fk="login-app-settings" onActivate={openAppSettings}>App settings</Btn> : null}
       </div>
-      <p className="hud-note">
-        The glasses keyboard can't type <span className="hud-login-symbols">{UNTYPABLE}</span>, and
-        dictating says your password out loud. A pairing code is safer.
-      </p>
+      {IS_GLASSES ? (
+        <p className="hud-note">
+          The glasses keyboard can't type <span className="hud-login-symbols">{UNTYPABLE}</span>, and
+          dictating says your password out loud. A pairing code is safer.
+        </p>
+      ) : null}
     </ScreenFrame>
   )
 }

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Long-press the launcher icon → Deck settings. -->
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:enabled="true"
+        android:icon="@drawable/ic_shortcut_settings"
+        android:shortcutId="deck_settings"
+        android:shortcutLongLabel="@string/shortcut_settings_long"
+        android:shortcutShortLabel="@string/shortcut_settings_short">
+        <intent
+            android:action="android.intent.action.VIEW"
+            android:targetClass="com.captainclaw.hud.SettingsActivity"
+            android:targetPackage="com.captainclaw.hud" />
+    </shortcut>
+</shortcuts>

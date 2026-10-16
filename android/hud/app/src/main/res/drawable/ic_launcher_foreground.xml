@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Flight Deck icon (static/icon-512.png) inside the adaptive icon's
+     72dp safe zone of its 108dp canvas. -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:drawable="@drawable/ic_launcher_art"
+    android:inset="18dp" />
