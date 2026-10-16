@@ -8,13 +8,16 @@
 // _id, a step goes to the next older / newer _id, and a note says when the
 // table changed meanwhile. Steps read whole pages (shared with the rows
 // screen), and swipes made while a record loads are queued, not dropped.
+// Off the glasses (a phone, a desktop) ‹ Prev / Next › chips in the footer
+// and a sideways finger swipe make the same steps.
 
 import { useEffect, useEffectEvent, useRef, useState } from 'react'
 import type { HudAgent, HudTable } from '../api'
+import { IS_GLASSES } from '../device'
 import { focusEl } from '../focus'
-import { useAutoFocus } from '../hooks'
+import { useAutoFocus, useHorizontalSwipe } from '../hooks'
 import { navigate, navigateUp, routeKey, type Route } from '../router'
-import { ScreenFrame, StateView } from '../ui'
+import { Btn, ScreenFrame, StateView } from '../ui'
 import {
   cellType, columnTypes, EMPTY, findCachedTable, formatValue, getCachedNeighbour, getCachedRecord, getLastRecord,
   idOf, isEmptyValue, isFresh, isStructured, loadNeighbour, loadRecord, loadTables, memberCreator, PAGE, plural,
@@ -203,6 +206,12 @@ export function RecordScreen({ agent, table, index }: { agent: HudAgent; table: 
     return () => document.removeEventListener('keydown', h, true)
   }, [])
 
+  // Touch: a sideways swipe steps like Left / Right.
+  useHorizontalSwipe(scrollRef, (dir) => {
+    if (st.entry ? !st.entry.row : st.error !== null) return
+    step(dir)
+  })
+
   const entry = st.entry
   const total = entry?.total ?? 0
   const pos = (entry?.row ? entry.index : index) + 1
@@ -237,7 +246,7 @@ export function RecordScreen({ agent, table, index }: { agent: HudAgent; table: 
           <div className="hud-data-id">#{rowId(row)}</div>
           <div className="hud-data-pos">Record {pos.toLocaleString()} of {total.toLocaleString()}</div>
           {creator ? <div className="hud-data-creator">Added by {creator}</div> : null}
-          {total > 1 ? <div className="hud-data-hint">{st.stepping ? 'Loading…' : '◂ ▸ previous / next record'}</div> : null}
+          {total > 1 && IS_GLASSES ? <div className="hud-data-hint">{st.stepping ? 'Loading…' : '◂ ▸ previous / next record'}</div> : null}
           {st.note ? <div className="hud-data-stale">{st.note}</div> : null}
           {st.error ? <div className="hud-data-stale">Couldn't refresh</div> : null}
         </div>
@@ -261,8 +270,18 @@ export function RecordScreen({ agent, table, index }: { agent: HudAgent; table: 
   const subtitle = entry?.row
     ? `${agent.name} · ${pos.toLocaleString()} of ${total.toLocaleString()}`
     : entry ? agent.name : `${agent.name} · ${pos.toLocaleString()} of …`
+  // Off the glasses: the steps as chips, in the footer so they stay in reach.
+  const pager = !IS_GLASSES && entry?.row && total > 1 ? (
+    <div className="hud-data-pager hud-data-steps">
+      <Btn variant="chip" fk="record-prev" disabled={pos <= 1} onActivate={() => step(-1)}>‹ Prev</Btn>
+      <div className="hud-data-range" aria-live="polite">
+        {st.stepping ? 'Loading…' : `${pos.toLocaleString()} of ${total.toLocaleString()}`}
+      </div>
+      <Btn variant="chip" fk="record-next" disabled={pos >= total} onActivate={() => step(1)}>Next ›</Btn>
+    </div>
+  ) : null
   return (
-    <ScreenFrame title={table} subtitle={subtitle} scrollRef={scrollRef}>
+    <ScreenFrame title={table} subtitle={subtitle} scrollRef={scrollRef} footer={pager}>
       {body}
     </ScreenFrame>
   )

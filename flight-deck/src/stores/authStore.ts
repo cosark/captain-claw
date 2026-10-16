@@ -11,6 +11,14 @@ export interface User {
   kiosk?: boolean
 }
 
+// What "No account?" on the sign-in page leads to: creating an account
+// (registration open), applying on the waitlist for `cohort` (an admin
+// approves), or nothing (closed — an admin creates accounts).
+export interface SignUp {
+  mode: 'register' | 'waitlist' | 'closed'
+  cohort: string
+}
+
 export interface AuthStore {
   user: User | null
   token: string
@@ -24,6 +32,7 @@ export interface AuthStore {
   simpleChatOnly: boolean
   // A sign-out is in flight (logoutUser) — the sign-out buttons show it.
   signingOut: boolean
+  signUp: SignUp
 
   setAuth: (user: User, token: string) => void
   clearAuth: () => void
@@ -31,6 +40,7 @@ export interface AuthStore {
   setDockerSpawnEnabled: (enabled: boolean) => void
   setInternalFdUrl: (url: string) => void
   setSimpleChatOnly: (v: boolean) => void
+  setSignUp: (v: SignUp) => void
   setToken: (token: string) => void
 }
 
@@ -43,6 +53,7 @@ export const useAuthStore = create<AuthStore>((set) => ({
   internalFdUrl: '',
   simpleChatOnly: false,
   signingOut: false,
+  signUp: { mode: 'register', cohort: '' },
 
   setAuth: (user, token) => set({ user, token, isAuthenticated: true }),
   clearAuth: () => set({ user: null, token: '', isAuthenticated: false }),
@@ -50,6 +61,7 @@ export const useAuthStore = create<AuthStore>((set) => ({
   setDockerSpawnEnabled: (enabled) => set({ dockerSpawnEnabled: enabled }),
   setInternalFdUrl: (url) => set({ internalFdUrl: url }),
   setSimpleChatOnly: (v) => set({ simpleChatOnly: v }),
+  setSignUp: (v) => set({ signUp: v }),
   setToken: (token) => set({ token }),
 }))
 
@@ -91,6 +103,13 @@ export async function checkAuthStatus(): Promise<boolean> {
   useAuthStore.getState().setDockerSpawnEnabled(data.docker_spawn_enabled !== false)
   if (data.internal_fd_url) useAuthStore.getState().setInternalFdUrl(data.internal_fd_url)
   useAuthStore.getState().setSimpleChatOnly(data.simple_chat_only === true)
+  // A deck that predates the waitlist sends neither flag: keep "register".
+  if (typeof data.registration_open === 'boolean') {
+    useAuthStore.getState().setSignUp({
+      mode: data.registration_open ? 'register' : data.waitlist_open ? 'waitlist' : 'closed',
+      cohort: typeof data.waitlist_cohort === 'string' ? data.waitlist_cohort : '',
+    })
+  }
   return enabled
 }
 
@@ -148,6 +167,31 @@ export async function registerUser(email: string, password: string, displayName:
   const data = await res.json()
   useAuthStore.getState().setAuth(data.user, data.access_token)
   return data.user
+}
+
+export interface WaitlistApplication {
+  email: string
+  password: string
+  display_name: string
+  referrer_name: string
+  referrer_email: string
+}
+
+/** Apply for an account while registration is closed. Resolves with the
+ * cohort applied for; an admin approves before the applicant can sign in. */
+export async function joinWaitlist(application: WaitlistApplication): Promise<string> {
+  const res = await fetch(`${FD}/auth/waitlist`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify(application),
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ detail: 'Could not join the waitlist' }))
+    throw new Error(body.detail || 'Could not join the waitlist')
+  }
+  const data = await res.json()
+  return typeof data.cohort === 'string' ? data.cohort : ''
 }
 
 // ── Session hand-off (sign-out / expiry) ──

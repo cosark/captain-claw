@@ -23,7 +23,7 @@ import { useCallback, useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useAuthStore } from '../../stores/authStore'
 import { HudApiError, pairPoll, pairStart } from '../api'
-import { deviceLabel } from '../device'
+import { deviceLabel, IS_GLASSES } from '../device'
 import { clock } from '../format'
 import { focusEl } from '../focus'
 import { useAutoFocus, useNow } from '../hooks'
@@ -393,7 +393,7 @@ export function PairScreen() {
             </div>
           </div>
           <p className="hud-note">
-            Nothing secret is typed on the glasses — you approve this code where you are already signed in.
+            Nothing secret is typed {IS_GLASSES ? 'on the glasses' : 'here'} — you approve this code where you are already signed in.
           </p>
           {emailBtn}
         </>

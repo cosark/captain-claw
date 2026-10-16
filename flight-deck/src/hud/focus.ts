@@ -21,7 +21,7 @@
 // useActivate): the legacy glasses page found the Display's own focus walk
 // only lands on tabindexed elements, and divs work with our engine too.
 
-import { IS_GLASSES } from './device'
+import { IS_GLASSES, IS_TOUCH } from './device'
 import { clearBackPending, goBack, isBackPending, takeRestoreFocusKey } from './router'
 
 export type Direction = 'up' | 'down' | 'left' | 'right'
@@ -495,6 +495,29 @@ function onPopState() {
   if (pendingBack) { clearTimeout(pendingBack); pendingBack = null }
 }
 
+// ── Touch mode (phones, never glasses) ──
+//
+// Focus still moves on a phone (a tap focuses the control, every screen
+// focuses its first stop), but the finger already shows what was pressed: the
+// root class `hud-touch` hides the rings (hud.css). A touch / pen press sets
+// it, a mouse press or a D-pad / Tab key from a hardware keyboard clears it.
+// A touch device starts in it.
+
+const TOUCH_CLASS = 'hud-touch'
+const RING_KEYS = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Tab'])
+
+function setTouchMode(on: boolean): void {
+  document.documentElement.classList.toggle(TOUCH_CLASS, on)
+}
+
+function onPointerDownMode(e: PointerEvent) {
+  setTouchMode(e.pointerType !== 'mouse')
+}
+
+function onKeyDownMode(e: KeyboardEvent) {
+  if (RING_KEYS.has(e.key)) setTouchMode(false)
+}
+
 let installedEngine = false
 
 /** Install the global listeners once. Returns an uninstaller. */
@@ -506,12 +529,19 @@ export function installFocusEngine(): () => void {
   document.addEventListener('focusin', onFocusIn)
   document.addEventListener('focusout', onFocusOut)
   window.addEventListener('popstate', onPopState)
+  if (!IS_GLASSES) {
+    setTouchMode(IS_TOUCH)
+    document.addEventListener('pointerdown', onPointerDownMode, true)
+    document.addEventListener('keydown', onKeyDownMode, true)
+  }
   return () => {
     document.removeEventListener('keydown', onKeyDownCapture, true)
     document.removeEventListener('keydown', onKeyDown)
     document.removeEventListener('focusin', onFocusIn)
     document.removeEventListener('focusout', onFocusOut)
     window.removeEventListener('popstate', onPopState)
+    document.removeEventListener('pointerdown', onPointerDownMode, true)
+    document.removeEventListener('keydown', onKeyDownMode, true)
     installedEngine = false
   }
 }

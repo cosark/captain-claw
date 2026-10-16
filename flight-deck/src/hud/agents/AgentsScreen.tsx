@@ -9,6 +9,7 @@ import { useEffect, useRef, useState } from 'react'
 import { logoutUser, useAuthStore } from '../../stores/authStore'
 import type { HudAgent } from '../api'
 import { lastAgentId, useAgents } from '../agentsStore'
+import { hasAppSettings, openAppSettings } from '../device'
 import { useAutoFocus } from '../hooks'
 import { navigate } from '../router'
 import { Btn, Pill, Row, ScreenFrame, StateView } from '../ui'
@@ -110,6 +111,11 @@ export function AgentsScreen() {
     </Btn>
   ) : null
 
+  // The Android app: change the deck's address, reload.
+  const settingsBtn = hasAppSettings() ? (
+    <Btn key="settings" variant="chip" fk="agents-app-settings" onActivate={openAppSettings}>App settings</Btn>
+  ) : null
+
   const footerNotes = (
     <>
       {signOutFailed ? (
@@ -133,7 +139,7 @@ export function AgentsScreen() {
         <div className="hud-agents-retry" data-fk="agents-refresh">
           <StateView kind="error" message={`Couldn't load agents — ${error}`} onRetry={refresh} />
         </div>
-        {signOutBtn ? <div className="hud-actions hud-agents-actions">{signOutBtn}</div> : null}
+        {signOutBtn || settingsBtn ? <div className="hud-actions hud-agents-actions">{signOutBtn}{settingsBtn}</div> : null}
         {footerNotes}
       </ScreenFrame>
     )
@@ -154,6 +160,7 @@ export function AgentsScreen() {
     <div className="hud-actions hud-agents-actions">
       <Btn key="refresh" variant="chip" fk="agents-refresh" onActivate={refresh}>{loading ? 'Refreshing…' : 'Refresh'}</Btn>
       {signOutBtn}
+      {settingsBtn}
     </div>
   )
 

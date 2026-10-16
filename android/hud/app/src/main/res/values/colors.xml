@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The HUD's palette (flight-deck/src/hud/hud.css). -->
+    <color name="bg">#000000</color>
+    <color name="surface">#1C1E21</color>
+    <color name="line">#2C3036</color>
+    <color name="text">#FFFFFF</color>
+    <color name="text_dim">#B0B3B8</color>
+    <color name="accent">#5FFF9F</color>
+    <color name="accent_ink">#03140A</color>
+    <color name="error">#FF8A8A</color>
+    <color name="icon_bg">#111114</color>
+</resources>

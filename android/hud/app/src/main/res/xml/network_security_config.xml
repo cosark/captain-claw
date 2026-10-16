@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Decks are self-hosted at any address, often a LAN IP on plain http
+  (http://192.168.1.20:25080). A network security config can't name IP
+  ranges, so clear text is allowed here and the app itself limits it to the
+  local network: Deck.kt accepts http:// only for private, loopback,
+  link-local or CGNAT (Tailscale) addresses and local names, and MainActivity
+  re-checks it whenever it opens the HUD. Everything else must be https.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

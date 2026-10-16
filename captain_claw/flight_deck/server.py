@@ -8198,11 +8198,20 @@ async def auth_status():
     # until an admin picks a mode, CLI `--simple-chat` / env FD_SIMPLE_CHAT).
     # Whether a signed-in user is locked comes with the user (`kiosk`); this
     # deck-wide flag is what an auth-off deck goes by.
+    # Sign-up: "Create account" while registration is open, else the waitlist
+    # (an admin approves applications) when the admin left it on.
+    registration_open = False
+    if AUTH_ENABLED and hasattr(app.state, "fd_db"):
+        from captain_claw.flight_deck.auth_routes import registration_open as _registration_open
+        registration_open = await _registration_open(app.state.fd_db)
     return {
         "auth_enabled": AUTH_ENABLED,
         "docker_spawn_enabled": cfg.get("docker_spawn_enabled", docker_default),
         "internal_fd_url": internal_fd_url,
         "simple_chat_only": cfg.get("kiosk_mode") == "all",
+        "registration_open": registration_open,
+        "waitlist_open": AUTH_ENABLED and not registration_open and bool(cfg.get("waitlist_enabled")),
+        "waitlist_cohort": cfg.get("waitlist_cohort") or "",
     }
 
 

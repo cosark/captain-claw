@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Captain Claw</string>
+    <string name="setup_title">Connect to your Flight Deck</string>
+    <string name="settings_title">Deck settings</string>
+    <string name="deck_label">Flight Deck address</string>
+    <string name="deck_hint">deck.example.com</string>
+    <string name="deck_help">The address you open Flight Deck at — https://deck.example.com, or http://192.168.1.20:25080 for a deck on your local network (plain http only works there).</string>
+    <string name="signin_note">You sign in on the next screen, with your Flight Deck email and password or a pairing code. A deck started with FD_LOCKDOWN marks its sign-in cookie Secure, so the sign-in only lasts over https.</string>
+    <string name="connect">Connect</string>
+    <string name="checking">Checking…</string>
+    <string name="reload">Reload HUD</string>
+    <string name="cancel">Cancel</string>
+    <string name="version">Captain Claw HUD for Android %1$s</string>
+    <string name="retry">Try again</string>
+    <string name="shortcut_settings_short">Deck settings</string>
+    <string name="shortcut_settings_long">Change Flight Deck address</string>
+</resources>

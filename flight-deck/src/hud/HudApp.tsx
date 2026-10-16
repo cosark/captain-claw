@@ -13,6 +13,7 @@ import { awaitAuthStatus, refreshAccessToken, useAuthStore } from '../stores/aut
 import { AgentsScreen } from './agents/AgentsScreen'
 import { restoreSession } from './api'
 import { lastAgentId, rememberAgent, useAgents } from './agentsStore'
+import { EmailLogin } from './auth/EmailLogin'
 import { PairApprovePage } from './auth/PairApprovePage'
 import { PairScreen } from './auth/PairScreen'
 import { chat } from './chat/chatStore'
@@ -20,12 +21,13 @@ import { ChatScreen } from './chat/ChatScreen'
 import { RecordScreen } from './data/RecordScreen'
 import { RowsScreen } from './data/RowsScreen'
 import { TablesScreen } from './data/TablesScreen'
+import { hasAppSettings, IS_TOUCH, openAppSettings } from './device'
 import { FileScreen } from './files/FileScreen'
 import { FilesScreen } from './files/FilesScreen'
 import { installFocusEngine } from './focus'
 import { useAutoFocus } from './hooks'
 import { collapseHistory, getRoute, initRouter, navigate, navigateUp, routeKey, useRoute, type Route } from './router'
-import { ScreenFrame, StateView } from './ui'
+import { Btn, ScreenFrame, StateView } from './ui'
 import { registerWebMcpTools } from './webmcp'
 
 export function HudApp() {
@@ -76,18 +78,29 @@ function GlassesApp() {
     else if (wasSignedIn.current) { wasSignedIn.current = false; collapseHistory() }
   }, [booted, authEnabled, isAuthenticated, signingOut])
 
-  if (!booted) return <BootScreen text={unreachable ? "Can't reach Flight Deck — retrying…" : 'Captain Claw…'} />
+  if (!booted) return <BootScreen text={unreachable ? "Can't reach Flight Deck — retrying…" : 'Captain Claw…'} settings={unreachable} />
   // Signing out reloads the page in a moment; the sign-in screen mounted
   // meanwhile would request a pairing code only to drop it.
-  if (authEnabled && !isAuthenticated) return signingOut ? <BootScreen text="Signing out…" /> : <PairScreen />
+  if (authEnabled && !isAuthenticated) return signingOut ? <BootScreen text="Signing out…" /> : <SignIn />
   return <Shell />
 }
 
-function BootScreen({ text }: { text: string }) {
+/** Signed out. Glasses (and desktops) pair by code. A phone has a keyboard
+ *  and a password manager, so it starts with email — pairing stays one tap
+ *  away, and only then asks the deck for a code. */
+function SignIn() {
+  const [pairing, setPairing] = useState(!IS_TOUCH)
+  if (!pairing) return <EmailLogin onUsePairing={() => setPairing(true)} />
+  return <PairScreen />
+}
+
+function BootScreen({ text, settings }: { text: string; settings?: boolean }) {
   return (
     <main className="hud-screen hud-boot-screen">
       <div className="hud-state hud-state--loading">
         <div className="hud-state-text">{text}</div>
+        {/* The Android app: the deck may have moved — let its address be changed. */}
+        {settings && hasAppSettings() ? <Btn variant="chip" onActivate={openAppSettings}>App settings</Btn> : null}
       </div>
     </main>
   )

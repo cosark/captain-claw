@@ -1,7 +1,8 @@
 // Small React hooks shared by every HUD screen.
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { KeyboardEvent, MouseEvent } from 'react'
+import type { KeyboardEvent, MouseEvent, RefObject } from 'react'
+import { IS_GLASSES } from './device'
 import { claimActivation, focusInitial } from './focus'
 
 export interface ActivateProps {
@@ -57,6 +58,49 @@ export function useAutoFocus(ready: boolean): void {
     })
     return () => { cancelAnimationFrame(raf1); cancelAnimationFrame(raf2) }
   }, [ready])
+}
+
+/** A swipe: at least this far sideways, twice as far as up / down, this quick. */
+const SWIPE_PX = 64
+const SWIPE_MS = 600
+
+/**
+ * A sideways finger swipe on `ref`'s element calls `onSwipe(1)` (right to
+ * left: next) or `onSwipe(-1)` (left to right: previous) — the touch
+ * counterpart of the Right / Left keys. Passive listeners that never cancel
+ * anything, so vertical scrolling is untouched. Never on glasses.
+ */
+export function useHorizontalSwipe(ref: RefObject<HTMLElement | null>, onSwipe: (dir: 1 | -1) => void, enabled = true): void {
+  const fn = useRef(onSwipe)
+  useEffect(() => { fn.current = onSwipe })
+  useEffect(() => {
+    const el = ref.current
+    if (!el || !enabled || IS_GLASSES) return
+    let start: { x: number; y: number; at: number } | null = null
+    const onStart = (e: TouchEvent) => {
+      const t = e.touches[0]
+      start = e.touches.length === 1 && t ? { x: t.clientX, y: t.clientY, at: Date.now() } : null
+    }
+    const onEnd = (e: TouchEvent) => {
+      const s = start
+      start = null
+      const t = e.changedTouches[0]
+      if (!s || !t || e.touches.length) return
+      const dx = t.clientX - s.x
+      const dy = t.clientY - s.y
+      if (Date.now() - s.at > SWIPE_MS || Math.abs(dx) < SWIPE_PX || Math.abs(dx) < 2 * Math.abs(dy)) return
+      fn.current(dx < 0 ? 1 : -1)
+    }
+    const onCancel = () => { start = null }
+    el.addEventListener('touchstart', onStart, { passive: true })
+    el.addEventListener('touchend', onEnd, { passive: true })
+    el.addEventListener('touchcancel', onCancel, { passive: true })
+    return () => {
+      el.removeEventListener('touchstart', onStart)
+      el.removeEventListener('touchend', onEnd)
+      el.removeEventListener('touchcancel', onCancel)
+    }
+  }, [ref, enabled])
 }
 
 /** Current time, refreshed every `ms` (header clock, relative times). */
