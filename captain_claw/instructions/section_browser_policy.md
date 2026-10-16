@@ -52,4 +52,4 @@ Workflow recording (teach once, replay many):
 
 When to use accessibility tree vs. vision:
 - Accessibility tree (`observe` or `accessibility_tree`): Always available, shows semantic structure and interactive elements with selectors. Use for finding clickable elements.
-- Vision analysis (part of `observe`): Requires a configured vision model. Use for understanding visual layout, reading text from images, or when the accessibility tree is insufficient.
+- Vision analysis (part of `observe` / `act`): when you see images yourself, the screenshot is attached to your next step — look at it; otherwise a configured vision model describes it. Use for understanding visual layout, reading text from images, or when the accessibility tree is insufficient.

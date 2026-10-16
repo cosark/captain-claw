@@ -521,6 +521,8 @@ class BrowserTool(Tool):
                 pass  # non-critical
 
         title = await session.get_title()
+        # The agent's own model sees images: the screenshot rides on its next call.
+        look = bool(kwargs.get("_look_inline"))
         return ToolResult(
             success=True,
             content=(
@@ -529,8 +531,10 @@ class BrowserTool(Tool):
                 f"Current URL: {session.current_url}\n"
                 f"Page title: {title}\n"
                 f"Full page: {full_page}\n\n"
-                "Use image_vision or image_ocr on this path to analyze the screenshot content."
+                + ("The screenshot is attached below — look at it directly." if look else
+                   "Use image_vision or image_ocr on this path to analyze the screenshot content.")
             ),
+            images=[str(path)] if look else [],
         )
 
     async def _click(self, **kwargs: Any) -> ToolResult:
@@ -815,12 +819,20 @@ class BrowserTool(Tool):
         else:
             vision_prompt = custom_prompt  # empty string = default prompt in BrowserVision
 
-        vision_text = await BrowserVision.analyze_screenshot(
+        # The agent's own model sees images: it gets the screenshot itself
+        # instead of a separate vision model's description of it.
+        look = bool(kwargs.get("_look_inline"))
+        vision_text = "" if look else await BrowserVision.analyze_screenshot(
             screenshot_bytes,
             prompt=vision_prompt,
         )
 
-        if vision_text:
+        if look:
+            parts.append("--- Visual Analysis ---")
+            parts.append("(the screenshot is attached below — look at it directly"
+                         + (f", with the goal in mind: {goal}" if goal else "") + ")")
+            parts.append("")
+        elif vision_text:
             parts.append("--- Visual Analysis ---")
             parts.append(vision_text)
             parts.append("")
@@ -853,6 +865,7 @@ class BrowserTool(Tool):
         return ToolResult(
             success=True,
             content="\n".join(parts),
+            images=[str(path)] if look else [],
         )
 
     async def _act(self, **kwargs: Any) -> ToolResult:
@@ -920,12 +933,19 @@ class BrowserTool(Tool):
             "Keep the response concise and actionable."
         )
 
-        vision_text = await BrowserVision.analyze_screenshot(
+        # The agent's own model sees images: it reads the screenshot itself.
+        look = bool(kwargs.get("_look_inline"))
+        vision_text = "" if look else await BrowserVision.analyze_screenshot(
             screenshot_bytes,
             prompt=vision_prompt,
         )
 
-        if vision_text:
+        if look:
+            parts.append("--- Analysis ---")
+            parts.append("(the screenshot is attached below — look at it for the goal: what is on the "
+                         "page, what is relevant, the single next action, any blocker)")
+            parts.append("")
+        elif vision_text:
             parts.append("--- Analysis ---")
             parts.append(vision_text)
             parts.append("")
@@ -957,6 +977,7 @@ class BrowserTool(Tool):
         return ToolResult(
             success=True,
             content="\n".join(parts),
+            images=[str(path)] if look else [],
         )
 
     @staticmethod

@@ -324,13 +324,26 @@ class _BaseImageLLMTool(Tool):
         cfg_max = int(getattr(tool_cfg, "max_chars", 120000) if tool_cfg else 120000)
         effective_max = int(max_chars or cfg_max)
 
+        # No separate model, and the calling agent's own model sees images: ask
+        # it through its own provider — its endpoint, auth and self-heal — not
+        # the global config model through litellm (desktop_action, video_vision
+        # and screen_capture ask for descriptions this way).
+        agent = kwargs.get("_agent")
+        _agent_sees = getattr(agent, "sees_images", None)
+        use_agent_model = used_fallback and callable(_agent_sees) and bool(_agent_sees())
+        model_label = (
+            str(getattr(getattr(agent, "provider", None), "model", "") or model_cfg.model)
+            if use_agent_model else model_cfg.model
+        )
+
         log.info(
             "%s requested", self.name,
             provider=model_cfg.provider,
-            model=model_cfg.model,
+            model=model_label,
             path=str(file_path),
             prompt=effective_prompt[:80],
             fallback_to_chat_model=used_fallback,
+            via_agent_provider=use_agent_model,
         )
 
         try:
@@ -386,9 +399,20 @@ class _BaseImageLLMTool(Tool):
             b64_data = base64.b64encode(image_bytes).decode("ascii")
             mime = resized_mime or mimetypes.guess_type(str(file_path))[0] or "image/png"
 
-            # Route: OpenAI + bearer headers → ChatGPT Responses API directly,
-            # everything else → litellm Chat Completions.
-            if provider == "openai" and extra_headers:
+            # Route: the agent's own provider when it sees images; OpenAI +
+            # bearer headers → ChatGPT Responses API directly; everything else →
+            # litellm Chat Completions.
+            if use_agent_model:
+                from captain_claw.llm import Message
+                from captain_claw.llm.vision import EncodedImage
+
+                picture = EncodedImage(path=str(file_path), mime=mime, data=b64_data, width=0, height=0)
+                response = await agent.provider.complete([
+                    Message(role="system", content="Answer only from the attached image."),
+                    Message(role="user", content=effective_prompt, images=[picture]),
+                ])
+                extracted = str(getattr(response, "content", "") or "")
+            elif provider == "openai" and extra_headers:
                 base_url = (
                     str(getattr(model_cfg, "base_url", "") or "").strip()
                     or "https://chatgpt.com/backend-api/codex/responses"
@@ -460,14 +484,14 @@ class _BaseImageLLMTool(Tool):
             log.info(
                 "%s completed", self.name,
                 path=str(file_path),
-                model=model_cfg.model,
+                model=model_label,
                 chars=len(extracted),
             )
             return ToolResult(
                 success=True,
                 content=(
                     f"{self.name} results from {file_path.name} "
-                    f"({size_kb:.1f} KB, model: {model_cfg.model}):\n\n"
+                    f"({size_kb:.1f} KB, model: {model_label}):\n\n"
                     f"{extracted}"
                 ),
             )

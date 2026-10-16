@@ -176,6 +176,11 @@ def _resolve_input(path: str, kwargs: dict[str, Any]) -> tuple[Path | None, str 
     return file_path, None
 
 
+def _shown(kwargs: dict[str, Any], dest: Path) -> list[str]:
+    """A derived image for the agent's own model to look at, when it sees images."""
+    return [str(dest)] if kwargs.get("_look_inline") else []
+
+
 def _resolve_output(out: str | None, kwargs: dict[str, Any], default_name: str) -> tuple[Path, str]:
     """Pick a destination path for a derived image. Returns (real_path, display).
 
@@ -478,12 +483,14 @@ class CvTool(Tool):
         changed_pct = round(100.0 * float((thresh > 0).sum()) / float(w * h), 2)
 
         out_display = ""
+        shown: list[str] = []
         if kw.get("out") is not None or boxes:
             annotated = ib.copy() if ib.ndim == 3 else _cv2.cvtColor(ib, _cv2.COLOR_GRAY2BGR)
             for (x, y, bw, bh) in boxes:
                 _cv2.rectangle(annotated, (x, y), (x + bw, y + bh), (0, 0, 255), 2)
             dest, out_display = _resolve_output(kw.get("out"), kw, f"diff_{uuid.uuid4().hex[:8]}.png")
             _cv2.imwrite(str(dest), annotated)
+            shown = _shown(kw, dest)
 
         payload = {
             "ssim": round(score, 4),
@@ -495,7 +502,8 @@ class CvTool(Tool):
         if out_display:
             payload["annotated"] = out_display
         verdict = "identical" if payload["identical"] else f"{len(boxes)} changed region(s), {changed_pct}% of pixels"
-        return ToolResult(success=True, content=f"diff: SSIM={payload['ssim']} — {verdict}\n{json.dumps(payload, indent=2)}")
+        return ToolResult(success=True, content=f"diff: SSIM={payload['ssim']} — {verdict}\n{json.dumps(payload, indent=2)}",
+                          images=shown)
 
     def _op_dedupe(self, kw: dict[str, Any]) -> ToolResult:
         paths_in = kw.get("paths") or []
@@ -773,7 +781,8 @@ class CvTool(Tool):
             drawn += 1
         dest, out_display = _resolve_output(kw.get("out"), kw, f"annot_{rp.stem}_{uuid.uuid4().hex[:6]}.png")
         _cv2.imwrite(str(dest), img)
-        return ToolResult(success=True, content=f"annotate: drew {drawn} box(es) → {out_display}")
+        return ToolResult(success=True, content=f"annotate: drew {drawn} box(es) → {out_display}",
+                          images=_shown(kw, dest))
 
     def _op_keyframes(self, kw: dict[str, Any]) -> ToolResult:
         rp, err = _resolve_input(kw.get("path") or kw.get("a"), kw)
@@ -849,10 +858,12 @@ class CvTool(Tool):
             return ToolResult(success=False, error=f"detect ({what}): {derr}")
 
         out_display = ""
+        shown: list[str] = []
         if kw.get("out") is not None:
             annotated = self._draw_detections(img, dets)
             dest, out_display = _resolve_output(kw.get("out"), kw, f"detect_{what}_{rp.stem}_{uuid.uuid4().hex[:6]}.png")
             _cv2.imwrite(str(dest), annotated)
+            shown = _shown(kw, dest)
 
         # Summarize by label (e.g. "3 person, 1 dog") for objects; count otherwise.
         counts: dict[str, int] = {}
@@ -862,7 +873,8 @@ class CvTool(Tool):
         payload: dict[str, Any] = {"what": what, "count": len(dets), "detections": dets[:100]}
         if out_display:
             payload["annotated"] = out_display
-        return ToolResult(success=True, content=f"detect ({what}): {len(dets)} — {summary}.\n" + json.dumps(payload, indent=2))
+        return ToolResult(success=True, content=f"detect ({what}): {len(dets)} — {summary}.\n" + json.dumps(payload, indent=2),
+                          images=shown)
 
     @staticmethod
     def _detect_faces(img, conf: float) -> tuple[list[dict[str, Any]], str | None]:
