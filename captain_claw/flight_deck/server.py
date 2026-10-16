@@ -8141,9 +8141,9 @@ async def clone_process(slug: str, req: CloneRequest, request: Request, user: di
 
 async def _get_system_config() -> dict:
     """Load system config from DB. Returns defaults when auth disabled."""
-    from captain_claw.flight_deck.admin_routes import _load_system_config, SYSTEM_CONFIG_DEFAULTS
+    from captain_claw.flight_deck.admin_routes import _load_system_config
     if not AUTH_ENABLED or not hasattr(app.state, "fd_db"):
-        return {**SYSTEM_CONFIG_DEFAULTS}
+        return _load_system_config(None)
     raw = await app.state.fd_db.get_system_setting("fd:system-config")
     return _load_system_config(raw)
 
@@ -8158,16 +8158,15 @@ async def auth_status():
     internal_fd_url = os.environ.get("FD_INTERNAL_URL", "")
     if not internal_fd_url and os.environ.get("CAPTAIN_CLAW_DOCKER"):
         internal_fd_url = "http://localhost:25080"
-    # Kiosk lock (CLI `--simple-chat` / env FD_SIMPLE_CHAT): the frontend forces
-    # the locked, chat-only Simple layout when this is on.
-    simple_chat_only = os.environ.get("FD_SIMPLE_CHAT", "").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
+    # Kiosk lock for EVERY non-admin (Admin → Settings → Kiosk mode "Everyone";
+    # until an admin picks a mode, CLI `--simple-chat` / env FD_SIMPLE_CHAT).
+    # Whether a signed-in user is locked comes with the user (`kiosk`); this
+    # deck-wide flag is what an auth-off deck goes by.
     return {
         "auth_enabled": AUTH_ENABLED,
         "docker_spawn_enabled": cfg.get("docker_spawn_enabled", docker_default),
         "internal_fd_url": internal_fd_url,
-        "simple_chat_only": simple_chat_only,
+        "simple_chat_only": cfg.get("kiosk_mode") == "all",
     }
 
 
@@ -8770,21 +8769,22 @@ def main():
         "--simple-chat",
         action="store_true",
         help=(
-            "Kiosk mode: lock the UI to the chat-first Simple layout — agents on "
-            "the left, conversation in the middle, the active agent's files and "
-            "data on the right. Strips the full-view switch, the Spawner, agent "
-            "config and start/stop controls so shared-account users can only "
-            "chat, create an agent from a Library archetype, manage their Google "
-            "/ MCP connections, or sign out. Admins are exempt. Also settable "
-            "via the FD_SIMPLE_CHAT env var."
+            "Kiosk mode for every non-admin: lock the UI to the chat-first "
+            "Simple layout — agents on the left, conversation in the middle, "
+            "the active agent's files and data on the right. Strips the "
+            "full-view switch, the Spawner, agent config and start/stop "
+            "controls so users can only chat, create an agent from a Library "
+            "archetype, manage their connections, or sign out. Admins are "
+            "exempt. Only the default: once an admin picks a kiosk mode in "
+            "Admin → Settings (off / everyone / selected users) that wins. "
+            "Also settable via the FD_SIMPLE_CHAT env var."
         ),
     )
     args = parser.parse_args()
 
-    # Kiosk lock. The frontend reads this back from /fd/auth/status and forces
-    # the locked Simple layout; the CLI flag simply seeds the env var so the
-    # HTTP handler (and any reload/worker) sees it. Don't clobber an explicit
-    # FD_SIMPLE_CHAT already in the environment.
+    # Kiosk lock default. The deck's kiosk mode (admin_routes._load_system_config)
+    # falls back to FD_SIMPLE_CHAT until an admin picks one; the CLI flag simply
+    # seeds the env var so the HTTP handlers (and any reload/worker) see it.
     if args.simple_chat:
         os.environ["FD_SIMPLE_CHAT"] = "1"
 

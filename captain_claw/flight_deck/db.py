@@ -840,15 +840,16 @@ class FlightDeckDB:
 
     async def create_user(
         self, email: str, password_hash: str, display_name: str = "",
-        role: str = "user",
+        role: str = "user", metadata: dict | None = None,
     ) -> dict:
         now = _utcnow()
         uid = _uuid()
         assert self._db is not None
         await self._db.execute(
-            "INSERT INTO users (id, email, password_hash, display_name, role, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (uid, email.lower().strip(), password_hash, display_name, role, now, now),
+            "INSERT INTO users (id, email, password_hash, display_name, role, created_at, updated_at, metadata)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (uid, email.lower().strip(), password_hash, display_name, role, now, now,
+             json.dumps(metadata or {})),
         )
         await self._db.commit()
         return {"id": uid, "email": email.lower().strip(), "display_name": display_name,

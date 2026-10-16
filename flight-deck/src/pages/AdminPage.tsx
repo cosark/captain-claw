@@ -16,6 +16,7 @@ import {
   Check,
   Bot,
   Plug,
+  MessageSquare,
 } from 'lucide-react'
 import { useAuthStore } from '../stores/authStore'
 import { UserAgentsDialog } from '../components/agents/UserAgentsDialog'
@@ -47,6 +48,44 @@ interface UserInfo {
   created_at: string
   updated_at: string
   metadata: string
+}
+
+// Kiosk (simple-chat) lock for the deck: nobody, every non-admin, or the users
+// marked in the Users tab. Admins are never locked.
+type KioskMode = 'off' | 'all' | 'selected'
+
+interface SystemConfig {
+  docker_spawn_enabled: boolean
+  kiosk_mode: KioskMode
+  kiosk_new_users: boolean
+  // The mode is the `--simple-chat` default — no admin has picked one yet.
+  kiosk_mode_from_env?: boolean
+}
+
+const CONFIG_DEFAULTS: SystemConfig = {
+  docker_spawn_enabled: true, kiosk_mode: 'off', kiosk_new_users: false,
+}
+
+const KIOSK_MODES: { value: KioskMode; label: string; hint: string }[] = [
+  { value: 'off', label: 'Off', hint: 'Everyone gets the normal layout.' },
+  { value: 'all', label: 'Everyone', hint: 'Every non-admin is locked to simple chat.' },
+  { value: 'selected', label: 'Selected users', hint: 'Only the users marked in the Users tab are locked.' },
+]
+
+function userKioskFlag(user: UserInfo): boolean {
+  try { return JSON.parse(user.metadata || '{}').kiosk === true } catch { return false }
+}
+
+// What the server resolves as the user's lock (auth_routes._user_payload).
+function kioskEffective(role: string, flag: boolean, mode: KioskMode): boolean {
+  if (role === 'admin') return false
+  return mode === 'all' || (mode === 'selected' && flag)
+}
+
+function kioskModeNote(mode: KioskMode): string | null {
+  if (mode === 'all') return 'Kiosk mode is on for everyone (Settings), so this user is locked either way.'
+  if (mode === 'off') return 'Kiosk mode is off (Settings); this takes effect under "Selected users".'
+  return null
 }
 
 interface UsageLog {
@@ -106,6 +145,7 @@ async function createUser(payload: {
   password: string
   display_name?: string
   role?: string
+  kiosk?: boolean
 }): Promise<void> {
   const res = await fetch('/fd/admin/users', {
     method: 'POST', headers: _headers(), credentials: 'include',
@@ -170,20 +210,21 @@ async function fetchCostRollup(since?: string, until?: string): Promise<CostRoll
   return res.json()
 }
 
-async function fetchConfig(): Promise<Record<string, boolean>> {
+async function fetchConfig(): Promise<SystemConfig> {
   const res = await fetch('/fd/admin/config', {
     headers: _headers(), credentials: 'include',
   })
-  if (!res.ok) return { docker_spawn_enabled: true }
-  return res.json()
+  if (!res.ok) return { ...CONFIG_DEFAULTS }
+  return { ...CONFIG_DEFAULTS, ...(await res.json()) }
 }
 
-async function saveConfig(cfg: Record<string, boolean>): Promise<void> {
+async function saveConfig(cfg: Partial<SystemConfig>): Promise<SystemConfig> {
   const res = await fetch('/fd/admin/config', {
     method: 'PUT', headers: _headers(), credentials: 'include',
     body: JSON.stringify(cfg),
   })
   if (!res.ok) throw new Error('Failed to save config')
+  return { ...CONFIG_DEFAULTS, ...(await res.json()) }
 }
 
 async function fetchProviderKeys(): Promise<Record<string, string>> {
@@ -233,18 +274,22 @@ async function updatePlan(plan: string, limits: Partial<PlanLimits>): Promise<vo
 
 // ── Components ──
 
-function CreateUserForm({ onCreated }: { onCreated: () => void }) {
+function CreateUserForm({ onCreated, config }: { onCreated: () => void; config: SystemConfig }) {
   const [open, setOpen] = useState(false)
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [displayName, setDisplayName] = useState('')
   const [role, setRole] = useState('user')
+  // Starts at the deck's "new users start in kiosk mode".
+  const [kiosk, setKiosk] = useState(config.kiosk_new_users)
   const [saving, setSaving] = useState(false)
   const [err, setErr] = useState('')
 
   const reset = () => {
-    setEmail(''); setPassword(''); setDisplayName(''); setRole('user'); setErr('')
+    setEmail(''); setPassword(''); setDisplayName(''); setRole('user')
+    setKiosk(config.kiosk_new_users); setErr('')
   }
+  useEffect(() => { setKiosk(config.kiosk_new_users) }, [config.kiosk_new_users])
 
   const valid = email.trim().includes('@') && password.length >= 6
 
@@ -257,6 +302,7 @@ function CreateUserForm({ onCreated }: { onCreated: () => void }) {
         password,
         display_name: displayName.trim() || undefined,
         role,
+        ...(role === 'admin' ? {} : { kiosk }),
       })
       reset()
       setOpen(false)
@@ -334,6 +380,11 @@ function CreateUserForm({ onCreated }: { onCreated: () => void }) {
             className="w-full rounded-md border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-sm text-zinc-200 focus:border-violet-500/50 focus:outline-none"
           />
         </div>
+        {role !== 'admin' && (
+          <div className="col-span-2">
+            <KioskCheckbox checked={kiosk} onChange={setKiosk} note={kioskModeNote(config.kiosk_mode)} />
+          </div>
+        )}
       </div>
       {err && <p className="text-xs text-red-400">{err}</p>}
       <div className="flex items-center gap-2 pt-1">
@@ -355,20 +406,68 @@ function CreateUserForm({ onCreated }: { onCreated: () => void }) {
   )
 }
 
+function KioskCheckbox({ checked, onChange, note }: {
+  checked: boolean
+  onChange: (v: boolean) => void
+  note: string | null
+}) {
+  return (
+    <div>
+      <label className="flex items-center gap-2 text-sm text-zinc-300 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={(e) => onChange(e.target.checked)}
+          className="h-3.5 w-3.5 rounded border-zinc-600 bg-zinc-950 accent-violet-600"
+        />
+        Kiosk mode <span className="text-xs text-zinc-500">— simple chat only</span>
+      </label>
+      {note && <p className="mt-1 ml-5 text-[11px] text-zinc-500">{note}</p>}
+    </div>
+  )
+}
+
+function Switch({ on, onToggle, disabled = false, label }: {
+  on: boolean
+  onToggle: () => void
+  disabled?: boolean
+  label: string
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={on}
+      aria-label={label}
+      onClick={onToggle}
+      disabled={disabled}
+      className={`relative inline-flex h-6 w-11 shrink-0 rounded-full border-2 border-transparent transition-colors disabled:opacity-50 ${
+        on ? 'bg-violet-600' : 'bg-zinc-700'
+      }`}
+    >
+      <span className={`inline-block h-5 w-5 rounded-full bg-white transition-transform ${
+        on ? 'translate-x-5' : 'translate-x-0'
+      }`} />
+    </button>
+  )
+}
+
 function UserRow({
-  user, plans, onUpdate, onDelete, currentUserId,
+  user, plans, onUpdate, onDelete, currentUserId, kioskMode,
 }: {
   user: UserInfo
   plans: Record<string, PlanLimits>
   onUpdate: () => void
   onDelete: (id: string) => void
   currentUserId: string
+  kioskMode: KioskMode
 }) {
   const [expanded, setExpanded] = useState(false)
   const [plan, setPlan] = useState(() => {
     try { return JSON.parse(user.metadata || '{}').plan || 'free' } catch { return 'free' }
   })
   const [role, setRole] = useState(user.role)
+  const [kiosk, setKiosk] = useState(() => userKioskFlag(user))
   const [password, setPassword] = useState('')
   const [saving, setSaving] = useState(false)
   const [agentsOpen, setAgentsOpen] = useState(false)
@@ -377,7 +476,7 @@ function UserRow({
   const handleSave = async () => {
     setSaving(true)
     try {
-      const patch: Record<string, unknown> = { plan, role }
+      const patch: Record<string, unknown> = { plan, role, kiosk }
       if (password.trim()) patch.password = password
       await updateUser(user.id, patch)
       setPassword('')
@@ -401,6 +500,15 @@ function UserRow({
           </div>
           <div className="text-xs text-zinc-500">{user.email}</div>
         </div>
+        {kioskEffective(user.role, userKioskFlag(user), kioskMode) && (
+          <span
+            title="Locked to the simple chat layout (kiosk mode)"
+            className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-violet-500/15 text-violet-300"
+          >
+            <MessageSquare className="h-3 w-3" />
+            kiosk
+          </span>
+        )}
         <span className="text-xs px-2 py-0.5 rounded-full bg-zinc-800 text-zinc-400 capitalize">{plan}</span>
       </button>
 
@@ -432,6 +540,12 @@ function UserRow({
               </select>
             </div>
           </div>
+
+          {role === 'admin' ? (
+            <p className="text-[11px] text-zinc-500">Admins are never held to kiosk mode.</p>
+          ) : (
+            <KioskCheckbox checked={kiosk} onChange={setKiosk} note={kioskModeNote(kioskMode)} />
+          )}
 
           <div>
             <label className="block text-xs font-medium text-zinc-500 mb-1">Reset password</label>
@@ -564,7 +678,7 @@ export function AdminPage() {
   const [users, setUsers] = useState<UserInfo[]>([])
   const [totalUsers, setTotalUsers] = useState(0)
   const [plans, setPlans] = useState<Record<string, PlanLimits>>({})
-  const [config, setConfig] = useState<Record<string, boolean>>({ docker_spawn_enabled: true })
+  const [config, setConfig] = useState<SystemConfig>({ ...CONFIG_DEFAULTS })
   const [providerKeys, setProviderKeys] = useState<Record<string, string>>({})
   const [providerKeysDraft, setProviderKeysDraft] = useState<Record<string, string>>({})
   const [keySaveFlash, setKeySaveFlash] = useState<string | null>(null)
@@ -726,7 +840,7 @@ export function AdminPage() {
         {/* Users tab */}
         {!loading && tab === 'users' && (
           <div className="space-y-2">
-            <CreateUserForm onCreated={loadUsers} />
+            <CreateUserForm onCreated={loadUsers} config={config} />
             {users.map((u) => (
               <UserRow
                 key={u.id}
@@ -735,6 +849,7 @@ export function AdminPage() {
                 onUpdate={loadUsers}
                 onDelete={handleDelete}
                 currentUserId={currentUser.id}
+                kioskMode={config.kiosk_mode}
               />
             ))}
             {users.length === 0 && (
@@ -859,6 +974,70 @@ export function AdminPage() {
                     config.docker_spawn_enabled ? 'translate-x-5' : 'translate-x-0'
                   }`} />
                 </button>
+              </label>
+            </div>
+
+            {/* Kiosk mode (simple chat) */}
+            <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-4 space-y-4">
+              <div>
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-zinc-200">
+                  <MessageSquare className="h-4 w-4 text-violet-400" />
+                  Kiosk mode (simple chat)
+                </h3>
+                <p className="text-xs text-zinc-500 mt-0.5">
+                  Locks users to the chat-first simple layout: they can chat, start an agent from an archetype,
+                  manage their own connections and profile, and sign out. Admins are never locked.
+                  A user already signed in picks up a change within about 15 minutes, or on reload.
+                </p>
+              </div>
+              <div>
+                <div className="inline-flex rounded-md border border-zinc-700 p-0.5" role="radiogroup" aria-label="Kiosk mode">
+                  {KIOSK_MODES.map((m) => (
+                    <button
+                      key={m.value}
+                      type="button"
+                      role="radio"
+                      aria-checked={config.kiosk_mode === m.value}
+                      onClick={async () => {
+                        if (config.kiosk_mode === m.value && !config.kiosk_mode_from_env) return
+                        try {
+                          const next = await saveConfig({ kiosk_mode: m.value })
+                          setConfig(next)
+                          useAuthStore.getState().setSimpleChatOnly(next.kiosk_mode === 'all')
+                        } catch { setError('Failed to save config') }
+                      }}
+                      className={`rounded px-3 py-1.5 text-xs font-medium transition-colors ${
+                        config.kiosk_mode === m.value
+                          ? 'bg-violet-600 text-white'
+                          : 'text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200'
+                      }`}
+                    >
+                      {m.label}
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-1.5 text-xs text-zinc-500">
+                  {KIOSK_MODES.find((m) => m.value === config.kiosk_mode)?.hint}
+                  {config.kiosk_mode_from_env && ' Set by --simple-chat until you pick a mode here.'}
+                </p>
+              </div>
+              <label className="flex items-center justify-between gap-4">
+                <div>
+                  <div className="text-sm text-zinc-300">New users start in kiosk mode</div>
+                  <div className="text-xs text-zinc-500 mt-0.5">
+                    Marks accounts created from now on (Add user or sign-up). Counts under "Selected users";
+                    with "Everyone" every non-admin is locked anyway.
+                  </div>
+                </div>
+                <Switch
+                  on={config.kiosk_new_users}
+                  label="New users start in kiosk mode"
+                  onToggle={async () => {
+                    try {
+                      setConfig(await saveConfig({ kiosk_new_users: !config.kiosk_new_users }))
+                    } catch { setError('Failed to save config') }
+                  }}
+                />
               </label>
             </div>
 

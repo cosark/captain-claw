@@ -394,7 +394,7 @@ function AppContent() {
     </>
   )
 
-  // ── Kiosk lock (server --simple-chat / FD_SIMPLE_CHAT) ──
+  // ── Kiosk lock (Admin → Settings → Kiosk mode; `--simple-chat` default) ──
   // Force the locked, chat-first Simple layout on every form factor and ignore
   // the stored layoutMode entirely. `locked` strips the escape hatches (full
   // view, the Spawner, agent config, start/stop) so shared-account users can

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -31,11 +32,13 @@ class CreateUserRequest(BaseModel):
     password: str  # min 6 chars
     display_name: str | None = None
     role: str = "user"
+    kiosk: bool | None = None  # None = the deck's "new users start in kiosk"
 
 
 class UpdateUserRequest(BaseModel):
     display_name: str | None = None
     role: str | None = None
+    kiosk: bool | None = None  # held to the simple-chat layout ("selected" mode)
     plan: str | None = None
     max_agents: int | None = None
     max_storage_mb: int | None = None
@@ -84,14 +87,16 @@ async def create_user(body: CreateUserRequest, admin: dict = Depends(require_adm
         raise HTTPException(409, "Email already registered")
 
     display = (body.display_name or "").strip() or email.split("@")[0]
+    meta = await new_user_metadata(db, body.role, body.kiosk)
     user = await db.create_user(
         email=email, password_hash=hash_password(body.password),
-        display_name=display, role=body.role,
+        display_name=display, role=body.role, metadata=meta,
     )
     return {
         "ok": True,
         "user": {"id": user["id"], "email": user["email"],
-                 "display_name": display, "role": body.role},
+                 "display_name": display, "role": body.role,
+                 "kiosk": meta.get("kiosk") is True},
     }
 
 
@@ -136,6 +141,12 @@ async def update_user(
         pass
 
     changed_meta = False
+    if body.kiosk is not None:
+        if body.kiosk:
+            meta["kiosk"] = True
+        else:
+            meta.pop("kiosk", None)
+        changed_meta = True
     if body.plan is not None:
         if body.plan not in PLAN_LIMITS:
             raise HTTPException(400, f"Plan must be one of: {', '.join(PLAN_LIMITS.keys())}")
@@ -260,6 +271,8 @@ class UpdatePlanRequest(BaseModel):
 
 class UpdateConfigRequest(BaseModel):
     docker_spawn_enabled: bool | None = None
+    kiosk_mode: str | None = None  # one of KIOSK_MODES
+    kiosk_new_users: bool | None = None
 
 
 class ProviderKeysRequest(BaseModel):
@@ -269,19 +282,82 @@ class ProviderKeysRequest(BaseModel):
 # System config defaults
 SYSTEM_CONFIG_DEFAULTS = {
     "docker_spawn_enabled": True,
+    # Kiosk (simple-chat) lock: True = new accounts start locked. Only matters
+    # in "selected" mode — with "all" every non-admin is locked anyway.
+    "kiosk_new_users": False,
 }
+
+# Kiosk (simple-chat) lock for the deck: "off" = nobody, "all" = every
+# non-admin, "selected" = the users an admin marked (user metadata "kiosk").
+# Admins are never locked.
+KIOSK_MODES = ("off", "all", "selected")
+
+
+def _env_kiosk_default() -> str:
+    """The CLI ``--simple-chat`` / ``FD_SIMPLE_CHAT`` flag: the deck's kiosk
+    mode until an admin picks one on the Admin page."""
+    on = os.environ.get("FD_SIMPLE_CHAT", "").strip().lower() in ("1", "true", "yes", "on")
+    return "all" if on else "off"
 
 
 def _load_system_config(raw: str | None) -> dict:
     """Parse system config from DB, merge with defaults."""
     cfg = {**SYSTEM_CONFIG_DEFAULTS}
+    stored: dict = {}
     if raw:
         try:
-            stored = json.loads(raw)
+            stored = json.loads(raw) or {}
             cfg.update(stored)
         except (json.JSONDecodeError, TypeError):
-            pass
+            stored = {}
+    if cfg.get("kiosk_mode") not in KIOSK_MODES:
+        cfg["kiosk_mode"] = _env_kiosk_default()
+    # The Admin page says where an unpicked mode came from.
+    cfg["kiosk_mode_from_env"] = (
+        stored.get("kiosk_mode") not in KIOSK_MODES and cfg["kiosk_mode"] == "all"
+    )
     return cfg
+
+
+def _user_meta(user: dict) -> dict:
+    try:
+        meta = json.loads(user.get("metadata") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def kiosk_locked(user: dict, cfg: dict) -> bool:
+    """Whether *user* is held to the kiosk (simple-chat) layout under *cfg*.
+
+    A UI lock, not an API boundary: the frontend reads this back as the
+    user's ``kiosk`` field and enforces it."""
+    if user.get("role") == "admin":
+        return False
+    mode = cfg.get("kiosk_mode")
+    if mode == "all":
+        return True
+    if mode == "selected":
+        return _user_meta(user).get("kiosk") is True
+    return False
+
+
+async def user_kiosk_locked(db, user: dict) -> bool:
+    """kiosk_locked() against the deck's stored config. *user* needs
+    ``role`` and ``metadata`` (get_user_by_id / get_user_by_email rows)."""
+    raw = await db.get_system_setting("fd:system-config")
+    return kiosk_locked(user, _load_system_config(raw))
+
+
+async def new_user_metadata(db, role: str, kiosk: bool | None = None) -> dict:
+    """Metadata for a new account: the kiosk flag, *kiosk* when an admin chose
+    one, else the deck's "new users start in kiosk" default. Admins get none."""
+    if role == "admin":
+        return {}
+    if kiosk is None:
+        raw = await db.get_system_setting("fd:system-config")
+        kiosk = bool(_load_system_config(raw).get("kiosk_new_users"))
+    return {"kiosk": True} if kiosk else {}
 
 
 @router.get("/plans")
@@ -302,12 +378,22 @@ async def get_config(admin: dict = Depends(require_admin)):
 async def update_config(body: UpdateConfigRequest, admin: dict = Depends(require_admin)):
     """Update system configuration (admin only)."""
     db = get_db()
+    updates = body.model_dump(exclude_none=True)
+    if "kiosk_mode" in updates and updates["kiosk_mode"] not in KIOSK_MODES:
+        raise HTTPException(400, f"kiosk_mode must be one of: {', '.join(KIOSK_MODES)}")
     raw = await db.get_system_setting("fd:system-config")
-    cfg = _load_system_config(raw)
-    for key, val in body.model_dump(exclude_none=True).items():
-        cfg[key] = val
-    await db.set_system_setting("fd:system-config", json.dumps(cfg))
-    return cfg
+    # Store only what was stored or set here, not the merged defaults: an
+    # unrelated toggle must not freeze the --simple-chat default into the DB.
+    try:
+        stored = json.loads(raw) if raw else {}
+    except (json.JSONDecodeError, TypeError):
+        stored = {}
+    if not isinstance(stored, dict):
+        stored = {}
+    stored.update(updates)
+    stored.pop("kiosk_mode_from_env", None)
+    await db.set_system_setting("fd:system-config", json.dumps(stored))
+    return _load_system_config(json.dumps(stored))
 
 
 PROVIDER_KEYS_SETTING = "fd:provider-keys"
