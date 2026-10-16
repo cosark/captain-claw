@@ -705,7 +705,7 @@ async def handle_chat(
     effective_content = content
     _all_images = [str(p) for p in ([image_path] if image_path else []) + list(image_paths or [])]
     _all_files = [str(p) for p in ([file_path] if file_path else []) + list(file_paths or [])]
-    _sees_inline = str(getattr(getattr(agent, "provider", None), "provider", "")).lower() == "ollama"
+    _sees_inline = agent_sees_attached_images(agent)
     _prefix = build_attachment_prefix(_all_images, _all_files, attachment_notes,
                                       sees_inline=_sees_inline)
     video_attachments: list[str] = list(_prefix.videos)  # auto-analyzed server-side before the turn
@@ -1020,6 +1020,19 @@ async def _prefix_video_analysis(
         "the user explicitly asked you to.\n\n"
         f"{content}"
     )
+
+
+def agent_sees_attached_images(agent: Any) -> bool:
+    """Whether this turn's attached pictures go to the agent's own model inline
+    instead of being described server-side by a vision model or a peer."""
+    sees = getattr(agent, "sees_images", None)
+    if not callable(sees):
+        return str(getattr(getattr(agent, "provider", None), "provider", "")).lower() == "ollama"
+    try:
+        return bool(sees())
+    except Exception as exc:
+        log.debug("Vision capability check failed", error=str(exc))
+        return False
 
 
 async def _prefix_image_analysis(

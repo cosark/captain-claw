@@ -1,0 +1,4 @@
+Attached image policy:
+- When a message contains `[Attached image: <path>]`, you MUST use a tool to look at it — you cannot see an image just by reading the message text.
+- First try the `image_vision` tool with that exact path. If it reports no vision model is available (or you otherwise can't see images), DELEGATE the image to a multimodal peer instead: call `flight_deck` with `action="consult"` (or `delegate`), `agent_name` of a peer that can see images, and `file="<path>"`, asking it to describe the image. Then relay what the peer returns.
+- NEVER use `read` on an image file (it's binary, not text), and NEVER claim you can't open or analyze an image before you have actually called `image_vision` or delegated it. Ignore any earlier turn that said an image couldn't be opened — try again now.

@@ -8,7 +8,7 @@ import { useProcessStore } from '../stores/processStore'
 import { useUIStore } from '../stores/uiStore'
 import { spawnProcess, type SpawnConfig } from '../services/docker'
 import {
-  useTierConfig, PROVIDERS, TIER_ORDER, isSetUnconfigured,
+  useTierConfig, tierVision, PROVIDERS, TIER_ORDER, isSetUnconfigured,
   INPUT_CTX_OPTIONS, OUTPUT_CTX_OPTIONS, fmtCtxTokens, type Archetype,
   REASONING_EFFORTS, REASONING_EFFORT_PROVIDERS, splitReasoningEffort, withReasoningEffort,
 } from '../services/tierConfig'
@@ -260,6 +260,7 @@ export function LibraryPage() {
       max_context: tc.input_ctx > 0 ? tc.input_ctx : 0,
       provider_api_key: tc.api_key,
       base_url: tc.base_url,
+      vision: tierVision(tc),
       botport_enabled: false,
       botport_url: '',
       botport_instance_name: '',
@@ -612,6 +613,22 @@ export function LibraryPage() {
                         <span className="ml-1 text-zinc-500">
                           — a small or fast model (e.g. a Flash tier). A multi-agent run leans on
                           the deterministic backstops for this slot. Leave off for a strong model.
+                        </span>
+                      </span>
+                    </label>
+                    <label className="flex cursor-pointer items-start gap-2 text-xs text-zinc-400">
+                      <input
+                        type="checkbox"
+                        checked={!!tc.vision}
+                        onChange={(e) => updateTier(t, { vision: e.target.checked })}
+                        className="mt-0.5 h-3.5 w-3.5 rounded border-zinc-600 bg-zinc-950 text-violet-500 focus:ring-violet-500/40"
+                      />
+                      <span>
+                        <span className="font-medium text-zinc-300">Sees images</span>
+                        <span className="ml-1 text-zinc-500">
+                          — the model is multimodal: agents on this tier look at pictures themselves
+                          instead of asking a separate vision model. Needed for local builds (e.g. Qwen 3.8);
+                          GPT, Claude and Gemini are recognised without it.
                         </span>
                       </span>
                     </label>

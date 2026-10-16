@@ -65,7 +65,7 @@ import { AgentFilesPanel } from './AgentFilesPanel'
 import { AgentDatastorePanel } from './AgentDatastorePanel'
 import { QueuePlannerModal } from './QueuePlannerModal'
 import { usePersistedSize } from '../../hooks/usePersistedSize'
-import type { ChatMessage, TokenUsage } from '../../services/agentChat'
+import { imageRef, type ChatMessage, type TokenUsage } from '../../services/agentChat'
 
 // Plugin arrays hoisted to module scope so they keep a stable identity across
 // renders (react-markdown otherwise sees "new" plugins every render).
@@ -106,21 +106,18 @@ function swallowDrop(e: React.DragEvent) {
 }
 
 // Build the outgoing message text, appending references to any uploaded files
-// so the agent can locate them. Images use the "[Attached image: …]" marker
-// that routes them to the image_vision tool (describe) / image_ocr (read text)
-// instead of `read` — and NOT the `cv` (OpenCV pixel-ops) tool.
+// so the agent can locate them. Images use the "[Attached image: …]" ref,
+// which travels as the chat frame's image_paths (see splitImageRefs): the
+// agent shows them to its own model when it sees images, and otherwise has a
+// vision model describe them before the turn.
 function appendAttachmentRefs(text: string, uploadedFiles: Attachment[]): string {
   if (uploadedFiles.length === 0) return text
-  const hasImage = uploadedFiles.some((a) => a.type.startsWith('image/'))
   const fileRefs = uploadedFiles.map((a) =>
     a.type.startsWith('image/')
-      ? `[Attached image: ${a.uploadedPath}]`
+      ? imageRef(a.uploadedPath || '')
       : `[Attached file: ${a.name} → ${a.uploadedPath}]`,
   ).join('\n')
-  const hint = hasImage
-    ? '\n(To view/understand the image(s), call image_vision (to describe or answer questions) or image_ocr (to read text) with the path. Do NOT use read on an image, and do NOT use the "cv" tool for this — "cv" does pixel ops only (measure/diff/detect regions) and cannot read text or say what an image shows.)'
-    : ''
-  return text ? `${text}\n\n${fileRefs}${hint}` : `${fileRefs}${hint}`
+  return text ? `${text}\n\n${fileRefs}` : fileRefs
 }
 
 // Shared file-attachment state + handlers for the chat and queue inputs.

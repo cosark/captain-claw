@@ -20,7 +20,7 @@ import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import { useChatStore } from '../../stores/chatStore'
 import { uploadFileToAgent } from '../../services/fileTransfer'
-import type { ChatMessage } from '../../services/agentChat'
+import { imageRef, type ChatMessage } from '../../services/agentChat'
 
 interface Attachment {
   id: string
@@ -206,7 +206,10 @@ function EmbeddedChatBody({
 
     let content = text
     if (uploadedFiles.length > 0) {
-      const refs = uploadedFiles.map((a) => `[Attached file: ${a.name} → ${a.uploadedPath}]`).join('\n')
+      // Pictures as image refs — sent as image_paths (chatStore.sendMessage).
+      const refs = uploadedFiles.map((a) => a.type.startsWith('image/')
+        ? imageRef(a.uploadedPath || '')
+        : `[Attached file: ${a.name} → ${a.uploadedPath}]`).join('\n')
       content = content ? `${content}\n\n${refs}` : refs
     }
     onSend(content)

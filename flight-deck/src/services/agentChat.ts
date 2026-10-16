@@ -37,6 +37,34 @@ export interface ChatMessage {
 
 type EventHandler = (data: Record<string, unknown>) => void
 
+// A picture the chat composers attach is written as an `[Attached image: <path>]`
+// line — what the user's bubble shows. On the wire it travels as `image_paths`:
+// the agent then words the turn for its model — a model that sees images looks
+// at it itself, otherwise a vision model describes it before the turn.
+const IMAGE_REF_LINE_RE = /^\[Attached image:\s*(.+?)\s*\]$/
+// The hint earlier builds appended after image refs (queued items may carry it).
+const LEGACY_IMAGE_HINT_RE = /^\(To view\/understand the image\(s\), call image_vision.*\)$/
+
+export function imageRef(path: string): string {
+  return `[Attached image: ${path}]`
+}
+
+/** The text and the `image_paths` of an outgoing message (see imageRef). */
+export function splitImageRefs(content: string): { text: string; imagePaths: string[] } {
+  const imagePaths: string[] = []
+  const kept: string[] = []
+  for (const line of content.split('\n')) {
+    const ref = line.trim().match(IMAGE_REF_LINE_RE)
+    if (ref) {
+      if (!imagePaths.includes(ref[1])) imagePaths.push(ref[1])
+      continue
+    }
+    if (LEGACY_IMAGE_HINT_RE.test(line.trim())) continue
+    kept.push(line)
+  }
+  return imagePaths.length ? { text: kept.join('\n').trim(), imagePaths } : { text: content, imagePaths }
+}
+
 export class AgentChatWS {
   private ws: WebSocket | null = null
   private handlers = new Map<string, Set<EventHandler>>()
@@ -250,7 +278,7 @@ export class AgentChatWS {
     if (this._unsubAuth) { this._unsubAuth(); this._unsubAuth = null }
   }
 
-  send(content: string, opts?: { noNextSteps?: boolean }) {
+  send(content: string, opts?: { noNextSteps?: boolean; imagePaths?: string[] }) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
     this.ws.send(JSON.stringify({
       type: 'chat',
@@ -260,6 +288,7 @@ export class AgentChatWS {
       // task-rephrase, which would rewrite instructions the user chose
       // word by word.
       ...(opts?.noNextSteps ? { no_next_steps: true, no_rephrase: true } : {}),
+      ...(opts?.imagePaths?.length ? { image_paths: opts.imagePaths } : {}),
     }))
   }
 

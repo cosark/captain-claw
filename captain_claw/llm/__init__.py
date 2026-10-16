@@ -18,6 +18,21 @@ from typing import Any, AsyncIterator, Callable
 import httpx
 
 from captain_claw.exceptions import LLMAPIError, LLMError
+from captain_claw.llm.vision import (
+    IMAGE_TOKEN_ALLOWANCE as _IMAGE_TOKEN_ALLOWANCE,
+    as_encoded as _as_encoded,
+    count_payload_images as _count_payload_images,
+    has_image_parts as _has_image_parts,
+    is_image_input_rejected_error as _is_image_input_rejected_error,
+    openai_image_part as _openai_image_part,
+    refused_image_paths as _refused_image_paths,
+    remember_vision_rejected as _remember_vision_rejected,
+    replace_refused_note as _replace_refused_note,
+    responses_image_part as _responses_image_part,
+    strip_image_parts as _strip_image_parts,
+    text_view_of_payload as _text_view_of_payload,
+    tool_images_lead as _tool_images_lead,
+)
 from captain_claw.logging import get_logger
 
 log = get_logger(__name__)
@@ -47,6 +62,11 @@ class Message:
     # breakpoint for providers with explicit cache control (Anthropic), so a
     # new turn reuses the cached history. Not sent on the wire.
     cache_breakpoint: bool = False
+    # Pictures this message carries to a model that sees images
+    # (``EncodedImage`` or paths; see llm/vision.py). Sent as image parts —
+    # after the run of tool results, for a tool message — and never stored:
+    # the session keeps only the content's path markers.
+    images: list[Any] | None = None
 
 
 @dataclass
@@ -247,6 +267,7 @@ class LLMProvider(ABC):
         for msg in messages:
             text = msg.content if isinstance(msg, Message) else str(msg.get("content", ""))
             prompt_tokens += self.count_tokens(text) if text else 0
+            prompt_tokens += _IMAGE_TOKEN_ALLOWANCE * len(getattr(msg, "images", None) or [])
         # Add a conservative estimate for the completion side.
         completion_budget = max_tokens or 4096
         return prompt_tokens + completion_budget
@@ -407,6 +428,9 @@ async def _acompletion_tolerant(kwargs: dict[str, Any], provider: Any = None) ->
                 stripped=",".join(stripped) or None,
                 reasoning_backfilled=reasoning_backfilled,
             )
+            if "images" in stripped:
+                retry_kwargs["messages"] = await _describe_refused_images(
+                    kwargs.get("messages") or [], retry_kwargs["messages"], provider)
             return await acompletion(**retry_kwargs)
         raise
 
@@ -435,6 +459,7 @@ def _is_healable_request_error(msg: str) -> bool:
         or _is_reasoning_with_tools_rejected_error(msg)
         or _is_reasoning_content_required_error(msg)
         or _output_budget_that_fits(msg) is not None
+        or _is_image_input_rejected_error(msg)
     )
 
 
@@ -527,12 +552,59 @@ def _heal_request_kwargs(
     # synthesized context/nudge message. Backfill a placeholder on any
     # assistant message that lacks reasoning and retry once. Scoped to the
     # exact 400 so no other provider ever sees the placeholder.
+    # Server refuses image input (a text-only model, a GGUF served without its
+    # mmproj, a gateway that takes string content only): send the text, with a
+    # note where the pictures were, and never send this model one again — the
+    # agent describes images with its separate vision model / a peer from here.
+    if _has_image_parts(retry_kwargs.get("messages")) and _is_image_input_rejected_error(msg):
+        retry_kwargs["messages"] = _strip_image_parts(retry_kwargs.get("messages"))
+        stripped.append("images")
+        _remember_provider_rejected_images(provider, kwargs.get("model", ""))
+
     reasoning_backfilled = False
     if _is_reasoning_content_required_error(msg):
         reasoning_backfilled = _backfill_reasoning_content(
             retry_kwargs.get("messages")
         )
     return retry_kwargs, stripped, reasoning_backfilled
+
+
+async def _describe_refused_images(
+    original: list[Any], healed: list[Any], provider: Any = None,
+) -> list[Any]:
+    """*healed* with each refused picture's note replaced by what the agent's
+    fallback (a separate vision model, a multimodal peer) says it shows — so
+    the retried call answers from a description instead of from nothing.
+    Without a describer on the provider the notes stay."""
+    describe = getattr(provider, "describe_refused_images", None)
+    if not callable(describe):
+        return healed
+    result = list(healed)
+    for index, paths in _refused_image_paths(original):
+        if index >= len(result):
+            continue
+        try:
+            text = str(await describe(paths) or "").strip()
+        except Exception as exc:
+            log.warning("Describing refused images failed", error=str(exc))
+            continue
+        if text:
+            result[index] = _replace_refused_note(result[index], text)
+    return result
+
+
+def _remember_provider_rejected_images(provider: Any, model: str = "") -> None:
+    if provider is None:
+        return
+    _remember_vision_rejected(
+        str(getattr(provider, "provider", "") or ""),
+        str(getattr(provider, "model", "") or model or ""),
+        str(getattr(provider, "base_url", "") or ""),
+    )
+    try:
+        provider.sees_images = False
+    except Exception:
+        pass
 
 
 # Matches <think>...</think> blocks (and common variants like <thinking>,
@@ -933,13 +1005,16 @@ def _context_overflow(msg: str) -> _ContextOverflow | None:
 def _estimate_prompt_tokens(kwargs: dict[str, Any]) -> int:
     """A deliberately high count of a request's prompt tokens, for servers that
     don't report it: three characters a token over the JSON of its messages and
-    tools, where prose runs nearer four — so a budget computed from it errs small."""
+    tools, where prose runs nearer four — so a budget computed from it errs small.
+    An image counts as its token allowance, not as the characters of its base64."""
+    messages = kwargs.get("messages") or []
+    images = _count_payload_images(messages)
     try:
-        chars = len(json.dumps(kwargs.get("messages") or [], default=str))
+        chars = len(json.dumps(_text_view_of_payload(messages) if images else messages, default=str))
         chars += len(json.dumps(kwargs.get("tools") or [], default=str))
     except Exception:
         return 0
-    return chars // 3
+    return chars // 3 + images * _IMAGE_TOKEN_ALLOWANCE
 
 
 def _output_budget_that_fits(
@@ -1190,9 +1265,29 @@ def _inject_anthropic_cache_control(
     return result
 
 
+def _encoded_images_of(msg: Any) -> list[Any]:
+    raw = msg.get("images") if isinstance(msg, dict) else getattr(msg, "images", None)
+    return [img for img in (_as_encoded(item) for item in raw or []) if img is not None]
+
+
 def _convert_messages_for_openai_style(messages: list[Message]) -> list[dict[str, Any]]:
-    """Convert messages to OpenAI-style payload."""
+    """Convert messages to OpenAI-style payload.
+
+    A message's ``images`` go as ``image_url`` parts (LiteLLM maps them for
+    Anthropic and Gemini). A tool message can't carry image parts, so the
+    pictures tool results return follow the run of tool messages as one user
+    message.
+    """
     result: list[dict[str, Any]] = []
+    tool_images: list[Any] = []
+
+    def _flush_tool_images() -> None:
+        if tool_images:
+            result.append({"role": "user", "content": [
+                {"type": "text", "text": _tool_images_lead(tool_images)}]
+                + [_openai_image_part(img) for img in tool_images]})
+            tool_images.clear()
+
     for msg in messages:
         if isinstance(msg, dict):
             role = str(msg.get("role", ""))
@@ -1211,6 +1306,8 @@ def _convert_messages_for_openai_style(messages: list[Message]) -> list[dict[str
 
         if role not in {"system", "user", "assistant", "tool"}:
             continue
+        if role != "tool":
+            _flush_tool_images()
         # Anthropic rejects empty text content blocks.
         if not content and role == "tool":
             content = "[empty tool response]"
@@ -1271,7 +1368,14 @@ def _convert_messages_for_openai_style(messages: list[Message]) -> list[dict[str
             entry["tool_call_id"] = tool_call_id or f"call_{len(result)}"
         if role == "tool" and tool_name:
             entry["name"] = tool_name
+        images = _encoded_images_of(msg)
+        if images and role == "user":
+            entry["content"] = [{"type": "text", "text": content}] + [
+                _openai_image_part(img) for img in images]
+        elif images and role == "tool":
+            tool_images.extend(images)
         result.append(entry)
+    _flush_tool_images()
     return result
 
 
@@ -1323,13 +1427,24 @@ def _encode_ollama_image(path: str) -> str | None:
         return None
 
 
-def _convert_messages_for_ollama(messages: list[Message]) -> list[dict[str, Any]]:
+def _convert_messages_for_ollama(
+    messages: list[Message], *, legacy_markers: bool = True,
+) -> list[dict[str, Any]]:
     """Convert messages to Ollama API format.
 
-    Attached images are sent INLINE to multimodal models via Ollama's
-    per-message ``images`` array — but only on the most recent user message
-    that references one, so historical images aren't re-encoded every call.
+    Images go INLINE via Ollama's per-message ``images`` array. When any
+    message carries ``images`` (the agent picked this call's pictures), those
+    are sent — a tool result's after the run of tool messages, as a user
+    message. Otherwise, with *legacy_markers*, the ``[Attached image:]``
+    markers of the most recent user message that has one are inlined (callers
+    that build their own messages); an agent's provider turns that off, since
+    its agent does the picking.
     """
+    if any(_encoded_images_of(m) for m in messages):
+        return _convert_messages_for_ollama_picked(messages)
+    if not legacy_markers:
+        return _convert_messages_for_ollama_picked(messages)
+
     def _content_of(m: Any) -> str:
         return str(m.get("content", "")) if isinstance(m, dict) else str(getattr(m, "content", ""))
 
@@ -1370,6 +1485,45 @@ def _convert_messages_for_ollama(messages: list[Message]) -> list[dict[str, Any]
                 if images:
                     entry["images"] = images
             result.append(entry)
+    return result
+
+
+def _convert_messages_for_ollama_picked(messages: list[Message]) -> list[dict[str, Any]]:
+    """Ollama format with exactly the ``images`` the messages carry."""
+    result: list[dict[str, Any]] = []
+    tool_images: list[Any] = []
+
+    def _flush_tool_images() -> None:
+        if tool_images:
+            result.append({"role": "user", "content": _tool_images_lead(tool_images),
+                           "images": [img.data for img in tool_images]})
+            tool_images.clear()
+
+    for msg in messages:
+        if isinstance(msg, dict):
+            role = str(msg.get("role", ""))
+            content = str(msg.get("content", ""))
+            tool_name = msg.get("tool_name")
+        else:
+            role = str(getattr(msg, "role", ""))
+            content = str(getattr(msg, "content", ""))
+            tool_name = getattr(msg, "tool_name", None)
+        if role not in {"system", "user", "assistant", "tool"}:
+            continue
+        images = _encoded_images_of(msg)
+        if role == "tool":
+            entry: dict[str, Any] = {"role": "tool", "content": content}
+            if tool_name:
+                entry["tool_name"] = str(tool_name)
+            result.append(entry)
+            tool_images.extend(images)
+            continue
+        _flush_tool_images()
+        entry = {"role": role, "content": content}
+        if images and role == "user":
+            entry["images"] = [img.data for img in images]
+        result.append(entry)
+    _flush_tool_images()
     return result
 
 
@@ -1555,6 +1709,19 @@ def _convert_messages_for_responses_api(
     """
     system_parts: list[str] = []
     items: list[dict[str, Any]] = []
+    # A tool result's pictures follow the run of function outputs as one
+    # user message.
+    tool_images: list[Any] = []
+
+    def _flush_tool_images() -> None:
+        if tool_images:
+            items.append({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": _tool_images_lead(tool_images)}]
+                + [_responses_image_part(img) for img in tool_images],
+            })
+            tool_images.clear()
 
     for msg in messages:
         if isinstance(msg, dict):
@@ -1567,6 +1734,9 @@ def _convert_messages_for_responses_api(
             content = str(getattr(msg, "content", ""))
             tool_call_id = getattr(msg, "tool_call_id", None)
             tool_calls = getattr(msg, "tool_calls", None)
+        images = _encoded_images_of(msg)
+        if role != "tool":
+            _flush_tool_images()
 
         if role == "system":
             if content:
@@ -1577,7 +1747,8 @@ def _convert_messages_for_responses_api(
             items.append({
                 "type": "message",
                 "role": "user",
-                "content": [{"type": "input_text", "text": content}],
+                "content": [{"type": "input_text", "text": content}]
+                + [_responses_image_part(img) for img in images],
             })
             continue
 
@@ -1616,8 +1787,10 @@ def _convert_messages_for_responses_api(
                 "call_id": str(tool_call_id or f"call_{len(items)}"),
                 "output": content,
             })
+            tool_images.extend(images)
             continue
 
+    _flush_tool_images()
     instructions = "\n\n".join(system_parts)
     return instructions, items
 
@@ -2836,7 +3009,8 @@ class OllamaProvider(LLMProvider):
             pass
 
         url = f"{self.base_url}/api/chat"
-        ollama_messages = _convert_messages_for_ollama(messages)
+        ollama_messages = _convert_messages_for_ollama(
+            messages, legacy_markers=getattr(self, "sees_images", None) is None)
         ollama_tools = _convert_tools_for_openai_style(tools) if tools else None
 
         options: dict[str, Any] = {
@@ -2908,6 +3082,14 @@ class OllamaProvider(LLMProvider):
                                     model=self.model)
                         self.think = False
                         body.pop("think", None)
+                        continue
+                    # Model can't take images → send the text, fall back after.
+                    if (_has_image_parts(body.get("messages"))
+                            and _is_image_input_rejected_error(response.text)):
+                        _remember_provider_rejected_images(self)
+                        _sent_messages = body.get("messages") or []
+                        body["messages"] = await _describe_refused_images(
+                            _sent_messages, _strip_image_parts(_sent_messages), self)
                         continue
                     raise LLMAPIError(
                         f"Ollama API error {response.status_code}: {response.text}",
@@ -3068,7 +3250,8 @@ class OllamaProvider(LLMProvider):
             pass
 
         url = f"{self.base_url}/api/chat"
-        ollama_messages = _convert_messages_for_ollama(messages)
+        ollama_messages = _convert_messages_for_ollama(
+            messages, legacy_markers=getattr(self, "sees_images", None) is None)
         ollama_tools = _convert_tools_for_openai_style(tools) if tools else None
 
         options: dict[str, Any] = {
@@ -3786,6 +3969,9 @@ class LiteLLMProvider(LLMProvider):
                         healed, stripped, backfilled = _heal_request_kwargs(
                             kwargs, str(stream_err).lower(), self
                         )
+                        if "images" in stripped:
+                            healed["messages"] = await _describe_refused_images(
+                                kwargs.get("messages") or [], healed["messages"], self)
                         if stripped or backfilled:
                             kwargs = healed
                             _reasoning_parts.clear()
@@ -3857,11 +4043,15 @@ class LiteLLMProvider(LLMProvider):
                 # never sees them. The 400 is a pre-flight rejection (no content
                 # streamed yet, on_chunk not called), so fixing the request and
                 # retrying once is safe.
+                _sent_messages = kwargs.get("messages") or []
                 kwargs, stripped, backfilled = _heal_request_kwargs(
                     kwargs, str(stream_err).lower(), self
                 )
                 if not (stripped or backfilled):
                     raise
+                if "images" in stripped:
+                    kwargs["messages"] = await _describe_refused_images(
+                        _sent_messages, kwargs["messages"], self)
                 log.warning(
                     "Streaming model rejected request; retrying with fix",
                     model=kwargs.get("model"),

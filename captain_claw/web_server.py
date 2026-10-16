@@ -1984,7 +1984,8 @@ class WebServer:
                     "You are a vision assistant. Describe or answer based ONLY on the "
                     "attached image. Use no other context, memory, or tools."
                 )),
-                Message(role="user", content=f"{prompt}\n[Attached image: {image}]"),
+                Message(role="user", content=f"{prompt}\n[Attached image: {image}]",
+                        images=[image] if self.agent.sees_images() else None),
             ]
             resp = await self.agent.provider.complete(msgs)
             content = str(getattr(resp, "content", "") or "").strip()

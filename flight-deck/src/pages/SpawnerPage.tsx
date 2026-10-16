@@ -28,6 +28,8 @@ interface AgentConfig {
   maxTokens: number
   providerApiKey: string
   baseUrl: string
+  // Does the model see images itself: 'auto' | 'on' | 'off' (model.vision)
+  vision: string
 
   // BotPort
   botportEnabled: boolean
@@ -133,6 +135,7 @@ const defaultConfig: AgentConfig = {
   maxTokens: 32768,
   providerApiKey: '',
   baseUrl: '',
+  vision: 'auto',
   botportEnabled: false,
   botportUrl: '',
   botportInstanceName: '',
@@ -181,7 +184,7 @@ function generateConfigYaml(c: AgentConfig): string {
   temperature: ${c.temperature}
   max_tokens: ${c.maxTokens}
   api_key: '${c.providerApiKey}'
-  base_url: '${c.baseUrl}'
+  base_url: '${c.baseUrl}'${c.vision === 'on' ? '\n  vision: true' : c.vision === 'off' ? '\n  vision: false' : ''}
 context:
   max_tokens: 160000
   compaction_threshold: 0.8
@@ -699,6 +702,15 @@ export function SpawnerPage() {
                   />
                 </Field>
               </div>
+              {config.provider !== 'antigravity-cli' && (
+                <Field label="Vision" hint="Does this model see images itself? On: pictures go straight to it. Off: a separate vision model describes them. Auto: on for known multimodal models (GPT, Claude, Gemini, -VL names) — local Qwen builds need On.">
+                  <select value={config.vision || 'auto'} onChange={(e) => update('vision', e.target.value)} className="input">
+                    <option value="auto">Auto — known multimodal models</option>
+                    <option value="on">On — the model sees images itself</option>
+                    <option value="off">Off — a vision model describes them</option>
+                  </select>
+                </Field>
+              )}
               {config.provider === 'antigravity-cli' ? <p className="text-xs text-zinc-400">Uses local Antigravity sign-in. Text only; no agent tools, API keys or extra credits. Sampling and output limits are controlled by the CLI. See Connections for setup and model IDs.</p> : <>
               <Field label="API Key" hint={config.providerApiKey === '@system' ? `Using the system ${LLM_PROVIDERS.find((p) => p.value === config.provider)?.label || config.provider} key (set by admin) — resolved securely at spawn` : providerKeys[config.provider] ? `Auto-filled from your saved ${LLM_PROVIDERS.find((p) => p.value === config.provider)?.label || config.provider} key` : systemKeys[config.provider]?.configured ? `A system ${LLM_PROVIDERS.find((p) => p.value === config.provider)?.label || config.provider} key is available (${systemKeys[config.provider]?.hint || 'set by admin'}) — leave blank to use it` : 'Save keys in Provider API Keys section below, or ask admin to set system-wide keys.'}>
                 <input type="password" value={config.providerApiKey === '@system' ? '' : config.providerApiKey} onChange={(e) => update('providerApiKey', e.target.value)} placeholder={config.providerApiKey === '@system' ? '(using system key)' : 'sk-...'} className="input font-mono text-xs" />
@@ -997,6 +1009,7 @@ export function SpawnerPage() {
                     max_tokens: config.maxTokens,
                     provider_api_key: config.providerApiKey,
                     base_url: config.baseUrl,
+                    vision: config.vision || 'auto',
                     botport_enabled: config.botportEnabled,
                     botport_url: config.botportUrl,
                     botport_instance_name: config.botportInstanceName,

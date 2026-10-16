@@ -691,6 +691,13 @@ class AgentGuardMixin:
             arguments = {**arguments, "_session": _session}
         # Pass agent ref so tools can access fallback attributes (e.g. _fd_url)
         arguments = {**arguments, "_agent": self}
+        # The model asked to look at an image and sees images itself: the tool
+        # hands it the picture instead of a second model's description. Only
+        # here — tools calling image_vision internally still get a description.
+        if name in ("image_vision", "image_ocr"):
+            _sees = getattr(self, "sees_images", None)
+            if callable(_sees) and _sees():
+                arguments = {**arguments, "_look_inline": True}
         # Inject shared workspace for orchestration workspace tools.
         _ws = getattr(self, "_shared_workspace", None)
         if _ws is not None:

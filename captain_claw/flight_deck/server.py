@@ -1536,6 +1536,10 @@ class AgentConfig(BaseModel):
     max_context: int = 0  # input context window; 0 → default (160000)
     provider_api_key: str = ""
     base_url: str = ""
+    # Does the model see images itself (auto | on | off)? Written as the
+    # agent's `model.vision`; "auto" leaves it to the agent (known multimodal
+    # families on, local builds off — Qwen quants ship with and without vision).
+    vision: str = "auto"
     # Model recommendation tier (reason | balanced | fast | longctx). When set,
     # the spawn endpoints resolve it to a concrete provider/model via the central
     # tier table in instructions/archetypes.json, so model choices live in ONE
@@ -1813,6 +1817,10 @@ async def _resolve_archetype(config: AgentConfig, request: Request, user: dict |
                 config.max_tokens = int(tcfg["output_ctx"])
             if "max_context" not in config.model_fields_set and int(tcfg.get("input_ctx") or 0) > 0:
                 config.max_context = int(tcfg["input_ctx"])
+            # The tier's model sees images (Library "Sees images"), unless the
+            # caller said otherwise.
+            if "vision" not in config.model_fields_set and _vision_switch(tcfg.get("vision")) is not None:
+                config.vision = "on" if _vision_switch(tcfg.get("vision")) else "off"
             config.tier = ""  # pinned now — don't let _resolve_tier re-map it
         elif not config.tier and _registry_tier_fits_the_caller(config, eff_tier):
             config.tier = eff_tier  # last resort: central registry tier table
@@ -1880,6 +1888,24 @@ def _docker_host() -> str:
     return "127.0.0.1"
 
 
+def _vision_switch(value: Any) -> bool | None:
+    """An agent's `model.vision` from a spawn/tier value: True (on), False
+    (off) or None (auto — the key is left out, the agent decides)."""
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"on", "true", "yes", "1"}:
+        return True
+    if text in {"off", "false", "no", "0"}:
+        return False
+    return None
+
+
+def _vision_yaml(value: Any) -> dict:
+    switch = _vision_switch(value)
+    return {} if switch is None else {"vision": switch}
+
+
 def _build_config_yaml(c: AgentConfig) -> str:
     """Generate config.yaml content from agent config."""
     dhost = _docker_host()
@@ -1895,6 +1921,7 @@ def _build_config_yaml(c: AgentConfig) -> str:
                 if c.base_url
                 else (f"http://{dhost}:11434" if c.provider == "ollama" else "")
             ),
+            **_vision_yaml(c.vision),
             **({"allowed": c.allowed_models} if c.allowed_models else {}),
         },
         "context": {
@@ -2295,6 +2322,7 @@ def _build_process_config_yaml(c: AgentConfig, agent_dir: Path) -> str:
                 if c.base_url
                 else ("http://127.0.0.1:11434" if c.provider == "ollama" else "")
             ),
+            **_vision_yaml(c.vision),
             **({"allowed": c.allowed_models} if c.allowed_models else {}),
         },
         "context": {
@@ -3624,6 +3652,7 @@ class AgentModelUpdate(BaseModel):
     provider: str
     model: str
     api_key: str | None = None
+    vision: str | None = None  # auto | on | off; None leaves it as it is
 
 
 @app.put("/fd/agent-model/{kind}/{identifier}")
@@ -3631,7 +3660,8 @@ async def update_agent_model(
     kind: str, identifier: str, body: AgentModelUpdate, request: Request,
     user: dict | None = _agent_manager_dep,
 ):
-    """Quick-update an agent's provider, model, and optionally api_key in all config locations."""
+    """Quick-update an agent's provider, model, and optionally api_key and vision
+    in all config locations."""
     if kind not in ("docker", "process"):
         raise HTTPException(400, "kind must be 'docker' or 'process'")
     user_id = getattr(request.state, "user_id", "")
@@ -3663,6 +3693,12 @@ async def update_agent_model(
             data["model"].pop("base_url", None)
         elif body.api_key is not None:
             data["model"]["api_key"] = body.api_key
+        if body.vision is not None:
+            switch = _vision_switch(body.vision)
+            if switch is None:
+                data["model"].pop("vision", None)
+            else:
+                data["model"]["vision"] = switch
         cfg_path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False, allow_unicode=True))
         updated_count += 1
 

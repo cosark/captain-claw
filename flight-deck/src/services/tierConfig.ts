@@ -42,8 +42,16 @@ export interface TierConfig {
   // backstops (surfaced to the worker as CLAW_MODEL_WEAK). Optional; omitted =
   // not weak. An explicit signal — never inferred from the model name.
   weak?: boolean
+  // The model sees images itself (the agent's model.vision: on). Optional;
+  // omitted = auto, decided by the agent. Local Qwen builds need it on.
+  vision?: boolean
 }
 export type TierMap = Record<string, TierConfig>
+
+/** The spawn's `vision` for an agent on this tier. */
+export function tierVision(tc?: TierConfig): string {
+  return tc?.vision ? 'on' : 'auto'
+}
 
 export interface TierDef {
   label: string
