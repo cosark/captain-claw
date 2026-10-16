@@ -1,4 +1,10 @@
-# Parallel Search MCP
+# MCP examples
+
+- [Local repository lookup with Sem](sem-code.md): symbol lookup over stdio,
+  including a smoke test through Flight Deck's MCP manager without an LLM.
+- Parallel Search over HTTP: setup and smoke test below.
+
+## Parallel Search MCP
 
 Add optional web search and page excerpts to Flight Deck using its existing HTTP
 MCP connection. The [Parallel Search MCP endpoint](https://docs.parallel.ai/integrations/mcp/search-mcp)
