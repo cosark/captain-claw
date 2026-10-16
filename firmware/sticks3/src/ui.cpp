@@ -6,9 +6,26 @@ namespace ui {
 
 static M5Canvas canvas(&M5.Display);
 static constexpr int W = 240, H = 135, BAR = 16, PAD = 4;
-static const lgfx::U8g2font* kBody = &fonts::efontJA_14;
-static const lgfx::U8g2font* kSmall = &fonts::efontJA_12;
+static const lgfx::U8g2font* kBody = &fonts::efontJA_14;  // fixed size: status page, setup
+static const lgfx::U8g2font* kSmall = &fonts::efontJA_12; // fixed size: top bar, panels
 static constexpr int kLine = 16;
+
+// Reading text (replies, the working screen, notices, the menu) in the size
+// the user picked. efontJA at 14/16/24 px all have č ć š ž đ.
+struct TextSize {
+  const lgfx::U8g2font* body;
+  int line;
+  const lgfx::U8g2font* small;  // activity lines on the working screen
+  int smallLine;
+};
+static const TextSize kSizes[] = {
+    {&fonts::efontJA_14, 16, &fonts::efontJA_12, 15},  // small (the original)
+    {&fonts::efontJA_16, 18, &fonts::efontJA_14, 16},  // medium
+    {&fonts::efontJA_24, 26, &fonts::efontJA_16, 18},  // large
+};
+static uint8_t sizeIdx = 0;
+static const TextSize& ts() { return kSizes[sizeIdx]; }
+static String replyText;
 
 static String barAgent = "";
 static String barState = "";
@@ -20,7 +37,7 @@ static int page = 0;
 static uint8_t* imgBuf = nullptr;
 static size_t imgLen = 0;
 
-static int linesPerPage() { return (H - BAR - PAD) / kLine; }
+static int linesPerPage() { return (H - BAR - PAD) / ts().line; }
 
 void begin() {
   M5.Display.setRotation(1);
@@ -135,10 +152,11 @@ static String fit(const String& text, int width) {
   return s + "…";
 }
 
-// Word-wrap UTF-8 text to the body width (long words break between characters).
-static std::vector<String> wrap(const String& text, int width) {
+// Word-wrap UTF-8 text to `width` (long words break between characters), in
+// `font` — the reading font when none is given.
+static std::vector<String> wrap(const String& text, int width, const lgfx::U8g2font* font = nullptr) {
   std::vector<String> out;
-  canvas.setFont(kBody);
+  canvas.setFont(font ? font : ts().body);
   int start = 0;
   const int n = text.length();
   while (start <= n) {
@@ -206,14 +224,13 @@ void showSetup(const char* reason, const char* apName, const char* ip) {
 void showMessage(const char* title, const String& body, uint16_t color) {
   canvas.fillScreen(TFT_BLACK);
   drawBar();
-  canvas.setFont(kBody);
+  auto ls = wrap(body, W - 2 * PAD);  // sets the reading font
   canvas.setTextDatum(top_left);
   canvas.setTextColor(color);
   canvas.drawString(title, PAD, BAR + 6);
   canvas.setTextColor(TFT_LIGHTGREY);
-  auto ls = wrap(body, W - 2 * PAD);
   for (int i = 0; i < (int)ls.size() && i < linesPerPage() - 1; ++i) {
-    canvas.drawString(ls[i], PAD, BAR + 6 + kLine * (i + 1) + 4);
+    canvas.drawString(ls[i], PAD, BAR + 6 + ts().line * (i + 1) + 4);
   }
   push();
 }
@@ -244,25 +261,24 @@ void showWorking(const String& heard, const std::vector<String>& activity, const
   canvas.setTextDatum(top_left);
   int y = BAR + 3;
   if (heard.length()) {  // the end of a long sentence matters most: last two lines
-    canvas.setFont(kBody);
-    canvas.setTextColor(TFT_CYAN);
     auto ls = wrap(String("“") + heard + "”", W - 2 * PAD);
-    int maxLines = activity.empty() ? 5 : 2;
-    for (int i = max(0, (int)ls.size() - maxLines); i < (int)ls.size(); ++i, y += kLine) {
+    canvas.setTextColor(TFT_CYAN);
+    int maxLines = activity.empty() ? (H - 16 - y) / ts().line : 2;
+    for (int i = max(0, (int)ls.size() - maxLines); i < (int)ls.size(); ++i, y += ts().line) {
       canvas.drawString(ls[i], PAD, y);
     }
     y += 3;
   }
-  canvas.setFont(kSmall);
-  constexpr int kSmallLine = 15;
-  int room = (H - 16 - y) / kSmallLine;  // keep the bottom line free
+  canvas.setFont(ts().small);
+  int room = max(0, (H - 16 - y) / ts().smallLine);  // keep the bottom line free
   int first = max(0, (int)activity.size() - room);
-  for (int i = first; i < (int)activity.size(); ++i, y += kSmallLine) {
+  for (int i = first; i < (int)activity.size(); ++i, y += ts().smallLine) {
     bool newest = i == (int)activity.size() - 1;
     canvas.setTextColor(newest ? TFT_WHITE : 0x8410);  // older lines grey
     canvas.drawString(fit((newest ? "→ " : "   ") + activity[i], W - 2 * PAD), PAD, y);
   }
   if (status.length()) {
+    canvas.setFont(kSmall);
     canvas.setTextColor(TFT_DARKGREY);
     canvas.drawString(fit(status, W - 2 * PAD), PAD, H - 14);
   }
@@ -270,8 +286,14 @@ void showWorking(const String& heard, const std::vector<String>& activity, const
 }
 
 void setReply(const String& text) {
+  replyText = text;
   lines = wrap(text, W - 2 * PAD - 4);
   page = 0;
+}
+
+void setTextSize(uint8_t size) {
+  sizeIdx = size < sizeof(kSizes) / sizeof(kSizes[0]) ? size : 0;
+  if (replyText.length()) setReply(replyText);  // re-wrap for the new size
 }
 
 bool hasReply() { return !lines.empty(); }
@@ -279,14 +301,14 @@ bool hasReply() { return !lines.empty(); }
 void showReply() {
   canvas.fillScreen(TFT_BLACK);
   drawBar();
-  canvas.setFont(kBody);
+  canvas.setFont(ts().body);
   canvas.setTextDatum(top_left);
   canvas.setTextColor(TFT_WHITE);
   int per = linesPerPage();
   int pages = max(1, ((int)lines.size() + per - 1) / per);
   int first = page * per;
   for (int i = 0; i < per && first + i < (int)lines.size(); ++i) {
-    canvas.drawString(lines[first + i], PAD, BAR + PAD + i * kLine);
+    canvas.drawString(lines[first + i], PAD, BAR + PAD + i * ts().line);
   }
   if (pages > 1) {  // scroll position on the right edge
     int track = H - BAR - 4;
@@ -306,28 +328,98 @@ bool nextPage() {
   return page != 0;
 }
 
-void showPanel(const char* title, uint16_t titleColor, const std::vector<Row>& rows) {
+// Panels (status page, idle health) follow the text size too: compact rows
+// with the label beside the value for small/medium, label above the value
+// for large. Values wrap; a row never splits across pages.
+struct PanelSize {
+  const lgfx::U8g2font* font;
+  int line;
+};
+static const PanelSize kPanelSizes[] = {
+    {&fonts::efontJA_12, 14},  // small (the original)
+    {&fonts::efontJA_16, 18},  // medium
+    {&fonts::efontJA_24, 26},  // large
+};
+
+int showPanel(const char* title, uint16_t titleColor, const std::vector<Row>& rows, int page) {
+  const PanelSize& ps = kPanelSizes[sizeIdx];
+  const bool stacked = sizeIdx == 2;
+  const uint16_t labelColor = rgb(140, 150, 165);
+  const int top = BAR + 3;
+  const int bottom = H - 2;
+  // Title (only on the first page) in the reading font.
+  int titleH = 0;
+  if (title && *title) titleH = ts().line + 2;
+  // Label column for side-by-side rows.
+  canvas.setFont(ps.font);
+  int labelW = 0;
+  if (!stacked) {
+    for (const Row& r : rows) labelW = max(labelW, (int)canvas.textWidth(r.label));
+    labelW += 8;
+  }
+  const int valueW = stacked ? W - 2 * PAD : W - 2 * PAD - labelW;
+  // Lay the rows out into pages.
+  struct Laid {
+    std::vector<String> lines;
+    int h;
+  };
+  std::vector<Laid> laid;
+  for (const Row& r : rows) {
+    Laid l{wrap(r.value.length() ? r.value : String("-"), valueW, ps.font), 0};
+    l.h = (int)l.lines.size() * ps.line + (stacked ? 14 : 0) + (stacked ? 4 : 0);
+    laid.push_back(l);
+  }
+  std::vector<int> pageStart{0};
+  int y = top + titleH;
+  for (int i = 0; i < (int)laid.size(); ++i) {
+    if (y + laid[i].h > bottom && i > pageStart.back()) {
+      pageStart.push_back(i);
+      y = top;
+    }
+    y += laid[i].h;
+  }
+  const int pages = pageStart.size();
+  page = constrain(page, 0, pages - 1);
+
   canvas.fillScreen(TFT_BLACK);
   drawBar();
   canvas.setTextDatum(top_left);
-  int y = BAR + 3;
-  if (title && *title) {
-    canvas.setFont(kBody);
+  y = top;
+  if (page == 0 && titleH) {
+    canvas.setFont(ts().body);
     canvas.setTextColor(titleColor);
     canvas.drawString(title, PAD, y);
-    y += kLine + 2;
+    y += titleH;
   }
-  canvas.setFont(kSmall);
-  constexpr int kRow = 14, kLabelW = 50;
-  for (const Row& r : rows) {
-    if (y > H - kRow + 1) break;
-    canvas.setTextColor(rgb(140, 150, 165));
-    canvas.drawString(r.label, PAD, y);
+  int end = page + 1 < pages ? pageStart[page + 1] : (int)laid.size();
+  for (int i = pageStart[page]; i < end; ++i) {
+    const Row& r = rows[i];
+    if (stacked) {
+      canvas.setFont(kSmall);
+      canvas.setTextColor(labelColor);
+      canvas.drawString(r.label, PAD, y);
+      y += 14;
+    } else {
+      canvas.setFont(ps.font);
+      canvas.setTextColor(labelColor);
+      canvas.drawString(r.label, PAD, y);
+    }
+    canvas.setFont(ps.font);
     canvas.setTextColor(r.color);
-    canvas.drawString(fit(r.value, W - PAD - kLabelW - PAD), PAD + kLabelW, y);
-    y += kRow;
+    for (const String& line : laid[i].lines) {
+      if (y + ps.line > bottom + 2) break;  // a row taller than a page: cut it
+      canvas.drawString(line, stacked ? PAD : PAD + labelW, y);
+      y += ps.line;
+    }
+    if (stacked) y += 4;
+  }
+  if (pages > 1) {  // page dots, bottom right
+    for (int k = 0; k < pages; ++k) {
+      canvas.fillCircle(W - 6 - (pages - 1 - k) * 8, H - 5, 2, k == page ? TFT_WHITE : rgb(70, 70, 80));
+    }
   }
   push();
+  return pages;
 }
 
 void showFace(uint8_t kind, face::Pose pose, int level) {
@@ -360,14 +452,14 @@ void showStoredImage() {
 void showPicker(const std::vector<String>& names, int selected, int current) {
   canvas.fillScreen(TFT_BLACK);
   drawBar();
-  canvas.setFont(kBody);
+  canvas.setFont(ts().body);
   canvas.setTextDatum(top_left);
   int per = linesPerPage();
   int first = max(0, min(selected - per / 2, (int)names.size() - per));
   for (int i = 0; i < per && first + i < (int)names.size(); ++i) {
     int idx = first + i;
-    int y = BAR + PAD + i * kLine;
-    if (idx == selected) canvas.fillRect(0, y - 1, W, kLine, 0x3186);
+    int y = BAR + PAD + i * ts().line;
+    if (idx == selected) canvas.fillRect(0, y - 1, W, ts().line, 0x3186);
     canvas.setTextColor(idx == current ? TFT_GREEN : TFT_WHITE);
     canvas.drawString(fit((idx == current ? "● " : "  ") + names[idx], W - 2 * PAD), PAD, y);
   }

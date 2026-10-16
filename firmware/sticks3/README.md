@@ -24,6 +24,10 @@ Matrix, Orc, Elf, Dwarf, C64, Amiga, Cat, Dog, Dinosaur, Alien, Caveman, HAL 900
 Pac-Man. Menu → *Character »* previews each one cycling through its poses (side button =
 next, front = pick, side hold = back).
 
+Menu → *Text size* (small / medium / large) sets the reading text: replies, the working
+screen, notices, the menu and the status page (which then spans pages: B = next page, after
+the last one back to the main screen). The top bar stays compact.
+
 Hold the front button while switching on to reopen setup. With no Wi-Fi
 saved, or none in reach for 30 s, setup opens by itself.
 

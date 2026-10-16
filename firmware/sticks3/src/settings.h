@@ -28,6 +28,7 @@ struct Settings {
   bool cueBeep = true;      // chime before speech starts
   bool cueFlash = true;     // flash the screen before speech starts
   uint8_t cueLeadS = 1;     // the cue comes this many seconds (1 or 2) before speech
+  uint8_t textSize = 0;     // reading text: 0 small, 1 medium, 2 large
 
   void load();
   void save() const;

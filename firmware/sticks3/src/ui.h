@@ -37,7 +37,9 @@ struct Row {
   String value;
   uint16_t color;
 };
-void showPanel(const char* title, uint16_t titleColor, const std::vector<Row>& rows);
+// Draws page `page` of the rows (in the chosen text size); returns the page
+// count. The title shows on the first page only.
+int showPanel(const char* title, uint16_t titleColor, const std::vector<Row>& rows, int page = 0);
 
 // Conversation views (text mode).
 void showListening(int level, uint32_t elapsedMs);
@@ -45,6 +47,8 @@ void showListening(int level, uint32_t elapsedMs);
 // first), and the last narration / phase line at the bottom.
 void showWorking(const String& heard, const std::vector<String>& activity, const String& status);
 void setReply(const String& text);  // wraps into pages (shown by showReply)
+// Reading text size: 0 small, 1 medium, 2 large (re-wraps the current reply).
+void setTextSize(uint8_t size);
 void showReply();                   // redraw the current page
 bool nextPage();                    // false when it wrapped back to page 1
 bool hasReply();
