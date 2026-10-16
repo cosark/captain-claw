@@ -17,8 +17,11 @@ import {
   Bot,
   Plug,
   MessageSquare,
+  KeyRound,
 } from 'lucide-react'
 import { useAuthStore } from '../stores/authStore'
+import { useUIStore } from '../stores/uiStore'
+import { MIN_PASSWORD_LENGTH } from '../components/profile/ChangePasswordCard'
 import { UserAgentsDialog } from '../components/agents/UserAgentsDialog'
 import { DeckProfileDefaults } from '../components/profile/DeckProfileDefaults'
 import { SharedTelegramBotAdmin } from '../components/admin/SharedTelegramBotAdmin'
@@ -162,7 +165,10 @@ async function updateUser(userId: string, patch: Record<string, unknown>): Promi
     method: 'PUT', headers: _headers(), credentials: 'include',
     body: JSON.stringify(patch),
   })
-  if (!res.ok) throw new Error('Failed to update user')
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(typeof data.detail === 'string' ? data.detail : 'Failed to update user')
+  }
 }
 
 async function deleteUser(userId: string): Promise<void> {
@@ -468,20 +474,19 @@ function UserRow({
   })
   const [role, setRole] = useState(user.role)
   const [kiosk, setKiosk] = useState(() => userKioskFlag(user))
-  const [password, setPassword] = useState('')
   const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState('')
   const [agentsOpen, setAgentsOpen] = useState(false)
   const isSelf = user.id === currentUserId
 
   const handleSave = async () => {
-    setSaving(true)
+    setSaving(true); setSaveError('')
     try {
-      const patch: Record<string, unknown> = { plan, role, kiosk }
-      if (password.trim()) patch.password = password
-      await updateUser(user.id, patch)
-      setPassword('')
+      await updateUser(user.id, { plan, role, kiosk })
       onUpdate()
-    } catch { /* ignore */ }
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : 'Failed to update user')
+    }
     setSaving(false)
   }
 
@@ -547,21 +552,6 @@ function UserRow({
             <KioskCheckbox checked={kiosk} onChange={setKiosk} note={kioskModeNote(kioskMode)} />
           )}
 
-          <div>
-            <label className="block text-xs font-medium text-zinc-500 mb-1">Reset password</label>
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              placeholder="New password (leave blank to keep)"
-              autoComplete="new-password"
-              className="w-full rounded-md border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-sm text-zinc-200 focus:border-violet-500/50 focus:outline-none"
-            />
-            {password && password.length < 6 && (
-              <p className="mt-1 text-[11px] text-amber-500/80">At least 6 characters.</p>
-            )}
-          </div>
-
           {plans[plan] && (
             <div className="text-xs text-zinc-500 grid grid-cols-2 gap-1">
               <span>Max agents: {plans[plan].max_agents}</span>
@@ -574,6 +564,7 @@ function UserRow({
           <div className="text-xs text-zinc-600">
             Joined: {new Date(user.created_at).toLocaleDateString()}
           </div>
+          {saveError && <p className="text-xs text-red-400">{saveError}</p>}
 
           <div className="flex items-center gap-2 pt-1">
             <button
@@ -601,6 +592,8 @@ function UserRow({
               </button>
             )}
           </div>
+
+          <SetPasswordSection userId={user.id} email={user.email} isSelf={isSelf} />
         </div>
       )}
       {agentsOpen && (
@@ -610,6 +603,106 @@ function UserRow({
           onClose={() => setAgentsOpen(false)}
         />
       )}
+    </div>
+  )
+}
+
+// Admin sets someone's password (they forgot it, or it leaked) — no current
+// password needed. Its own action, apart from Save Changes. Their own: Profile.
+function SetPasswordSection({ userId, email, isSelf }: { userId: string; email: string; isSelf: boolean }) {
+  const setView = useUIStore((s) => s.setView)
+  const [password, setPassword] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [signOut, setSignOut] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [notice, setNotice] = useState('')
+  const [err, setErr] = useState('')
+
+  if (isSelf) {
+    return (
+      <div className="border-t border-zinc-800 pt-3 text-xs text-zinc-500">
+        <KeyRound className="h-3 w-3 inline mr-1" />
+        Change your own password on your{' '}
+        <button onClick={() => setView('profile')} className="text-violet-400 underline underline-offset-2 hover:no-underline">
+          Profile
+        </button>.
+      </div>
+    )
+  }
+
+  const tooShort = password.length > 0 && password.length < MIN_PASSWORD_LENGTH
+  const mismatch = confirm.length > 0 && confirm !== password
+  const valid = password.length >= MIN_PASSWORD_LENGTH && confirm === password
+
+  const handleSet = async () => {
+    if (!valid) return
+    setSaving(true); setErr(''); setNotice('')
+    try {
+      await updateUser(userId, { password, sign_out: signOut })
+      setPassword(''); setConfirm('')
+      setNotice(signOut ? 'Password set. They were signed out everywhere.' : 'Password set.')
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Failed to set password')
+    }
+    setSaving(false)
+  }
+
+  const input = 'w-full rounded-md border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-sm text-zinc-200 focus:border-violet-500/50 focus:outline-none'
+
+  return (
+    <div className="border-t border-zinc-800 pt-3 space-y-2">
+      <div className="flex items-center gap-1.5 text-xs font-medium text-zinc-400">
+        <KeyRound className="h-3.5 w-3.5" />
+        Set password
+      </div>
+      {/* For password managers: the account this password is for. */}
+      <input type="text" autoComplete="username" value={email} readOnly hidden />
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => { setPassword(e.target.value); setNotice('') }}
+            placeholder="New password"
+            autoComplete="new-password"
+            aria-label="New password"
+            className={input}
+          />
+          {tooShort && <p className="mt-1 text-[11px] text-amber-500/80">At least {MIN_PASSWORD_LENGTH} characters.</p>}
+        </div>
+        <div>
+          <input
+            type="password"
+            value={confirm}
+            onChange={(e) => { setConfirm(e.target.value); setNotice('') }}
+            placeholder="Confirm new password"
+            autoComplete="new-password"
+            aria-label="Confirm new password"
+            className={input}
+          />
+          {mismatch && <p className="mt-1 text-[11px] text-amber-500/80">Doesn't match.</p>}
+        </div>
+      </div>
+      <div className="flex flex-wrap items-center gap-3">
+        <button
+          onClick={handleSet}
+          disabled={saving || !valid}
+          className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-200 hover:border-violet-500/50 hover:bg-zinc-800 disabled:opacity-50"
+        >
+          {saving ? 'Setting…' : 'Set password'}
+        </button>
+        <label className="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={signOut}
+            onChange={(e) => setSignOut(e.target.checked)}
+            className="h-3.5 w-3.5 rounded border-zinc-600 bg-zinc-950 accent-violet-600"
+          />
+          Sign them out everywhere
+        </label>
+      </div>
+      {notice && <p className="text-xs text-emerald-400">{notice}</p>}
+      {err && <p className="text-xs text-red-400">{err}</p>}
     </div>
   )
 }

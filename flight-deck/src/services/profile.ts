@@ -125,6 +125,14 @@ export const saveProfile = (patch: Partial<ProfileFields>) =>
     body: JSON.stringify(patch),
   }).then(_normalizeProfile)
 
+/** Change the signed-in user's own password (needs the current one).
+ *  `signOutOthers` ends their other sessions; this one stays signed in. */
+export const changeOwnPassword = (current: string, next: string, signOutOthers: boolean) =>
+  fdFetch<unknown>('/auth/me', {
+    method: 'PUT',
+    body: JSON.stringify({ current_password: current, password: next, sign_out_others: signOutOthers }),
+  })
+
 /** Admin only (auth-off decks: the local user). */
 export const getDeckProfileDefaults = () =>
   fdFetch<DeckDefaultsResponse>('/admin/profile-defaults')

@@ -66,6 +66,9 @@ class UpdateProfileRequest(BaseModel):
     display_name: str | None = None
     password: str | None = None
     current_password: str | None = None
+    # With a new password: end this user's other sessions (other browsers and
+    # devices); the one making the change stays signed in.
+    sign_out_others: bool = False
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
@@ -287,7 +290,8 @@ async def _refresh_owner_profile(db, user_id: str) -> None:
 
 
 @router.put("/me")
-async def update_me(body: UpdateProfileRequest, user: dict = Depends(get_current_user)):
+async def update_me(body: UpdateProfileRequest, request: Request,
+                    user: dict = Depends(get_current_user)):
     db = get_db()
     updates: dict = {}
 
@@ -297,6 +301,7 @@ async def update_me(body: UpdateProfileRequest, user: dict = Depends(get_current
     if body.password is not None:
         if not body.current_password:
             raise HTTPException(status_code=400, detail="Current password required")
+        _rate_limit(_password_change_limiter, f"pw:{user['id']}", PASSWORD_CHANGE_LIMIT)
         full_user = await db.get_user_by_email(user["email"])
         if not full_user or not verify_password(body.current_password, full_user["password_hash"]):
             raise HTTPException(status_code=400, detail="Current password is incorrect")
@@ -308,6 +313,12 @@ async def update_me(body: UpdateProfileRequest, user: dict = Depends(get_current
         await db.update_user(user["id"], **updates)
         if "display_name" in updates and updates["display_name"] != (user.get("display_name") or ""):
             await _refresh_owner_profile(db, str(user["id"]))
+    if "password_hash" in updates and body.sign_out_others:
+        # Keep the session making the change (its refresh cookie). Other
+        # sessions' access tokens stay valid until they expire (≤15 min).
+        own = request.cookies.get(REFRESH_COOKIE)
+        await db.delete_user_refresh_sessions(
+            user["id"], keep_token_hash=hash_token(own) if own else None)
 
     updated = await db.get_user_by_id(user["id"])
     return await _user_payload(db, updated)
@@ -413,6 +424,10 @@ class _PairLimiter(_SlidingWindow):
 _pair_start_limiter = _PairLimiter()
 _pair_poll_limiter = _PairLimiter()
 _pair_approver_limiter = _PairLimiter()
+# Changing your own password checks the current one: a stolen access token
+# must not become a password-guessing oracle.
+_password_change_limiter = _PairLimiter()
+PASSWORD_CHANGE_LIMIT = (10, 900.0)  # attempts per user per 15 min
 
 
 def _rate_limit(limiter: _PairLimiter, key: str, limit: tuple[int, float]) -> None:
