@@ -114,6 +114,8 @@ export interface SpawnConfig {
   max_context?: number
   provider_api_key: string
   base_url: string
+  // Does the model see images itself: "auto" | "on" | "off" (model.vision).
+  vision?: string
   botport_enabled: boolean
   botport_url: string
   botport_instance_name: string

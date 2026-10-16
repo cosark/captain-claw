@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Loader2, Send, Square, Paperclip, Wrench, X } from 'lucide-react'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { AgentChatWS } from '../../services/agentChat'
+import { AgentChatWS, imageRef, splitImageRefs } from '../../services/agentChat'
 import { useAuthStore, refreshAccessToken } from '../../stores/authStore'
 
 // A live chat scoped to one topic. Reuses AgentChatWS for streaming (narration,
@@ -16,6 +16,9 @@ type LiveMsg =
   | { kind: 'tool'; tool: string; detail: string }
 
 interface Attachment { name: string; status: 'uploading' | 'uploaded' | 'error'; path?: string }
+
+// The picture types the agent shows its own model / a vision model.
+const IMAGE_FILE_RE = /\.(png|jpe?g|webp|gif|bmp)$/i
 
 async function authedFetch(path: string, init?: RequestInit): Promise<Response> {
   const { token, authEnabled } = useAuthStore.getState()
@@ -137,11 +140,16 @@ export function TopicChat({ host, port, auth, topicId, onPersisted }: {
   const send = () => {
     if (!canSend || !wsRef.current) return
     let content = input.trim()
-    for (const a of attachments) if (a.status === 'uploaded' && a.path) content += `\n[Attached file: ${a.name} → ${a.path}]`
+    for (const a of attachments) {
+      if (a.status !== 'uploaded' || !a.path) continue
+      content += IMAGE_FILE_RE.test(a.name) ? `\n${imageRef(a.path)}` : `\n[Attached file: ${a.name} → ${a.path}]`
+    }
     userText.current = content; agentText.current = ''
     setLive((m) => [...m, { kind: 'user', text: content }])
     awaiting.current = true; setBusy(true); setStatus('Thinking…')
-    wsRef.current.send(content)
+    // Pictures go as image_paths; the bubble keeps their refs.
+    const frame = splitImageRefs(content)
+    wsRef.current.send(frame.text, { imagePaths: frame.imagePaths })
     setInput(''); setAttachments([])
   }
 

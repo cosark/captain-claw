@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { AgentChatWS, type ChatMessage, type TokenUsage } from '../services/agentChat'
+import { AgentChatWS, splitImageRefs, type ChatMessage, type TokenUsage } from '../services/agentChat'
 import { useAuthStore, registerSignOutFlush, registerSignOutTeardown } from './authStore'
 import { useContainerStore } from './containerStore'
 import { useLocalAgentStore } from './localAgentStore'
@@ -1890,7 +1890,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       nextStepOptions: [],
       liveTurnUsage: null,
     })
-    session.ws.send(content, { noNextSteps: !!opts?.fromQueue })
+    // Attached pictures go as image_paths; the bubble above keeps their refs.
+    const frame = splitImageRefs(content)
+    session.ws.send(frame.text, { noNextSteps: !!opts?.fromQueue, imagePaths: frame.imagePaths })
   },
 
   sendBtw: (containerId, content) => {
