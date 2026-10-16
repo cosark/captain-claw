@@ -6,6 +6,9 @@ export interface User {
   email: string
   display_name: string
   role: string
+  // Held to the kiosk (simple-chat) layout — resolved by the server from the
+  // deck's kiosk mode and this user's flag (Admin page); never an admin.
+  kiosk?: boolean
 }
 
 export interface AuthStore {
@@ -15,8 +18,9 @@ export interface AuthStore {
   authEnabled: boolean | null  // null = not yet checked
   dockerSpawnEnabled: boolean
   internalFdUrl: string  // Internal URL for agent-to-FD calls (e.g. http://localhost:25080)
-  // Kiosk lock (server `--simple-chat` / FD_SIMPLE_CHAT): force the locked,
-  // chat-only Simple layout and hide every escape hatch.
+  // Deck-wide kiosk lock: every non-admin (Admin → Settings → Kiosk mode
+  // "Everyone", or `--simple-chat` until one is picked). Per-user locks come
+  // with the user (`user.kiosk`) — see selectKioskLocked.
   simpleChatOnly: boolean
   // A sign-out is in flight (logoutUser) — the sign-out buttons show it.
   signingOut: boolean
@@ -50,19 +54,23 @@ export const useAuthStore = create<AuthStore>((set) => ({
 }))
 
 /**
- * Whether the kiosk lock (server `--simple-chat` / FD_SIMPLE_CHAT) is in effect
- * for the CURRENT viewer. Admins are exempt — an admin keeps full access even
- * when the deck runs in simple-chat mode, so they can spawn agents, open config
- * and administer users. Everyone else (the shared kiosk account) stays locked to
- * the chat-only Simple layout, keeping only sign-out, the archetype picker,
- * their own connections (Google, Microsoft, MCP, Jev) and their owner profile.
+ * Whether the kiosk lock is in effect for the CURRENT viewer. An admin picks
+ * who it holds in Admin → Settings (off / everyone / selected users); the
+ * server resolves it per user and sends it as `user.kiosk`. Admins are exempt
+ * — they keep full access so they can spawn agents, open config and administer
+ * users. A locked user stays in the chat-only Simple layout, keeping only
+ * sign-out, the archetype picker, their own connections (Google, Microsoft,
+ * MCP, Jev) and their owner profile. An auth-off deck has no users: there the
+ * deck-wide flag (`--simple-chat`) decides.
  *
- * Use this instead of reading `simpleChatOnly` directly wherever the lock is
- * enforced, so the admin exemption stays consistent across the app. Reactive:
- * it re-derives when the user logs in (role becomes known) or the flag changes.
+ * Use this instead of reading `simpleChatOnly` / `user.kiosk` directly wherever
+ * the lock is enforced. Reactive: it re-derives when the user signs in or their
+ * session refreshes.
  */
 export const selectKioskLocked = (s: AuthStore): boolean =>
-  s.simpleChatOnly && s.user?.role !== 'admin'
+  s.authEnabled === false
+    ? s.simpleChatOnly
+    : s.user?.role !== 'admin' && s.user?.kiosk === true
 
 // ── Auth API calls ──
 
@@ -233,8 +241,9 @@ export function refreshAccessToken(): Promise<boolean> {
 }
 
 // Browser-local (not per-user) chat state: the queue / plan slices chatStore
-// mirrors to localStorage by container id. On a kiosk deck (simpleChatOnly)
-// everyone shares one account, so they'd reload for the next person who opens
+// mirrors to localStorage by container id. On a kiosk deck (simpleChatOnly) or
+// for a kiosk user, a shared account / machine is the norm, so they'd reload
+// for the next person who opens
 // the same agent — and a queue with auto-mode on would auto-dispatch the
 // previous person's items as theirs — so a kiosk sign-out drops them.
 // Anywhere else they're the user's own work in progress (the queue is meant
@@ -256,11 +265,18 @@ function _purgeBrowserLocalState(): void {
   } catch { /* storage blocked — nothing persisted to purge */ }
 }
 
+// Whether the last signed-in user here was kiosk-locked — read at hand-over,
+// when a session that ended on its own has already cleared the user.
+let _sessionWasKiosk = false
+useAuthStore.subscribe((s) => {
+  if (s.user) _sessionWasKiosk = selectKioskLocked(s)
+})
+
 // The session is over (confirmed here or in another tab): hand this tab over.
 function _handOverTab(): void {
   _authGeneration++
   _runSignOutTeardowns()
-  if (useAuthStore.getState().simpleChatOnly) {
+  if (useAuthStore.getState().simpleChatOnly || _sessionWasKiosk) {
     _purgeBrowserLocalState()
     // Chat sockets can still deliver a message (and re-save a queue slice)
     // between here and the unload — purge once more on the way out.

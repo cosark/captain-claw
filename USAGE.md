@@ -4433,7 +4433,7 @@ Three cross-mode capabilities landed in 0.7.3 for Basna, Vatra, and Code. **All 
 
 **Simple layout.** A chat-first desktop layout: agents on the left (with a **Busy** pill and an on/off **power switch** per agent), the chat in the middle (queue toggleable), the active agent's files and datastore on the right. Switch in from the top bar's columns icon and out from the left header, or with **Cmd/Ctrl+\\**. Both rails collapse and remember it.
 
-**Kiosk.** `captain-claw-fd --simple-chat` (or `FD_SIMPLE_CHAT=1`) locks non-admin users into the simple layout for shared-account machines: no full view, no agent options or start/stop beyond the power switch. They can still start a **New agent** from an archetype picker (models and keys come from their tier set or the team default), manage their own **Connections** (Google, Microsoft, MCP, Jev) in a dialog, edit their **Profile**, and **sign out** cleanly (per-browser queues and plans are purged). Admins get the normal layout. It is a UI lock, not an API boundary. A kiosk deck needs a published team tier set and enough agent slots.
+**Kiosk.** Locks users into the simple layout — for shared-account machines or people who only chat. An admin picks who in **Admin → Settings → Kiosk mode**: **Off**, **Everyone** (every non-admin), or **Selected users** (tick **Kiosk mode** on a user in **Admin → Users**, or in the Add user form); **New users start in kiosk mode** pre-ticks it for accounts created from then on. `captain-claw-fd --simple-chat` (or `FD_SIMPLE_CHAT=1`) is the default (Everyone) until an admin picks a mode. A signed-in user picks up a change within ~15 minutes or on reload. Locked users get no full view, no agent options or start/stop beyond the power switch. They can still start a **New agent** from an archetype picker (models and keys come from their tier set or the team default), manage their own **Connections** (Google, Microsoft, MCP, Jev) in a dialog, edit their **Profile**, and **sign out** cleanly (per-browser queues and plans are purged). Admins get the normal layout. It is a UI lock, not an API boundary. A kiosk deck needs a published team tier set and enough agent slots.
 
 **Removed:** the Cmd/Ctrl+1–5 page-jump shortcuts, for everyone.
 
@@ -5431,7 +5431,7 @@ Flight Deck uses environment variables:
 | `FD_LOCKDOWN` | (unset) | `1` = hosted mode: agent shared secret required even from loopback, host-filesystem routes off, `Secure` refresh cookie |
 | `FD_REGISTRATION_OPEN` / `FD_REGISTRATION_DISABLED` | (unset) | Self-registration is closed once the first (admin) account exists; `_OPEN=1` reopens it, `_DISABLED=1` forces it closed. Admins add users in Admin → Users |
 | `FD_COOKIE_SECURE` | (auto) | Force the refresh cookie's `Secure` flag on (`1`) or off (`0`, local http only) |
-| `FD_SIMPLE_CHAT` | (unset) | `1` (or `captain-claw-fd --simple-chat`) = kiosk: non-admins get only the simple chat layout |
+| `FD_SIMPLE_CHAT` | (unset) | `1` (or `captain-claw-fd --simple-chat`) = kiosk for every non-admin until an admin picks a mode in Admin → Settings |
 | `CAPTAIN_CLAW_FD_HOME` | (unset) | Per-instance home for MCP servers, code apps and the agent secret (falls back to `FD_DATA_DIR`, then `~/.captain-claw-fd`) |
 | `FD_AGENT_SHARING` | (unset) | `1` = allow sharing an agent with other users (needs auth on) |
 | `FD_ARCHETYPE_GRID` | (unset) | `1` = function × domain archetype grid (`reviewer.legal`) |

@@ -70,6 +70,18 @@ class UpdateProfileRequest(BaseModel):
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
+async def _user_payload(db, user: dict) -> dict:
+    """The signed-in user as the frontend sees it. ``kiosk`` = held to the
+    simple-chat layout (deck kiosk mode + this user's flag; never an admin)."""
+    from captain_claw.flight_deck.admin_routes import user_kiosk_locked
+
+    return {
+        "id": user["id"], "email": user["email"],
+        "display_name": user["display_name"], "role": user["role"],
+        "kiosk": await user_kiosk_locked(db, user),
+    }
+
+
 def _cookie_secure() -> bool:
     """Whether the refresh cookie is marked Secure (HTTPS-only).
 
@@ -144,10 +156,14 @@ async def register(body: RegisterRequest, response: Response):
 
     role = "admin" if user_count == 0 else "user"
 
+    from captain_claw.flight_deck.admin_routes import new_user_metadata
+
     user = await db.create_user(
         email=body.email, password_hash=pw_hash,
         display_name=display, role=role,
+        metadata=await new_user_metadata(db, role),
     )
+    user = await db.get_user_by_id(user["id"]) or user
 
     access_token = create_access_token(user["id"], role=role)
     refresh_token = create_refresh_token()
@@ -156,11 +172,7 @@ async def register(body: RegisterRequest, response: Response):
     await db.create_refresh_session(user["id"], hash_token(refresh_token), expires_at)
     _set_refresh_cookie(response, refresh_token)
 
-    return TokenResponse(
-        access_token=access_token,
-        user={"id": user["id"], "email": user["email"],
-              "display_name": display, "role": role},
-    )
+    return TokenResponse(access_token=access_token, user=await _user_payload(db, user))
 
 
 @router.post("/login", response_model=TokenResponse)
@@ -183,11 +195,7 @@ async def _issue_session(db, user: dict, response: Response) -> TokenResponse:
     await db.create_refresh_session(user["id"], hash_token(refresh_token), expires_at)
     _set_refresh_cookie(response, refresh_token)
 
-    return TokenResponse(
-        access_token=access_token,
-        user={"id": user["id"], "email": user["email"],
-              "display_name": user["display_name"], "role": user["role"]},
-    )
+    return TokenResponse(access_token=access_token, user=await _user_payload(db, user))
 
 
 @router.post("/refresh")
@@ -236,8 +244,7 @@ async def refresh(request: Request, response: Response):
     return {
         "access_token": new_access,
         "token_type": "bearer",
-        "user": {"id": user["id"], "email": user["email"],
-                 "display_name": user["display_name"], "role": user["role"]},
+        "user": await _user_payload(db, user),
     }
 
 
@@ -258,10 +265,7 @@ async def logout(request: Request, response: Response):
 
 @router.get("/me")
 async def get_me(user: dict = Depends(get_current_user)):
-    return {
-        "id": user["id"], "email": user["email"],
-        "display_name": user["display_name"], "role": user["role"],
-    }
+    return await _user_payload(get_db(), user)
 
 
 async def _refresh_owner_profile(db, user_id: str) -> None:
@@ -306,10 +310,7 @@ async def update_me(body: UpdateProfileRequest, user: dict = Depends(get_current
             await _refresh_owner_profile(db, str(user["id"]))
 
     updated = await db.get_user_by_id(user["id"])
-    return {
-        "id": updated["id"], "email": updated["email"],
-        "display_name": updated["display_name"], "role": updated["role"],
-    }
+    return await _user_payload(db, updated)
 
 
 # ── Device pairing (RFC 8628-style device authorization) ─────────────
