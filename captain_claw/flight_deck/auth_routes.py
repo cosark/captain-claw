@@ -6,7 +6,9 @@ import hashlib
 import ipaddress
 import logging
 import os
+import re
 import secrets
+import sqlite3
 import time
 import unicodedata
 from collections import OrderedDict
@@ -142,17 +144,15 @@ async def register(body: RegisterRequest, response: Response):
 
     # First user becomes admin (bootstrap). Self-registration of ADDITIONAL
     # users is closed by default for team deployments — an admin creates
-    # accounts from the Admin page. An operator can re-open it with
-    # FD_REGISTRATION_OPEN=1; FD_REGISTRATION_DISABLED=1 forces it closed.
+    # accounts from the Admin page, or approves them from the waitlist.
     user_count = await db.count_users()
-    if user_count > 0:
-        disabled = os.environ.get("FD_REGISTRATION_DISABLED", "").lower() in ("true", "1", "yes")
-        open_reg = os.environ.get("FD_REGISTRATION_OPEN", "").lower() in ("true", "1", "yes")
-        if disabled or not open_reg:
-            raise HTTPException(
-                status_code=403,
-                detail="Registration is closed. Ask an administrator to create your account.",
-            )
+    if user_count > 0 and not _self_registration_open():
+        from captain_claw.flight_deck.admin_routes import waitlist_settings
+
+        detail = ("Registration is closed — apply on the waitlist instead."
+                  if (await waitlist_settings(db))["enabled"]
+                  else "Registration is closed. Ask an administrator to create your account.")
+        raise HTTPException(status_code=403, detail=detail)
 
     pw_hash = hash_password(body.password)
     display = body.display_name or body.email.split("@")[0]
@@ -178,10 +178,122 @@ async def register(body: RegisterRequest, response: Response):
     return TokenResponse(access_token=access_token, user=await _user_payload(db, user))
 
 
+def _self_registration_open() -> bool:
+    """FD_REGISTRATION_OPEN=1 lets anyone create an account (once the first,
+    admin, account exists); FD_REGISTRATION_DISABLED=1 forces it closed."""
+    disabled = os.environ.get("FD_REGISTRATION_DISABLED", "").lower() in ("true", "1", "yes")
+    open_reg = os.environ.get("FD_REGISTRATION_OPEN", "").lower() in ("true", "1", "yes")
+    return open_reg and not disabled
+
+
+async def registration_open(db) -> bool:
+    """Whether /register creates an account right now: always for the
+    first (admin) account, then only with self-registration open."""
+    return await db.count_users() == 0 or _self_registration_open()
+
+
+# ── Waitlist ─────────────────────────────────────────────────────────
+# While self-registration is closed the sign-up page takes applications: the
+# applicant's name, email and password plus the name and email of the person
+# who recommended them. An admin approves (admin_routes.approve_waitlist
+# creates the account with that password) or rejects. Public, so limited per
+# client network and capped in size.
+
+WAITLIST_APPLY_LIMIT = (10, 3600.0)  # applications per client network per hour
+WAITLIST_MAX_PENDING = 1000
+WAITLIST_NAME_MAX = 100
+EMAIL_MAX = 254
+BCRYPT_MAX_BYTES = 72
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class WaitlistRequest(BaseModel):
+    email: str
+    password: str
+    display_name: str = ""
+    referrer_name: str = ""
+    referrer_email: str = ""
+
+
+def _clean_email(value: str | None) -> str:
+    return str(value or "").strip().lower()[: EMAIL_MAX + 1]
+
+
+def _valid_email(email: str) -> bool:
+    return len(email) <= EMAIL_MAX and bool(_EMAIL_RE.match(email))
+
+
+@router.post("/waitlist", status_code=201)
+async def join_waitlist(body: WaitlistRequest, request: Request):
+    if not _fd_auth_enabled():
+        raise HTTPException(
+            status_code=403,
+            detail="The waitlist is unavailable: this Flight Deck runs without accounts (FD_AUTH_ENABLED=false).",
+        )
+    db = get_db()
+    if await registration_open(db):
+        raise HTTPException(status_code=409, detail="Registration is open — create your account instead.")
+    from captain_claw.flight_deck.admin_routes import waitlist_settings
+
+    wl = await waitlist_settings(db)
+    if not wl["enabled"]:
+        raise HTTPException(
+            status_code=403,
+            detail="Registration is closed. Ask an administrator to create your account.",
+        )
+
+    email = _clean_email(body.email)
+    referrer_email = _clean_email(body.referrer_email)
+    name = _clean_text(body.display_name, WAITLIST_NAME_MAX)
+    referrer_name = _clean_text(body.referrer_name, WAITLIST_NAME_MAX)
+    if not name:
+        raise HTTPException(status_code=400, detail="Your name is required")
+    if not _valid_email(email):
+        raise HTTPException(status_code=400, detail="Enter a valid email address")
+    if len(body.password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+    if len(body.password.encode()) > BCRYPT_MAX_BYTES:
+        raise HTTPException(status_code=400, detail="Password is too long (72 bytes at most)")
+    if not referrer_name:
+        raise HTTPException(status_code=400, detail="The name of the person who recommended you is required")
+    if not _valid_email(referrer_email):
+        raise HTTPException(status_code=400, detail="Enter a valid email for the person who recommended you")
+    if referrer_email == email:
+        raise HTTPException(status_code=400, detail="The person who recommended you must be someone else")
+
+    # Past input checks only, so a typo doesn't use up the budget.
+    _rate_limit(_waitlist_limiter, f"net:{_client_network(_client_ip(request))}", WAITLIST_APPLY_LIMIT)
+    if await db.get_user_by_email(email):
+        raise HTTPException(status_code=409, detail="This email already has an account — sign in instead.")
+    if await db.get_pending_waitlist_entry(email):
+        raise HTTPException(status_code=409, detail="This email is already on the waitlist.")
+    if await db.count_waitlist("pending") >= WAITLIST_MAX_PENDING:
+        raise HTTPException(status_code=503, detail="The waitlist is full right now — try again later.")
+
+    try:
+        await db.create_waitlist_entry(
+            email=email, display_name=name, password_hash=hash_password(body.password),
+            referrer_name=referrer_name, referrer_email=referrer_email, cohort=wl["cohort"],
+        )
+    except sqlite3.IntegrityError:  # the same email applied a moment ago
+        raise HTTPException(status_code=409, detail="This email is already on the waitlist.")
+    log.info("Waitlist application for %s (%s)", email, wl["cohort"])
+    return {"ok": True, "cohort": wl["cohort"]}
+
+
 @router.post("/login", response_model=TokenResponse)
 async def login(body: LoginRequest, response: Response):
     db = get_db()
     user = await db.get_user_by_email(body.email)
+    if not user:
+        # An applicant signing in with the password they applied with learns
+        # they're still waiting; anyone else gets the usual answer.
+        entry = await db.get_pending_waitlist_entry(body.email)
+        if entry and entry.get("password_hash") and verify_password(body.password, entry["password_hash"]):
+            raise HTTPException(
+                status_code=403,
+                detail="Your waitlist application is still waiting for an administrator's approval.",
+            )
     if not user or not verify_password(body.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
@@ -428,6 +540,9 @@ _pair_approver_limiter = _PairLimiter()
 # must not become a password-guessing oracle.
 _password_change_limiter = _PairLimiter()
 PASSWORD_CHANGE_LIMIT = (10, 900.0)  # attempts per user per 15 min
+
+# Waitlist applications (join_waitlist): public, keyed by client network.
+_waitlist_limiter = _PairLimiter()
 
 
 def _rate_limit(limiter: _PairLimiter, key: str, limit: tuple[int, float]) -> None:
