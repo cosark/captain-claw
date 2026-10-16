@@ -223,6 +223,89 @@ async def delete_user(user_id: str, admin: dict = Depends(require_admin)):
     return {"ok": True}
 
 
+# ── Waitlist ──
+# Applications from the sign-up page while self-registration is closed
+# (auth_routes.join_waitlist). Approving creates the account with the
+# password the applicant chose; they then sign in as usual.
+
+WAITLIST_STATUSES = ("pending", "approved", "rejected")
+
+
+class ApproveWaitlistRequest(BaseModel):
+    kiosk: bool | None = None  # None = the deck's "new users start in kiosk"
+
+
+@router.get("/waitlist")
+async def list_waitlist(
+    status: str = Query("pending"),
+    admin: dict = Depends(require_admin),
+):
+    """Waitlist applications, newest first (admin only). *status* is one of
+    pending | approved | rejected | all."""
+    if status != "all" and status not in WAITLIST_STATUSES:
+        raise HTTPException(400, "status must be one of: pending, approved, rejected, all")
+    db = get_db()
+    entries = await db.list_waitlist(None if status == "all" else status)
+    return {"entries": entries, "pending": await db.count_waitlist("pending")}
+
+
+async def _pending_entry(db, entry_id: str) -> dict:
+    entry = await db.get_waitlist_entry(entry_id)
+    if not entry:
+        raise HTTPException(404, "Application not found")
+    if entry["status"] != "pending":
+        raise HTTPException(409, f"This application was already {entry['status']}")
+    return entry
+
+
+@router.post("/waitlist/{entry_id}/approve")
+async def approve_waitlist(
+    entry_id: str, body: ApproveWaitlistRequest | None = None,
+    admin: dict = Depends(require_admin),
+):
+    """Create the applicant's account (role user) and mark them approved."""
+    import sqlite3
+
+    db = get_db()
+    entry = await _pending_entry(db, entry_id)
+    if not entry.get("password_hash"):
+        raise HTTPException(409, "This application has no password to create the account with")
+    if await db.get_user_by_email(entry["email"]):
+        raise HTTPException(409, "An account with this email already exists — reject or delete the application")
+    meta = await new_user_metadata(db, "user", body.kiosk if body else None)
+    display = (entry.get("display_name") or "").strip() or entry["email"].split("@")[0]
+    try:
+        user = await db.create_user(
+            email=entry["email"], password_hash=entry["password_hash"],
+            display_name=display, role="user", metadata=meta,
+        )
+    except sqlite3.IntegrityError:  # another admin approved it a moment ago
+        raise HTTPException(409, "An account with this email already exists")
+    await db.decide_waitlist_entry(entry_id, "approved", admin["id"], user_id=user["id"])
+    return {
+        "ok": True,
+        "user": {"id": user["id"], "email": user["email"], "display_name": display,
+                 "role": "user", "kiosk": meta.get("kiosk") is True},
+    }
+
+
+@router.post("/waitlist/{entry_id}/reject")
+async def reject_waitlist(entry_id: str, admin: dict = Depends(require_admin)):
+    db = get_db()
+    await _pending_entry(db, entry_id)
+    if not await db.decide_waitlist_entry(entry_id, "rejected", admin["id"]):
+        raise HTTPException(409, "This application was already decided")
+    return {"ok": True}
+
+
+@router.delete("/waitlist/{entry_id}")
+async def delete_waitlist(entry_id: str, admin: dict = Depends(require_admin)):
+    """Remove an application outright, whatever its status (admin only)."""
+    if not await get_db().delete_waitlist_entry(entry_id):
+        raise HTTPException(404, "Application not found")
+    return {"ok": True}
+
+
 @router.get("/usage")
 async def get_usage(
     user_id: str | None = None,
@@ -278,6 +361,8 @@ class UpdateConfigRequest(BaseModel):
     docker_spawn_enabled: bool | None = None
     kiosk_mode: str | None = None  # one of KIOSK_MODES
     kiosk_new_users: bool | None = None
+    waitlist_enabled: bool | None = None
+    waitlist_cohort: str | None = None
 
 
 class ProviderKeysRequest(BaseModel):
@@ -290,7 +375,14 @@ SYSTEM_CONFIG_DEFAULTS = {
     # Kiosk (simple-chat) lock: True = new accounts start locked. Only matters
     # in "selected" mode — with "all" every non-admin is locked anyway.
     "kiosk_new_users": False,
+    # While self-registration is closed, the sign-up page takes applications
+    # for this cohort instead (each names who recommended them); an admin
+    # approves them under Admin → Waitlist.
+    "waitlist_enabled": True,
+    "waitlist_cohort": "CC Cohort 001",
 }
+
+WAITLIST_COHORT_MAX = 60
 
 # Kiosk (simple-chat) lock for the deck: "off" = nobody, "all" = every
 # non-admin, "selected" = the users an admin marked (user metadata "kiosk").
@@ -365,6 +457,16 @@ async def new_user_metadata(db, role: str, kiosk: bool | None = None) -> dict:
     return {"kiosk": True} if kiosk else {}
 
 
+async def waitlist_settings(db) -> dict:
+    """The deck's waitlist: ``enabled`` (takes applications while
+    self-registration is closed) and the ``cohort`` applicants join."""
+    cfg = _load_system_config(await db.get_system_setting("fd:system-config"))
+    return {
+        "enabled": bool(cfg.get("waitlist_enabled")),
+        "cohort": str(cfg.get("waitlist_cohort") or SYSTEM_CONFIG_DEFAULTS["waitlist_cohort"]),
+    }
+
+
 @router.get("/plans")
 async def list_plans(admin: dict = Depends(require_admin)):
     """List available plan tiers and their limits (admin only)."""
@@ -386,6 +488,13 @@ async def update_config(body: UpdateConfigRequest, admin: dict = Depends(require
     updates = body.model_dump(exclude_none=True)
     if "kiosk_mode" in updates and updates["kiosk_mode"] not in KIOSK_MODES:
         raise HTTPException(400, f"kiosk_mode must be one of: {', '.join(KIOSK_MODES)}")
+    if "waitlist_cohort" in updates:
+        cohort = " ".join(updates["waitlist_cohort"].split())
+        if not cohort:
+            raise HTTPException(400, "The cohort name can't be empty")
+        if len(cohort) > WAITLIST_COHORT_MAX:
+            raise HTTPException(400, f"The cohort name is at most {WAITLIST_COHORT_MAX} characters")
+        updates["waitlist_cohort"] = cohort
     raw = await db.get_system_setting("fd:system-config")
     # Store only what was stored or set here, not the merged defaults: an
     # unrelated toggle must not freeze the --simple-chat default into the DB.

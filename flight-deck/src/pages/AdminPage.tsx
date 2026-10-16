@@ -18,6 +18,7 @@ import {
   Plug,
   MessageSquare,
   KeyRound,
+  ClipboardList,
 } from 'lucide-react'
 import { useAuthStore } from '../stores/authStore'
 import { useUIStore } from '../stores/uiStore'
@@ -26,9 +27,10 @@ import { UserAgentsDialog } from '../components/agents/UserAgentsDialog'
 import { DeckProfileDefaults } from '../components/profile/DeckProfileDefaults'
 import { SharedTelegramBotAdmin } from '../components/admin/SharedTelegramBotAdmin'
 import { SharedCredentialsAdmin } from '../components/admin/SharedCredentialsAdmin'
+import { WaitlistAdmin, fetchWaitlist } from '../components/admin/WaitlistAdmin'
 import { ADMIN_TAB_KEY } from '../services/sharedIntegrations'
 
-type AdminTab = 'users' | 'usage' | 'plans' | 'settings' | 'integrations'
+type AdminTab = 'users' | 'waitlist' | 'usage' | 'plans' | 'settings' | 'integrations'
 
 // Other pages may open Admin on a given tab (Connections → Telegram sends an
 // admin to Integrations, see ADMIN_TAB_KEY); otherwise it opens on Users.
@@ -36,7 +38,7 @@ function takeRequestedTab(): AdminTab {
   try {
     const t = sessionStorage.getItem(ADMIN_TAB_KEY)
     sessionStorage.removeItem(ADMIN_TAB_KEY)
-    if (t === 'usage' || t === 'plans' || t === 'settings' || t === 'integrations') return t
+    if (t === 'waitlist' || t === 'usage' || t === 'plans' || t === 'settings' || t === 'integrations') return t
   } catch { /* storage blocked */ }
   return 'users'
 }
@@ -63,10 +65,14 @@ interface SystemConfig {
   kiosk_new_users: boolean
   // The mode is the `--simple-chat` default — no admin has picked one yet.
   kiosk_mode_from_env?: boolean
+  // While self-registration is closed, sign-up takes waitlist applications.
+  waitlist_enabled: boolean
+  waitlist_cohort: string
 }
 
 const CONFIG_DEFAULTS: SystemConfig = {
   docker_spawn_enabled: true, kiosk_mode: 'off', kiosk_new_users: false,
+  waitlist_enabled: true, waitlist_cohort: 'CC Cohort 001',
 }
 
 const KIOSK_MODES: { value: KioskMode; label: string; hint: string }[] = [
@@ -229,7 +235,10 @@ async function saveConfig(cfg: Partial<SystemConfig>): Promise<SystemConfig> {
     method: 'PUT', headers: _headers(), credentials: 'include',
     body: JSON.stringify(cfg),
   })
-  if (!res.ok) throw new Error('Failed to save config')
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(typeof body.detail === 'string' ? body.detail : 'Failed to save config')
+  }
   return { ...CONFIG_DEFAULTS, ...(await res.json()) }
 }
 
@@ -782,14 +791,21 @@ export function AdminPage() {
   const [error, setError] = useState('')
   // Bumped by Refresh: the Integrations cards load on their own and reload on it.
   const [refreshTick, setRefreshTick] = useState(0)
+  const [waitlistPending, setWaitlistPending] = useState(0)
+  const [cohortDraft, setCohortDraft] = useState('')
+  const signUpMode = useAuthStore((s) => s.signUp.mode)
 
   const loadUsers = useCallback(async () => {
     try {
-      const [usersData, plansData, cfgData, keys] = await Promise.all([fetchUsers(), fetchPlans(), fetchConfig(), fetchProviderKeys()])
+      const [usersData, plansData, cfgData, keys, waitlist] = await Promise.all([
+        fetchUsers(), fetchPlans(), fetchConfig(), fetchProviderKeys(), fetchWaitlist().catch(() => null),
+      ])
       setUsers(usersData.users)
       setTotalUsers(usersData.total)
       setPlans(plansData)
       setConfig(cfgData)
+      setCohortDraft(cfgData.waitlist_cohort)
+      if (waitlist) setWaitlistPending(waitlist.pending)
       setProviderKeys(keys)
       setProviderKeysDraft(keys)
       setError('')
@@ -879,6 +895,22 @@ export function AdminPage() {
             Users ({totalUsers})
           </button>
           <button
+            onClick={() => setTab('waitlist')}
+            className={`flex items-center gap-2 px-4 py-2.5 text-sm border-b-2 transition-colors ${
+              tab === 'waitlist'
+                ? 'border-violet-500 text-zinc-100'
+                : 'border-transparent text-zinc-500 hover:text-zinc-300'
+            }`}
+          >
+            <ClipboardList className="h-4 w-4" />
+            Waitlist
+            {waitlistPending > 0 && (
+              <span className="rounded-full bg-violet-600 px-1.5 py-0.5 text-[10px] font-semibold leading-none text-white">
+                {waitlistPending}
+              </span>
+            )}
+          </button>
+          <button
             onClick={() => setTab('usage')}
             className={`flex items-center gap-2 px-4 py-2.5 text-sm border-b-2 transition-colors ${
               tab === 'usage'
@@ -949,6 +981,22 @@ export function AdminPage() {
               <p className="text-center text-sm text-zinc-500 py-8">No users found</p>
             )}
           </div>
+        )}
+
+        {/* Waitlist tab: loads on its own, like the Integrations cards. */}
+        {tab === 'waitlist' && (
+          <WaitlistAdmin
+            refreshTick={refreshTick}
+            onPendingCount={setWaitlistPending}
+            onApproved={loadUsers}
+            note={
+              signUpMode === 'register'
+                ? 'Self-registration is open (FD_REGISTRATION_OPEN), so the sign-up page creates accounts directly and takes no applications.'
+                : !config.waitlist_enabled
+                  ? 'The waitlist is off (Settings), so the sign-up page takes no new applications.'
+                  : null
+            }
+          />
         )}
 
         {/* Usage tab */}
@@ -1118,7 +1166,7 @@ export function AdminPage() {
                 <div>
                   <div className="text-sm text-zinc-300">New users start in kiosk mode</div>
                   <div className="text-xs text-zinc-500 mt-0.5">
-                    Marks accounts created from now on (Add user or sign-up). Counts under "Selected users";
+                    Marks accounts created from now on (Add user, sign-up or a waitlist approval). Counts under "Selected users";
                     with "Everyone" every non-admin is locked anyway.
                   </div>
                 </div>
@@ -1132,6 +1180,76 @@ export function AdminPage() {
                   }}
                 />
               </label>
+            </div>
+
+            {/* Waitlist (sign-up while registration is closed) */}
+            <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-4 space-y-4">
+              <div>
+                <h3 className="flex items-center gap-2 text-sm font-semibold text-zinc-200">
+                  <ClipboardList className="h-4 w-4 text-violet-400" />
+                  Waitlist
+                </h3>
+                <p className="text-xs text-zinc-500 mt-0.5">
+                  While registration is closed, the sign-up page takes applications instead: name, email, a
+                  password, and the name and email of whoever recommended them. You approve them in the
+                  Waitlist tab.
+                  {signUpMode === 'register' && ' Self-registration is open on this deck (FD_REGISTRATION_OPEN), so the waitlist isn\'t shown.'}
+                </p>
+              </div>
+              <label className="flex items-center justify-between gap-4">
+                <div>
+                  <div className="text-sm text-zinc-300">Take waitlist applications</div>
+                  <div className="text-xs text-zinc-500 mt-0.5">
+                    Off: the sign-up page only says to ask an administrator. Applications already in stay listed.
+                  </div>
+                </div>
+                <Switch
+                  on={config.waitlist_enabled}
+                  label="Take waitlist applications"
+                  onToggle={async () => {
+                    try {
+                      const next = await saveConfig({ waitlist_enabled: !config.waitlist_enabled })
+                      setConfig(next)
+                      const { signUp, setSignUp } = useAuthStore.getState()
+                      if (signUp.mode !== 'register') {
+                        setSignUp({ mode: next.waitlist_enabled ? 'waitlist' : 'closed', cohort: next.waitlist_cohort })
+                      }
+                    } catch { setError('Failed to save config') }
+                  }}
+                />
+              </label>
+              <div>
+                <label className="block text-sm text-zinc-300 mb-1">Cohort</label>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={cohortDraft}
+                    onChange={(e) => setCohortDraft(e.target.value)}
+                    maxLength={60}
+                    placeholder="CC Cohort 001"
+                    className="flex-1 rounded-md border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-sm text-zinc-200 focus:border-violet-500/50 focus:outline-none"
+                  />
+                  <button
+                    onClick={async () => {
+                      try {
+                        const next = await saveConfig({ waitlist_cohort: cohortDraft })
+                        setConfig(next)
+                        setCohortDraft(next.waitlist_cohort)
+                        const { signUp, setSignUp } = useAuthStore.getState()
+                        setSignUp({ ...signUp, cohort: next.waitlist_cohort })
+                      } catch (e) { setError(e instanceof Error ? e.message : 'Failed to save config') }
+                    }}
+                    disabled={!cohortDraft.trim() || cohortDraft.trim() === config.waitlist_cohort}
+                    className="flex items-center gap-1.5 rounded-md bg-violet-600 px-3 py-1.5 text-xs text-white hover:bg-violet-500 disabled:opacity-50"
+                  >
+                    <Save className="h-3.5 w-3.5" />
+                    Save
+                  </button>
+                </div>
+                <p className="mt-1 text-xs text-zinc-500">
+                  Shown on the sign-up page and saved with each application. Changing it doesn't move earlier applicants.
+                </p>
+              </div>
             </div>
 
             {/* Provider API Keys */}
