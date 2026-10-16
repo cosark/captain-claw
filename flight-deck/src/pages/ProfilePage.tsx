@@ -21,6 +21,7 @@ import {
 import { CappedTextarea } from '../components/profile/CappedTextarea'
 import { DeckProfileDefaults } from '../components/profile/DeckProfileDefaults'
 import { MyContextPacks } from '../components/profile/MyContextPacks'
+import { ChangePasswordCard } from '../components/profile/ChangePasswordCard'
 import { useSharedAgentStore } from '../stores/sharedAgentStore'
 import type { MyPackRow } from '../services/contextPacks'
 import { MY_PACKS_HEADING, MY_PACKS_ID, profilePackAgents, profileSharedNote } from '../utils/contextPacks'
@@ -342,6 +343,14 @@ export function ProfilePage({ kiosk = false, onDirtyChange }: {
               showEmpty={contextPacks}
               onPacks={setMyPacks}
             />
+          </div>
+        )}
+
+        {/* The account's password — only a deck with accounts has one. Kept
+            out of the profile block so it stays usable if that fails to load. */}
+        {authEnabled === true && (data || !loading) && (
+          <div className="mt-4">
+            <ChangePasswordCard />
           </div>
         )}
       </div>

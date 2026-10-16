@@ -45,6 +45,7 @@ class UpdateUserRequest(BaseModel):
     requests_per_minute: int | None = None
     spawns_per_hour: int | None = None
     password: str | None = None  # admin password reset (min 6 chars)
+    sign_out: bool | None = None  # with a reset: end the user's sessions everywhere
 
 
 # ── Endpoints ──
@@ -164,6 +165,10 @@ async def update_user(
         return {"ok": True, "message": "No changes"}
 
     await db.update_user(user_id, **updates)
+    # Not for the admin's own account: that would sign out the session making
+    # the change — they change their own password from their profile.
+    if "password_hash" in updates and body.sign_out and user_id != admin["id"]:
+        await db.delete_user_refresh_sessions(user_id)
     if "display_name" in updates and updates["display_name"] != (user.get("display_name") or ""):
         # Their agents' owner profile names them: rewrite it.
         try:

@@ -920,10 +920,22 @@ class FlightDeckDB:
         await self._db.execute("DELETE FROM user_sessions WHERE id = ?", (session_id,))
         await self._db.commit()
 
-    async def delete_user_refresh_sessions(self, user_id: str) -> None:
+    async def delete_user_refresh_sessions(
+        self, user_id: str, keep_token_hash: str | None = None,
+    ) -> int:
+        """Sign *user_id* out everywhere — except the session whose refresh
+        token hashes to *keep_token_hash* (the caller's own). Returns how many
+        sessions went."""
         assert self._db is not None
-        await self._db.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
+        if keep_token_hash:
+            cur = await self._db.execute(
+                "DELETE FROM user_sessions WHERE user_id = ? AND refresh_token_hash != ?",
+                (user_id, keep_token_hash),
+            )
+        else:
+            cur = await self._db.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
         await self._db.commit()
+        return cur.rowcount
 
     async def cleanup_expired_sessions(self) -> None:
         assert self._db is not None
