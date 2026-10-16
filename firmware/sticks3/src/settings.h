@@ -21,7 +21,8 @@ struct Settings {
   bool speak = true;    // read replies aloud
   uint8_t volume = 191; // 0..255 (M5 docs: above ~75% on battery may brown out)
   uint8_t boostDb = 6;  // extra speech gain with a soft limiter: 0, 6 or 10 dB
-  uint16_t sleepMin = 15;  // deep sleep after this many idle minutes (0 = never)
+  uint8_t screenOffS = 15;  // screen goes dark after this many idle seconds: 5, 10 or 15
+  uint8_t powerOffS = 60;   // deep sleep (front button wakes) after: 15, 30 or 60 s
   bool femaleVoice = false; // spoken replies: male (Adrian) / female (Emma) on the deck
   bool iconMode = false;    // screen: text stages, or an animated character
   uint8_t character = 0;    // face::Kind (0 = captain)
