@@ -1035,29 +1035,25 @@ def agent_sees_attached_images(agent: Any) -> bool:
         return False
 
 
-async def _prefix_image_analysis(
-    agent: Any, content: str, image_paths: list[str], send: Any,
-) -> str:
-    """Describe attached image(s) server-side and prepend it to the user message —
-    the image mirror of ``_prefix_video_analysis``. Routes like ``video_vision``
-    does internally: a locally-configured vision model if there is one, otherwise a
-    multimodal peer over Flight Deck. When neither exists it injects an explicit
-    "couldn't see it" note so the model tells the truth instead of hallucinating.
+_DESCRIBE_PROMPT = (
+    "Describe this image in detail for someone who cannot see it. Include: how "
+    "many people are present (count them), the main objects, any visible text "
+    "(quote it), and what is happening."
+)
 
-    This is what actually fixes the failure the naming/prompt work only nudged: a
-    weak, non-vision model no longer has to *choose* image_vision over the always-on
-    `cv` tool — the description is already in the turn.
-    """
+
+async def describe_images_without_vision(
+    agent: Any, image_paths: list[str], prompt: str, send: Any = None,
+) -> list[tuple[str, str | None]]:
+    """``(path, description)`` per image, for an agent whose own model doesn't see
+    images: a locally-configured vision model if there is one, otherwise a
+    multimodal peer over Flight Deck. The description is None when neither
+    exists; a failure reads ``(automatic analysis failed: …)``."""
     from pathlib import Path as _Path
 
     from captain_claw.tools.image_ocr import ImageVisionTool
 
     kwargs = {"_agent": agent, "_session": getattr(agent, "session", None)}
-    prompt = (
-        "Describe this image in detail for someone who cannot see it. Include: how "
-        "many people are present (count them), the main objects, any visible text "
-        "(quote it), and what is happening."
-    )
 
     # Resolve the vision path once (not per image): local model, else a peer.
     has_local = ImageVisionTool()._find_model() is not None
@@ -1072,15 +1068,17 @@ async def _prefix_image_analysis(
             fdt = FlightDeckTool()
             fd_url = fdt._get_fd_url(**kwargs)
             if not fd_url:
-                peer = None  # no way to reach the peer → fall through to the note
+                peer = None  # no way to reach the peer → no description
 
-    blocks: list[str] = []
+    described: list[tuple[str, str | None]] = []
     for ip in image_paths:
         name = _Path(ip).name
-        try:
-            send({"type": "status", "status": f"\U0001F5BC️ Analyzing attached image {name}…"})
-        except Exception:
-            pass
+        if send is not None:
+            try:
+                send({"type": "status", "status": f"\U0001F5BC️ Analyzing attached image {name}…"})
+            except Exception:
+                pass
+        desc: str | None
         try:
             if has_local:
                 res = await agent._execute_tool_with_guard(
@@ -1097,15 +1095,38 @@ async def _prefix_image_analysis(
 
                 desc = await _describe_frame_via_peer(fdt, fd_url, peer, _Path(ip), prompt, kwargs)
             else:
-                desc = (
-                    "(could not be analyzed — this session has no vision model or multimodal "
-                    "peer, so the image can't be seen here. Tell the user that plainly; do NOT "
-                    "guess what it shows.)"
-                )
+                desc = None
         except Exception as exc:
             log.warning("Auto image analysis failed", path=ip, error=str(exc))
             desc = f"(automatic analysis failed: {exc})"
-        blocks.append(f"[Automatic analysis of attached image {name}]\n{desc}")
+        described.append((ip, desc))
+    return described
+
+
+async def _prefix_image_analysis(
+    agent: Any, content: str, image_paths: list[str], send: Any,
+) -> str:
+    """Describe attached image(s) server-side and prepend it to the user message —
+    the image mirror of ``_prefix_video_analysis``. Routes like ``video_vision``
+    does internally (see ``describe_images_without_vision``). When neither a
+    vision model nor a peer exists it injects an explicit "couldn't see it" note
+    so the model tells the truth instead of hallucinating.
+
+    This is what actually fixes the failure the naming/prompt work only nudged: a
+    weak, non-vision model no longer has to *choose* image_vision over the always-on
+    `cv` tool — the description is already in the turn.
+    """
+    from pathlib import Path as _Path
+
+    blocks: list[str] = []
+    for ip, desc in await describe_images_without_vision(agent, image_paths, _DESCRIBE_PROMPT, send):
+        if desc is None:
+            desc = (
+                "(could not be analyzed — this session has no vision model or multimodal "
+                "peer, so the image can't be seen here. Tell the user that plainly; do NOT "
+                "guess what it shows.)"
+            )
+        blocks.append(f"[Automatic analysis of attached image {_Path(ip).name}]\n{desc}")
 
     if not blocks:
         return content

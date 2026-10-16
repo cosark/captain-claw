@@ -48,7 +48,9 @@ class _SessionManager:
 
 
 @pytest.fixture
-def vision_config():
+def vision_config(tmp_path, monkeypatch):
+    monkeypatch.setattr(vision, "_REJECTED_STORE", tmp_path / "vision_rejected.json")
+    monkeypatch.setattr(vision, "_rejected_loaded", False)
     vision._VISION_REJECTED.clear()
     old_cfg = get_config().model_copy(deep=True)
     cfg = old_cfg.model_copy(deep=True)

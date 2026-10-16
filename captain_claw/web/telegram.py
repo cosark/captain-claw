@@ -465,10 +465,17 @@ async def _handle_telegram_message(server: WebServer, message: TelegramMessage) 
         # Store the chat_id on the agent so delegate callbacks can route back here
         user_agent._telegram_chat_id = message.chat_id  # type: ignore[attr-defined]
 
+        # A model that sees images gets the photo inline (its marker); any other
+        # has it described first — a vision model or a multimodal peer — as the
+        # chat path does for WhatsApp and Flight Deck.
+        from captain_claw.web.chat_handler import agent_sees_attached_images
+
+        describe = [image_path] if image_path and not agent_sees_attached_images(user_agent) else None
         await _tg_process_with_typing(
             server, message.chat_id, effective_text, message.message_id,
             user_agent=user_agent,
             user_id=str(message.user_id),
+            describe_images=describe,
         )
 
     except Exception as exc:
@@ -991,11 +998,15 @@ async def _tg_process_with_typing(
     *,
     user_agent: Agent,
     user_id: str,
+    describe_images: list[str] | None = None,
 ) -> None:
     """Run user_agent.complete() with typing indicator and per-user lock.
 
     Different Telegram users run concurrently.  Requests from the *same*
-    user are serialised by a per-user asyncio lock.
+    user are serialised by a per-user asyncio lock. *describe_images* are
+    described server-side first (for a model that doesn't see images); the
+    description goes to the agent, never into the user's words the mail
+    guard reads.
     """
     bridge = server._telegram_bridge
     if not bridge:
@@ -1051,12 +1062,18 @@ async def _tg_process_with_typing(
                 # every blurb into one long message.
                 narration = _TgNarration(server, chat_id) if _stream_narration() else None
                 user_agent.narration_callback = narration
+                agent_text = text
+                if describe_images:
+                    from captain_claw.web.chat_handler import _prefix_image_analysis
+
+                    agent_text = await _prefix_image_analysis(
+                        user_agent, text, describe_images, lambda _event: None)
                 try:
                     with mail_authority.bound(mail_authority.interactive(text)):
                         from captain_claw import msg_origin as _msg_origin
 
                         _msg_origin.hint_turn_provenance(user_agent, channel="telegram")
-                        response = await user_agent.complete(text)
+                        response = await user_agent.complete(agent_text)
                 finally:
                     user_agent.narration_callback = None
                     if narration is not None:
