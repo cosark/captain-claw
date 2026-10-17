@@ -2,7 +2,7 @@
 
     uv run --no-project --with cryptography python tools/publish.py keygen
     uv run --no-project --with cryptography python tools/publish.py sticks3 \\
-        --deck https://glasses.captain-claw.com --token cc_pat_… [--notes "…"] [--no-build]
+        --deck https://glasses.captain-claw.com [--token cc_pat_…] [--notes "…"] [--no-build]
 
 keygen   makes the signing key pair once: the private key stays on this Mac
          (~/.captain-claw/firmware-signing/ota-key.pem, mode 600); the public
@@ -32,6 +32,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 KEY = Path(os.environ.get("CLAW_OTA_KEY", "~/.captain-claw/firmware-signing/ota-key.pem")).expanduser()
+# The admin token can live in a file (mode 600) instead of the command line.
+TOKEN_FILE = KEY.parent / "deck-token"
 PUBKEY_H = ROOT / "src/ota_pubkey.h"
 
 
@@ -105,14 +107,17 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("target", help="keygen, or a PlatformIO env to publish (sticks3, stopwatch)")
     ap.add_argument("--deck", help="Flight Deck URL, e.g. https://glasses.captain-claw.com")
-    ap.add_argument("--token", default=os.environ.get("FD_TOKEN", ""), help="admin token (or FD_TOKEN)")
+    ap.add_argument("--token", default=os.environ.get("FD_TOKEN", ""),
+                    help=f"admin token (or FD_TOKEN, or the file {TOKEN_FILE})")
     ap.add_argument("--notes", default="", help="release notes shown on the device")
     ap.add_argument("--no-build", action="store_true", help="publish the last build as is")
     a = ap.parse_args()
     if a.target == "keygen":
         return keygen()
+    if not a.token and TOKEN_FILE.exists():
+        a.token = TOKEN_FILE.read_text().strip()
     if not a.deck or not a.token:
-        sys.exit("--deck and --token (or FD_TOKEN) are required")
+        sys.exit(f"--deck and a token (--token, FD_TOKEN or {TOKEN_FILE}) are required")
     path = ROOT / ".pio/build" / a.target / "firmware.bin" if a.no_build else build(a.target)
     blob = path.read_bytes()
     version = fw_version()

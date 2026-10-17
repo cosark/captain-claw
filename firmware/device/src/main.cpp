@@ -27,7 +27,7 @@
 #include "settings.h"
 #include "ui.h"
 
-#define FW_VERSION "0.8.0"
+#define FW_VERSION "0.8.1"
 
 enum class Mode { Idle, Listening, Waiting, Reply, Image, Menu, Agents, CharPick, Status, Notice };
 
