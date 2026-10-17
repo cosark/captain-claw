@@ -39,6 +39,8 @@ void Settings::load() {
   cueBuzz = p.getBool("cuebuzz", true);
   cueLeadS = constrain(p.getUChar("cuelead", 1), 1, 2);
   textSize = min<uint8_t>(p.getUChar("tsize", 0), 2);
+  autoUpdate = p.getBool("autoupd", false);
+  lastFw = p.getString("lastfw", "");
   tz = p.getString("tz", kDefaultTz);
   if (tz.isEmpty()) tz = kDefaultTz;
   p.end();
@@ -76,6 +78,8 @@ void Settings::save() const {
   p.putBool("cuebuzz", cueBuzz);
   p.putUChar("cuelead", cueLeadS);
   p.putUChar("tsize", textSize);
+  p.putBool("autoupd", autoUpdate);
+  p.putString("lastfw", lastFw);
   p.putString("tz", tz);
   p.end();
 }

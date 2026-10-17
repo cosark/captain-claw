@@ -14,6 +14,7 @@ namespace board {
 #if defined(BOARD_STOPWATCH)
 
 constexpr const char* kModel = "StopWatch";   // portal title, hotspot name
+constexpr const char* kHw = "stopwatch";      // build kind for over-the-air updates (= PlatformIO env)
 constexpr const char* kNoun = "watch";        // "the watch restarts…"
 constexpr const char* kIdPrefix = "watch";    // device id: watch-a1b2c3
 constexpr const char* kTalkButton = "yellow button";
@@ -31,6 +32,7 @@ constexpr bool kChunkedImages = true;
 #else  // BOARD_STICKS3
 
 constexpr const char* kModel = "StickS3";
+constexpr const char* kHw = "sticks3";
 constexpr const char* kNoun = "stick";
 constexpr const char* kIdPrefix = "stick";
 constexpr const char* kTalkButton = "front button";

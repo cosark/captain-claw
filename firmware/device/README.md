@@ -93,6 +93,27 @@ Back up its factory firmware before the first upload:
 Serial log: open the port with DTR/RTS released — asserting them resets the
 StickS3 into download mode. `pio device monitor --dtr 0 --rts 0`.
 
+## Updates over the air
+
+From 0.8.0 the devices update over Wi-Fi from Flight Deck (design:
+`docs/device-ota-plan.md`). Bump `FW_VERSION` in `src/main.cpp`, then:
+
+```bash
+uv run --no-project --with cryptography python tools/publish.py sticks3 \
+    --deck https://glasses.captain-claw.com --token cc_pat_… --notes "what changed"
+```
+
+It builds, signs (ECDSA P-256, key in `~/.captain-claw/firmware-signing/` — back it
+up; without it no device accepts a new build) and uploads (admin token). Connected
+devices of that kind get the offer at once, others on their next connect:
+Menu → *Software update* (or by itself with *Auto update*, when idle on USB). A new
+version that can't reach Flight Deck within 90 s rolls back to the previous one.
+The key pair was made once with `publish.py keygen`; `src/ota_pubkey.h` is its
+public half.
+
+The StickS3 screens use trimmed copies of efontJA (`src/efont_subset.*`, made by
+`tools/subset_fonts.py`) — run it again if a screen needs a glyph that isn't kept.
+
 ## Back to stock firmware
 
 M5Burner → StickS3 / StopWatch → UIFlow2 (or Xiaozhi), or write back a full flash dump
