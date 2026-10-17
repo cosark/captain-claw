@@ -353,6 +353,54 @@ class TestUserAndAdminRoutes:
         r = c.post("/fd/telegram-shared/request", headers=_bearer(BOB), json={"agent_slug": "bob-bot"})
         assert r.json()["link"]["status"] == "pending"
 
+    async def test_auto_approve_lets_new_requests_straight_in(self, db, tg, agents):
+        await _bot_on(db)
+        c = _client()
+        r = c.put("/fd/admin/telegram-shared", headers=_bearer(ALICE, "admin"), json={"auto_approve": True})
+        assert r.status_code == 200 and r.json()["config"]["auto_approve"] is True
+        assert c.get("/fd/telegram-shared", headers=_bearer(BOB)).json()["auto_approve"] is True
+
+        r = c.post("/fd/telegram-shared/request", headers=_bearer(BOB), json={"agent_slug": "bob-bot"})
+        link = r.json()["link"]
+        assert link["status"] == "approved" and link["deep_link"].startswith("https://t.me/team_bot?start=")
+        assert (await db.get_telegram_link(BOB))["decided_by"] == "auto"
+        notes = await db.list_notifications(ALICE)
+        assert notes and "automatically" in notes[0]["title"]
+
+        # Opening the bot through the link connects at once: no admin step.
+        await ts.route_update(db, _msg(1, TG_BOB, f"/start {link['deep_link'].rsplit('=', 1)[1]}"))
+        assert "Connected" in _sent(tg)[-1]["body"]["text"]
+        assert await ts.route_update(db, _msg(2, TG_BOB)) == "queued"
+
+    async def test_auto_approve_leaves_turned_down_people_to_an_admin(self, db, tg, agents):
+        await _bot_on(db)
+        c = _client()
+        c.post("/fd/telegram-shared/request", headers=_bearer(BOB), json={"agent_slug": "bob-bot"})
+        c.post(f"/fd/admin/telegram-shared/links/{BOB}/reject", headers=_bearer(ALICE, "admin"))
+        c.put("/fd/admin/telegram-shared", headers=_bearer(ALICE, "admin"), json={"auto_approve": True})
+        r = c.post("/fd/telegram-shared/request", headers=_bearer(BOB), json={"agent_slug": "bob-bot"})
+        assert r.json()["link"]["status"] == "pending"
+
+    async def test_switching_auto_approve_on_approves_who_is_waiting(self, db, tg, agents):
+        await _bot_on(db)
+        c = _client()
+        c.post("/fd/telegram-shared/request", headers=_bearer(BOB), json={"agent_slug": "bob-bot"})
+        c.post("/fd/telegram-shared/request", headers=_bearer(CAROL), json={"agent_slug": "carol-bot"})
+        c.post(f"/fd/admin/telegram-shared/links/{CAROL}/reject", headers=_bearer(ALICE, "admin"))
+        r = c.put("/fd/admin/telegram-shared", headers=_bearer(ALICE, "admin"), json={"auto_approve": True})
+        status = {row["user_id"]: row["status"] for row in r.json()["links"]}
+        assert status == {BOB: "approved", CAROL: "rejected"}
+        assert any(n["title"] == "Telegram access approved" for n in await db.list_notifications(BOB))
+        # Removing the token keeps the choice for the next one.
+        c.delete("/fd/admin/telegram-shared", headers=_bearer(ALICE, "admin"))
+        assert (await ts.load_config(db))["auto_approve"] is True
+        # …and switching it off sends new requests to an admin again.
+        await _bot_on(db)
+        c.put("/fd/admin/telegram-shared", headers=_bearer(ALICE, "admin"), json={"auto_approve": False})
+        c.delete("/fd/telegram-shared", headers=_bearer(BOB))
+        r = c.post("/fd/telegram-shared/request", headers=_bearer(BOB), json={"agent_slug": "bob-bot"})
+        assert r.json()["link"]["status"] == "pending"
+
 
 class TestRelay:
     async def test_get_updates_and_send_within_own_chats(self, db, tg, agents):

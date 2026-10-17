@@ -98,6 +98,9 @@ async def load_config(db) -> dict[str, Any]:
     return {
         "token": str(cfg.get("token") or ""),
         "enabled": bool(cfg.get("enabled", True)),
+        # New requests are approved at once (Admin → Integrations); a person
+        # an admin turned down still waits for an admin.
+        "auto_approve": bool(cfg.get("auto_approve", False)),
         "bot_username": str(cfg.get("bot_username") or ""),
         "bot_name": str(cfg.get("bot_name") or ""),
         "bot_id": str(cfg.get("bot_id") or ""),

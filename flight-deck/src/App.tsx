@@ -18,6 +18,7 @@ import { SpawnerPage } from './pages/SpawnerPage'
 import { ForgePage } from './pages/ForgePage'
 import { LibraryPage } from './pages/LibraryPage'
 import { LoginPage } from './pages/LoginPage'
+import { ChoosePasswordPage } from './pages/ChoosePasswordPage'
 import { AdminPage } from './pages/AdminPage'
 import { CouncilPage } from './pages/CouncilPage'
 import { BasnaPage } from './pages/BasnaPage'
@@ -47,7 +48,7 @@ import { BeingsPage } from './pages/BeingsPage'
 import { PublicBeingPage } from './pages/PublicBeingPage'
 import { useUIStore } from './stores/uiStore'
 import { useAgentStore } from './stores/agentStore'
-import { useAuthStore, selectKioskLocked, awaitAuthStatus, refreshAccessToken, reloadAfterSessionEnd } from './stores/authStore'
+import { useAuthStore, selectKioskLocked, awaitAuthStatus, refreshAccessToken, reloadAfterSessionEnd, DEFAULT_INSTANCE_NAME } from './stores/authStore'
 import { useChatStore } from './stores/chatStore'
 import { useContainerStore } from './stores/containerStore'
 import { useLocalAgentStore } from './stores/localAgentStore'
@@ -575,6 +576,8 @@ function AppContent() {
 function App() {
   const authEnabled = useAuthStore((s) => s.authEnabled)
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated)
+  const mustChangePassword = useAuthStore((s) => s.user?.must_change_password === true)
+  const instanceName = useAuthStore((s) => s.branding.name)
   const [authChecked, setAuthChecked] = useState(false)
   const [fdUnreachable, setFdUnreachable] = useState(false)
 
@@ -609,6 +612,9 @@ function App() {
     return () => { cancelled = true }
   }, [])
 
+  // The browser tab carries the deck's name (Admin → Settings → Branding).
+  useEffect(() => { document.title = instanceName || DEFAULT_INSTANCE_NAME }, [instanceName])
+
   // After login, hydrate stores. On the way back out (sign-out, or a session
   // that expired: a 401 whose refresh failed → clearAuth()), reload instead of
   // just showing LoginPage over the old session's sockets and stores — see
@@ -637,6 +643,11 @@ function App() {
   // Auth enabled but not logged in → show login page
   if (authEnabled && !isAuthenticated) {
     return <LoginPage />
+  }
+
+  // An admin set this account's password: the user picks their own first.
+  if (authEnabled && mustChangePassword) {
+    return <ChoosePasswordPage />
   }
 
   // Auth disabled or authenticated → show main app

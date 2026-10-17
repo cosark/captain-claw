@@ -165,6 +165,33 @@ export function SharedTelegramBotAdmin({ refreshTick = 0 }: { refreshTick?: numb
         </div>
       )}
 
+      {cfg?.configured && (
+        <label className="flex items-start justify-between gap-4 rounded-md border border-zinc-800 bg-zinc-950/50 px-3 py-2.5">
+          <div>
+            <div className="text-sm text-zinc-300">Approve requests automatically</div>
+            <div className="text-xs text-zinc-500 mt-0.5">
+              Anyone on this deck who asks gets the bot at once, with their own agent. Someone you turned
+              down still waits for you. Switching it on also approves the requests waiting now.
+            </div>
+          </div>
+          <input
+            type="checkbox"
+            role="switch"
+            checked={cfg.auto_approve}
+            disabled={busy}
+            onChange={(e) => {
+              const on = e.target.checked
+              if (on && pending.length > 0
+                && !confirm(`Approve requests automatically? The ${pending.length} waiting now ${pending.length === 1 ? 'is' : 'are'} approved too.`)) {
+                return
+              }
+              run(() => saveAdminTelegram({ auto_approve: on }))
+            }}
+            className="mt-1 h-4 w-4 shrink-0 accent-violet-600"
+          />
+        </label>
+      )}
+
       {data?.status.error && cfg?.enabled && (
         <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
           <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5" />

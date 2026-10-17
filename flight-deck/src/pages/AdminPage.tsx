@@ -28,6 +28,7 @@ import { DeckProfileDefaults } from '../components/profile/DeckProfileDefaults'
 import { SharedTelegramBotAdmin } from '../components/admin/SharedTelegramBotAdmin'
 import { SharedCredentialsAdmin } from '../components/admin/SharedCredentialsAdmin'
 import { WaitlistAdmin, fetchWaitlist } from '../components/admin/WaitlistAdmin'
+import { BrandingAdmin } from '../components/admin/BrandingAdmin'
 import { ADMIN_TAB_KEY } from '../services/sharedIntegrations'
 
 type AdminTab = 'users' | 'waitlist' | 'usage' | 'plans' | 'settings' | 'integrations'
@@ -68,11 +69,15 @@ interface SystemConfig {
   // While self-registration is closed, sign-up takes waitlist applications.
   waitlist_enabled: boolean
   waitlist_cohort: string
+  // Branding: the panels' title and the sign-in page (the logo: BrandingCard).
+  instance_name: string
+  instance_description: string
 }
 
 const CONFIG_DEFAULTS: SystemConfig = {
   docker_spawn_enabled: true, kiosk_mode: 'off', kiosk_new_users: false,
   waitlist_enabled: true, waitlist_cohort: 'CC Cohort 001',
+  instance_name: 'Flight Deck', instance_description: 'Agent Management Console',
 }
 
 const KIOSK_MODES: { value: KioskMode; label: string; hint: string }[] = [
@@ -83,6 +88,11 @@ const KIOSK_MODES: { value: KioskMode; label: string; hint: string }[] = [
 
 function userKioskFlag(user: UserInfo): boolean {
   try { return JSON.parse(user.metadata || '{}').kiosk === true } catch { return false }
+}
+
+// An admin set their password and they haven't chosen their own yet.
+function userMustChangePassword(user: UserInfo): boolean {
+  try { return JSON.parse(user.metadata || '{}').must_change_password === true } catch { return false }
 }
 
 // What the server resolves as the user's lock (auth_routes._user_payload).
@@ -155,6 +165,7 @@ async function createUser(payload: {
   display_name?: string
   role?: string
   kiosk?: boolean
+  must_change_password?: boolean
 }): Promise<void> {
   const res = await fetch('/fd/admin/users', {
     method: 'POST', headers: _headers(), credentials: 'include',
@@ -297,12 +308,14 @@ function CreateUserForm({ onCreated, config }: { onCreated: () => void; config: 
   const [role, setRole] = useState('user')
   // Starts at the deck's "new users start in kiosk mode".
   const [kiosk, setKiosk] = useState(config.kiosk_new_users)
+  // You know the password you type here: they pick their own at first sign-in.
+  const [mustChange, setMustChange] = useState(true)
   const [saving, setSaving] = useState(false)
   const [err, setErr] = useState('')
 
   const reset = () => {
     setEmail(''); setPassword(''); setDisplayName(''); setRole('user')
-    setKiosk(config.kiosk_new_users); setErr('')
+    setKiosk(config.kiosk_new_users); setMustChange(true); setErr('')
   }
   useEffect(() => { setKiosk(config.kiosk_new_users) }, [config.kiosk_new_users])
 
@@ -317,6 +330,7 @@ function CreateUserForm({ onCreated, config }: { onCreated: () => void; config: 
         password,
         display_name: displayName.trim() || undefined,
         role,
+        must_change_password: mustChange,
         ...(role === 'admin' ? {} : { kiosk }),
       })
       reset()
@@ -395,6 +409,14 @@ function CreateUserForm({ onCreated, config }: { onCreated: () => void; config: 
             className="w-full rounded-md border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-sm text-zinc-200 focus:border-violet-500/50 focus:outline-none"
           />
         </div>
+        <div className="col-span-2">
+          <MustChangeCheckbox
+            checked={mustChange}
+            onChange={setMustChange}
+            label="They choose their own password at first sign-in"
+            note="Turn off for a shared account that everyone signs in with (a kiosk)."
+          />
+        </div>
         {role !== 'admin' && (
           <div className="col-span-2">
             <KioskCheckbox checked={kiosk} onChange={setKiosk} note={kioskModeNote(config.kiosk_mode)} />
@@ -436,6 +458,28 @@ function KioskCheckbox({ checked, onChange, note }: {
           className="h-3.5 w-3.5 rounded border-zinc-600 bg-zinc-950 accent-violet-600"
         />
         Kiosk mode <span className="text-xs text-zinc-500">— simple chat only</span>
+      </label>
+      {note && <p className="mt-1 ml-5 text-[11px] text-zinc-500">{note}</p>}
+    </div>
+  )
+}
+
+function MustChangeCheckbox({ checked, onChange, label, note }: {
+  checked: boolean
+  onChange: (v: boolean) => void
+  label: string
+  note?: string
+}) {
+  return (
+    <div>
+      <label className="flex items-center gap-2 text-sm text-zinc-300 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={(e) => onChange(e.target.checked)}
+          className="h-3.5 w-3.5 rounded border-zinc-600 bg-zinc-950 accent-violet-600"
+        />
+        {label}
       </label>
       {note && <p className="mt-1 ml-5 text-[11px] text-zinc-500">{note}</p>}
     </div>
@@ -514,6 +558,15 @@ function UserRow({
           </div>
           <div className="text-xs text-zinc-500">{user.email}</div>
         </div>
+        {userMustChangePassword(user) && (
+          <span
+            title="An admin set this password; they choose their own at their next sign-in"
+            className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-700 dark:text-amber-300"
+          >
+            <KeyRound className="h-3 w-3" />
+            temporary password
+          </span>
+        )}
         {kioskEffective(user.role, userKioskFlag(user), kioskMode) && (
           <span
             title="Locked to the simple chat layout (kiosk mode)"
@@ -602,7 +655,7 @@ function UserRow({
             )}
           </div>
 
-          <SetPasswordSection userId={user.id} email={user.email} isSelf={isSelf} />
+          <SetPasswordSection userId={user.id} email={user.email} isSelf={isSelf} onSet={onUpdate} />
         </div>
       )}
       {agentsOpen && (
@@ -618,11 +671,17 @@ function UserRow({
 
 // Admin sets someone's password (they forgot it, or it leaked) — no current
 // password needed. Its own action, apart from Save Changes. Their own: Profile.
-function SetPasswordSection({ userId, email, isSelf }: { userId: string; email: string; isSelf: boolean }) {
+function SetPasswordSection({ userId, email, isSelf, onSet }: {
+  userId: string
+  email: string
+  isSelf: boolean
+  onSet: () => void
+}) {
   const setView = useUIStore((s) => s.setView)
   const [password, setPassword] = useState('')
   const [confirm, setConfirm] = useState('')
   const [signOut, setSignOut] = useState(true)
+  const [mustChange, setMustChange] = useState(true)
   const [saving, setSaving] = useState(false)
   const [notice, setNotice] = useState('')
   const [err, setErr] = useState('')
@@ -647,9 +706,14 @@ function SetPasswordSection({ userId, email, isSelf }: { userId: string; email: 
     if (!valid) return
     setSaving(true); setErr(''); setNotice('')
     try {
-      await updateUser(userId, { password, sign_out: signOut })
+      await updateUser(userId, { password, sign_out: signOut, must_change_password: mustChange })
       setPassword(''); setConfirm('')
-      setNotice(signOut ? 'Password set. They were signed out everywhere.' : 'Password set.')
+      setNotice([
+        'Password set.',
+        signOut && 'They were signed out everywhere.',
+        mustChange && 'They choose their own at their next sign-in.',
+      ].filter(Boolean).join(' '))
+      onSet()
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'Failed to set password')
     }
@@ -708,6 +772,15 @@ function SetPasswordSection({ userId, email, isSelf }: { userId: string; email: 
             className="h-3.5 w-3.5 rounded border-zinc-600 bg-zinc-950 accent-violet-600"
           />
           Sign them out everywhere
+        </label>
+        <label className="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={mustChange}
+            onChange={(e) => setMustChange(e.target.checked)}
+            className="h-3.5 w-3.5 rounded border-zinc-600 bg-zinc-950 accent-violet-600"
+          />
+          They choose their own at next sign-in
         </label>
       </div>
       {notice && <p className="text-xs text-emerald-400">{notice}</p>}
@@ -1090,6 +1163,16 @@ export function AdminPage() {
         {/* Settings tab */}
         {!loading && tab === 'settings' && (
           <div className="space-y-4">
+            <BrandingAdmin
+              name={config.instance_name}
+              description={config.instance_description}
+              onSave={async (patch) => {
+                const next = await saveConfig(patch)
+                setConfig(next)
+                return next
+              }}
+            />
+
             <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-4 space-y-4">
               <h3 className="text-sm font-semibold text-zinc-200">Spawn Settings</h3>
               <label className="flex items-center justify-between cursor-pointer">
@@ -1200,7 +1283,8 @@ export function AdminPage() {
                 <div>
                   <div className="text-sm text-zinc-300">Take waitlist applications</div>
                   <div className="text-xs text-zinc-500 mt-0.5">
-                    Off: the sign-up page only says to ask an administrator. Applications already in stay listed.
+                    Off: the sign-in page says sign-up is closed and that an administrator creates accounts
+                    (Users → Add user). Applications already in stay listed.
                   </div>
                 </div>
                 <Switch

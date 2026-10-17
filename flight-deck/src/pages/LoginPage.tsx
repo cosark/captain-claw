@@ -1,14 +1,13 @@
 import { useState } from 'react'
+import { ArrowRight, AtSign, CheckCircle2, KeyRound, Loader2, Lock, Mail, User, UserCheck } from 'lucide-react'
 import { checkAuthStatus, joinWaitlist, loginUser, registerUser, useAuthStore } from '../stores/authStore'
-import { APP_VERSION, BUILD_DATE } from '../version'
+import { AuthCard, AuthError, AuthField, AuthShell } from '../components/auth/AuthShell'
 
 type Mode = 'login' | 'register' | 'waitlist' | 'applied'
 
-const INPUT =
-  'w-full bg-[#0a0a1a] border border-zinc-700 rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-indigo-500 placeholder-zinc-600'
-
 export function LoginPage() {
   const signUp = useAuthStore((s) => s.signUp)
+  const name = useAuthStore((s) => s.branding.name)
   const [mode, setMode] = useState<Mode>('login')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -20,6 +19,8 @@ export function LoginPage() {
   const [loading, setLoading] = useState(false)
 
   const cohort = signUp.cohort
+  // What "the other tab" is: creating an account, applying, or nothing at all.
+  const signUpMode: Mode | null = signUp.mode === 'register' ? 'register' : signUp.mode === 'waitlist' ? 'waitlist' : null
 
   const switchTo = (next: Mode) => {
     setMode(next)
@@ -60,176 +61,176 @@ export function LoginPage() {
     }
   }
 
-  const title =
-    mode === 'login' ? 'Sign In' : mode === 'register' ? 'Create Account' : 'Join the Waitlist'
+  if (mode === 'applied') {
+    return (
+      <AuthShell>
+        <AuthCard>
+          <div className="flex flex-col items-center text-center">
+            <div className="flex h-14 w-14 items-center justify-center rounded-full bg-emerald-400/10 ring-1 ring-emerald-300/30">
+              <CheckCircle2 className="h-7 w-7 text-emerald-300" />
+            </div>
+            <h2 className="mt-5 text-2xl font-semibold tracking-tight text-white">You're on the waitlist</h2>
+            <p className="mt-3 text-sm leading-relaxed text-white/65">
+              Thanks{displayName.trim() ? `, ${displayName.trim()}` : ''}. Your application
+              {appliedCohort ? <> for <span className="font-medium text-white">{appliedCohort}</span></> : null} is in.
+            </p>
+            <p className="mt-2 text-sm leading-relaxed text-white/50">
+              An administrator will review it. Once you're approved, sign in with{' '}
+              <span className="text-white/85">{email.trim()}</span> and the password you chose.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => { setPassword(''); switchTo('login') }}
+            className="fd-auth-primary mt-7 flex h-11 w-full items-center justify-center gap-2 rounded-xl text-sm font-medium text-white"
+          >
+            Back to sign in
+            <ArrowRight className="h-4 w-4" />
+          </button>
+        </AuthCard>
+      </AuthShell>
+    )
+  }
+
+  const heading =
+    mode === 'login' ? 'Welcome back' : mode === 'register' ? 'Create your account' : 'Join the waitlist'
+  const subheading =
+    mode === 'login'
+      ? `Sign in to ${name}.`
+      : mode === 'register'
+        ? `Set up your account on ${name}.`
+        : cohort
+          ? <>Sign-up is by application. Apply for <span className="font-medium text-violet-200">{cohort}</span> — an administrator reviews each one.</>
+          : 'Sign-up is by application — an administrator reviews each one.'
   const submitLabel =
-    mode === 'login' ? 'Sign In' : mode === 'register' ? 'Create Account' : cohort ? `Apply for ${cohort}` : 'Join the waitlist'
+    mode === 'login' ? 'Sign in' : mode === 'register' ? 'Create account' : cohort ? `Apply for ${cohort}` : 'Apply'
 
   return (
-    <div className="min-h-screen bg-[#0a0a1a] flex items-center justify-center px-4 py-8">
-      <div className="w-full max-w-sm">
-        <div className="text-center mb-8">
-          <h1 className="text-2xl font-bold text-white tracking-tight">Flight Deck</h1>
-          <p className="text-zinc-500 text-sm mt-1">Agent Management Console</p>
-          <p className="text-zinc-600 text-xs mt-1">v{APP_VERSION} &middot; {BUILD_DATE}</p>
+    <AuthShell>
+      <AuthCard>
+        {signUpMode && (
+          <div role="tablist" aria-label="Sign in or sign up" className="mb-7 grid grid-cols-2 rounded-xl bg-white/[0.05] p-1 ring-1 ring-white/[0.07]">
+            {(['login', signUpMode] as Mode[]).map((m) => (
+              <button
+                key={m}
+                type="button"
+                role="tab"
+                aria-selected={mode === m}
+                onClick={() => switchTo(m)}
+                className={`h-9 rounded-lg text-sm font-medium transition-all ${
+                  mode === m
+                    ? 'bg-white/[0.12] text-white shadow-sm ring-1 ring-white/10'
+                    : 'text-white/50 hover:text-white/80'
+                }`}
+              >
+                {m === 'login' ? 'Sign in' : m === 'register' ? 'Create account' : 'Join waitlist'}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <div className="mb-6">
+          <h2 className="text-2xl font-semibold tracking-tight text-white">{heading}</h2>
+          <p className="mt-1.5 text-sm leading-relaxed text-white/55">{subheading}</p>
         </div>
 
-        {mode === 'applied' ? (
-          <div className="bg-[#12122a] border border-zinc-800 rounded-lg p-6 space-y-4">
-            <h2 className="text-lg font-semibold text-white">You're on the waitlist</h2>
-            <p className="text-sm text-zinc-300">
-              Thanks{displayName.trim() ? `, ${displayName.trim()}` : ''}. Your application
-              {appliedCohort ? <> for <span className="text-white font-medium">{appliedCohort}</span></> : null} is in.
-            </p>
-            <p className="text-sm text-zinc-400">
-              An administrator will review it. Once you're approved, sign in with{' '}
-              <span className="text-zinc-200">{email.trim()}</span> and the password you chose.
-            </p>
-            <button
-              type="button"
-              onClick={() => { setPassword(''); switchTo('login') }}
-              className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-medium py-2 rounded text-sm transition-colors"
-            >
-              Back to sign in
-            </button>
-          </div>
-        ) : (
-          <form onSubmit={handleSubmit} className="bg-[#12122a] border border-zinc-800 rounded-lg p-6 space-y-4">
-            <div>
-              <h2 className="text-lg font-semibold text-white">{title}</h2>
-              {mode === 'waitlist' && (
-                <p className="text-xs text-zinc-400 mt-1.5">
-                  Registration is closed.
-                  {cohort ? <> Apply for <span className="text-indigo-300 font-medium">{cohort}</span> — </> : ' '}
-                  an administrator reviews each application, and you can sign in once you're approved.
-                </p>
-              )}
-            </div>
+        <form onSubmit={handleSubmit} className="space-y-4">
+          {error && <AuthError>{error}</AuthError>}
 
-            {error && (
-              <div className="text-red-400 text-sm bg-red-950/30 border border-red-900/50 rounded px-3 py-2">
-                {error}
+          {(mode === 'register' || mode === 'waitlist') && (
+            <AuthField
+              label={mode === 'waitlist' ? 'Your name' : 'Display name'}
+              icon={User}
+              value={displayName}
+              onChange={(e) => setDisplayName(e.target.value)}
+              placeholder="Your name"
+              autoComplete="name"
+              required={mode === 'waitlist'}
+              maxLength={100}
+            />
+          )}
+
+          <AuthField
+            label="Email"
+            icon={Mail}
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            placeholder="you@example.com"
+            autoComplete={mode === 'login' ? 'username' : 'email'}
+            required
+            autoFocus
+          />
+
+          <AuthField
+            label="Password"
+            icon={Lock}
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder={mode === 'login' ? 'Your password' : 'At least 6 characters'}
+            autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
+            required
+            minLength={6}
+            hint={mode === 'waitlist' ? "You'll sign in with this once you're approved." : undefined}
+          />
+
+          {mode === 'waitlist' && (
+            <fieldset className="space-y-4 pt-2">
+              <legend className="sr-only">Who recommended you</legend>
+              <div className="flex items-center gap-3 pb-1">
+                <div className="h-px flex-1 bg-white/10" />
+                <span className="flex items-center gap-1.5 text-xs font-medium text-white/60">
+                  <UserCheck className="h-3.5 w-3.5" />
+                  Who recommended you?
+                </span>
+                <div className="h-px flex-1 bg-white/10" />
               </div>
-            )}
-
-            {(mode === 'register' || mode === 'waitlist') && (
-              <div>
-                <label className="block text-sm text-zinc-300 mb-1">
-                  {mode === 'waitlist' ? 'Your Name' : 'Display Name'}
-                </label>
-                <input
-                  type="text"
-                  value={displayName}
-                  onChange={(e) => setDisplayName(e.target.value)}
-                  className={INPUT}
-                  placeholder="Your name"
-                  required={mode === 'waitlist'}
-                  maxLength={100}
-                />
-              </div>
-            )}
-
-            <div>
-              <label className="block text-sm text-zinc-300 mb-1">Email</label>
-              <input
+              <AuthField
+                label="Their name"
+                icon={User}
+                value={referrerName}
+                onChange={(e) => setReferrerName(e.target.value)}
+                placeholder="Who recommended you"
+                required
+                maxLength={100}
+              />
+              <AuthField
+                label="Their email"
+                icon={AtSign}
                 type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                className={INPUT}
-                placeholder="you@example.com"
+                value={referrerEmail}
+                onChange={(e) => setReferrerEmail(e.target.value)}
+                placeholder="them@example.com"
                 required
-                autoFocus
               />
+            </fieldset>
+          )}
+
+          <button
+            type="submit"
+            disabled={loading}
+            className="fd-auth-primary mt-2 flex h-11 w-full items-center justify-center gap-2 rounded-xl text-sm font-medium text-white"
+          >
+            {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+            {loading ? 'Please wait…' : submitLabel}
+            {!loading && <ArrowRight className="h-4 w-4" />}
+          </button>
+        </form>
+
+        {/* Sign-up closed and no waitlist: an administrator creates accounts. */}
+        {mode === 'login' && !signUpMode && (
+          <div className="mt-6 flex items-start gap-3 rounded-xl border border-white/[0.08] bg-white/[0.03] px-4 py-3.5">
+            <KeyRound className="mt-0.5 h-4 w-4 shrink-0 text-violet-200/80" />
+            <div className="text-sm leading-relaxed">
+              <p className="font-medium text-white/85">Sign-up is closed</p>
+              <p className="mt-0.5 text-white/50">
+                Accounts on {name} are created by an administrator. Ask yours to set one up for you.
+              </p>
             </div>
-
-            <div>
-              <label className="block text-sm text-zinc-300 mb-1">Password</label>
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className={INPUT}
-                placeholder="At least 6 characters"
-                autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
-                required
-                minLength={6}
-              />
-              {mode === 'waitlist' && (
-                <p className="text-xs text-zinc-500 mt-1">You'll sign in with this once you're approved.</p>
-              )}
-            </div>
-
-            {mode === 'waitlist' && (
-              <fieldset className="space-y-3 border-t border-zinc-800 pt-4">
-                <legend className="sr-only">Who recommended you</legend>
-                <div>
-                  <p className="text-sm font-medium text-zinc-200">Who recommended you?</p>
-                  <p className="text-xs text-zinc-500 mt-0.5">
-                    {cohort ? `${cohort} is` : 'Applications are'} by recommendation — name the person who referred you.
-                  </p>
-                </div>
-                <div>
-                  <label className="block text-sm text-zinc-300 mb-1">Their Name</label>
-                  <input
-                    type="text"
-                    value={referrerName}
-                    onChange={(e) => setReferrerName(e.target.value)}
-                    className={INPUT}
-                    placeholder="Who recommended you"
-                    required
-                    maxLength={100}
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm text-zinc-300 mb-1">Their Email</label>
-                  <input
-                    type="email"
-                    value={referrerEmail}
-                    onChange={(e) => setReferrerEmail(e.target.value)}
-                    className={INPUT}
-                    placeholder="them@example.com"
-                    required
-                  />
-                </div>
-              </fieldset>
-            )}
-
-            <button
-              type="submit"
-              disabled={loading}
-              className="w-full bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-800 disabled:cursor-not-allowed text-white font-medium py-2 rounded text-sm transition-colors"
-            >
-              {loading ? 'Please wait...' : submitLabel}
-            </button>
-
-            <div className="text-center text-sm text-zinc-400">
-              {mode === 'login' ? (
-                signUp.mode === 'closed' ? (
-                  <>No account? Ask an administrator to create one.</>
-                ) : (
-                  <>
-                    No account?{' '}
-                    <button
-                      type="button"
-                      onClick={() => switchTo(signUp.mode === 'waitlist' ? 'waitlist' : 'register')}
-                      className="text-indigo-400 hover:text-indigo-300"
-                    >
-                      {signUp.mode === 'waitlist' ? 'Join the waitlist' : 'Create one'}
-                    </button>
-                  </>
-                )
-              ) : (
-                <>
-                  Already have an account?{' '}
-                  <button type="button" onClick={() => switchTo('login')} className="text-indigo-400 hover:text-indigo-300">
-                    Sign in
-                  </button>
-                </>
-              )}
-            </div>
-          </form>
+          </div>
         )}
-      </div>
-    </div>
+      </AuthCard>
+    </AuthShell>
   )
 }

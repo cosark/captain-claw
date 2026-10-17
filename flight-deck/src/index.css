@@ -209,3 +209,79 @@ html.light .text-amber-400 { color: #d97706 !important; }
 html.light .border-violet-500\/50 { border-color: rgba(139,92,246,0.45) !important; }
 html.light .bg-violet-500\/10 { background-color: rgba(139,92,246,0.1) !important; }
 html.light .bg-violet-500\/5 { background-color: rgba(139,92,246,0.06) !important; }
+
+/* ── Sign-in / sign-up / first password (AuthShell) ──
+   Always the deck's night palette, whatever the app theme: these screens come
+   before any preference loads. Own classes and white/alpha utilities only, so
+   the html.light zinc remap never reaches them. */
+.fd-auth {
+  color-scheme: dark;
+  background:
+    radial-gradient(60rem 40rem at 12% -10%, rgba(124, 58, 237, 0.28), transparent 60%),
+    radial-gradient(50rem 36rem at 105% 110%, rgba(56, 189, 248, 0.14), transparent 60%),
+    radial-gradient(40rem 30rem at 70% 20%, rgba(99, 102, 241, 0.12), transparent 65%),
+    #07070f;
+  color: #f4f4f5;
+}
+.fd-auth-grid {
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: radial-gradient(ellipse 70% 60% at 30% 40%, #000 30%, transparent 75%);
+  -webkit-mask-image: radial-gradient(ellipse 70% 60% at 30% 40%, #000 30%, transparent 75%);
+}
+.fd-auth-glow {
+  background: radial-gradient(closest-side, rgba(139, 92, 246, 0.35), transparent);
+  filter: blur(40px);
+  animation: fd-auth-drift 18s ease-in-out infinite alternate;
+}
+@keyframes fd-auth-drift {
+  from { transform: translate3d(-4%, -2%, 0) scale(1); }
+  to { transform: translate3d(6%, 4%, 0) scale(1.12); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fd-auth-glow { animation: none; }
+}
+.fd-auth-title {
+  background: linear-gradient(180deg, #ffffff 30%, rgba(221, 214, 254, 0.75));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+.fd-auth-card {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.03));
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  box-shadow: 0 30px 80px -20px rgba(0, 0, 0, 0.7), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+}
+.fd-auth-input {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: #fafafa;
+  transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+}
+.fd-auth-input::placeholder { color: rgba(255, 255, 255, 0.3); }
+.fd-auth-input:hover { border-color: rgba(255, 255, 255, 0.18); }
+.fd-auth-input:focus {
+  outline: none;
+  background: rgba(255, 255, 255, 0.07);
+  border-color: rgba(167, 139, 250, 0.7);
+  box-shadow: 0 0 0 4px rgba(139, 92, 246, 0.18);
+}
+.fd-auth-input:-webkit-autofill,
+.fd-auth-input:-webkit-autofill:hover,
+.fd-auth-input:-webkit-autofill:focus {
+  -webkit-text-fill-color: #fafafa;
+  -webkit-box-shadow: 0 0 0 1000px #16152a inset;
+  caret-color: #fafafa;
+}
+.fd-auth-primary {
+  background: linear-gradient(135deg, #8b5cf6, #6366f1 55%, #4f46e5);
+  box-shadow: 0 10px 30px -10px rgba(124, 58, 237, 0.8), inset 0 1px 0 rgba(255, 255, 255, 0.18);
+  transition: filter 0.15s, transform 0.05s, opacity 0.15s;
+}
+.fd-auth-primary:hover:not(:disabled) { filter: brightness(1.1); }
+.fd-auth-primary:active:not(:disabled) { transform: translateY(1px); }
+.fd-auth-primary:disabled { opacity: 0.6; cursor: not-allowed; }

@@ -2,7 +2,6 @@ import { useState, useMemo } from 'react'
 import {
   Monitor,
   Plus,
-  Radio,
   ChevronLeft,
   Settings,
   Check,
@@ -37,7 +36,6 @@ import {
   IdCard,
 } from 'lucide-react'
 import { useUIStore } from '../../stores/uiStore'
-import { APP_VERSION, BUILD_DATE } from '../../version'
 import { useAgentStore } from '../../stores/agentStore'
 import { useAuthStore } from '../../stores/authStore'
 import { useConnectionStore } from '../../stores/connectionStore'
@@ -45,6 +43,7 @@ import { useChatStore } from '../../stores/chatStore'
 import { useOnboardingStore } from '../../stores/onboardingStore'
 import { botportWS } from '../../services/ws'
 import { StatusBadge } from '../common/StatusBadge'
+import { BrandMark } from '../common/BrandMark'
 import type { ViewMode } from '../../types'
 
 type NavItem = { id: ViewMode; icon: typeof Monitor; label: string; adminOnly?: boolean }
@@ -174,15 +173,7 @@ export function Sidebar() {
     >
       {/* Header */}
       <div className="flex h-14 items-center justify-between border-b border-zinc-800 px-3">
-        {sidebarOpen && (
-          <div className="flex items-center gap-2">
-            <Radio className={`h-4 w-4 ${wsConnected ? 'text-emerald-400' : 'text-zinc-600'}`} />
-            <div>
-              <span className="text-sm font-semibold tracking-tight">Flight Deck</span>
-              <div className="text-[9px] text-zinc-600 leading-none">v{APP_VERSION} &middot; {BUILD_DATE}</div>
-            </div>
-          </div>
-        )}
+        {sidebarOpen && <BrandMark connected={wsConnected} />}
         <div className="flex items-center gap-0.5">
           {sidebarOpen && (
             <button

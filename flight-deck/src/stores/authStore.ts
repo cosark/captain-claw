@@ -9,7 +9,21 @@ export interface User {
   // Held to the kiosk (simple-chat) layout — resolved by the server from the
   // deck's kiosk mode and this user's flag (Admin page); never an admin.
   kiosk?: boolean
+  // An admin set this password: the user chooses their own before the app
+  // opens (cleared by the server once they change it).
+  must_change_password?: boolean
 }
+
+// The deck's branding (Admin → Settings → Branding): the name in the panels'
+// title and on the sign-in page, a short description shown there, and a logo
+// ('' = none; a versioned /fd/branding/logo URL).
+export interface Branding {
+  name: string
+  description: string
+  logo: string
+}
+
+export const DEFAULT_INSTANCE_NAME = 'Flight Deck'
 
 // What "No account?" on the sign-in page leads to: creating an account
 // (registration open), applying on the waitlist for `cohort` (an admin
@@ -33,6 +47,7 @@ export interface AuthStore {
   // A sign-out is in flight (logoutUser) — the sign-out buttons show it.
   signingOut: boolean
   signUp: SignUp
+  branding: Branding
 
   setAuth: (user: User, token: string) => void
   clearAuth: () => void
@@ -41,6 +56,7 @@ export interface AuthStore {
   setInternalFdUrl: (url: string) => void
   setSimpleChatOnly: (v: boolean) => void
   setSignUp: (v: SignUp) => void
+  setBranding: (v: Partial<Branding>) => void
   setToken: (token: string) => void
 }
 
@@ -54,6 +70,7 @@ export const useAuthStore = create<AuthStore>((set) => ({
   simpleChatOnly: false,
   signingOut: false,
   signUp: { mode: 'register', cohort: '' },
+  branding: { name: DEFAULT_INSTANCE_NAME, description: '', logo: '' },
 
   setAuth: (user, token) => set({ user, token, isAuthenticated: true }),
   clearAuth: () => set({ user: null, token: '', isAuthenticated: false }),
@@ -62,6 +79,7 @@ export const useAuthStore = create<AuthStore>((set) => ({
   setInternalFdUrl: (url) => set({ internalFdUrl: url }),
   setSimpleChatOnly: (v) => set({ simpleChatOnly: v }),
   setSignUp: (v) => set({ signUp: v }),
+  setBranding: (v) => set((s) => ({ branding: { ...s.branding, ...v } })),
   setToken: (token) => set({ token }),
 }))
 
@@ -110,6 +128,14 @@ export async function checkAuthStatus(): Promise<boolean> {
       cohort: typeof data.waitlist_cohort === 'string' ? data.waitlist_cohort : '',
     })
   }
+  useAuthStore.getState().setBranding({
+    name: typeof data.instance_name === 'string' && data.instance_name ? data.instance_name : DEFAULT_INSTANCE_NAME,
+    description: typeof data.instance_description === 'string'
+      ? data.instance_description
+      // A deck that predates branding: the sign-in page's old tagline.
+      : 'Agent Management Console',
+    logo: typeof data.instance_logo === 'string' ? data.instance_logo : '',
+  })
   return enabled
 }
 
@@ -149,8 +175,22 @@ export async function loginUser(email: string, password: string): Promise<User> 
     throw new Error(body.detail || 'Login failed')
   }
   const data = await res.json()
+  _signInPassword = data.user?.must_change_password ? password : ''
   useAuthStore.getState().setAuth(data.user, data.access_token)
   return data.user
+}
+
+// The password a user whose password an admin set just signed in with — kept
+// in memory (never stored) so choosing their own doesn't ask for it again.
+// Gone after a reload (then they type it) and once the new one is set.
+let _signInPassword = ''
+
+export function signInPassword(): string {
+  return _signInPassword
+}
+
+export function forgetSignInPassword(): void {
+  _signInPassword = ''
 }
 
 export async function registerUser(email: string, password: string, displayName: string): Promise<User> {

@@ -33,6 +33,8 @@ class CreateUserRequest(BaseModel):
     display_name: str | None = None
     role: str = "user"
     kiosk: bool | None = None  # None = the deck's "new users start in kiosk"
+    # The admin knows this password: the user picks their own at first sign-in.
+    must_change_password: bool = True
 
 
 class UpdateUserRequest(BaseModel):
@@ -46,6 +48,8 @@ class UpdateUserRequest(BaseModel):
     spawns_per_hour: int | None = None
     password: str | None = None  # admin password reset (min 6 chars)
     sign_out: bool | None = None  # with a reset: end the user's sessions everywhere
+    # They pick their own password at their next sign-in (set with a reset).
+    must_change_password: bool | None = None
 
 
 # ── Endpoints ──
@@ -89,6 +93,8 @@ async def create_user(body: CreateUserRequest, admin: dict = Depends(require_adm
 
     display = (body.display_name or "").strip() or email.split("@")[0]
     meta = await new_user_metadata(db, body.role, body.kiosk)
+    if body.must_change_password:
+        meta[MUST_CHANGE_PASSWORD] = True
     user = await db.create_user(
         email=email, password_hash=hash_password(body.password),
         display_name=display, role=body.role, metadata=meta,
@@ -97,7 +103,8 @@ async def create_user(body: CreateUserRequest, admin: dict = Depends(require_adm
         "ok": True,
         "user": {"id": user["id"], "email": user["email"],
                  "display_name": display, "role": body.role,
-                 "kiosk": meta.get("kiosk") is True},
+                 "kiosk": meta.get("kiosk") is True,
+                 "must_change_password": meta.get(MUST_CHANGE_PASSWORD) is True},
     }
 
 
@@ -142,6 +149,13 @@ async def update_user(
         pass
 
     changed_meta = False
+    # Not for the admin's own account: they change their password on Profile.
+    if body.must_change_password is not None and user_id != admin["id"]:
+        if body.must_change_password:
+            meta[MUST_CHANGE_PASSWORD] = True
+        else:
+            meta.pop(MUST_CHANGE_PASSWORD, None)
+        changed_meta = True
     if body.kiosk is not None:
         if body.kiosk:
             meta["kiosk"] = True
@@ -363,6 +377,8 @@ class UpdateConfigRequest(BaseModel):
     kiosk_new_users: bool | None = None
     waitlist_enabled: bool | None = None
     waitlist_cohort: str | None = None
+    instance_name: str | None = None  # blank = back to the default
+    instance_description: str | None = None
 
 
 class ProviderKeysRequest(BaseModel):
@@ -380,9 +396,15 @@ SYSTEM_CONFIG_DEFAULTS = {
     # approves them under Admin → Waitlist.
     "waitlist_enabled": True,
     "waitlist_cohort": "CC Cohort 001",
+    # Branding: the name in the panels' title and on the sign-in page, and the
+    # short description under it there (the logo: branding_routes).
+    "instance_name": "Flight Deck",
+    "instance_description": "Agent Management Console",
 }
 
 WAITLIST_COHORT_MAX = 60
+INSTANCE_NAME_MAX = 60
+INSTANCE_DESCRIPTION_MAX = 300
 
 # Kiosk (simple-chat) lock for the deck: "off" = nobody, "all" = every
 # non-admin, "selected" = the users an admin marked (user metadata "kiosk").
@@ -422,6 +444,15 @@ def _user_meta(user: dict) -> dict:
     except (json.JSONDecodeError, TypeError):
         return {}
     return meta if isinstance(meta, dict) else {}
+
+
+# User metadata flag: the account's password was set by an admin, so the user
+# chooses their own before anything else (cleared by changing it, PUT /fd/auth/me).
+MUST_CHANGE_PASSWORD = "must_change_password"
+
+
+def must_change_password(user: dict) -> bool:
+    return _user_meta(user).get(MUST_CHANGE_PASSWORD) is True
 
 
 def kiosk_locked(user: dict, cfg: dict) -> bool:
@@ -495,6 +526,24 @@ async def update_config(body: UpdateConfigRequest, admin: dict = Depends(require
         if len(cohort) > WAITLIST_COHORT_MAX:
             raise HTTPException(400, f"The cohort name is at most {WAITLIST_COHORT_MAX} characters")
         updates["waitlist_cohort"] = cohort
+    from captain_claw.flight_deck.auth_routes import _clean_text
+
+    reset: list[str] = []
+    if "instance_name" in updates:
+        name = _clean_text(updates["instance_name"], INSTANCE_NAME_MAX + 1)
+        if len(name) > INSTANCE_NAME_MAX:
+            raise HTTPException(400, f"The instance name is at most {INSTANCE_NAME_MAX} characters")
+        if name:
+            updates["instance_name"] = name
+        else:  # blank: the default name again
+            del updates["instance_name"]
+            reset.append("instance_name")
+    if "instance_description" in updates:
+        desc = _clean_text(updates["instance_description"], INSTANCE_DESCRIPTION_MAX + 1)
+        if len(desc) > INSTANCE_DESCRIPTION_MAX:
+            raise HTTPException(
+                400, f"The description is at most {INSTANCE_DESCRIPTION_MAX} characters")
+        updates["instance_description"] = desc  # blank: none shown
     raw = await db.get_system_setting("fd:system-config")
     # Store only what was stored or set here, not the merged defaults: an
     # unrelated toggle must not freeze the --simple-chat default into the DB.
@@ -505,6 +554,8 @@ async def update_config(body: UpdateConfigRequest, admin: dict = Depends(require
     if not isinstance(stored, dict):
         stored = {}
     stored.update(updates)
+    for key in reset:
+        stored.pop(key, None)
     stored.pop("kiosk_mode_from_env", None)
     await db.set_system_setting("fd:system-config", json.dumps(stored))
     return _load_system_config(json.dumps(stored))
