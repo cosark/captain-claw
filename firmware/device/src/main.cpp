@@ -1,8 +1,10 @@
-// Captain Claw voice client for the M5Stack StickS3.
+// Captain Claw voice client for the M5Stack StickS3 and StopWatch (board.h).
 //
-//   Front button (A)  hold = talk, release = send · tap = stop speaking / flip picture↔text
-//                     in the menu: choose / change the row
-//   Side button  (B)  click = next page / next row · hold = menu (hold again = close)
+//   Button A  (StickS3 front, StopWatch yellow)
+//             hold = talk, release = send · tap = stop speaking / flip picture↔text
+//             in the menu: choose / change the row
+//   Button B  (StickS3 side, StopWatch the other one)
+//             click = next page / next row · hold = menu (hold again = close)
 //   Hold A while switching on (or no Wi-Fi saved) = setup hotspot
 //
 // Talks to Flight Deck's /device/ws (captain_claw/flight_deck/device_bridge.py):
@@ -18,12 +20,13 @@
 #include <esp_timer.h>
 
 #include "audio.h"
+#include "board.h"
 #include "face.h"
 #include "portal.h"
 #include "settings.h"
 #include "ui.h"
 
-#define FW_VERSION "0.6.4"
+#define FW_VERSION "0.7.0"
 
 enum class Mode { Idle, Listening, Waiting, Reply, Image, Menu, Agents, CharPick, Status, Notice };
 
@@ -50,6 +53,9 @@ static uint32_t flashStartMs = 0;
 static bool flashing = false;
 static int rttMs = -1;
 static uint32_t lastPingMs = 0, lastReplyMs = 0, turns = 0;
+static uint8_t* imgPart = nullptr;  // a picture arriving in parts (PSRAM)
+static size_t imgPartLen = 0;
+static uint32_t buzzOffMs = 0;       // vibration motor runs until then (0 = off)
 
 static constexpr uint32_t kTapMs = 300;      // shorter press = tap, not talk
 static constexpr uint32_t kDimLeadMs = 2000;  // dims this long before the screen goes off
@@ -58,6 +64,7 @@ static constexpr uint32_t kFlashMs = 700;    // white / normal, every 100 ms
 static constexpr uint16_t kGreen = ui::rgb(40, 200, 90), kRed = ui::rgb(230, 50, 50);
 static constexpr uint16_t kYellow = ui::rgb(250, 200, 40), kCyan = ui::rgb(60, 210, 240);
 static constexpr uint16_t kOrange = ui::rgb(255, 150, 40), kText = ui::rgb(230, 230, 230);
+static constexpr size_t kMaxImage = 256 * 1024;
 
 // ── helpers ──────────────────────────────────────────────────────────
 
@@ -82,6 +89,14 @@ static void touch() {
     ui::brightness(kBright);
     dimmed = screenOff = false;
   }
+}
+
+// A short buzz of the vibration motor (StopWatch); the loop switches it off.
+static void buzz(uint16_t ms, uint8_t level = 200) {
+  if (!board::kHasMotor) return;
+  M5.Power.setVibration(level);
+  buzzOffMs = millis() + ms;
+  if (!buzzOffMs) buzzOffMs = 1;
 }
 
 static void sendJson(const JsonDocument& doc) {
@@ -210,21 +225,33 @@ static void showIdle() {
     ui::showFace(settings.character, agentLinked ? face::Pose::Idle : face::Pose::Sad, 0);
     return;
   }
-  bool ok = wsUp && agentLinked && WiFi.status() == WL_CONNECTED;
-  std::vector<ui::Row> rows;
-  rows.push_back({"Stick", ok ? String("ready — hold front button") : String("not ready"), ok ? kGreen : kYellow});
   bool wifiOk = WiFi.status() == WL_CONNECTED;
-  rows.push_back({"Wi-Fi", wifiOk ? WiFi.SSID() : String("not connected"), wifiOk ? kGreen : kRed});
-  rows.push_back({"Deck", wsUp ? serverHost() : String("connecting…"), wsUp ? kGreen : kRed});
-  rows.push_back({"Agent", agentLinked ? agentName : (wsUp ? String("waiting for agent") : String("-")),
-                  agentLinked ? kGreen : kYellow});
-  ui::showPanel(ok ? "All good" : "Getting ready", ok ? kGreen : kYellow, rows);
+  bool ok = wsUp && agentLinked && wifiOk;
+  ui::Home home;
+  home.ready = ok;
+  home.title = ok ? "All good" : "Getting ready";
+  home.color = ok ? kGreen : kYellow;
+  home.hint = ok        ? String("Hold the ") + board::kTalkButton + " to talk"
+              : !wifiOk ? String("No Wi-Fi")
+              : !wsUp   ? String("Connecting to Flight Deck…")
+                        : String("Waiting for the agent");
+  String noun = board::kNoun;
+  noun.setCharAt(0, toupper(noun[0]));
+  home.rows.push_back({noun, ok ? String("ready — hold ") + board::kTalkButton : String("not ready"), ok ? kGreen : kYellow});
+  home.rows.push_back({"Wi-Fi", wifiOk ? WiFi.SSID() : String("not connected"), wifiOk ? kGreen : kRed});
+  home.rows.push_back({"Deck", wsUp ? serverHost() : String("connecting…"), wsUp ? kGreen : kRed});
+  home.rows.push_back({"Agent", agentLinked ? agentName : (wsUp ? String("waiting for agent") : String("-")),
+                       agentLinked ? kGreen : kYellow});
+  ui::showHome(home);
 }
 
 // ── menu ─────────────────────────────────────────────────────────────
 
-enum MenuRow { MStatus, MAgent, MVolume, MBoost, MVoice, MDisplay, MTextSize, MCharacter, MBeep, MFlash, MLead,
-               MScreenOff, MPowerOff, MSetup, MCount };
+enum MenuRow { MStatus, MAgent, MVolume, MBoost, MVoice, MDisplay, MTextSize, MCharacter, MBeep, MFlash, MBuzz,
+               MLead, MScreenOff, MPowerOff, MSetup, MCount };
+
+// Rows this device has (only a device with a motor can buzz).
+static bool rowShown(int row) { return row != MBuzz || board::kHasMotor; }
 
 static constexpr uint8_t kVolumeSteps[] = {64, 128, 191, 255};  // 25 / 50 / 75 / 100 %
 static constexpr uint8_t kBoostSteps[] = {0, 6, 10};
@@ -244,6 +271,7 @@ static String menuLabel(int row) {
     case MCharacter: return String("Character: ") + face::name(settings.character) + " »";
     case MBeep: return String("Beep before speech: ") + (settings.cueBeep ? "on" : "off");
     case MFlash: return String("Flash before speech: ") + (settings.cueFlash ? "on" : "off");
+    case MBuzz: return String("Buzz before speech: ") + (settings.cueBuzz ? "on" : "off");
     case MLead: return "Cue lead: " + String(settings.cueLeadS) + " s";
     case MScreenOff: return "Screen off: " + String(settings.screenOffS) + " s";
     case MPowerOff: return "Power off: " + String(settings.powerOffS) + " s";
@@ -251,10 +279,77 @@ static String menuLabel(int row) {
   }
 }
 
-static std::vector<String> menuNames() {
-  std::vector<String> names;
-  for (int i = 0; i < MCount; ++i) names.push_back(menuLabel(i));
-  return names;
+// A menu row as a card: the round screen shows the value big in a badge.
+static ui::Item menuItem(int row) {
+  static const char* sizes[] = {"small", "medium", "large"};
+  auto onOff = [](bool on) { return String(on ? "on" : "off"); };
+  ui::Item it;
+  it.label = menuLabel(row);
+  it.note = "yellow = change";
+  switch (row) {
+    case MStatus: it.title = "Status"; it.glyph = ui::Glyph::Info; it.note = "Wi-Fi, deck, battery…"; break;
+    case MAgent:
+      it.title = "Agent";
+      it.badge = agentName.length() ? agentName : String("?");
+      it.glyph = agentName.length() ? ui::Glyph::Initials : ui::Glyph::None;
+      it.note = agentName.length() ? agentName + " · change" : String("none · choose one");
+      break;
+    case MVolume: it.title = "Volume"; it.badge = String((settings.volume * 100 + 127) / 255) + "%"; break;
+    case MBoost:
+      it.title = "Speech boost";
+      it.badge = settings.boostDb ? "+" + String(settings.boostDb) + " dB" : String("off");
+      it.on = settings.boostDb > 0;
+      break;
+    case MVoice: it.title = "Voice"; it.badge = settings.femaleVoice ? "female" : "male"; break;
+    case MDisplay: it.title = "Display"; it.badge = settings.iconMode ? "icons" : "text"; break;
+    case MTextSize:
+      it.title = "Text size";
+      it.badge = String("Aa");
+      it.note = String(sizes[settings.textSize]) + " · change";
+      break;
+    case MCharacter: it.title = "Character"; it.badge = face::name(settings.character); it.note = "yellow = browse"; break;
+    case MBeep: it.title = "Beep before speech"; it.badge = onOff(settings.cueBeep); it.on = settings.cueBeep; break;
+    case MFlash: it.title = "Flash before speech"; it.badge = onOff(settings.cueFlash); it.on = settings.cueFlash; break;
+    case MBuzz: it.title = "Buzz before speech"; it.badge = onOff(settings.cueBuzz); it.on = settings.cueBuzz; break;
+    case MLead: it.title = "Cue lead"; it.badge = String(settings.cueLeadS) + " s"; it.note = "how early the cue comes"; break;
+    case MScreenOff: it.title = "Screen off"; it.badge = String(settings.screenOffS) + " s"; it.note = "after this long idle"; break;
+    case MPowerOff: it.title = "Power off"; it.badge = String(settings.powerOffS) + " s"; it.note = "after this long idle"; break;
+    default: it.title = "Wi-Fi & settings"; it.glyph = ui::Glyph::Wifi; it.note = "opens the setup hotspot"; break;
+  }
+  return it;
+}
+
+// The rows this device shows, and where the selected one is among them.
+static std::vector<ui::Item> menuItems(int* shownSel) {
+  std::vector<ui::Item> items;
+  for (int i = 0; i < MCount; ++i) {
+    if (!rowShown(i)) continue;
+    if (i == menuSel) *shownSel = items.size();
+    items.push_back(menuItem(i));
+  }
+  return items;
+}
+
+static std::vector<ui::Item> agentItems() {
+  std::vector<ui::Item> items;
+  for (size_t i = 0; i < agentNames.size(); ++i) {
+    ui::Item it;
+    it.label = it.title = agentNames[i];
+    bool back = !agentsLoading && i + 1 == agentNames.size();
+    if (agentsLoading) {
+      it.badge = "…";
+    } else if (back) {
+      it.title = "Back";
+      it.glyph = ui::Glyph::Back;
+      it.note = "to the menu";
+    } else {
+      it.badge = agentNames[i];
+      it.glyph = ui::Glyph::Initials;
+      it.note = (int)i == agentCur ? "current agent" : "yellow = choose";
+    }
+    items.push_back(it);
+  }
+  return items;
 }
 
 template <size_t N>
@@ -276,15 +371,20 @@ static void redraw() {
       break;
     case Mode::Waiting:
       if (settings.iconMode) ui::showFace(settings.character, face::Pose::Thinking, 0);
-      else ui::showWorking(heard, activity, statusLine);
+      else ui::showWorking(heard, activity, statusLine, millis() - workStartMs, toolSteps);
       break;
     case Mode::Reply:
       if (settings.iconMode && audio::playing()) ui::showFace(settings.character, face::Pose::Speaking, audio::outputLevel());
       else ui::showReply();
       break;
     case Mode::Image: ui::showStoredImage(); break;
-    case Mode::Menu: ui::showPicker(menuNames(), menuSel, -1); break;
-    case Mode::Agents: ui::showPicker(agentNames, agentSel, agentCur); break;
+    case Mode::Menu: {
+      int sel = 0;
+      auto items = menuItems(&sel);
+      ui::showPicker(items, sel, -1);
+      break;
+    }
+    case Mode::Agents: ui::showPicker(agentItems(), agentSel, agentCur); break;
     case Mode::CharPick: {
       // Cycle through the poses so the preview shows everything it does.
       static const face::Pose poses[] = {face::Pose::Idle, face::Pose::Listening, face::Pose::Thinking,
@@ -293,7 +393,7 @@ static void redraw() {
       face::Pose pose = poses[(t / 2500) % 5];
       int lvl = pose == face::Pose::Speaking || pose == face::Pose::Listening
                     ? 45 + (int)(40 * sinf(t / 90.0f)) : 0;
-      ui::showFace(charSel, pose, lvl);
+      ui::showCharPick(charSel, pose, lvl, charSel);
       break;
     }
     case Mode::Status: {
@@ -381,6 +481,10 @@ static void chooseMenuRow() {
       return;
     case MBeep: settings.cueBeep = !settings.cueBeep; break;
     case MFlash: settings.cueFlash = !settings.cueFlash; break;
+    case MBuzz:
+      settings.cueBuzz = !settings.cueBuzz;
+      if (settings.cueBuzz) buzz(160);
+      break;
     case MLead: settings.cueLeadS = settings.cueLeadS == 1 ? 2 : 1; break;
     case MScreenOff: settings.screenOffS = settings.screenOffS == 5 ? 10 : settings.screenOffS == 10 ? 15 : 5; break;
     case MPowerOff: settings.powerOffS = settings.powerOffS == 15 ? 30 : settings.powerOffS == 30 ? 60 : 15; break;
@@ -426,6 +530,7 @@ static void startTalking() {
   sendJson(d);
   recStartMs = millis();
   mode = Mode::Listening;
+  buzz(35);
   redraw();
 }
 
@@ -447,9 +552,11 @@ static void stopTalking(bool send) {
 
 static void startSpeech(uint32_t rate) {
   bool cue = settings.cueBeep || settings.cueFlash;
-  audio::playBegin(rate, cue ? settings.cueLeadS * 1000UL : 0);
+  bool buzzCue = board::kHasMotor && settings.cueBuzz;
+  audio::playBegin(rate, (cue || buzzCue) ? settings.cueLeadS * 1000UL : 0);
   touch();
   if (settings.cueBeep) audio::cue();
+  if (buzzCue) buzz(160);
   if (settings.cueFlash) {
     M5.Display.setBrightness(255);
     flashing = true;
@@ -557,7 +664,37 @@ static void onText(const char* payload, size_t len) {
     if (doc["t"].is<uint32_t>()) rttMs = millis() - doc["t"].as<uint32_t>();
   } else if (type == "error") {
     touch();
+    buzz(250);
     notice("Hmm", doc["text"] | "Something went wrong.", kOrange);
+  }
+}
+
+static void dropImagePart() {
+  free(imgPart);
+  imgPart = nullptr;
+  imgPartLen = 0;
+}
+
+// A picture: 0x03 frames are parts with more to come, 0x02 is the last (or
+// only) part. A WebSocket frame here carries at most ~15 KB.
+static void imageData(const uint8_t* data, size_t len, bool last) {
+  size_t need = imgPartLen + len;
+  uint8_t* grown = need <= kMaxImage ? (uint8_t*)ps_realloc(imgPart, need) : nullptr;
+  if (!grown) {
+    dropImagePart();
+    return;
+  }
+  memcpy(grown + imgPartLen, data, len);
+  imgPart = grown;
+  imgPartLen = need;
+  if (!last) return;
+  touch();
+  ui::storeImage(imgPart, imgPartLen);  // the screen keeps the bytes
+  imgPart = nullptr;
+  imgPartLen = 0;
+  if (!(settings.iconMode && audio::playing())) {
+    mode = Mode::Image;
+    if (!flashing) redraw();
   }
 }
 
@@ -565,13 +702,8 @@ static void onBinary(const uint8_t* data, size_t len) {
   if (len < 2) return;
   if (data[0] == 0x01) {
     audio::playFeed(data + 1, len - 1);
-  } else if (data[0] == 0x02) {
-    touch();
-    ui::storeImage(data + 1, len - 1);
-    if (!(settings.iconMode && audio::playing())) {
-      mode = Mode::Image;
-      if (!flashing) redraw();
-    }
+  } else if (data[0] == 0x02 || data[0] == 0x03) {
+    imageData(data + 1, len - 1, data[0] == 0x02);
   }
 }
 
@@ -591,6 +723,7 @@ static void onWs(WStype_t type, uint8_t* payload, size_t length) {
         agentLinked = false;
         if (audio::micActive()) audio::micStop([](const int16_t*, size_t) {});
         audio::playStop();
+        dropImagePart();
         if (mode == Mode::Listening || mode == Mode::Waiting) mode = ui::hasReply() ? Mode::Reply : Mode::Idle;
         redraw();
       }
@@ -617,7 +750,10 @@ static void connectServer() {
   String host = colon < 0 ? hostport : hostport.substring(0, colon);
   uint16_t port = colon < 0 ? (tls ? 443 : 80) : hostport.substring(colon + 1).toInt();
 
-  String path = prefix + "/device/ws?device=" + urlEncode(deviceId()) + "&sw=240&sh=135";
+  String path = prefix + "/device/ws?device=" + urlEncode(deviceId()) + "&sw=" + String(board::kScreenW) +
+                "&sh=" + String(board::kScreenH);
+  if (board::kRound) path += "&round=1";               // fit pictures inside the circle
+  if (board::kChunkedImages) path += "&img=chunks";    // pictures bigger than one frame
   if (settings.token.length()) path += "&token=" + urlEncode(settings.token);
   if (settings.agent.length()) path += "&agent=" + urlEncode(settings.agent);
   if (settings.lang.length()) path += "&lang=" + urlEncode(settings.lang);
@@ -640,13 +776,14 @@ static void connectServer() {
 // ── power ────────────────────────────────────────────────────────────
 
 static void goToSleep() {
-  ui::showMessage("Sleeping", "Press the front button to wake.", TFT_DARKGREY);
+  ui::showMessage("Sleeping", String("Press the ") + board::kTalkButton + " to wake.", TFT_DARKGREY);
   delay(1200);
   ws.disconnect();
   WiFi.disconnect(true);
+  if (board::kHasMotor) M5.Power.setVibration(0);
   ui::brightness(0);
   M5.Display.sleep();
-  esp_sleep_enable_ext0_wakeup(GPIO_NUM_11, 0);  // front button pulls low
+  esp_sleep_enable_ext0_wakeup(board::kTalkPin, 0);  // the talk button pulls low
   esp_deep_sleep_start();
 }
 
@@ -677,7 +814,7 @@ static void handleIdlePower() {
 static volatile uint32_t buttonSeenMs = 0;
 
 static void sampleButtons(void*) {
-  if (gpio_get_level(GPIO_NUM_11) == 0 || gpio_get_level(GPIO_NUM_12) == 0) buttonSeenMs = millis();
+  if (gpio_get_level(board::kTalkPin) == 0 || gpio_get_level(board::kSidePin) == 0) buttonSeenMs = millis();
 }
 
 static void noteButtonActivity() {
@@ -736,6 +873,7 @@ void setup() {
   Serial.printf("[claw] wifi %s ip %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
   ui::setHealth(wifiHealth(), ui::Down);
   ui::showMessage("Wi-Fi connected", WiFi.SSID() + "  " + WiFi.localIP().toString(), kGreen);
+  configTzTime(settings.tz.c_str(), "pool.ntp.org", "time.google.com");  // the round screen's clock
   connectServer();
   lastActivityMs = millis();
 }
@@ -802,7 +940,8 @@ void loop() {
   } else if (M5.BtnB.wasClicked()) {
     touch();
     if (mode == Mode::Menu) {
-      menuSel = (menuSel + 1) % MCount;
+      do menuSel = (menuSel + 1) % MCount;
+      while (!rowShown(menuSel));
       menuOpenedMs = millis();
       redraw();
     } else if (mode == Mode::CharPick) {
@@ -859,6 +998,10 @@ void loop() {
     }
     if (millis() - recStartMs > 110000) stopTalking(true);  // the server caps at 120 s
   }
+  if (buzzOffMs && (int32_t)(millis() - buzzOffMs) >= 0) {
+    M5.Power.setVibration(0);
+    buzzOffMs = 0;
+  }
   pollFlash();
   bool wasPlaying = audio::playing();
   audio::playPoll();
@@ -870,7 +1013,8 @@ void loop() {
       // Changes at most ~6×/s; the timer (and the icon's dots) once in a while.
       static uint32_t lastSecond = 0;
       uint32_t secs = (millis() - workStartMs) / 1000;
-      if ((workDirty && since > 150) || secs != lastSecond || (settings.iconMode && since > face::frameMs(settings.character))) {
+      if ((workDirty && since > 150) || secs != lastSecond || (settings.iconMode && since > face::frameMs(settings.character)) ||
+          (ui::animated() && since > 60)) {
         lastSecond = secs;
         lastDrawMs = millis();
         workDirty = false;
@@ -880,13 +1024,17 @@ void loop() {
       lastDrawMs = millis();
       setBarState();
       ui::showFace(settings.character, face::Pose::Speaking, audio::outputLevel());
+    } else if (!settings.iconMode && ui::animated() && mode == Mode::Reply && audio::playing() && since > 60) {
+      lastDrawMs = millis();  // the speaking ring follows the voice
+      redraw();
     } else if (settings.iconMode && mode == Mode::Idle && !ui::hasReply() && since > face::frameMs(settings.character)) {
       lastDrawMs = millis();  // blinking, rain, bouncing…
       redraw();
     } else if (mode == Mode::CharPick && since > face::frameMs(charSel)) {
       lastDrawMs = millis();
       redraw();
-    } else if ((mode == Mode::Status && since > 1000) || since > 30000) {
+    } else if ((mode == Mode::Status && since > 1000) || (ui::animated() && mode == Mode::Idle && since > 1000) ||
+               since > 30000) {
       lastDrawMs = millis();  // live status page; battery/health in the bar elsewhere
       if (mode != Mode::Listening && mode != Mode::Notice && mode != Mode::Image) redraw();
     }

@@ -1,3 +1,4 @@
+// StickS3 screen: 240×135 landscape LCD. Text uses efontJA, which has č ć š ž đ.
 #include "ui.h"
 
 #include <M5Unified.h>
@@ -48,6 +49,8 @@ void begin() {
 }
 
 void brightness(uint8_t level) { M5.Display.setBrightness(level); }
+
+bool animated() { return false; }
 
 static void push() { canvas.pushSprite(0, 0); }
 
@@ -255,7 +258,9 @@ void showListening(int level, uint32_t elapsedMs) {
   push();
 }
 
-void showWorking(const String& heard, const std::vector<String>& activity, const String& status) {
+// The time and steps are in the top bar (main sets them as the bar state).
+void showWorking(const String& heard, const std::vector<String>& activity, const String& status,
+                 uint32_t, int) {
   canvas.fillScreen(TFT_BLACK);
   drawBar();
   canvas.setTextDatum(top_left);
@@ -429,11 +434,15 @@ void showFace(uint8_t kind, face::Pose pose, int level) {
   push();
 }
 
-void storeImage(const uint8_t* jpg, size_t len) {
+// The bar already says "3/18  A=pick".
+void showCharPick(uint8_t kind, face::Pose pose, int level, int) { showFace(kind, pose, level); }
+
+void showHome(const Home& home) { showPanel(home.title, home.color, home.rows); }
+
+void storeImage(uint8_t* jpg, size_t len) {
   if (imgBuf) free(imgBuf);
-  imgBuf = (uint8_t*)ps_malloc(len);
-  imgLen = imgBuf ? len : 0;
-  if (imgBuf) memcpy(imgBuf, jpg, len);
+  imgBuf = jpg;
+  imgLen = jpg ? len : 0;
 }
 
 bool hasImage() { return imgLen > 0; }
@@ -449,7 +458,9 @@ void showStoredImage() {
   push();
 }
 
-void showPicker(const std::vector<String>& names, int selected, int current) {
+void showPicker(const std::vector<Item>& items, int selected, int current) {
+  std::vector<String> names;
+  for (const Item& it : items) names.push_back(it.label);
   canvas.fillScreen(TFT_BLACK);
   drawBar();
   canvas.setFont(ts().body);

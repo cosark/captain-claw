@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import math
 import time
 import wave
 
@@ -66,6 +67,51 @@ def test_fit_jpeg_stays_under_the_frame_limit():
     assert len(db.fit_jpeg(src.getvalue(), 240, 135)) <= db.MAX_JPEG_BYTES
 
 
+@pytest.mark.parametrize("aspect", [16 / 9, 4 / 3, 1.0, 3 / 4, 9 / 16])
+def test_round_fit_is_the_largest_picture_inside_the_circle(aspect):
+    w, h = db.round_fit(466, 466, aspect)
+    assert math.hypot(w / 2, h / 2) <= 233          # corners inside the circle
+    assert math.hypot(w / 2 + 1, h / 2 + 1) > 233   # and no room to spare
+    assert abs(w / h - aspect) < 0.02
+
+
+def _picture(size, color=(255, 0, 0)) -> bytes:
+    from PIL import Image
+
+    src = io.BytesIO()
+    Image.new("RGB", size, color).save(src, "PNG")
+    return src.getvalue()
+
+
+@pytest.mark.parametrize("size", [(400, 300), (300, 500), (200, 200)])
+def test_fit_jpeg_on_a_round_screen_keeps_the_corners_in_view(size):
+    from PIL import Image
+
+    jpeg = db.fit_jpeg(_picture(size), 466, 466, max_bytes=db.MAX_CHUNKED_JPEG_BYTES, round_screen=True)
+    im = Image.open(io.BytesIO(jpeg)).convert("RGB")
+    assert im.size == (466, 466)
+    x0, y0, x1, y1 = im.point(lambda v: 255 if v > 100 else 0).getbbox()
+    for x, y in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
+        assert math.hypot(x - 233, y - 233) <= 234   # the picture's corners show
+    assert abs((x1 - x0) / (y1 - y0) - size[0] / size[1]) < 0.03
+
+
+def test_jpeg_frames_split_a_picture_into_parts():
+    data = bytes(range(256)) * 118  # 30208 bytes
+    frames = db.jpeg_frames(data)
+    assert [k for k, _ in frames] == [db.BIN_JPEG_PART, db.BIN_JPEG_PART, db.BIN_JPEG]
+    assert all(len(p) <= db.MAX_JPEG_BYTES for _, p in frames)
+    assert b"".join(p for _, p in frames) == data
+    assert db.jpeg_frames(data[:500]) == [(db.BIN_JPEG, data[:500])]
+    assert db.jpeg_frames(data[:db.MAX_JPEG_BYTES]) == [(db.BIN_JPEG, data[:db.MAX_JPEG_BYTES])]
+
+
+def test_picture_options_default_to_the_stick():
+    assert db._picture_options({}) == {"screen": (240, 135), "round_screen": False, "chunked": False}
+    assert db._picture_options({"sw": "466", "sh": "466", "round": "1", "img": "chunks"}) == {
+        "screen": (466, 466), "round_screen": True, "chunked": True}
+
+
 class _WS:
     def __init__(self):
         self.sent: list = []
@@ -79,6 +125,83 @@ class _WS:
 
 def _conn(speak=False):
     return db._DeviceConn(_WS(), {"id": "u1"}, "stick", lang="", speak=speak, screen=(240, 135))
+
+
+def _watch():
+    return db._DeviceConn(_WS(), {"id": "u1"}, "watch", lang="", speak=False, screen=(466, 466),
+                          round_screen=True, chunked=True)
+
+
+def _noisy_png(size) -> bytes:
+    import os
+
+    from PIL import Image
+
+    src = io.BytesIO()
+    Image.frombytes("RGB", size, os.urandom(size[0] * size[1] * 3)).save(src, "PNG")
+    return src.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_a_big_picture_reaches_a_chunked_device_in_parts(monkeypatch):
+    conn = _watch()
+
+    async def _fetch(path):
+        return _noisy_png((600, 450))
+
+    monkeypatch.setattr(conn, "_fetch_from_agent", _fetch)
+    await conn._send_image({"path": "/w/a.png", "name": "a.png"})
+    head, frames = conn.ws.sent[0], conn.ws.sent[1:]
+    assert head["type"] == "image" and (head["w"], head["h"]) == (466, 466)
+    assert db.MAX_JPEG_BYTES < head["size"] <= db.MAX_CHUNKED_JPEG_BYTES
+    assert [f[0] for f in frames] == [db.BIN_JPEG_PART] * (len(frames) - 1) + [db.BIN_JPEG]
+    assert all(len(f) <= db.MAX_JPEG_BYTES + 1 for f in frames)
+    jpeg = b"".join(f[1:] for f in frames)
+    assert len(jpeg) == head["size"] and jpeg[:2] == b"\xff\xd8"
+
+
+@pytest.mark.asyncio
+async def test_a_device_without_chunks_gets_one_small_frame(monkeypatch):
+    conn = _conn()
+
+    async def _fetch(path):
+        return _noisy_png((600, 450))
+
+    monkeypatch.setattr(conn, "_fetch_from_agent", _fetch)
+    await conn._send_image({"path": "/w/a.png", "name": "a.png"})
+    assert _types(conn) == ["image", "bin"]
+    frame = conn.ws.sent[1]
+    assert frame[0] == db.BIN_JPEG and len(frame) - 1 == conn.ws.sent[0]["size"] <= db.MAX_JPEG_BYTES
+
+
+@pytest.mark.asyncio
+async def test_two_pictures_parts_never_interleave(monkeypatch):
+    conn = _watch()
+
+    async def _fetch(path):
+        await asyncio.sleep(0)
+        return _noisy_png((600, 450))
+
+    monkeypatch.setattr(conn, "_fetch_from_agent", _fetch)
+    await asyncio.gather(conn._send_image({"path": "a", "name": "a"}), conn._send_image({"path": "b", "name": "b"}))
+    kinds = ["image" if isinstance(m, dict) else m[0] for m in conn.ws.sent]
+    first_end = kinds.index(db.BIN_JPEG)
+    assert kinds[0] == "image" and kinds[first_end + 1] == "image"
+    assert "image" not in kinds[1:first_end] and kinds[-1] == db.BIN_JPEG
+
+
+def test_the_agent_hears_which_screen_it_writes_for():
+    assert "240×135 pixel screen" in _conn().system_context()
+    assert "small round 466 px screen" in _watch().system_context()
+    assert "{screen}" not in _watch().system_context()
+
+
+@pytest.mark.asyncio
+async def test_a_round_screen_keeps_capital_dj():
+    conn = _watch()
+    conn.pending = True
+    await conn.on_bus({"type": "agent", "text": "Đuro je potvrdio."})
+    assert conn.ws.sent[0]["text"] == "Đuro je potvrdio."
 
 
 def _types(conn):

@@ -183,7 +183,7 @@ void drawC64(M5Canvas& c, Pose pose, int level, uint32_t t, int cx, int cy) {
   c.setTextColor(ink);
   int first = max(0, (int)lines.size() - rows + 1);  // keep the last rows, room for the cursor
   int y = y0 + 2;
-  for (int i = first; i < (int)lines.size(); ++i, y += 8) c.drawString(lines[i], x0 + 2, y);
+  for (int i = first; i < (int)lines.size(); ++i, y += 8) c.drawString(lines[i].c_str(), x0 + 2, y);
   // Blinking cursor after the last line (on the next line after READY./LOADING).
   bool after = pose != Pose::Speaking;
   int cxl = after ? x0 + 2 : x0 + 2 + (int)lines.back().length() * 6;

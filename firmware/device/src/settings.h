@@ -5,6 +5,7 @@
 #include <Arduino.h>
 
 static constexpr int kMaxNetworks = 5;
+static constexpr const char* kDefaultTz = "CET-1CEST,M3.5.0,M10.5.0/3";  // Central Europe
 
 struct WifiNet {
   String ssid;
@@ -28,8 +29,10 @@ struct Settings {
   uint8_t character = 0;    // face::Kind (0 = captain)
   bool cueBeep = true;      // chime before speech starts
   bool cueFlash = true;     // flash the screen before speech starts
+  bool cueBuzz = true;      // buzz before speech starts (devices with a motor)
   uint8_t cueLeadS = 1;     // the cue comes this many seconds (1 or 2) before speech
   uint8_t textSize = 0;     // reading text: 0 small, 1 medium, 2 large
+  String tz;                // POSIX time zone for the clock ("" = kDefaultTz)
 
   void load();
   void save() const;
@@ -41,5 +44,5 @@ struct Settings {
 
 extern Settings settings;
 
-// "stick-a1b2c3" — stable per device (from the Wi-Fi MAC).
+// "stick-a1b2c3" / "watch-a1b2c3" — stable per device (from the Wi-Fi MAC).
 String deviceId();

@@ -1,9 +1,11 @@
-"""Device bridge — a handheld voice client (M5Stack StickS3) talks to an agent.
+"""Device bridge — a handheld voice client (M5Stack StickS3 / StopWatch) talks to an agent.
 
 One WebSocket per device: ``/device/ws?token=<cc_pat_…>&device=<id>``
 (optional ``agent=<slug|name|port>``, ``lang=<tts language>``, ``speak=0``,
 ``voice=male|female|<Soniox voice>``,
-``sw``/``sh`` = screen size for pictures, default 240×135).
+``sw``/``sh`` = screen size for pictures, default 240×135,
+``round=1`` = a round screen: pictures fit inside the circle,
+``img=chunks`` = pictures may span several frames, so they can be bigger).
 
 The device records while its button is held and streams the audio here;
 Flight Deck transcribes it (Soniox), sends the words to one of the owner's
@@ -32,7 +34,8 @@ Flight Deck → device
   text  {"type":"reply","text":"…","proactive":bool}
   text  {"type":"audio_start","rate":24000} … {"type":"audio_end"}
   bin   0x01 + PCM s16le mono                    audio chunks between those two
-  text  {"type":"image","name":"…","w":240,"h":135} then bin 0x02 + baseline JPEG
+  text  {"type":"image","name":"…","w":240,"h":135,"size":n} then bin 0x02 + baseline JPEG
+        (img=chunks: bin 0x03 + part … while more follow, then 0x02 + the last part)
   text  {"type":"error","text":"…"} | {"type":"pong","t":<echoed>}
 
 Auth: a personal access token (Profile → MCP agent access) names the owner;
@@ -46,6 +49,7 @@ import asyncio
 import io
 import json
 import logging
+import math
 import re
 import secrets
 import shutil
@@ -66,7 +70,7 @@ router = APIRouter()
 _DEVICE_SYSTEM_CONTEXT = (
     "[SYSTEM CONTEXT — do not echo, quote, or acknowledge this block in your reply.]\n"
     "The user is talking to you through a tiny handheld voice device: they spoke, "
-    "and your reply is read aloud and shown on a 240×135 pixel screen.\n"
+    "and your reply is read aloud and shown on a {screen} screen.\n"
     "Output rules for every reply on this session:\n"
     "  - Lead with the answer. No preamble, no recap.\n"
     "  - Keep it short and speakable: 1–3 short sentences, or a short list of "
@@ -84,7 +88,8 @@ _DEVICE_SYSTEM_CONTEXT = (
 
 # Binary frame kinds, Flight Deck → device (first byte of each frame).
 BIN_AUDIO = 0x01
-BIN_JPEG = 0x02
+BIN_JPEG = 0x02        # a picture, or the last part of one
+BIN_JPEG_PART = 0x03   # a part of a picture, more follow (devices that ask: img=chunks)
 
 PCM_CHUNK = 4096                 # bytes per audio frame sent to the device
 TTS_RATE = gb._STREAM_SAMPLE_RATE
@@ -94,6 +99,7 @@ MAX_SPOKEN_CHARS = 1500          # long replies are shown in full, spoken in par
 MEDIA_WINDOW_S = 180.0           # turn_media trails the reply; accept it this long
 AUDIO_FILE_MAX_S = 300
 MAX_JPEG_BYTES = 14000           # the device's WebSocket library takes ≤15 KB frames
+MAX_CHUNKED_JPEG_BYTES = 120_000  # a picture sent in parts (img=chunks)
 
 
 # ── Small pure helpers (tested) ───────────────────────────────────────
@@ -134,15 +140,17 @@ def speakable(text: str, limit: int = MAX_SPOKEN_CHARS) -> str:
     return out
 
 
-def screen_text(text: str) -> str:
+def screen_text(text: str, has_dj: bool = False) -> str:
     """A reply as the tiny screen should show it: markdown marks out (the
-    device renders plain text), structure kept."""
+    device renders plain text), structure kept. *has_dj*: the device's font
+    has Đ (the StopWatch's does; the StickS3's has only đ)."""
     out = _MD_LINK.sub(r"\1", str(text or ""))
     out = _MD_TABLE_RULE.sub("", out)
     out = re.sub(r"(\*\*|__|`+|~~)", "", out)
     out = re.sub(r"^#{1,6}\s*", "", out, flags=re.MULTILINE)
     out = re.sub(r"^\s*[-*]\s+", "• ", out, flags=re.MULTILINE)
-    out = out.replace("Đ", "Dj")  # the device font has đ but not Đ
+    if not has_dj:
+        out = out.replace("Đ", "Dj")  # the StickS3's font has đ but not Đ
     return re.sub(r"\n{3,}", "\n\n", out).strip()
 
 
@@ -160,11 +168,19 @@ def activity_text(text: str, limit: int = 120) -> str:
     return out[:limit]
 
 
+def round_fit(width: int, height: int, aspect: float) -> tuple[int, int]:
+    """The largest picture of *aspect* (w/h) that fits inside the circle a
+    round width×height screen shows (its diameter is the shorter side)."""
+    d = min(width, height)
+    return max(1, int(d * aspect / math.hypot(1, aspect))), max(1, int(d / math.hypot(1, aspect)))
+
+
 def fit_jpeg(blob: bytes, width: int, height: int, quality: int = 85,
-             max_bytes: int = MAX_JPEG_BYTES) -> bytes:
+             max_bytes: int = MAX_JPEG_BYTES, round_screen: bool = False) -> bytes:
     """Any picture as a baseline JPEG of exactly width×height (letterboxed on
     black) — what the device's decoder takes — no larger than *max_bytes*
-    (the device's WebSocket frame limit; quality steps down to fit)."""
+    (the device's WebSocket frame limit; quality steps down to fit). On a
+    round screen the picture fits inside the circle, corners and all."""
     from PIL import Image, ImageOps
 
     im = Image.open(io.BytesIO(blob))
@@ -174,7 +190,8 @@ def fit_jpeg(blob: bytes, width: int, height: int, quality: int = 85,
         bg = Image.new("RGBA", im.size, (0, 0, 0, 255))
         im = Image.alpha_composite(bg, im)
     im = im.convert("RGB")
-    im = ImageOps.contain(im, (width, height), Image.LANCZOS)
+    box = round_fit(width, height, im.width / im.height) if round_screen else (width, height)
+    im = ImageOps.contain(im, box, Image.LANCZOS)
     canvas = Image.new("RGB", (width, height), (0, 0, 0))
     canvas.paste(im, ((width - im.width) // 2, (height - im.height) // 2))
     while True:
@@ -183,6 +200,14 @@ def fit_jpeg(blob: bytes, width: int, height: int, quality: int = 85,
         if out.tell() <= max_bytes or quality <= 20:
             return out.getvalue()
         quality -= 10
+
+
+def jpeg_frames(jpeg: bytes, part: int = MAX_JPEG_BYTES) -> list[tuple[int, bytes]]:
+    """A picture as device frames for img=chunks: (0x03, part) while more
+    follow, then (0x02, the last part). One that fits a frame is a single
+    (0x02, bytes) — exactly what a device without img=chunks gets."""
+    parts = [jpeg[i:i + part] for i in range(0, len(jpeg), part)] or [b""]
+    return [(BIN_JPEG_PART, p) for p in parts[:-1]] + [(BIN_JPEG, parts[-1])]
 
 
 def voice_name(choice: str) -> str:
@@ -204,6 +229,16 @@ def _int_param(value: str, default: int, lo: int, hi: int) -> int:
         return max(lo, min(hi, int(value)))
     except Exception:
         return default
+
+
+def _picture_options(q) -> dict:
+    """How pictures are made for a device, from its query (sw, sh, round,
+    img); with none of them, the StickS3's 240×135 in one frame."""
+    return {
+        "screen": (_int_param(q.get("sw", ""), 240, 32, 800), _int_param(q.get("sh", ""), 135, 32, 800)),
+        "round_screen": q.get("round", "") in ("1", "true", "on"),
+        "chunked": q.get("img", "") == "chunks",
+    }
 
 
 # ── Auth + agent choice ───────────────────────────────────────────────
@@ -262,7 +297,8 @@ def _pick_agent(user_id: str, selector: str) -> dict | None:
 
 class _DeviceConn:
     def __init__(self, ws: WebSocket, user: dict, device_id: str, *, lang: str,
-                 speak: bool, screen: tuple[int, int], voice: str = "") -> None:
+                 speak: bool, screen: tuple[int, int], voice: str = "",
+                 round_screen: bool = False, chunked: bool = False) -> None:
         self.ws = ws
         self.user = user
         self.user_id = str(user.get("id", ""))
@@ -271,6 +307,9 @@ class _DeviceConn:
         self.speak = speak
         self.voice = voice_name(voice)
         self.screen = screen
+        self.round_screen = round_screen  # pictures fit inside the circle
+        self.chunked = chunked            # pictures may span several frames
+        self._image_lock = asyncio.Lock()  # one picture's parts at a time
         self.ch: gb._ChannelState | None = None
         self.agent: dict | None = None
         self._send_lock = asyncio.Lock()
@@ -341,7 +380,9 @@ class _DeviceConn:
             if not text.strip():
                 return
             self.last_reply_at = time.monotonic()
-            await self.send_json({"type": "reply", "text": screen_text(text), "proactive": proactive})
+            # Round screens are the StopWatch, whose font has Đ.
+            await self.send_json({"type": "reply", "text": screen_text(text, has_dj=self.round_screen),
+                                  "proactive": proactive})
             if self.speak:
                 spoken = speakable(text)
                 if spoken:
@@ -392,6 +433,11 @@ class _DeviceConn:
         await self.send_json({"type": "activity", "text": line, "tool": tool})
 
     # ── device → agent ──
+    def system_context(self) -> str:
+        w, h = self.screen
+        screen = f"small round {min(w, h)} px" if self.round_screen else f"{w}×{h} pixel"
+        return _DEVICE_SYSTEM_CONTEXT.replace("{screen}", screen)
+
     async def send_to_agent(self, text: str) -> None:
         ch = self.ch
         if ch is None:
@@ -405,7 +451,7 @@ class _DeviceConn:
             await self.send_json({"type": "error", "text": "Agent isn't reachable."})
             return
         async with ch.send_lock:
-            content = text if ch.context_sent else _DEVICE_SYSTEM_CONTEXT + text
+            content = text if ch.context_sent else self.system_context() + text
             payload = {
                 "type": "chat", "content": content, "surface": "device",
                 "client_msg_id": "dev_" + secrets.token_hex(6),
@@ -462,10 +508,15 @@ class _DeviceConn:
         try:
             blob = await self._fetch_from_agent(str(item["path"]))
             w, h = self.screen
-            jpeg = await asyncio.to_thread(fit_jpeg, blob, w, h)
-            await self.send_json({"type": "image", "name": str(item.get("name", "")), "w": w, "h": h,
-                                  "size": len(jpeg)})
-            await self.send_bin(BIN_JPEG, jpeg)
+            max_bytes = MAX_CHUNKED_JPEG_BYTES if self.chunked else MAX_JPEG_BYTES
+            jpeg = await asyncio.to_thread(fit_jpeg, blob, w, h, max_bytes=max_bytes,
+                                           round_screen=self.round_screen)
+            frames = jpeg_frames(jpeg) if self.chunked else [(BIN_JPEG, jpeg)]
+            async with self._image_lock:  # two pictures' parts must not interleave
+                await self.send_json({"type": "image", "name": str(item.get("name", "")), "w": w, "h": h,
+                                      "size": len(jpeg)})
+                for kind, part in frames:
+                    await self.send_bin(kind, part)
         except Exception as exc:
             log.warning("device image delivery failed: %s", exc)
             await self.send_json({"type": "status", "text": f"Couldn't show {item.get('name', 'the picture')}."})
@@ -592,8 +643,7 @@ async def device_ws(ws: WebSocket) -> None:
     lang = re.sub(r"[^A-Za-z-]", "", q.get("lang", "") or "")[:8]
     conn = _DeviceConn(
         ws, user, device_id, lang=lang, speak=q.get("speak", "1") not in ("0", "false", "off"),
-        voice=q.get("voice", ""),
-        screen=(_int_param(q.get("sw", ""), 240, 32, 800), _int_param(q.get("sh", ""), 135, 32, 800)),
+        voice=q.get("voice", ""), **_picture_options(q),
     )
     conn.start_audio_worker()
     try:
