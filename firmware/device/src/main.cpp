@@ -27,7 +27,7 @@
 #include "settings.h"
 #include "ui.h"
 
-#define FW_VERSION "0.8.0"
+#define FW_VERSION "0.8.1"
 
 enum class Mode { Idle, Listening, Waiting, Reply, Image, Menu, Agents, CharPick, Status, Notice };
 
@@ -807,6 +807,11 @@ static void connectServer() {
   int colon = hostport.lastIndexOf(':');
   String host = colon < 0 ? hostport : hostport.substring(0, colon);
   uint16_t port = colon < 0 ? (tls ? 443 : 80) : hostport.substring(colon + 1).toInt();
+#ifdef OTA_TEST_NO_DECK
+  // Rollback test build (PLATFORMIO_BUILD_FLAGS=-DOTA_TEST_NO_DECK): Wi-Fi works,
+  // Flight Deck is never reached, so an update to this build must roll back.
+  host = "deck.invalid";
+#endif
 
   String path = prefix + "/device/ws?device=" + urlEncode(deviceId()) + "&sw=" + String(board::kScreenW) +
                 "&sh=" + String(board::kScreenH);

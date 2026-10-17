@@ -2,7 +2,7 @@
 
     uv run --no-project --with cryptography python tools/publish.py keygen
     uv run --no-project --with cryptography python tools/publish.py sticks3 \\
-        --deck https://glasses.captain-claw.com --token cc_pat_… [--notes "…"] [--no-build]
+        --deck https://glasses.captain-claw.com [--token cc_pat_…] [--notes "…"] [--no-build]
 
 keygen   makes the signing key pair once: the private key stays on this Mac
          (~/.captain-claw/firmware-signing/ota-key.pem, mode 600); the public
@@ -32,6 +32,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 KEY = Path(os.environ.get("CLAW_OTA_KEY", "~/.captain-claw/firmware-signing/ota-key.pem")).expanduser()
+# The admin token can live in a file (mode 600) instead of the command line.
+TOKEN_FILE = KEY.parent / "deck-token"
 PUBKEY_H = ROOT / "src/ota_pubkey.h"
 
 
@@ -99,23 +101,38 @@ def upload(deck: str, token: str, fields: dict[str, str], blob: bytes) -> dict:
             return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         sys.exit(f"upload refused: HTTP {exc.code} {exc.read().decode(errors='replace')[:300]}")
+    except urllib.error.URLError as exc:
+        # Flight Deck answers a bad token before reading the upload, so the
+        # client sees the connection closed mid-send.
+        sys.exit(f"upload failed ({exc.reason}) — usually a rejected token, or the deck is unreachable")
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("target", help="keygen, or a PlatformIO env to publish (sticks3, stopwatch)")
     ap.add_argument("--deck", help="Flight Deck URL, e.g. https://glasses.captain-claw.com")
-    ap.add_argument("--token", default=os.environ.get("FD_TOKEN", ""), help="admin token (or FD_TOKEN)")
+    ap.add_argument("--token", default=os.environ.get("FD_TOKEN", ""),
+                    help=f"admin token (or FD_TOKEN, or the file {TOKEN_FILE})")
     ap.add_argument("--notes", default="", help="release notes shown on the device")
     ap.add_argument("--no-build", action="store_true", help="publish the last build as is")
     a = ap.parse_args()
     if a.target == "keygen":
         return keygen()
+    if not a.token and TOKEN_FILE.exists():
+        a.token = TOKEN_FILE.read_text().strip()
     if not a.deck or not a.token:
-        sys.exit("--deck and --token (or FD_TOKEN) are required")
+        sys.exit(f"--deck and a token (--token, FD_TOKEN or {TOKEN_FILE}) are required")
+    if any(c.isspace() for c in a.token) or not (a.token.startswith("cc_pat_") or a.token.count(".") == 2):
+        sys.exit("the token doesn't look like a Flight Deck token (cc_pat_… or a JWT) — "
+                 f"check {TOKEN_FILE if not os.environ.get('FD_TOKEN') else 'FD_TOKEN'}")
     path = ROOT / ".pio/build" / a.target / "firmware.bin" if a.no_build else build(a.target)
     blob = path.read_bytes()
     version = fw_version()
+    # The firmware reports itself as "&fw=<FW_VERSION>"; a build that doesn't
+    # contain it is stale (built before FW_VERSION changed) — never publish it.
+    if f"&fw={version}".encode() not in blob:
+        sys.exit(f"{path} isn't a {version} build (FW_VERSION changed since it was built) — "
+                 "publish without --no-build")
     digest = hashlib.sha256(blob).hexdigest()
     fields = {"hw": a.target, "version": version, "sha256": digest, "sig": sign(blob), "notes": a.notes}
     print(f"{a.target} {version}: {len(blob) // 1024} KB, sha256 {digest[:16]}…")
