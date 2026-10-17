@@ -617,6 +617,7 @@ def test_next_file_never_shows_the_last_ones_content_under_its_trust():
         Pencil = Icon, Save = Icon, Markdown = 'Markdown', CodeEditor = 'CodeEditor';
       const remarkGfm = null, defaultUrlTransform = (u) => u;
       const formatSize = () => '', saveFileContent = async () => {};
+      const useIsMobile = () => ({ isMobile: false, isTablet: false, isDesktop: true });
       const getViewUrl = (h, p, path) => 'view:' + path, getDownloadUrl = (h, p, path) => 'dl:' + path;
       const window = { addEventListener() {}, removeEventListener() {} };
       const BODY = { '/w/saved/theirs.html': '<b>THEIRS</b>', '/w/saved/mine.html': '<b>MINE</b>' };
@@ -708,7 +709,9 @@ def test_member_html_is_never_offered_as_a_deck():
           };
         """)
         assert "!isMemberCreated(f.created_by)" in found["deckable"], src.name
-        assert found["badges"] == [{"mode": '"owner"', "creator": "{f.created_by}"}], src.name
+        # The row's badge — and, in the panel, a phone's row and its action sheet.
+        assert found["badges"] and all(b["mode"] == '"owner"' for b in found["badges"]), src.name
+        assert {b["creator"] for b in found["badges"]} <= {"{f.created_by}", "{actionFile.created_by}"}, src.name
     tables = _query(_AGENT_DATA, _JSX_HELPERS + r"""
       return named('CreatorBadge').map((n) => ({ mode: attr(n, 'mode'), creator: attr(n, 'creator') }));
     """)
@@ -819,14 +822,16 @@ def test_datastore_browser_member_mode():
     assert found["showCreator"].startswith("!!rows && (isShared ||")
     assert "_creator?.kind === 'member'" in found["showCreator"]
     assert "c !== '_creator'" in found["rowColumns"]
-    assert len(found["heads"]) == 1 and found["heads"][0][0].startswith("showCreator && (")
+    # The table's header and a phone's row card: both only under showCreator.
+    assert len(found["heads"]) == 2 and all(h[0].startswith("showCreator && (") for h in found["heads"])
     assert {"sharedRef", "ownerName"} <= set(found["props"])
     modes = [(b["mode"], b["creator"]) for b in found["badges"]]
     assert modes == [
         ("{sharedRef ? 'member' : 'owner'}", "{table.created_by}"),
-        ("{isShared ? 'member' : 'owner'}", "{row._creator}"),
+        ("{isShared ? 'member' : 'owner'}", "{row._creator}"),  # a phone's row card
+        ("{isShared ? 'member' : 'owner'}", "{row._creator}"),  # the table row
     ]
-    assert found["badges"][1]["guards"][0].startswith("showCreator && (")
+    assert all(b["guards"][0].startswith("showCreator && (") for b in found["badges"][1:])
 
 
 def test_files_panel_is_read_and_own_delete_only():
@@ -855,6 +860,8 @@ def test_files_panel_is_read_and_own_delete_only():
         texts: all.filter((n) => ts.isJsxExpression(n) && n.expression && ts.isIdentifier(n.expression)
           && /^[A-Z_]+$/.test(n.expression.text)).map((n) => n.expression.text),
         badge: named('CreatorBadge').map((n) => ({ mode: attr(n, 'mode'), creator: attr(n, 'creator') })),
+        sheet: (() => { const s = named('FileActionSheet')[0];
+          return s && { onDelete: attr(s, 'onDelete'), downloadUrl: attr(s, 'downloadUrl'), onView: attr(s, 'onView') }; })(),
       };
     """)
     v = found["viewer"]
@@ -874,7 +881,13 @@ def test_files_panel_is_read_and_own_delete_only():
     assert "upload.extensions.join(',')" in found["accept"]
     for t in ("UPLOAD_LABEL", "MEMBER_FILES_NOTE", "TRUNCATED_NOTE"):
         assert t in found["texts"], t
-    assert found["badge"] == [{"mode": '"member"', "creator": "{f.created_by}"}]
+    # The row's badge, a phone's row and its action sheet: all the member's view.
+    assert found["badge"] and all(b["mode"] == '"member"' for b in found["badge"])
+    assert {b["creator"] for b in found["badge"]} <= {"{f.created_by}", "{actionFile.created_by}"}
+    sheet = found["sheet"]
+    assert sheet["onDelete"].startswith("{actionFile.can_delete ?")
+    assert sheet["downloadUrl"] == "{sharedFileUrl(agentRef, actionFile.id, 'download')}"
+    assert "isViewable(toViewerFile(actionFile))" in sheet["onView"]
 
 
 def test_datastore_panel_is_read_only():

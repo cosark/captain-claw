@@ -1,6 +1,9 @@
 import { useSyncExternalStore } from 'react'
 
-const MOBILE = '(max-width: 767px)'
+// A phone either way up: narrow, or — turned to landscape, where even a
+// small phone is 900+ px wide — a touch screen that is short. Tablets are
+// taller than 500px both ways, so they stay tablets.
+const MOBILE = '(max-width: 767px), (pointer: coarse) and (max-height: 500px)'
 const TABLET = '(min-width: 768px) and (max-width: 1023px)'
 const DESKTOP = '(min-width: 1024px)'
 
@@ -20,7 +23,8 @@ const server = () => false
 
 export function useIsMobile() {
   const isMobile = useSyncExternalStore(subscribe(MOBILE), snapshot(MOBILE), server)
-  const isTablet = useSyncExternalStore(subscribe(TABLET), snapshot(TABLET), server)
-  const isDesktop = useSyncExternalStore(subscribe(DESKTOP), snapshot(DESKTOP), server)
-  return { isMobile, isTablet, isDesktop }
+  const tablet = useSyncExternalStore(subscribe(TABLET), snapshot(TABLET), server)
+  const desktop = useSyncExternalStore(subscribe(DESKTOP), snapshot(DESKTOP), server)
+  // A landscape phone is a phone, whatever its width says.
+  return { isMobile, isTablet: tablet && !isMobile, isDesktop: desktop && !isMobile }
 }

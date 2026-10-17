@@ -10,6 +10,8 @@ import {
   getFileTypeGroup, isViewable,
 } from '../../services/fileTransfer'
 import { FileViewer } from './FileViewer'
+import { FileActionSheet } from './FileActionSheet'
+import { useIsMobile } from '../../hooks/useMediaQuery'
 import { CreatorBadge } from './CreatorBadge'
 import { isMemberCreated } from '../../utils/sharedWorkspace'
 import { usePinnedFilesStore } from '../../stores/pinnedFilesStore'
@@ -92,6 +94,9 @@ export function AgentFilesPanel({ containerId }: { containerId: string }) {
   const [viewingFile, setViewingFile] = useState<AgentFile | null>(null)
   const [viewerStartEdit, setViewerStartEdit] = useState(false)
   const { pin: pinFile, isPinned: isFilePinned } = usePinnedFilesStore()
+  // A phone has no hover: a tap on a file opens its actions in a sheet.
+  const { isMobile: phone } = useIsMobile()
+  const [actionFile, setActionFile] = useState<AgentFile | null>(null)
 
   const agentId = agent?.id
   const loadFiles = async () => {
@@ -230,7 +235,19 @@ export function AgentFilesPanel({ containerId }: { containerId: string }) {
         )}
         {!loading && !error && processedFiles.length > 0 && (
           <ul className="flex flex-col gap-0.5">
-            {processedFiles.map((f) => (
+            {processedFiles.map((f) => phone ? (
+              <li key={f.physical}>
+                <button
+                  onClick={() => setActionFile(f)}
+                  className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-3 text-left active:bg-zinc-800/60"
+                >
+                  <FileIcon file={f} />
+                  <span className="min-w-0 flex-1 truncate text-sm text-zinc-200">{f.filename}</span>
+                  <CreatorBadge mode="owner" creator={f.created_by} />
+                  <span className="shrink-0 text-xs text-zinc-500">{formatSize(f.size)}</span>
+                </button>
+              </li>
+            ) : (
               <li key={f.physical} className="group rounded-md px-1.5 py-1 hover:bg-zinc-900/60">
                 <div className="flex items-center gap-1.5">
                   <FileIcon file={f} />
@@ -252,6 +269,21 @@ export function AgentFilesPanel({ containerId }: { containerId: string }) {
           </ul>
         )}
       </div>
+
+      {/* Phone: what a tap on a file offers */}
+      {actionFile && (
+        <FileActionSheet
+          filename={actionFile.filename}
+          size={actionFile.size}
+          mime={actionFile.mime_type}
+          icon={<FileIcon file={actionFile} />}
+          detail={<CreatorBadge mode="owner" creator={actionFile.created_by} />}
+          downloadUrl={getDownloadUrl(agent.host, agent.port, actionFile.physical, agent.auth)}
+          onView={isViewable(actionFile) ? () => { setActionFile(null); handleView(actionFile) } : undefined}
+          onDownload={() => handleDownload(actionFile)}
+          onClose={() => setActionFile(null)}
+        />
+      )}
 
       {/* Viewer modal */}
       {viewingFile && (

@@ -9,6 +9,7 @@ import type { AgentFile } from '../../services/fileTransfer'
 import { getViewUrl, getDownloadUrl, formatSize, getFileTypeGroup, saveFileContent } from '../../services/fileTransfer'
 import { isMemberCreated } from '../../utils/sharedWorkspace'
 import { CodeEditor } from './CodeEditor'
+import { useIsMobile } from '../../hooks/useMediaQuery'
 
 // File groups whose text content can be edited in place.
 const EDITABLE_GROUPS = new Set(['markdown', 'code', 'data', 'text', 'html'])
@@ -72,6 +73,8 @@ export function FileViewer({ file, host = '', port = 0, auth = '', urls, readOnl
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
   const [savedTick, setSavedTick] = useState(false)
+  // A phone (either way up): the viewer is the whole screen.
+  const { isMobile: phone } = useIsMobile()
 
   const group = getFileTypeGroup(file)
   const editable = !readOnly && content !== null && EDITABLE_GROUPS.has(group)
@@ -183,22 +186,27 @@ export function FileViewer({ file, host = '', port = 0, auth = '', urls, readOnl
     } catch { /* ignore */ }
   }
 
-  const sizeClass = maximized
-    ? 'w-[95vw] max-h-[95vh]'
-    : 'w-[900px] max-h-[85vh]'
+  const sizeClass = phone
+    ? 'h-[100dvh] w-full'
+    : maximized
+      ? 'w-[95vw] max-h-[95vh] rounded-xl border border-zinc-800'
+      : 'w-[900px] max-w-[calc(100vw-2rem)] max-h-[85vh] rounded-xl border border-zinc-800'
+  // What the content area may take: the screen below the header on a phone.
+  const contentHeight = phone ? 'calc(100dvh - 52px)' : maximized ? 'calc(95vh - 52px)' : 'calc(85vh - 52px)'
 
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70" onClick={onClose}>
       <div
-        className={`flex flex-col rounded-xl border border-zinc-800 bg-zinc-950 shadow-2xl transition-all duration-200 ${sizeClass}`}
+        className={`flex flex-col bg-zinc-950 shadow-2xl transition-all duration-200 ${sizeClass}`}
         onClick={(e) => e.stopPropagation()}
       >
-        {/* Header */}
-        <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-2.5 shrink-0">
+        {/* Header (a phone: bigger buttons) */}
+        <div className={`flex items-center justify-between border-b border-zinc-800 shrink-0 ${phone ? 'gap-1 px-3 py-1.5 [&_button]:p-2' : 'px-4 py-2.5'}`}>
           <div className="flex items-center gap-2 min-w-0">
             <h3 className="text-sm font-semibold truncate">{file.filename}</h3>
-            <span className="text-[11px] text-zinc-500 font-mono shrink-0">{file.extension}</span>
-            <span className="text-[11px] text-zinc-600 shrink-0">{formatSize(file.size)}</span>
+            {/* A phone needs the room for the name. */}
+            {!phone && <span className="text-[11px] text-zinc-500 font-mono shrink-0">{file.extension}</span>}
+            {!phone && <span className="text-[11px] text-zinc-600 shrink-0">{formatSize(file.size)}</span>}
           </div>
           <div className="flex items-center gap-0.5 shrink-0">
             {/* Prev / Next */}
@@ -220,7 +228,7 @@ export function FileViewer({ file, host = '', port = 0, auth = '', urls, readOnl
                 >
                   <ChevronRight className="h-4 w-4" />
                 </button>
-                <div className="w-px h-4 bg-zinc-800 mx-1" />
+                <div className={`w-px h-4 bg-zinc-800 mx-1 ${phone ? 'hidden' : ''}`} />
               </>
             )}
             {/* Edit / Save / Cancel */}
@@ -242,7 +250,7 @@ export function FileViewer({ file, host = '', port = 0, auth = '', urls, readOnl
                 >
                   Cancel
                 </button>
-                <div className="w-px h-4 bg-zinc-800 mx-1" />
+                <div className={`w-px h-4 bg-zinc-800 mx-1 ${phone ? 'hidden' : ''}`} />
               </>
             ) : editable ? (
               <>
@@ -252,9 +260,9 @@ export function FileViewer({ file, host = '', port = 0, auth = '', urls, readOnl
                   title="Edit file"
                 >
                   {savedTick ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Pencil className="h-3.5 w-3.5" />}
-                  {savedTick ? 'Saved' : 'Edit'}
+                  {!phone && (savedTick ? 'Saved' : 'Edit')}
                 </button>
-                <div className="w-px h-4 bg-zinc-800 mx-1" />
+                <div className={`w-px h-4 bg-zinc-800 mx-1 ${phone ? 'hidden' : ''}`} />
               </>
             ) : null}
             {/* Copy (text content only) */}
@@ -282,14 +290,16 @@ export function FileViewer({ file, host = '', port = 0, auth = '', urls, readOnl
             >
               <Download className="h-3.5 w-3.5" />
             </button>
-            {/* Maximize */}
-            <button
-              onClick={() => setMaximized(!maximized)}
-              className="rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300"
-              title={maximized ? 'Restore' : 'Maximize'}
-            >
-              {maximized ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
-            </button>
+            {/* Maximize (a phone's viewer is the whole screen already) */}
+            {!phone && (
+              <button
+                onClick={() => setMaximized(!maximized)}
+                className="rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300"
+                title={maximized ? 'Restore' : 'Maximize'}
+              >
+                {maximized ? <Minimize2 className="h-3.5 w-3.5" /> : <Maximize2 className="h-3.5 w-3.5" />}
+              </button>
+            )}
             {/* Close */}
             <button onClick={onClose} className="rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300" title="Close (Esc)">
               <X className="h-4 w-4" />
@@ -300,7 +310,7 @@ export function FileViewer({ file, host = '', port = 0, auth = '', urls, readOnl
         {/* Content */}
         <div className="flex-1 overflow-auto">
           {editing ? (
-            <div className="flex flex-col" style={{ height: maximized ? 'calc(95vh - 52px)' : 'calc(85vh - 52px)' }}>
+            <div className="flex flex-col" style={{ height: contentHeight }}>
               {saveError && (
                 <div className="flex items-center gap-2 px-4 py-2 text-xs text-red-300 bg-red-500/10 border-b border-red-500/20 shrink-0">
                   <AlertCircle className="h-3.5 w-3.5 shrink-0" /> {saveError}
@@ -330,19 +340,19 @@ export function FileViewer({ file, host = '', port = 0, auth = '', urls, readOnl
           )}
 
           {!loading && !error && group === 'image' && (
-            <div className="flex items-center justify-center p-6 bg-zinc-900/50 min-h-[300px]">
+            <div className={`flex items-center justify-center bg-zinc-900/50 ${phone ? 'h-full p-2' : 'p-6 min-h-[300px]'}`}>
               <img
                 src={viewUrl}
                 alt={file.filename}
-                className="max-w-full max-h-[70vh] object-contain rounded-lg"
+                className={`max-w-full object-contain rounded-lg ${phone ? 'max-h-[calc(100dvh-72px)]' : 'max-h-[70vh]'}`}
                 style={{ imageRendering: file.extension === '.svg' ? 'auto' : undefined }}
               />
             </div>
           )}
 
           {!loading && !error && group === 'video' && (
-            <div className="flex items-center justify-center bg-black p-4 min-h-[300px]">
-              <video src={viewUrl} controls className="max-w-full max-h-[75vh] rounded-lg" />
+            <div className={`flex items-center justify-center bg-black ${phone ? 'h-full p-0' : 'p-4 min-h-[300px]'}`}>
+              <video src={viewUrl} controls playsInline className={`max-w-full rounded-lg ${phone ? 'max-h-[calc(100dvh-60px)]' : 'max-h-[75vh]'}`} />
             </div>
           )}
 
@@ -359,7 +369,7 @@ export function FileViewer({ file, host = '', port = 0, auth = '', urls, readOnl
                 srcDoc={htmlFrame(content, untrusted).srcDoc}
                 title={file.filename}
                 className="w-full border-0"
-                style={{ height: maximized ? 'calc(95vh - 52px)' : 'calc(85vh - 52px)' }}
+                style={{ height: contentHeight }}
                 // Never same-origin, for any file: a srcdoc frame would
                 // otherwise run in Flight Deck's origin, with its storage and
                 // the viewer's token — and a shared agent's saved/ folder holds
@@ -370,7 +380,7 @@ export function FileViewer({ file, host = '', port = 0, auth = '', urls, readOnl
           )}
 
           {!loading && !error && content !== null && group === 'markdown' && (
-            <div className="fd-file-markdown p-6">
+            <div className={`fd-file-markdown ${phone ? 'px-4 py-4' : 'p-6'}`}>
               {untrusted ? (
                 <Markdown remarkPlugins={[remarkGfm]} urlTransform={untrustedUrlTransform}>{content}</Markdown>
               ) : (
@@ -380,7 +390,7 @@ export function FileViewer({ file, host = '', port = 0, auth = '', urls, readOnl
           )}
 
           {!loading && !error && content !== null && group === 'data' && file.extension === '.json' && (
-            <pre className="p-6 text-xs font-mono text-zinc-300 leading-relaxed whitespace-pre-wrap break-words">
+            <pre className={`${phone ? 'p-4' : 'p-6'} text-xs font-mono text-zinc-300 leading-relaxed whitespace-pre-wrap break-words`}>
               {(() => { try { return JSON.stringify(JSON.parse(content), null, 2) } catch { return content } })()}
             </pre>
           )}
@@ -388,10 +398,10 @@ export function FileViewer({ file, host = '', port = 0, auth = '', urls, readOnl
           {!loading && !error && content !== null && !['html', 'markdown', 'image', 'audio', 'video'].includes(group) && !(group === 'data' && file.extension === '.json') && (
             <div className="relative">
               {/* Line numbers + code */}
-              <pre className="p-6 text-xs font-mono leading-relaxed overflow-x-auto">
+              <pre className={`${phone ? 'p-3' : 'p-6'} text-xs font-mono leading-relaxed overflow-x-auto`}>
                 {content.split('\n').map((line, i) => (
                   <div key={i} className="flex">
-                    <span className="w-10 shrink-0 text-right pr-4 text-zinc-700 select-none">{i + 1}</span>
+                    <span className={`${phone ? 'w-8 pr-2' : 'w-10 pr-4'} shrink-0 text-right text-zinc-700 select-none`}>{i + 1}</span>
                     <span className="text-zinc-300 whitespace-pre-wrap break-all">{line}</span>
                   </div>
                 ))}

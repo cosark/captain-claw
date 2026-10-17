@@ -966,7 +966,7 @@ function ChatContent({
             placeholder={closed ? 'Disconnected' : !session.connected ? 'Connecting...' : shared || isMobile ? 'Message…' : 'Message, paste image, or drop files...'}
             disabled={!session.connected || closed}
             rows={1}
-            className="max-h-32 min-h-[38px] min-w-0 flex-1 resize-none rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-base text-zinc-200 sm:text-sm placeholder-zinc-600 focus:border-violet-500/50 focus:outline-none disabled:opacity-40"
+            className="max-h-32 min-h-[38px] min-w-0 flex-1 resize-none rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-base text-zinc-200 wide:text-sm placeholder-zinc-600 focus:border-violet-500/50 focus:outline-none disabled:opacity-40"
             style={{ height: 'auto', overflow: 'hidden' }}
             onInput={(e) => {
               const el = e.currentTarget
@@ -1116,7 +1116,7 @@ function LaneStrip({ agentId, activeLane, agentName, trailing }: {
                 : s.busy ? `Lane ${lane} — running`
                 : `Lane ${lane} — idle`
             }
-            className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors sm:px-2 sm:py-1 sm:text-[11px] ${
+            className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors wide:px-2 wide:py-1 wide:text-[11px] ${
               isActive
                 ? 'bg-violet-600/20 text-violet-700 dark:text-violet-200'
                 : 'text-zinc-500 hover:bg-zinc-800/60 hover:text-zinc-300'
@@ -1132,7 +1132,7 @@ function LaneStrip({ agentId, activeLane, agentName, trailing }: {
               }`}
             />
             {/* A phone has the agent's name in its header already. */}
-            <span>{lane === LANE_AUTO ? 'Auto' : lane}<span className="hidden sm:inline"> - {agentName}</span></span>
+            <span>{lane === LANE_AUTO ? 'Auto' : lane}<span className="hidden wide:inline"> - {agentName}</span></span>
             {pending > 0 && (
               <span className="rounded-full bg-zinc-800 px-1 text-[9px] text-zinc-400">{pending}</span>
             )}
@@ -1148,9 +1148,9 @@ function LaneStrip({ agentId, activeLane, agentName, trailing }: {
         onClick={() => activeSession && newSession(activeSession.key)}
         disabled={!activeSession || activeSession.busy}
         title="Start a new session on this lane"
-        className="ml-auto shrink-0 whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-800/60 hover:text-zinc-300 disabled:opacity-40 disabled:hover:bg-transparent sm:px-2 sm:py-1 sm:text-[11px]"
+        className="ml-auto shrink-0 whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-800/60 hover:text-zinc-300 disabled:opacity-40 disabled:hover:bg-transparent wide:px-2 wide:py-1 wide:text-[11px]"
       >
-        + New<span className="hidden sm:inline"> session</span>
+        + New<span className="hidden wide:inline"> session</span>
       </button>}
       {trailing}
     </div>
@@ -1408,7 +1408,7 @@ function QueuePanel({ sessionKey, agentId, shared = false }: { sessionKey: strin
           onPaste={shared ? undefined : handlePasteEvent}
           rows={5}
           placeholder={shared ? 'Queue a message…' : 'Queue a message, paste image, or drop files…'}
-          className="w-full resize-y overflow-y-auto rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-base leading-relaxed sm:text-xs text-zinc-200 placeholder-zinc-600 focus:border-violet-500/60 focus:outline-none"
+          className="w-full resize-y overflow-y-auto rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-base leading-relaxed wide:text-xs text-zinc-200 placeholder-zinc-600 focus:border-violet-500/60 focus:outline-none"
           style={{ minHeight: QUEUE_INPUT_MIN_PX }}
         />
         {!shared && <input

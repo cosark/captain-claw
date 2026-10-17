@@ -5,6 +5,15 @@
    manual html.light / html.dark switching (see themeStore.ts). */
 @custom-variant dark (&:where(html.dark, html.dark *));
 
+/* `wide:` — like `sm:` (640px and up) but never on a phone turned to
+   landscape (a short touch screen), which keeps its portrait layout: the
+   same test as useIsMobile() in hooks/useMediaQuery.ts. */
+@custom-variant wide {
+  @media (min-width: 640px) and (min-height: 501px), (min-width: 640px) and (pointer: fine) {
+    @slot;
+  }
+}
+
 :root {
   --fd-sidebar: 260px;
   --fd-panel: 380px;
@@ -286,10 +295,24 @@ html.light .bg-violet-500\/5 { background-color: rgba(139,92,246,0.06) !importan
 .fd-auth-primary:active:not(:disabled) { transform: translateY(1px); }
 .fd-auth-primary:disabled { opacity: 0.6; cursor: not-allowed; }
 
-/* Phones: iOS zooms the page into any text field under 16px on focus (and
-   stays zoomed). Every form field is 16px on a touch-only small screen. */
-@media (max-width: 767px) and (hover: none) and (pointer: coarse) {
+/* Phones (either way up): iOS zooms the page into any text field under 16px
+   on focus (and stays zoomed). Every form field is 16px on a touch-only
+   small screen. */
+@media (max-width: 767px) and (hover: none) and (pointer: coarse),
+       (max-height: 500px) and (hover: none) and (pointer: coarse) {
   input:not([type="checkbox"]):not([type="radio"]):not([type="range"]), textarea, select {
     font-size: 16px !important;
   }
+}
+
+/* Phones (either way up): markdown fits the screen — long words and links
+   wrap, a wide table scrolls sideways inside its own box, headings shrink. */
+@media (max-width: 767px), (pointer: coarse) and (max-height: 500px) {
+  .fd-file-markdown, .fd-markdown { overflow-wrap: anywhere; }
+  .fd-file-markdown table, .fd-markdown table { display: block; max-width: 100%; overflow-x: auto; }
+  /* …but a cell breaks only between words: a table too wide scrolls instead. */
+  .fd-file-markdown :is(th, td), .fd-markdown :is(th, td) { overflow-wrap: normal; word-break: normal; min-width: 4.5rem; }
+  .fd-file-markdown h1 { font-size: 1.4em; margin-top: 1em; }
+  .fd-file-markdown h2 { font-size: 1.2em; }
+  .fd-file-markdown pre, .fd-markdown pre { max-width: 100%; }
 }

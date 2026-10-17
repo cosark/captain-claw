@@ -530,11 +530,11 @@ function KioskSettingsDialog({ onClose, onRefresh, onConnections, onProfile }: {
   ]
 
   return createPortal(
-    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/60 sm:items-center sm:p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/60 wide:items-center wide:p-4" onClick={onClose}>
       <div
         role="dialog"
         aria-label="Settings"
-        className="relative max-h-[100dvh] w-full max-w-md overflow-y-auto rounded-t-2xl border border-zinc-800 bg-zinc-950 pb-[env(safe-area-inset-bottom)] shadow-2xl sm:rounded-2xl sm:pb-0"
+        className="relative max-h-[100dvh] w-full max-w-md overflow-y-auto rounded-t-2xl border border-zinc-800 bg-zinc-950 pb-[env(safe-area-inset-bottom)] shadow-2xl wide:rounded-2xl wide:pb-0"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-zinc-800 px-5 py-4">
@@ -542,8 +542,8 @@ function KioskSettingsDialog({ onClose, onRefresh, onConnections, onProfile }: {
             <Settings className="h-4 w-4 text-violet-400" />
             Settings
           </h2>
-          <button onClick={onClose} title="Close" aria-label="Close" className="rounded-lg p-2 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200 sm:p-1">
-            <X className="h-5 w-5 sm:h-4 sm:w-4" />
+          <button onClick={onClose} title="Close" aria-label="Close" className="rounded-lg p-2 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200 wide:p-1">
+            <X className="h-5 w-5 wide:h-4 wide:w-4" />
           </button>
         </div>
 
@@ -636,20 +636,20 @@ function KioskDialog({ label, onClose, children }: { label: string; onClose: () 
   }, [onClose])
 
   return createPortal(
-    <div className="fixed inset-0 z-50 flex items-stretch justify-center bg-black/60 sm:items-center sm:p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-stretch justify-center bg-black/60 wide:items-center wide:p-4" onClick={onClose}>
       <div
         role="dialog"
         aria-label={label}
-        className="relative flex h-[100dvh] w-full flex-col overflow-hidden bg-zinc-950 shadow-2xl sm:h-[85vh] sm:max-w-3xl sm:rounded-xl sm:border sm:border-zinc-800"
+        className="relative flex h-[100dvh] w-full flex-col overflow-hidden bg-zinc-950 shadow-2xl wide:h-[85vh] wide:max-w-3xl wide:rounded-xl wide:border wide:border-zinc-800"
         onClick={(e) => e.stopPropagation()}
       >
         <button
           onClick={onClose}
           title="Close"
           aria-label="Close"
-          className="absolute right-2 top-2 z-10 rounded-lg p-2 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200 sm:right-3 sm:top-3 sm:p-1"
+          className="absolute right-2 top-2 z-10 rounded-lg p-2 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200 wide:right-3 wide:top-3 wide:p-1"
         >
-          <X className="h-5 w-5 sm:h-4 sm:w-4" />
+          <X className="h-5 w-5 wide:h-4 wide:w-4" />
         </button>
         <div className="min-h-0 flex-1">
           {children}
@@ -1280,6 +1280,12 @@ function PhoneLayout({
   const [atList, setAtList] = useState(false)
   useEffect(() => { setAtList(false) }, [activeChatId])
   const showChat = !!activeAgentId && !atList
+  // A tap shows the chat even when it is the one already open: then
+  // activeChatId doesn't change, so the effect above never fires.
+  const openAgent = (a: SimpleAgent) => {
+    onOpen(a)
+    setAtList(false)
+  }
 
   // The phone's Back: while a chat is open it returns to the list instead of
   // leaving Flight Deck.
@@ -1412,7 +1418,7 @@ function PhoneLayout({
                 }`}
               >
                 <button
-                  onClick={() => onOpen(a)}
+                  onClick={() => openAgent(a)}
                   disabled={!openable}
                   className="flex min-w-0 flex-1 items-center gap-3 py-3.5 pl-3.5 text-left disabled:opacity-60"
                 >
