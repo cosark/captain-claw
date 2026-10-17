@@ -271,7 +271,8 @@ export default function TelegramConnection({ onStatus }: { onStatus?: (s: MyTele
                     className="flex items-center gap-1.5 rounded-md bg-violet-600 px-3 py-1.5 text-xs text-white hover:bg-violet-500 disabled:opacity-50"
                   >
                     {busy && <Loader2 className="h-3 w-3 animate-spin" />}
-                    Request access
+                    {/* Approved at once — unless an admin turned you down before. */}
+                    {me?.auto_approve && link?.status !== 'rejected' ? 'Connect' : 'Request access'}
                   </button>
                 )}
                 {active && (

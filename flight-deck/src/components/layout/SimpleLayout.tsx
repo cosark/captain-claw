@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import {
-  Radio,
   ChevronLeft,
   ChevronRight,
   LayoutDashboard,
@@ -49,7 +48,7 @@ import { ArchetypeSpawnDialog } from './ArchetypeSpawnDialog'
 import ConnectionsPage from '../../pages/ConnectionsPage'
 import { ProfilePage } from '../../pages/ProfilePage'
 import { NotificationBell } from '../common/NotificationCenter'
-import { APP_VERSION, BUILD_DATE } from '../../version'
+import { BrandMark } from '../common/BrandMark'
 
 // ── Simple layout ────────────────────────────────────────────────────
 //
@@ -155,6 +154,8 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
   const [connectionsOpen, setConnectionsOpen] = useState(false)
   // Kiosk Profile dialog — the owner profile every agent of theirs receives.
   const [profileOpen, setProfileOpen] = useState(false)
+  // Kiosk Settings dialog — theme, connections, profile, refresh, sign-out.
+  const [settingsOpen, setSettingsOpen] = useState(false)
 
   // Keep the agent list fresh — the Desktop page normally does this polling,
   // and it isn't mounted here. Same auth guard as there: with auth on and no
@@ -390,8 +391,7 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
         onRefresh={refresh}
         onSpawn={goSpawn}
         onOptions={setOptionsAgent}
-        onConnections={locked ? () => setConnectionsOpen(true) : undefined}
-        onProfile={locked ? () => setProfileOpen(true) : undefined}
+        onSettings={locked ? () => setSettingsOpen(true) : undefined}
         locked={locked}
       />
 
@@ -419,6 +419,14 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
         />
       )}
 
+      {locked && settingsOpen && (
+        <KioskSettingsDialog
+          onClose={() => setSettingsOpen(false)}
+          onRefresh={() => { refresh(); setSettingsOpen(false) }}
+          onConnections={() => { setSettingsOpen(false); setConnectionsOpen(true) }}
+          onProfile={() => { setSettingsOpen(false); setProfileOpen(true) }}
+        />
+      )}
       {locked && connectionsOpen && <KioskConnectionsDialog onClose={() => setConnectionsOpen(false)} />}
       {locked && profileOpen && <KioskProfileDialog onClose={() => setProfileOpen(false)} />}
 
@@ -432,6 +440,103 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
         document.body,
       )}
     </div>
+  )
+}
+
+// ── Kiosk: Settings ──────────────────────────────────────────────────
+//
+// The kiosk keeps its whole footer behind one Settings button: this dialog
+// holds the theme switch, Connections, Profile, a refresh of the agent list,
+// and sign-out (how a shared kiosk hands the screen to the next person).
+
+function KioskSettingsDialog({ onClose, onRefresh, onConnections, onProfile }: {
+  onClose: () => void
+  onRefresh: () => void
+  onConnections: () => void
+  onProfile: () => void
+}) {
+  const { theme, toggle: toggleTheme } = useThemeStore()
+  const authEnabled = useAuthStore((s) => s.authEnabled)
+  const authUser = useAuthStore((s) => s.user)
+  const signingOut = useAuthStore((s) => s.signingOut)
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  const dark = theme === 'dark'
+  const tiles: { icon: typeof Plug; title: string; detail: string; onClick: () => void }[] = [
+    { icon: dark ? Sun : Moon, title: dark ? 'Light theme' : 'Dark theme', detail: `Switch to the ${dark ? 'light' : 'dark'} look`, onClick: toggleTheme },
+    { icon: Plug, title: 'Connections', detail: 'Google, Microsoft, MCP and Jev', onClick: onConnections },
+    { icon: IdCard, title: 'Profile', detail: 'About you, your company, your preferences', onClick: onProfile },
+    { icon: RefreshCw, title: 'Refresh agents', detail: 'Check every agent again', onClick: onRefresh },
+  ]
+
+  return createPortal(
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
+      <div
+        role="dialog"
+        aria-label="Settings"
+        className="relative w-full max-w-md overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-950 shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-zinc-800 px-5 py-4">
+          <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
+            <Settings className="h-4 w-4 text-violet-400" />
+            Settings
+          </h2>
+          <button onClick={onClose} title="Close" className="rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        {authEnabled && authUser && (
+          <div className="flex items-center gap-3 px-5 pt-4">
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-violet-500/15 text-sm font-semibold text-violet-400">
+              {initials(authUser.display_name || authUser.email)}
+            </span>
+            <div className="min-w-0">
+              <div className="truncate text-sm font-medium text-zinc-200">{authUser.display_name || authUser.email}</div>
+              {authUser.display_name && <div className="truncate text-xs text-zinc-500">{authUser.email}</div>}
+            </div>
+          </div>
+        )}
+
+        <div className="grid grid-cols-2 gap-2.5 p-5">
+          {tiles.map(({ icon: Icon, title, detail, onClick }) => (
+            <button
+              key={title}
+              onClick={onClick}
+              className="flex flex-col items-start gap-3 rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 text-left transition-colors hover:border-violet-500/50 hover:bg-zinc-800/60"
+            >
+              <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-violet-500/10 text-violet-400">
+                <Icon className="h-[18px] w-[18px]" />
+              </span>
+              <span>
+                <span className="block text-sm font-medium text-zinc-200">{title}</span>
+                <span className="mt-0.5 block text-[11px] leading-snug text-zinc-500">{detail}</span>
+              </span>
+            </button>
+          ))}
+        </div>
+
+        {authEnabled && authUser && (
+          <div className="border-t border-zinc-800 p-5 pt-4">
+            <button
+              onClick={logoutUser}
+              disabled={signingOut}
+              className="flex w-full items-center justify-center gap-2 rounded-xl border border-zinc-800 px-4 py-2.5 text-sm font-medium text-zinc-300 transition-colors hover:border-red-500/40 hover:bg-red-500/10 hover:text-red-600 disabled:opacity-60 dark:hover:text-red-400"
+            >
+              {signingOut ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogOut className="h-4 w-4" />}
+              {signingOut ? 'Signing out…' : 'Sign out'}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>,
+    document.body,
   )
 }
 
@@ -502,7 +607,7 @@ function KioskDialog({ label, onClose, children }: { label: string; onClose: () 
 // ── Left: agents ─────────────────────────────────────────────────────
 
 function AgentsColumn({
-  agents, activeAgentId, sessionInfo, switching, booting, onOpen, onPower, onLeave, onRefresh, onSpawn, onOptions, onConnections, onProfile, locked = false,
+  agents, activeAgentId, sessionInfo, switching, booting, onOpen, onPower, onLeave, onRefresh, onSpawn, onOptions, onSettings, locked = false,
 }: {
   agents: SimpleAgent[]
   activeAgentId: string | null
@@ -518,10 +623,8 @@ function AgentsColumn({
   onRefresh: () => void
   onSpawn: () => void
   onOptions: (a: SimpleAgent) => void
-  /** Kiosk only: open the Connections dialog. */
-  onConnections?: () => void
-  /** Kiosk only: open the Profile dialog. */
-  onProfile?: () => void
+  /** Kiosk only: the footer is one Settings button opening this dialog. */
+  onSettings?: () => void
   locked?: boolean
 }) {
   const open = useUIStore((s) => s.simpleLeftOpen)
@@ -602,31 +705,32 @@ function AgentsColumn({
             <Plus className="h-4 w-4" />
           </button>
         </div>
-        <div className="flex flex-col items-center gap-0.5 border-t border-zinc-800 py-2">
-          <button onClick={toggleTheme} className={iconBtn} title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>
-            {theme === 'dark' ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
-          </button>
-          <button onClick={onRefresh} className={iconBtn} title="Refresh agents">
-            <RefreshCw className="h-3.5 w-3.5" />
-          </button>
-          {onConnections && (
-            <button onClick={onConnections} className={iconBtn} title="Connections — Google, Microsoft, MCP and Jev">
-              <Plug className="h-3.5 w-3.5" />
+        {onSettings ? (
+          <div className="flex flex-col items-center border-t border-zinc-800 py-2">
+            <button
+              onClick={onSettings}
+              title="Settings"
+              aria-label="Settings"
+              className="flex h-10 w-10 items-center justify-center rounded-lg text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-100"
+            >
+              <Settings className="h-5 w-5" />
             </button>
-          )}
-          {onProfile && (
-            <button onClick={onProfile} className={iconBtn} title="Profile — about you, your company, your preferences">
-              <IdCard className="h-3.5 w-3.5" />
+          </div>
+        ) : (
+          <div className="flex flex-col items-center gap-0.5 border-t border-zinc-800 py-2">
+            <button onClick={toggleTheme} className={iconBtn} title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>
+              {theme === 'dark' ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
             </button>
-          )}
-          {/* Sign-out stays in the kiosk lock too — it's how a shared kiosk
-              hands the screen to the next person. */}
-          {authEnabled && authUser && (
-            <button onClick={logoutUser} disabled={signingOut} className={iconBtn} title={signingOut ? 'Signing out…' : `Sign out ${authUser.display_name || authUser.email}`}>
-              {signingOut ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <LogOut className="h-3.5 w-3.5" />}
+            <button onClick={onRefresh} className={iconBtn} title="Refresh agents">
+              <RefreshCw className="h-3.5 w-3.5" />
             </button>
-          )}
-        </div>
+            {authEnabled && authUser && (
+              <button onClick={logoutUser} disabled={signingOut} className={iconBtn} title={signingOut ? 'Signing out…' : `Sign out ${authUser.display_name || authUser.email}`}>
+                {signingOut ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <LogOut className="h-3.5 w-3.5" />}
+              </button>
+            )}
+          </div>
+        )}
       </aside>
     )
   }
@@ -639,13 +743,7 @@ function AgentsColumn({
     >
       {/* Header */}
       <div className="flex h-14 items-center justify-between border-b border-zinc-800 px-3">
-        <div className="flex min-w-0 items-center gap-2">
-          <Radio className={`h-4 w-4 shrink-0 ${wsConnected ? 'text-emerald-600 dark:text-emerald-400' : 'text-zinc-600'}`} />
-          <div className="min-w-0">
-            <span className="text-sm font-semibold tracking-tight">Flight Deck</span>
-            <div className="text-[9px] leading-none text-zinc-600">v{APP_VERSION} &middot; {BUILD_DATE}</div>
-          </div>
-        </div>
+        <BrandMark connected={wsConnected} />
         <div className="flex items-center gap-0.5">
           <NotificationBell align="left" />
           {!locked && (
@@ -811,35 +909,45 @@ function AgentsColumn({
         </ul>
       </div>
 
-      {/* Footer */}
-      <div className="flex items-center justify-between gap-2 border-t border-zinc-800 px-2 py-1.5">
-        <div className="flex items-center gap-0.5">
-          <button onClick={toggleTheme} className={iconBtn} title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>
-            {theme === 'dark' ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
+      {/* Footer — the kiosk's is one Settings button (KioskSettingsDialog). */}
+      {onSettings ? (
+        <div className="border-t border-zinc-800 p-2">
+          <button
+            onClick={onSettings}
+            className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm font-medium text-zinc-300 transition-colors hover:bg-zinc-800 hover:text-zinc-100"
+          >
+            <Settings className="h-[18px] w-[18px] text-zinc-400" />
+            Settings
+            {authEnabled && authUser && (
+              <span
+                title={authUser.display_name || authUser.email}
+                className="ml-auto flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-violet-500/15 text-[10px] font-semibold text-violet-400"
+              >
+                {initials(authUser.display_name || authUser.email)}
+              </span>
+            )}
           </button>
-          <button onClick={onRefresh} className={iconBtn} title="Refresh agents">
-            <RefreshCw className="h-3.5 w-3.5" />
-          </button>
-          {onConnections && (
-            <button onClick={onConnections} className={iconBtn} title="Connections — Google, Microsoft, MCP and Jev">
-              <Plug className="h-3.5 w-3.5" />
-            </button>
-          )}
-          {onProfile && (
-            <button onClick={onProfile} className={iconBtn} title="Profile — about you, your company, your preferences">
-              <IdCard className="h-3.5 w-3.5" />
-            </button>
-          )}
         </div>
-        {authEnabled && authUser && (
-          <div className="flex min-w-0 items-center gap-1">
-            <span className="truncate text-xs text-zinc-500">{authUser.display_name || authUser.email}</span>
-            <button onClick={logoutUser} disabled={signingOut} className={iconBtn} title={signingOut ? 'Signing out…' : 'Sign out'}>
-              {signingOut ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <LogOut className="h-3.5 w-3.5" />}
+      ) : (
+        <div className="flex items-center justify-between gap-2 border-t border-zinc-800 px-2 py-1.5">
+          <div className="flex items-center gap-0.5">
+            <button onClick={toggleTheme} className={iconBtn} title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}>
+              {theme === 'dark' ? <Sun className="h-3.5 w-3.5" /> : <Moon className="h-3.5 w-3.5" />}
+            </button>
+            <button onClick={onRefresh} className={iconBtn} title="Refresh agents">
+              <RefreshCw className="h-3.5 w-3.5" />
             </button>
           </div>
-        )}
-      </div>
+          {authEnabled && authUser && (
+            <div className="flex min-w-0 items-center gap-1">
+              <span className="truncate text-xs text-zinc-500">{authUser.display_name || authUser.email}</span>
+              <button onClick={logoutUser} disabled={signingOut} className={iconBtn} title={signingOut ? 'Signing out…' : 'Sign out'}>
+                {signingOut ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <LogOut className="h-3.5 w-3.5" />}
+              </button>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Right edge: drag to resize */}
       <div

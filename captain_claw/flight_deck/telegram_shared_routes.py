@@ -108,6 +108,7 @@ async def _me(user: dict) -> dict[str, Any]:
     return {
         "auth_enabled": auth,
         "available": available,
+        "auto_approve": bool(available and cfg["auto_approve"]),
         "bot_username": cfg["bot_username"] if available else "",
         "link": _link_view(link),
         "agents": own_agents(user["id"]) if auth else [],
@@ -155,15 +156,26 @@ async def request_access(body: RequestBody, user: dict = Depends(get_current_use
                 and link.get("agent_slug") != agent["slug"]:
             await ts.send_text(link["tg_user_id"], f"↪️ From now on {agent['name']} answers you here.")
     else:
+        # Turned down before: that stays an admin's call, auto-approve or not.
+        auto = cfg["auto_approve"] and not (link and link.get("status") == "rejected")
         await db.create_telegram_link(user["id"], agent["slug"], agent["name"], ts.new_link_code())
-        await ts.reload_links(db)
         who = user.get("display_name") or user.get("email") or user["id"]
-        await _notify_admins(
-            "Telegram access request",
-            f"{who} asked to use the team Telegram bot with their agent {agent['name']}. "
-            "Approve it in Admin → Integrations.",
-            user["id"],
-        )
+        if auto:
+            await _set_decision(db, user["id"], "approved", "auto")
+            await _notify_admins(
+                "Telegram access approved automatically",
+                f"{who} connected the team Telegram bot to their agent {agent['name']}. "
+                "Requests are approved automatically (Admin → Integrations).",
+                user["id"],
+            )
+        else:
+            await ts.reload_links(db)
+            await _notify_admins(
+                "Telegram access request",
+                f"{who} asked to use the team Telegram bot with their agent {agent['name']}. "
+                "Approve it in Admin → Integrations.",
+                user["id"],
+            )
     return await _me(user)
 
 
@@ -205,6 +217,7 @@ async def _admin_view() -> dict[str, Any]:
         "config": {
             "configured": bool(cfg["token"]),
             "enabled": cfg["enabled"],
+            "auto_approve": cfg["auto_approve"],
             "bot_username": cfg["bot_username"],
             "bot_name": cfg["bot_name"],
             "token_hint": ts.token_hint(cfg["token"]),
@@ -244,8 +257,16 @@ async def admin_put(request: Request, _admin: dict = Depends(require_admin)) -> 
                    bot_name=str(me.get("first_name") or ""), bot_id=str(me.get("id") or ""))
     if isinstance(data.get("enabled"), bool):
         cfg["enabled"] = data["enabled"]
+    newly_auto = data.get("auto_approve") is True and not cfg["auto_approve"]
+    if isinstance(data.get("auto_approve"), bool):
+        cfg["auto_approve"] = data["auto_approve"]
     await ts.save_config(db, cfg)
     await ts.start(db)
+    if newly_auto:
+        # Switching it on lets in the people waiting now, too.
+        for row in await db.list_telegram_links():
+            if row.get("status") == "pending":
+                await _approve(str(row["user_id"]), _admin)
     return await _admin_view()
 
 
@@ -254,9 +275,20 @@ async def admin_clear(_admin: dict = Depends(require_admin)) -> dict[str, Any]:
     """Forget the bot token and stop polling. Requests and links stay, so a new
     token picks them up again."""
     db = get_db()
-    await ts.save_config(db, {"enabled": True})
+    cfg = await ts.load_config(db)
+    await ts.save_config(db, {"enabled": True, "auto_approve": cfg["auto_approve"]})
     await ts.start(db)
     return await _admin_view()
+
+
+async def _set_decision(db, user_id: str, status: str, decided_by: str) -> None:
+    from datetime import UTC, datetime
+
+    await db.update_telegram_link(
+        user_id, status=status, decided_at=datetime.now(UTC).isoformat(),
+        decided_by=decided_by,
+    )
+    await ts.reload_links(db)
 
 
 async def _decide(user_id: str, status: str, admin: dict) -> dict:
@@ -264,18 +296,13 @@ async def _decide(user_id: str, status: str, admin: dict) -> dict:
     link = await db.get_telegram_link(user_id)
     if not link:
         raise HTTPException(status_code=404, detail="No such request")
-    from datetime import UTC, datetime
-
-    await db.update_telegram_link(
-        user_id, status=status, decided_at=datetime.now(UTC).isoformat(),
-        decided_by=str(admin.get("id") or ""),
-    )
-    await ts.reload_links(db)
+    await _set_decision(db, user_id, status, str(admin.get("id") or ""))
     return link
 
 
-@router.post("/fd/admin/telegram-shared/links/{user_id}/approve")
-async def admin_approve(user_id: str, admin: dict = Depends(require_admin)) -> dict[str, Any]:
+async def _approve(user_id: str, admin: dict) -> None:
+    """Approve *user_id*'s request and tell them (Telegram once linked, else a
+    Flight Deck notification with the way to finish connecting)."""
     link = await _decide(user_id, "approved", admin)
     name = link.get("agent_name") or link.get("agent_slug")
     if link.get("tg_user_id"):
@@ -287,6 +314,11 @@ async def admin_approve(user_id: str, admin: dict = Depends(require_admin)) -> d
               else "Open Connections → Telegram and tap the link to finish connecting."),
         ref_type="telegram_link", ref_id=user_id,
     )
+
+
+@router.post("/fd/admin/telegram-shared/links/{user_id}/approve")
+async def admin_approve(user_id: str, admin: dict = Depends(require_admin)) -> dict[str, Any]:
+    await _approve(user_id, admin)
     return await _admin_view()
 
 

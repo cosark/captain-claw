@@ -1382,6 +1382,7 @@ from captain_claw.flight_deck.gmail_autoreply_routes import router as gmail_auto
 from captain_claw.flight_deck.microsoft_oauth_routes import router as microsoft_oauth_router
 from captain_claw.flight_deck.jev_routes import router as jev_router
 from captain_claw.flight_deck.telegram_shared_routes import router as telegram_shared_router
+from captain_claw.flight_deck.branding_routes import router as branding_router
 from captain_claw.flight_deck.codex_oauth_routes import router as codex_oauth_router
 from captain_claw.flight_deck.antigravity_routes import router as antigravity_router
 from captain_claw.flight_deck.games_routes import router as games_router
@@ -1447,6 +1448,7 @@ app.include_router(gmail_autoreply_router)
 app.include_router(microsoft_oauth_router)
 app.include_router(jev_router)
 app.include_router(telegram_shared_router)
+app.include_router(branding_router)
 app.include_router(codex_oauth_router)
 app.include_router(antigravity_router)
 app.include_router(games_router)
@@ -8201,9 +8203,12 @@ async def auth_status():
     # Sign-up: "Create account" while registration is open, else the waitlist
     # (an admin approves applications) when the admin left it on.
     registration_open = False
+    logo = ""
     if AUTH_ENABLED and hasattr(app.state, "fd_db"):
         from captain_claw.flight_deck.auth_routes import registration_open as _registration_open
+        from captain_claw.flight_deck.branding_routes import logo_url
         registration_open = await _registration_open(app.state.fd_db)
+        logo = await logo_url(app.state.fd_db)
     return {
         "auth_enabled": AUTH_ENABLED,
         "docker_spawn_enabled": cfg.get("docker_spawn_enabled", docker_default),
@@ -8212,6 +8217,10 @@ async def auth_status():
         "registration_open": registration_open,
         "waitlist_open": AUTH_ENABLED and not registration_open and bool(cfg.get("waitlist_enabled")),
         "waitlist_cohort": cfg.get("waitlist_cohort") or "",
+        # Branding (Admin → Settings): the sign-in page and the panels' title.
+        "instance_name": cfg.get("instance_name") or "Flight Deck",
+        "instance_description": cfg.get("instance_description") or "",
+        "instance_logo": logo,
     }
 
 

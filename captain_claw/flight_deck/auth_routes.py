@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -77,13 +78,16 @@ class UpdateProfileRequest(BaseModel):
 
 async def _user_payload(db, user: dict) -> dict:
     """The signed-in user as the frontend sees it. ``kiosk`` = held to the
-    simple-chat layout (deck kiosk mode + this user's flag; never an admin)."""
-    from captain_claw.flight_deck.admin_routes import user_kiosk_locked
+    simple-chat layout (deck kiosk mode + this user's flag; never an admin).
+    ``must_change_password`` = an admin set their password: they choose their
+    own before the app opens."""
+    from captain_claw.flight_deck.admin_routes import must_change_password, user_kiosk_locked
 
     return {
         "id": user["id"], "email": user["email"],
         "display_name": user["display_name"], "role": user["role"],
         "kiosk": await user_kiosk_locked(db, user),
+        "must_change_password": must_change_password(user),
     }
 
 
@@ -419,6 +423,16 @@ async def update_me(body: UpdateProfileRequest, request: Request,
             raise HTTPException(status_code=400, detail="Current password is incorrect")
         if len(body.password) < 6:
             raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+        from captain_claw.flight_deck.admin_routes import MUST_CHANGE_PASSWORD, _user_meta
+
+        meta = _user_meta(user)
+        if meta.get(MUST_CHANGE_PASSWORD) is True:
+            # The admin knows the one they set: it has to actually change.
+            if body.password == body.current_password:
+                raise HTTPException(status_code=400,
+                                    detail="Choose a new password, not the one you were given")
+            meta.pop(MUST_CHANGE_PASSWORD, None)
+            updates["metadata"] = json.dumps(meta)
         updates["password_hash"] = hash_password(body.password)
 
     if updates:

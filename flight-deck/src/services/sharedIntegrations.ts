@@ -3,6 +3,7 @@
 //   /fd/admin/telegram-shared for the token and the access requests) —
 //   captain_claw/flight_deck/telegram_shared_routes.py
 // - the team Jev key (/fd/jev/shared, /fd/jev/shared-key) — jev_routes.py
+// - the deck's logo (/fd/admin/branding/logo) — branding_routes.py
 //
 // None of these ever returns a token or key, only a hint of its last characters.
 
@@ -76,6 +77,8 @@ export interface OwnAgent {
 export interface MyTelegram {
   auth_enabled: boolean
   available: boolean
+  // The admin approves requests automatically (a turned-down one still waits).
+  auto_approve?: boolean
   bot_username: string
   link: TelegramLink | null
   agents: OwnAgent[]
@@ -103,6 +106,8 @@ export interface AdminTelegram {
   config: {
     configured: boolean
     enabled: boolean
+    // New requests are approved at once (not someone an admin turned down).
+    auto_approve: boolean
     bot_username: string
     bot_name: string
     token_hint: string
@@ -113,7 +118,7 @@ export interface AdminTelegram {
 
 export const getAdminTelegram = () => fdFetch<AdminTelegram>('/fd/admin/telegram-shared')
 
-export const saveAdminTelegram = (patch: { token?: string; enabled?: boolean }) =>
+export const saveAdminTelegram = (patch: { token?: string; enabled?: boolean; auto_approve?: boolean }) =>
   fdFetch<AdminTelegram>('/fd/admin/telegram-shared', {
     method: 'PUT',
     body: JSON.stringify(patch),
@@ -132,6 +137,18 @@ export const removeTelegramLink = (userId: string) =>
   fdFetch<AdminTelegram>(`/fd/admin/telegram-shared/links/${encodeURIComponent(userId)}`, {
     method: 'DELETE',
   })
+
+// ── Branding logo ──
+
+/** Upload the deck's logo (a `data:` URL of the image file); resolves with its URL. */
+export const uploadBrandingLogo = (dataUrl: string) =>
+  fdFetch<{ ok: boolean; logo: string }>('/fd/admin/branding/logo', {
+    method: 'PUT',
+    body: JSON.stringify({ data_url: dataUrl }),
+  })
+
+export const deleteBrandingLogo = () =>
+  fdFetch<{ ok: boolean; logo: string }>('/fd/admin/branding/logo', { method: 'DELETE' })
 
 // ── Team Jev key ──
 
