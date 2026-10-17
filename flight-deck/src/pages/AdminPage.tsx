@@ -68,6 +68,7 @@ interface SystemConfig {
   kiosk_mode_from_env?: boolean
   // While self-registration is closed, sign-up takes waitlist applications.
   waitlist_enabled: boolean
+  // Blank: applicants join under the instance name (waitlistName).
   waitlist_cohort: string
   // Branding: the panels' title and the sign-in page (the logo: BrandingCard).
   instance_name: string
@@ -76,7 +77,7 @@ interface SystemConfig {
 
 const CONFIG_DEFAULTS: SystemConfig = {
   docker_spawn_enabled: true, kiosk_mode: 'off', kiosk_new_users: false,
-  waitlist_enabled: true, waitlist_cohort: 'CC Cohort 001',
+  waitlist_enabled: true, waitlist_cohort: '',
   instance_name: 'Flight Deck', instance_description: 'Agent Management Console',
 }
 
@@ -85,6 +86,11 @@ const KIOSK_MODES: { value: KioskMode; label: string; hint: string }[] = [
   { value: 'all', label: 'Everyone', hint: 'Every non-admin is locked to simple chat.' },
   { value: 'selected', label: 'Selected users', hint: 'Only the users marked in the Users tab are locked.' },
 ]
+
+// What applicants join: the waitlist name an admin set, else the instance name.
+function waitlistName(cfg: SystemConfig): string {
+  return cfg.waitlist_cohort || cfg.instance_name || 'Flight Deck'
+}
 
 function userKioskFlag(user: UserInfo): boolean {
   try { return JSON.parse(user.metadata || '{}').kiosk === true } catch { return false }
@@ -1169,6 +1175,9 @@ export function AdminPage() {
               onSave={async (patch) => {
                 const next = await saveConfig(patch)
                 setConfig(next)
+                // A waitlist without a name of its own goes by the instance name.
+                const { signUp, setSignUp } = useAuthStore.getState()
+                setSignUp({ ...signUp, cohort: waitlistName(next) })
                 return next
               }}
             />
@@ -1296,21 +1305,21 @@ export function AdminPage() {
                       setConfig(next)
                       const { signUp, setSignUp } = useAuthStore.getState()
                       if (signUp.mode !== 'register') {
-                        setSignUp({ mode: next.waitlist_enabled ? 'waitlist' : 'closed', cohort: next.waitlist_cohort })
+                        setSignUp({ mode: next.waitlist_enabled ? 'waitlist' : 'closed', cohort: waitlistName(next) })
                       }
                     } catch { setError('Failed to save config') }
                   }}
                 />
               </label>
               <div>
-                <label className="block text-sm text-zinc-300 mb-1">Cohort</label>
+                <label className="block text-sm text-zinc-300 mb-1">Waitlist name</label>
                 <div className="flex gap-2">
                   <input
                     type="text"
                     value={cohortDraft}
                     onChange={(e) => setCohortDraft(e.target.value)}
                     maxLength={60}
-                    placeholder="CC Cohort 001"
+                    placeholder={config.instance_name}
                     className="flex-1 rounded-md border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-sm text-zinc-200 focus:border-violet-500/50 focus:outline-none"
                   />
                   <button
@@ -1320,10 +1329,10 @@ export function AdminPage() {
                         setConfig(next)
                         setCohortDraft(next.waitlist_cohort)
                         const { signUp, setSignUp } = useAuthStore.getState()
-                        setSignUp({ ...signUp, cohort: next.waitlist_cohort })
+                        setSignUp({ ...signUp, cohort: waitlistName(next) })
                       } catch (e) { setError(e instanceof Error ? e.message : 'Failed to save config') }
                     }}
-                    disabled={!cohortDraft.trim() || cohortDraft.trim() === config.waitlist_cohort}
+                    disabled={cohortDraft.trim() === config.waitlist_cohort}
                     className="flex items-center gap-1.5 rounded-md bg-violet-600 px-3 py-1.5 text-xs text-white hover:bg-violet-500 disabled:opacity-50"
                   >
                     <Save className="h-3.5 w-3.5" />
@@ -1331,7 +1340,8 @@ export function AdminPage() {
                   </button>
                 </div>
                 <p className="mt-1 text-xs text-zinc-500">
-                  Shown on the sign-up page and saved with each application. Changing it doesn't move earlier applicants.
+                  Leave it blank to use the instance name ({config.instance_name}). Shown on the sign-up page
+                  and saved with each application; changing it doesn't move earlier applicants.
                 </p>
               </div>
             </div>
