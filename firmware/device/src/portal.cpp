@@ -5,6 +5,7 @@
 #include <WebServer.h>
 #include <WiFi.h>
 
+#include "board.h"
 #include "face.h"
 #include "settings.h"
 #include "ui.h"
@@ -54,9 +55,13 @@ small{color:#888}</style>)";
 static void handleRoot() {
   String h;
   h.reserve(6000);
-  h += F("<!doctype html><html><head><meta charset=utf-8><title>Claw StickS3 setup</title>");
+  h += F("<!doctype html><html><head><meta charset=utf-8><title>Claw ");
+  h += board::kModel;
+  h += F(" setup</title>");
   h += FPSTR(kStyle);
-  h += F("</head><body><h1>Captain Claw &middot; StickS3</h1><form method=post action=/save>");
+  h += F("</head><body><h1>Captain Claw &middot; ");
+  h += board::kModel;
+  h += F("</h1><form method=post action=/save>");
 
   h += F("<h2>Wi-Fi networks</h2>");
   if (settings.netCount == 0) h += F("<small>None saved yet.</small>");
@@ -86,8 +91,9 @@ static void handleRoot() {
                       : F("<option value=1>Yes</option><option value=0 selected>No</option>");
   h += F("</select><label>Volume (%)</label><input name=vol type=number min=0 max=100 value=");
   h += String((settings.volume * 100 + 127) / 255);
-  h += F("><small>Above 75% on battery the stick may restart on loud peaks.</small>"
-         "<label>Speech boost</label><select name=boost>");
+  h += '>';
+  if (board::kLoudPeakRestarts) h += F("<small>Above 75% on battery the stick may restart on loud peaks.</small>");
+  h += F("<label>Speech boost</label><select name=boost>");
   for (int db : {0, 6, 10}) {
     h += "<option value=" + String(db) + (settings.boostDb == db ? " selected>" : ">") +
          (db ? "+" + String(db) + " dB" : String("Off")) + "</option>";
@@ -104,6 +110,11 @@ static void handleRoot() {
       {"none", "Nothing", !settings.cueBeep && !settings.cueFlash}};
   for (auto& c : cues) {
     h += String("<option value=") + c.v + (c.on ? " selected>" : ">") + c.label + "</option>";
+  }
+  if (board::kHasMotor) {
+    h += F("</select><label>Buzz before speaking</label><select name=buzz>");
+    h += settings.cueBuzz ? F("<option value=1 selected>Yes</option><option value=0>No</option>")
+                          : F("<option value=1>Yes</option><option value=0 selected>No</option>");
   }
   h += F("</select><label>Cue comes</label><select name=lead>");
   h += settings.cueLeadS == 2 ? F("<option value=1>1 s before speech</option><option value=2 selected>2 s before speech</option>")
@@ -122,7 +133,14 @@ static void handleRoot() {
   for (int k = 0; k < face::KindCount; ++k) {
     h += "<option value=" + String(k) + (settings.character == k ? " selected>" : ">") + face::name(k) + "</option>";
   }
-  h += F("</select><h2>Power</h2><label>Screen off when idle</label><select name=scroff>");
+  h += F("</select>");
+  if (board::kRound) {  // the round screen shows a clock
+    h += F("<label>Time zone</label><input name=tz autocapitalize=none value=\"");
+    h += esc(settings.tz);
+    h += F("\"><small>POSIX TZ for the clock, e.g. CET-1CEST,M3.5.0,M10.5.0/3 (Central Europe),"
+           " GMT0BST,M3.5.0/1,M10.5.0 (UK), EST5EDT,M3.2.0,M11.1.0 (US East)</small>");
+  }
+  h += F("<h2>Power</h2><label>Screen off when idle</label><select name=scroff>");
   for (int s : {5, 10, 15}) {
     h += "<option value=" + String(s) + (settings.screenOffS == s ? " selected>" : ">") + String(s) + " s</option>";
   }
@@ -130,7 +148,9 @@ static void handleRoot() {
   for (int s : {15, 30, 60}) {
     h += "<option value=" + String(s) + (settings.powerOffS == s ? " selected>" : ">") + String(s) + " s</option>";
   }
-  h += F("</select><small>Power off = deep sleep; the front button wakes it (a few seconds to reconnect)."
+  h += F("</select><small>Power off = deep sleep; the ");
+  h += board::kTalkButton;
+  h += F(" wakes it (a few seconds to reconnect)."
          " Never while it's listening, speaking or waiting for the agent.</small>"
          "<button type=submit>Save &amp; restart</button></form><p><small>Device ");
   h += deviceId();
@@ -174,15 +194,22 @@ static void handleSave() {
   settings.cueBeep = cue == "both" || cue == "beep";
   settings.cueFlash = cue == "both" || cue == "flash";
   settings.cueLeadS = server.arg("lead") == "2" ? 2 : 1;
+  if (board::kHasMotor) settings.cueBuzz = server.arg("buzz") != "0";
+  if (board::kRound) {
+    String tz = server.arg("tz");
+    tz.trim();
+    settings.tz = tz.length() ? tz : String(kDefaultTz);
+  }
   settings.iconMode = server.arg("display") == "icons";
   settings.character = constrain(server.arg("char").toInt(), 0, face::KindCount - 1);
   settings.textSize = constrain(server.arg("tsize").toInt(), 0, 2);
   settings.save();
 
   server.send(200, "text/html; charset=utf-8",
-              F("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
-                "<body style='font-family:system-ui;background:#111;color:#eee;padding:24px'>"
-                "<h2>Saved.</h2><p>The stick restarts and connects now. You can close this page.</p>"));
+              String(F("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+                       "<body style='font-family:system-ui;background:#111;color:#eee;padding:24px'>"
+                       "<h2>Saved.</h2><p>The ")) +
+                  board::kNoun + F(" restarts and connects now. You can close this page.</p>"));
   delay(800);
   ESP.restart();
 }
@@ -197,7 +224,7 @@ void runSetupPortal(const char* reason) {
   WiFi.mode(WIFI_AP_STA);
   scanNetworks();
   String id = deviceId();
-  String ap = "Captain-StickS3-" + id.substring(id.length() - 4);
+  String ap = String("Captain-") + board::kModel + "-" + id.substring(id.length() - 4);
   WiFi.softAP(ap.c_str());
   delay(200);
   dns.start(53, "*", WiFi.softAPIP());

@@ -3,6 +3,8 @@
 #include <Preferences.h>
 #include <WiFi.h>
 
+#include "board.h"
+
 Settings settings;
 
 static const char* kNs = "claw";
@@ -34,8 +36,11 @@ void Settings::load() {
   }
   cueBeep = p.getBool("cuebeep", true);
   cueFlash = p.getBool("cueflash", true);
+  cueBuzz = p.getBool("cuebuzz", true);
   cueLeadS = constrain(p.getUChar("cuelead", 1), 1, 2);
   textSize = min<uint8_t>(p.getUChar("tsize", 0), 2);
+  tz = p.getString("tz", kDefaultTz);
+  if (tz.isEmpty()) tz = kDefaultTz;
   p.end();
 }
 
@@ -68,8 +73,10 @@ void Settings::save() const {
   p.putUChar("charv", 2);
   p.putBool("cuebeep", cueBeep);
   p.putBool("cueflash", cueFlash);
+  p.putBool("cuebuzz", cueBuzz);
   p.putUChar("cuelead", cueLeadS);
   p.putUChar("tsize", textSize);
+  p.putString("tz", tz);
   p.end();
 }
 
@@ -102,6 +109,6 @@ String deviceId() {
   uint8_t mac[6];
   WiFi.macAddress(mac);
   char buf[16];
-  snprintf(buf, sizeof(buf), "stick-%02x%02x%02x", mac[3], mac[4], mac[5]);
+  snprintf(buf, sizeof(buf), "%s-%02x%02x%02x", board::kIdPrefix, mac[3], mac[4], mac[5]);
   return String(buf);
 }
