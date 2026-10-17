@@ -73,7 +73,7 @@ async def test_apply_then_approve_then_sign_in(fd_db):
     async with _client(_app(ADMIN)) as c:
         r = await _apply(c)
         assert r.status_code == 201, r.text
-        assert r.json()["cohort"] == "CC Cohort 001"
+        assert r.json()["cohort"] == "Flight Deck"  # the instance name
 
         # Still waiting: the right password hears so, a wrong one doesn't.
         r = await c.post("/fd/auth/login", json={"email": "newbie@example.com", "password": "hunter22"})
@@ -91,7 +91,7 @@ async def test_apply_then_approve_then_sign_in(fd_db):
         assert entry["display_name"] == "New Bie"
         assert entry["referrer_name"] == "Ref Erer"
         assert entry["referrer_email"] == "ref@example.com"
-        assert entry["cohort"] == "CC Cohort 001"
+        assert entry["cohort"] == "Flight Deck"
         assert "password_hash" not in entry
 
         r = await c.post(f"/fd/admin/waitlist/{entry['id']}/approve", json={})
@@ -225,11 +225,30 @@ async def test_cohort_name_is_admin_set(fd_db):
         r = await c.put("/fd/admin/config", json={"waitlist_cohort": "  CC   Cohort 002 "})
         assert r.status_code == 200
         assert r.json()["waitlist_cohort"] == "CC Cohort 002"
-        assert (await c.put("/fd/admin/config", json={"waitlist_cohort": "   "})).status_code == 400
         r = await _apply(c)
         assert r.json()["cohort"] == "CC Cohort 002"
         entry = (await c.get("/fd/admin/waitlist")).json()["entries"][0]
     assert entry["cohort"] == "CC Cohort 002"
+
+
+async def test_cohort_follows_the_instance_name(fd_db):
+    async with _client(_app(ADMIN)) as c:
+        await c.put("/fd/admin/config", json={"instance_name": "Northwind Agents"})
+        r = await _apply(c, email="one@example.com")
+        assert r.json()["cohort"] == "Northwind Agents"
+
+        # A named cohort wins; blank goes back to the instance name.
+        await c.put("/fd/admin/config", json={"waitlist_cohort": "Spring intake"})
+        assert (await _apply(c, email="two@example.com")).json()["cohort"] == "Spring intake"
+        r = await c.put("/fd/admin/config", json={"waitlist_cohort": "   "})
+        assert r.status_code == 200 and r.json()["waitlist_cohort"] == ""
+        assert (await _apply(c, email="three@example.com")).json()["cohort"] == "Northwind Agents"
+
+    # The old built-in default, saved as is on an older deck, counts as not set.
+    raw = json.loads(await fd_db.get_system_setting("fd:system-config"))
+    await fd_db.set_system_setting(
+        "fd:system-config", json.dumps({**raw, "waitlist_cohort": "CC Cohort 001"}))
+    assert (await admin_routes.waitlist_settings(fd_db))["cohort"] == "Northwind Agents"
 
 
 async def test_rate_limited_per_network(fd_db, monkeypatch):

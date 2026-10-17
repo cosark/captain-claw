@@ -393,9 +393,10 @@ SYSTEM_CONFIG_DEFAULTS = {
     "kiosk_new_users": False,
     # While self-registration is closed, the sign-up page takes applications
     # for this cohort instead (each names who recommended them); an admin
-    # approves them under Admin → Waitlist.
+    # approves them under Admin → Waitlist. Blank: the instance name
+    # (waitlist_cohort()).
     "waitlist_enabled": True,
-    "waitlist_cohort": "CC Cohort 001",
+    "waitlist_cohort": "",
     # Branding: the name in the panels' title and on the sign-in page, and the
     # short description under it there (the logo: branding_routes).
     "instance_name": "Flight Deck",
@@ -403,6 +404,9 @@ SYSTEM_CONFIG_DEFAULTS = {
 }
 
 WAITLIST_COHORT_MAX = 60
+# The cohort every deck had before it followed the instance name: still
+# stored where an admin saved it unchanged, and read as "not set".
+LEGACY_DEFAULT_COHORT = "CC Cohort 001"
 INSTANCE_NAME_MAX = 60
 INSTANCE_DESCRIPTION_MAX = 300
 
@@ -429,6 +433,8 @@ def _load_system_config(raw: str | None) -> dict:
             cfg.update(stored)
         except (json.JSONDecodeError, TypeError):
             stored = {}
+    if cfg.get("waitlist_cohort") == LEGACY_DEFAULT_COHORT:
+        cfg["waitlist_cohort"] = ""
     if cfg.get("kiosk_mode") not in KIOSK_MODES:
         cfg["kiosk_mode"] = _env_kiosk_default()
     # The Admin page says where an unpicked mode came from.
@@ -488,13 +494,20 @@ async def new_user_metadata(db, role: str, kiosk: bool | None = None) -> dict:
     return {"kiosk": True} if kiosk else {}
 
 
+def waitlist_cohort(cfg: dict) -> str:
+    """What applicants join under *cfg*: the cohort an admin named, else the
+    instance name."""
+    return str(cfg.get("waitlist_cohort") or cfg.get("instance_name")
+               or SYSTEM_CONFIG_DEFAULTS["instance_name"])
+
+
 async def waitlist_settings(db) -> dict:
     """The deck's waitlist: ``enabled`` (takes applications while
     self-registration is closed) and the ``cohort`` applicants join."""
     cfg = _load_system_config(await db.get_system_setting("fd:system-config"))
     return {
         "enabled": bool(cfg.get("waitlist_enabled")),
-        "cohort": str(cfg.get("waitlist_cohort") or SYSTEM_CONFIG_DEFAULTS["waitlist_cohort"]),
+        "cohort": waitlist_cohort(cfg),
     }
 
 
@@ -519,16 +532,18 @@ async def update_config(body: UpdateConfigRequest, admin: dict = Depends(require
     updates = body.model_dump(exclude_none=True)
     if "kiosk_mode" in updates and updates["kiosk_mode"] not in KIOSK_MODES:
         raise HTTPException(400, f"kiosk_mode must be one of: {', '.join(KIOSK_MODES)}")
+    reset: list[str] = []
     if "waitlist_cohort" in updates:
         cohort = " ".join(updates["waitlist_cohort"].split())
-        if not cohort:
-            raise HTTPException(400, "The cohort name can't be empty")
         if len(cohort) > WAITLIST_COHORT_MAX:
             raise HTTPException(400, f"The cohort name is at most {WAITLIST_COHORT_MAX} characters")
-        updates["waitlist_cohort"] = cohort
+        if cohort:
+            updates["waitlist_cohort"] = cohort
+        else:  # blank: the instance name again
+            del updates["waitlist_cohort"]
+            reset.append("waitlist_cohort")
     from captain_claw.flight_deck.auth_routes import _clean_text
 
-    reset: list[str] = []
     if "instance_name" in updates:
         name = _clean_text(updates["instance_name"], INSTANCE_NAME_MAX + 1)
         if len(name) > INSTANCE_NAME_MAX:

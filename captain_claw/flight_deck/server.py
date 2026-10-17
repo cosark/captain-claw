@@ -8189,6 +8189,8 @@ async def _get_system_config() -> dict:
 @app.get("/fd/auth/status")
 async def auth_status():
     """Check if auth is enabled and return system config flags (public endpoint)."""
+    from captain_claw.flight_deck.admin_routes import waitlist_cohort
+
     cfg = await _get_system_config()
     # When running inside a container, default docker spawn to False (no Docker socket)
     docker_default = not os.environ.get("CAPTAIN_CLAW_DOCKER")
@@ -8216,7 +8218,7 @@ async def auth_status():
         "simple_chat_only": cfg.get("kiosk_mode") == "all",
         "registration_open": registration_open,
         "waitlist_open": AUTH_ENABLED and not registration_open and bool(cfg.get("waitlist_enabled")),
-        "waitlist_cohort": cfg.get("waitlist_cohort") or "",
+        "waitlist_cohort": waitlist_cohort(cfg),
         # Branding (Admin → Settings): the sign-in page and the panels' title.
         "instance_name": cfg.get("instance_name") or "Flight Deck",
         "instance_description": cfg.get("instance_description") or "",
