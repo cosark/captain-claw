@@ -1,6 +1,7 @@
 // Screens and machines: Matrix rain, Commodore 64, Amiga Boing, HAL 9000,
 // KITT and Pac-Man — homages drawn from scratch, no copied artwork.
 #include "face_common.h"
+#include "efont_subset.h"
 
 namespace face {
 
@@ -58,7 +59,7 @@ void drawMatrix(M5Canvas& c, Pose pose, int level, uint32_t t, int cx, int cy) {
   rainT = t;
   const int rows = (kBottom - kTop) / kRowH;
   bool red = pose == Pose::Sad;
-  c.setFont(&fonts::efontJA_12);
+  c.setFont(&efont::efont12);
   c.setTextDatum(top_left);
   char g[5];
   for (int i = 0; i < kCols; ++i) {

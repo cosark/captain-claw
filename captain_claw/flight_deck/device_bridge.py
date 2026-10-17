@@ -2,7 +2,7 @@
 
 One WebSocket per device: ``/device/ws?token=<cc_pat_…>&device=<id>``
 (optional ``agent=<slug|name|port>``, ``lang=<tts language>``, ``speak=0``,
-``voice=male|female|<Soniox voice>``,
+``voice=male|female|<Soniox voice>``, ``hw=sticks3&fw=0.8.0`` for updates,
 ``sw``/``sh`` = screen size for pictures, default 240×135,
 ``round=1`` = a round screen: pictures fit inside the circle,
 ``img=chunks`` = pictures may span several frames, so they can be bigger).
@@ -24,6 +24,7 @@ Device → Flight Deck
   text  {"type":"agents"} / {"type":"select","agent":"<slug>"}
   text  {"type":"prefs","voice":"male|female|<name>","speak":bool}   change voice / speaking live
   text  {"type":"ping","t":<device ms>}          echoed back (round-trip time)
+  text  {"type":"update_check"}                  → update offer or {"type":"update_none"}
 
 Flight Deck → device
   text  {"type":"bound","agent":name,"slug":slug,"linked":bool} | {"type":"agents","items":[…],"current":slug}
@@ -37,6 +38,7 @@ Flight Deck → device
   text  {"type":"image","name":"…","w":240,"h":135,"size":n} then bin 0x02 + baseline JPEG
         (img=chunks: bin 0x03 + part … while more follow, then 0x02 + the last part)
   text  {"type":"error","text":"…"} | {"type":"pong","t":<echoed>}
+  text  {"type":"update","version","size","sha256","sig","notes","url"} | {"type":"update_none"}
 
 Auth: a personal access token (Profile → MCP agent access) names the owner;
 the device only ever reaches that owner's agents. With Flight Deck auth off
@@ -298,8 +300,11 @@ def _pick_agent(user_id: str, selector: str) -> dict | None:
 class _DeviceConn:
     def __init__(self, ws: WebSocket, user: dict, device_id: str, *, lang: str,
                  speak: bool, screen: tuple[int, int], voice: str = "",
-                 round_screen: bool = False, chunked: bool = False) -> None:
+                 round_screen: bool = False, chunked: bool = False,
+                 hw: str = "", fw: str = "") -> None:
         self.ws = ws
+        self.hw = hw  # device kind + firmware version, for over-the-air updates
+        self.fw = fw
         self.user = user
         self.user_id = str(user.get("id", ""))
         self.device_id = device_id
@@ -324,6 +329,19 @@ class _DeviceConn:
         self._audio_task: asyncio.Task | None = None
         self._audio_worker: asyncio.Task | None = None
         self._bg: set[asyncio.Task] = set()
+
+    # ── over-the-air updates ──
+    async def offer_update(self, reply_none: bool = False) -> bool:
+        """Offer the newest build of this device's kind when it's newer than
+        what it runs (device_firmware.py); "update_none" on request."""
+        from captain_claw.flight_deck.device_firmware import offer_for
+
+        offer = offer_for(self.hw, self.fw)
+        if offer:
+            await self.send_json(offer)
+        elif reply_none:
+            await self.send_json({"type": "update_none"})
+        return offer is not None
 
     # ── wire ──
     async def send_json(self, obj: dict) -> None:
@@ -630,6 +648,23 @@ class _DeviceConn:
 
 # ── Route ─────────────────────────────────────────────────────────────
 
+# Connected devices, so a freshly published build reaches them right away.
+_live: set[_DeviceConn] = set()
+
+
+async def offer_to_connected(hw: str) -> int:
+    """Offer the newest build to every connected device of kind ``hw``."""
+    offered = 0
+    for conn in list(_live):
+        if conn.hw != hw:
+            continue
+        try:
+            offered += await conn.offer_update()
+        except Exception:
+            pass
+    return offered
+
+
 
 @router.websocket("/device/ws")
 async def device_ws(ws: WebSocket) -> None:
@@ -644,10 +679,14 @@ async def device_ws(ws: WebSocket) -> None:
     conn = _DeviceConn(
         ws, user, device_id, lang=lang, speak=q.get("speak", "1") not in ("0", "false", "off"),
         voice=q.get("voice", ""), **_picture_options(q),
+        hw=re.sub(r"[^a-z0-9_-]", "", (q.get("hw", "") or "").lower())[:24],
+        fw=re.sub(r"[^0-9.]", "", q.get("fw", "") or "")[:16],
     )
     conn.start_audio_worker()
+    _live.add(conn)
     try:
         await conn.bind(q.get("agent", ""))
+        await conn.offer_update()
         while True:
             msg = await ws.receive()
             if msg.get("type") == "websocket.disconnect":
@@ -693,6 +732,8 @@ async def device_ws(ws: WebSocket) -> None:
                     conn.voice = voice_name(str(obj.get("voice", "")))
                 if "speak" in obj:
                     conn.speak = bool(obj.get("speak"))
+            elif mtype == "update_check":
+                await conn.offer_update(reply_none=True)
             elif mtype == "ping":
                 pong = {"type": "pong"}
                 if isinstance(obj.get("t"), (int, float)):
@@ -703,4 +744,5 @@ async def device_ws(ws: WebSocket) -> None:
     except Exception as exc:
         log.warning("device ws error: %s", exc)
     finally:
+        _live.discard(conn)
         await conn.close()

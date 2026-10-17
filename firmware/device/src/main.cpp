@@ -22,11 +22,12 @@
 #include "audio.h"
 #include "board.h"
 #include "face.h"
+#include "ota.h"
 #include "portal.h"
 #include "settings.h"
 #include "ui.h"
 
-#define FW_VERSION "0.7.0"
+#define FW_VERSION "0.8.0"
 
 enum class Mode { Idle, Listening, Waiting, Reply, Image, Menu, Agents, CharPick, Status, Notice };
 
@@ -34,6 +35,11 @@ static WebSocketsClient ws;
 static WiFiMulti wifiMulti;
 static bool wsUp = false;
 static bool agentLinked = false;  // Flight Deck's link to the agent is up
+static ota::Offer offer;           // a newer build Flight Deck offers (docs/device-ota-plan.md)
+static String offerAnnounced;      // version the user has been told about
+static bool offerAutoTried = false;
+static bool probation = false;     // this boot is a fresh update that hasn't reached the deck yet
+static bool checkingUpdate = false;
 static Mode mode = Mode::Idle;
 static String agentName, agentSlug;
 static String heard, statusLine;
@@ -217,6 +223,7 @@ static std::vector<ui::Row> statusRows() {
                                "  up " + uptime(),
                   kText});
   rows.push_back({"Device", deviceId() + "  fw " FW_VERSION "  " + String(ESP.getFreePsram() / 1024) + "k free", kText});
+  if (offer.valid()) rows.push_back({"Update", offer.version + " available (menu → Software update)", kCyan});
   return rows;
 }
 
@@ -248,7 +255,7 @@ static void showIdle() {
 // ── menu ─────────────────────────────────────────────────────────────
 
 enum MenuRow { MStatus, MAgent, MVolume, MBoost, MVoice, MDisplay, MTextSize, MCharacter, MBeep, MFlash, MBuzz,
-               MLead, MScreenOff, MPowerOff, MSetup, MCount };
+               MLead, MScreenOff, MPowerOff, MUpdate, MAutoUpdate, MSetup, MCount };
 
 // Rows this device has (only a device with a motor can buzz).
 static bool rowShown(int row) { return row != MBuzz || board::kHasMotor; }
@@ -275,6 +282,8 @@ static String menuLabel(int row) {
     case MLead: return "Cue lead: " + String(settings.cueLeadS) + " s";
     case MScreenOff: return "Screen off: " + String(settings.screenOffS) + " s";
     case MPowerOff: return "Power off: " + String(settings.powerOffS) + " s";
+    case MUpdate: return offer.valid() ? "Update to " + offer.version + " »" : String("Software " FW_VERSION " · check");
+    case MAutoUpdate: return String("Auto update: ") + (settings.autoUpdate ? "on" : "off");
     default: return "Wi-Fi & settings…";
   }
 }
@@ -314,6 +323,17 @@ static ui::Item menuItem(int row) {
     case MLead: it.title = "Cue lead"; it.badge = String(settings.cueLeadS) + " s"; it.note = "how early the cue comes"; break;
     case MScreenOff: it.title = "Screen off"; it.badge = String(settings.screenOffS) + " s"; it.note = "after this long idle"; break;
     case MPowerOff: it.title = "Power off"; it.badge = String(settings.powerOffS) + " s"; it.note = "after this long idle"; break;
+    case MUpdate:
+      it.title = "Software update";
+      it.badge = offer.valid() ? offer.version : String(FW_VERSION);
+      it.note = offer.valid() ? String("yellow = install") : String("up to date · yellow = check");
+      break;
+    case MAutoUpdate:
+      it.title = "Auto update";
+      it.badge = onOff(settings.autoUpdate);
+      it.on = settings.autoUpdate;
+      it.note = "installs when idle on USB";
+      break;
     default: it.title = "Wi-Fi & settings"; it.glyph = ui::Glyph::Wifi; it.note = "opens the setup hotspot"; break;
   }
   return it;
@@ -361,6 +381,8 @@ static uint8_t nextStep(const uint8_t (&steps)[N], uint8_t now) {
 }
 
 static void backToMain();
+static void startInstall();
+static void connectServer();
 
 static void redraw() {
   setBarState();
@@ -488,6 +510,18 @@ static void chooseMenuRow() {
     case MLead: settings.cueLeadS = settings.cueLeadS == 1 ? 2 : 1; break;
     case MScreenOff: settings.screenOffS = settings.screenOffS == 5 ? 10 : settings.screenOffS == 10 ? 15 : 5; break;
     case MPowerOff: settings.powerOffS = settings.powerOffS == 15 ? 30 : settings.powerOffS == 30 ? 60 : 15; break;
+    case MUpdate:
+      if (offer.valid()) {
+        startInstall();
+      } else if (wsUp) {
+        checkingUpdate = true;
+        sendType("update_check");
+        notice("Software update", "Checking for a newer version…", kText);
+      } else {
+        notice("Offline", "Connect to Flight Deck to check for updates.", kRed);
+      }
+      return;
+    case MAutoUpdate: settings.autoUpdate = !settings.autoUpdate; break;
   }
   settings.save();
   redraw();
@@ -660,6 +694,30 @@ static void onText(const char* payload, size_t len) {
     setBarState();
   } else if (type == "audio_end") {
     audio::playEnd();
+  } else if (type == "update") {
+    ota::Offer o;
+    o.version = doc["version"] | "";
+    o.size = doc["size"] | 0;
+    o.sha256 = doc["sha256"] | "";
+    o.sig = doc["sig"] | "";
+    o.url = doc["url"] | "";
+    o.notes = doc["notes"] | "";
+    if (o.valid() && ota::compareVersions(o.version, FW_VERSION) > 0) {
+      offer = o;
+      bool asked = checkingUpdate;
+      checkingUpdate = false;
+      if ((asked || offerAnnounced != o.version) && !settings.autoUpdate &&
+          (mode == Mode::Idle || mode == Mode::Reply || mode == Mode::Notice || mode == Mode::Menu)) {
+        offerAnnounced = o.version;
+        notice(("Update " + o.version + " available").c_str(),
+               (o.notes.length() ? o.notes + " — " : String("")) + "Menu → Software update.", kCyan);
+      }
+    }
+  } else if (type == "update_none") {
+    if (checkingUpdate) {
+      checkingUpdate = false;
+      notice("Up to date", String("This is the latest version (" FW_VERSION ")."), kGreen);
+    }
   } else if (type == "pong") {
     if (doc["t"].is<uint32_t>()) rttMs = millis() - doc["t"].as<uint32_t>();
   } else if (type == "error") {
@@ -758,6 +816,7 @@ static void connectServer() {
   if (settings.agent.length()) path += "&agent=" + urlEncode(settings.agent);
   if (settings.lang.length()) path += "&lang=" + urlEncode(settings.lang);
   path += String("&voice=") + (settings.femaleVoice ? "female" : "male");
+  path += String("&hw=") + board::kHw + "&fw=" FW_VERSION;
   if (!settings.speak) path += "&speak=0";
 
   if (tls) {
@@ -771,6 +830,63 @@ static void connectServer() {
   ws.onEvent(onWs);
   ws.setReconnectInterval(3000);
   ws.enableHeartbeat(15000, 5000, 2);
+}
+
+// ── over-the-air updates (docs/device-ota-plan.md) ───────────────────
+
+static String httpBase() {
+  String b = settings.server;
+  if (b.startsWith("wss://")) b = "https://" + b.substring(6);
+  else if (b.startsWith("ws://")) b = "http://" + b.substring(5);
+  while (b.endsWith("/")) b.remove(b.length() - 1);
+  return b;
+}
+
+static bool onUsbPower() {
+  int vbus = M5.Power.getVBUSVoltage();
+  if (vbus > 0) return vbus > 4000;
+  return M5.Power.isCharging() == m5::Power_Class::is_charging || M5.Power.getBatteryLevel() >= 99;
+}
+
+static void installProgress(size_t done, size_t total) {
+  static int lastPct = -1;
+  int pct = total ? (int)(done * 100 / total) : 0;
+  if (pct == lastPct || (pct % 2 && pct != 100)) return;
+  lastPct = pct;
+  ui::showMessage(("Updating to " + offer.version).c_str(),
+                  String(pct) + "%  ·  " + String(done / 1024) + " / " + String(total / 1024) +
+                      " KB. Keep it on.",
+                  kCyan);
+}
+
+static void startInstall() {
+  if (!offer.valid()) return;
+  if (mode == Mode::Listening || mode == Mode::Waiting || audio::playing()) {
+    notice("Not now", "Finish the conversation first.", kOrange);
+    return;
+  }
+  int pct = M5.Power.getBatteryLevel();
+  if (!onUsbPower() && pct >= 0 && pct < 30) {
+    notice("Battery low", "Charge to 30% (or plug in) to update.", kOrange);
+    return;
+  }
+  touch();
+  audio::playStop();
+  ws.disconnect();  // one TLS connection at a time; we restart anyway
+  wsUp = false;
+  agentLinked = false;
+  ui::setHealth(wifiHealth(), ui::Partial);
+  ui::setBar(agentName, "updating", kCyan);
+  ui::showMessage(("Updating to " + offer.version).c_str(), String("Downloading…"), kCyan);
+  String err = ota::install(offer, httpBase(), settings.token, installProgress);
+  if (err.isEmpty()) {
+    ui::showMessage("Update installed", "Restarting into " + offer.version + "…", kGreen);
+    delay(1200);
+    ESP.restart();
+  }
+  lastActivityMs = millis();
+  notice("Update failed", err + ". Still on " FW_VERSION ".", kOrange);
+  connectServer();
 }
 
 // ── power ────────────────────────────────────────────────────────────
@@ -791,7 +907,7 @@ static void goToSleep() {
 // flashing or waiting for the agent: then the screen goes off, later the
 // stick powers off (deep sleep; the front button wakes it).
 static void handleIdlePower() {
-  if (mode == Mode::Listening || mode == Mode::Waiting || audio::playing() || flashing) {
+  if (mode == Mode::Listening || mode == Mode::Waiting || audio::playing() || flashing || probation) {
     lastActivityMs = millis();
     return;
   }
@@ -839,9 +955,10 @@ void setup() {
   ui::begin();
   ui::brightness(kBright);
   settings.load();
+  probation = ota::onProbation();
   ui::setTextSize(settings.textSize);
-  Serial.printf("[claw] boot %s fw %s: %d network(s), server '%s'\n", deviceId().c_str(), FW_VERSION,
-                settings.netCount, settings.server.c_str());
+  Serial.printf("[claw] boot %s fw %s%s: %d network(s), server '%s'\n", deviceId().c_str(), FW_VERSION,
+                probation ? " (on probation)" : "", settings.netCount, settings.server.c_str());
   audio::begin(settings.volume, settings.boostDb);
   M5.BtnB.setHoldThresh(800);
   esp_timer_create_args_t sampler = {};
@@ -866,7 +983,10 @@ void setup() {
   uint32_t t0 = millis();
   while (wifiMulti.run(5000) != WL_CONNECTED) {
     M5.update();
-    if (M5.BtnA.wasPressed() || millis() - t0 > 30000) {
+    // A fresh update that can't even reach Wi-Fi goes back to the old version
+    // (which may well be fine) rather than into setup.
+    if (probation && millis() - t0 > 30000) ota::rollBack();
+    if (!probation && (M5.BtnA.wasPressed() || millis() - t0 > 30000)) {
       runSetupPortal("No Wi-Fi in reach");
     }
   }
@@ -1038,6 +1158,30 @@ void loop() {
       lastDrawMs = millis();  // live status page; battery/health in the bar elsewhere
       if (mode != Mode::Listening && mode != Mode::Notice && mode != Mode::Image) redraw();
     }
+  }
+
+  // A fresh update proves itself by reaching Flight Deck within 90 s;
+  // otherwise the bootloader goes back to the previous version.
+  if (probation) {
+    if (wsUp) {
+      ota::markGood();
+      probation = false;
+    } else if (millis() > 90000) {
+      ota::rollBack();
+    }
+  }
+  if (wsUp && settings.lastFw != FW_VERSION) {  // first run of this version
+    bool updated = settings.lastFw.length() > 0;
+    settings.lastFw = FW_VERSION;
+    settings.save();
+    if (updated && (mode == Mode::Idle || mode == Mode::Reply)) {
+      notice("Updated", "Now running " FW_VERSION ".", kGreen);
+    }
+  }
+  if (settings.autoUpdate && offer.valid() && !offerAutoTried && !audio::playing() &&
+      (mode == Mode::Idle || mode == Mode::Reply || mode == Mode::Image) && onUsbPower()) {
+    offerAutoTried = true;
+    startInstall();
   }
 
   noteButtonActivity();

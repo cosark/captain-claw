@@ -148,6 +148,9 @@ static void handleRoot() {
   for (int s : {15, 30, 60}) {
     h += "<option value=" + String(s) + (settings.powerOffS == s ? " selected>" : ">") + String(s) + " s</option>";
   }
+  h += F("</select><label>Software updates</label><select name=autoupd>");
+  h += settings.autoUpdate ? F("<option value=0>Ask me (menu → Software update)</option><option value=1 selected>Install by themselves (idle, on USB)</option>")
+                           : F("<option value=0 selected>Ask me (menu → Software update)</option><option value=1>Install by themselves (idle, on USB)</option>");
   h += F("</select><small>Power off = deep sleep; the ");
   h += board::kTalkButton;
   h += F(" wakes it (a few seconds to reconnect)."
@@ -189,6 +192,7 @@ static void handleSave() {
   int so = server.arg("scroff").toInt(), po = server.arg("pwroff").toInt();
   settings.screenOffS = (so == 5 || so == 10) ? so : 15;
   settings.powerOffS = (po == 15 || po == 30) ? po : 60;
+  settings.autoUpdate = server.arg("autoupd") == "1";
   settings.femaleVoice = server.arg("voice") == "female";
   String cue = server.arg("cue");
   settings.cueBeep = cue == "both" || cue == "beep";

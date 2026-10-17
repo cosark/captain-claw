@@ -1,5 +1,7 @@
-// StickS3 screen: 240×135 landscape LCD. Text uses efontJA, which has č ć š ž đ.
+// StickS3 screen: 240×135 landscape LCD. Text uses efont (trimmed efontJA, see
+// efont_subset.h), which has č ć š ž đ.
 #include "ui.h"
+#include "efont_subset.h"
 
 #include <M5Unified.h>
 
@@ -7,12 +9,12 @@ namespace ui {
 
 static M5Canvas canvas(&M5.Display);
 static constexpr int W = 240, H = 135, BAR = 16, PAD = 4;
-static const lgfx::U8g2font* kBody = &fonts::efontJA_14;  // fixed size: status page, setup
-static const lgfx::U8g2font* kSmall = &fonts::efontJA_12; // fixed size: top bar, panels
+static const lgfx::U8g2font* kBody = &efont::efont14;  // fixed size: status page, setup
+static const lgfx::U8g2font* kSmall = &efont::efont12; // fixed size: top bar, panels
 static constexpr int kLine = 16;
 
 // Reading text (replies, the working screen, notices, the menu) in the size
-// the user picked. efontJA at 14/16/24 px all have č ć š ž đ.
+// the user picked. efont at 14/16/24 px all have č ć š ž đ.
 struct TextSize {
   const lgfx::U8g2font* body;
   int line;
@@ -20,9 +22,9 @@ struct TextSize {
   int smallLine;
 };
 static const TextSize kSizes[] = {
-    {&fonts::efontJA_14, 16, &fonts::efontJA_12, 15},  // small (the original)
-    {&fonts::efontJA_16, 18, &fonts::efontJA_14, 16},  // medium
-    {&fonts::efontJA_24, 26, &fonts::efontJA_16, 18},  // large
+    {&efont::efont14, 16, &efont::efont12, 15},  // small (the original)
+    {&efont::efont16, 18, &efont::efont14, 16},  // medium
+    {&efont::efont24, 26, &efont::efont16, 18},  // large
 };
 static uint8_t sizeIdx = 0;
 static const TextSize& ts() { return kSizes[sizeIdx]; }
@@ -341,9 +343,9 @@ struct PanelSize {
   int line;
 };
 static const PanelSize kPanelSizes[] = {
-    {&fonts::efontJA_12, 14},  // small (the original)
-    {&fonts::efontJA_16, 18},  // medium
-    {&fonts::efontJA_24, 26},  // large
+    {&efont::efont12, 14},  // small (the original)
+    {&efont::efont16, 18},  // medium
+    {&efont::efont24, 26},  // large
 };
 
 int showPanel(const char* title, uint16_t titleColor, const std::vector<Row>& rows, int page) {

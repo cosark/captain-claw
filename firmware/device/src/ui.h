@@ -1,5 +1,5 @@
 // The screen. Each device has its own implementation of this interface:
-//   ui_stick.cpp  StickS3: 240×135 landscape LCD, efontJA (has č ć š ž đ)
+//   ui_stick.cpp  StickS3: 240×135 landscape LCD, efont, trimmed efontJA (has č ć š ž đ)
 //   ui_round.cpp  StopWatch: 466×466 round AMOLED, smooth Inter fonts
 // Both draw into an off-screen canvas and push it whole (no flicker).
 //
