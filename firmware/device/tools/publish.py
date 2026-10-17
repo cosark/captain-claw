@@ -128,6 +128,11 @@ def main() -> None:
     path = ROOT / ".pio/build" / a.target / "firmware.bin" if a.no_build else build(a.target)
     blob = path.read_bytes()
     version = fw_version()
+    # The firmware reports itself as "&fw=<FW_VERSION>"; a build that doesn't
+    # contain it is stale (built before FW_VERSION changed) — never publish it.
+    if f"&fw={version}".encode() not in blob:
+        sys.exit(f"{path} isn't a {version} build (FW_VERSION changed since it was built) — "
+                 "publish without --no-build")
     digest = hashlib.sha256(blob).hexdigest()
     fields = {"hw": a.target, "version": version, "sha256": digest, "sig": sign(blob), "notes": a.notes}
     print(f"{a.target} {version}: {len(blob) // 1024} KB, sha256 {digest[:16]}…")
