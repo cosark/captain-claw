@@ -101,6 +101,10 @@ def upload(deck: str, token: str, fields: dict[str, str], blob: bytes) -> dict:
             return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         sys.exit(f"upload refused: HTTP {exc.code} {exc.read().decode(errors='replace')[:300]}")
+    except urllib.error.URLError as exc:
+        # Flight Deck answers a bad token before reading the upload, so the
+        # client sees the connection closed mid-send.
+        sys.exit(f"upload failed ({exc.reason}) — usually a rejected token, or the deck is unreachable")
 
 
 def main() -> None:
@@ -118,6 +122,9 @@ def main() -> None:
         a.token = TOKEN_FILE.read_text().strip()
     if not a.deck or not a.token:
         sys.exit(f"--deck and a token (--token, FD_TOKEN or {TOKEN_FILE}) are required")
+    if any(c.isspace() for c in a.token) or not (a.token.startswith("cc_pat_") or a.token.count(".") == 2):
+        sys.exit("the token doesn't look like a Flight Deck token (cc_pat_… or a JWT) — "
+                 f"check {TOKEN_FILE if not os.environ.get('FD_TOKEN') else 'FD_TOKEN'}")
     path = ROOT / ".pio/build" / a.target / "firmware.bin" if a.no_build else build(a.target)
     blob = path.read_bytes()
     version = fw_version()
