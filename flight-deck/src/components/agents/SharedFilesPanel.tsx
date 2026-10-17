@@ -13,6 +13,8 @@ import {
   deleteConfirmText, toViewerFile, uploadError,
 } from '../../utils/sharedWorkspace'
 import { FileViewer } from './FileViewer'
+import { FileActionSheet } from './FileActionSheet'
+import { useIsMobile } from '../../hooks/useMediaQuery'
 import { CreatorBadge } from './CreatorBadge'
 
 // A shared agent's saved/ folder as a MEMBER sees it: every file in it, the
@@ -117,6 +119,10 @@ export function SharedFilesPanel({ agentRef, agentName, ownerName }: {
       setUploading(false)
     }
   }
+
+  // A phone has no hover: a tap on a file opens its actions in a sheet.
+  const { isMobile: phone } = useIsMobile()
+  const [actionFile, setActionFile] = useState<SharedFile | null>(null)
 
   const handleView = (f: SharedFile) => {
     if (getFileTypeGroup(toViewerFile(f)) === 'pdf') {
@@ -236,7 +242,21 @@ export function SharedFilesPanel({ agentRef, agentName, ownerName }: {
         )}
         {!loading && !error && shown.length > 0 && (
           <ul className="flex flex-col gap-0.5">
-            {shown.map((f) => (
+            {shown.map((f) => phone ? (
+              <li key={f.id}>
+                <button
+                  onClick={() => setActionFile(f)}
+                  className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-3 text-left active:bg-zinc-800/60"
+                >
+                  <SharedFileIcon file={f} />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm text-zinc-200">{f.filename}</span>
+                    <span className="mt-0.5 block"><CreatorBadge mode="member" creator={f.created_by} ownerName={ownerName} /></span>
+                  </span>
+                  <span className="shrink-0 text-xs text-zinc-500">{formatSize(f.size)}</span>
+                </button>
+              </li>
+            ) : (
               <li key={f.id} className="group rounded-md px-1.5 py-1 hover:bg-zinc-900/60">
                 <div className="flex items-center gap-1.5">
                   <SharedFileIcon file={f} />
@@ -262,6 +282,23 @@ export function SharedFilesPanel({ agentRef, agentName, ownerName }: {
           </ul>
         )}
       </div>
+
+      {/* Phone: what a tap on a file offers (Delete only on the member's own). */}
+      {actionFile && (
+        <FileActionSheet
+          filename={actionFile.filename}
+          size={actionFile.size}
+          mime={actionFile.mime_type}
+          icon={<SharedFileIcon file={actionFile} />}
+          detail={<CreatorBadge mode="member" creator={actionFile.created_by} ownerName={ownerName} />}
+          downloadUrl={sharedFileUrl(agentRef, actionFile.id, 'download')}
+          onView={isViewable(toViewerFile(actionFile)) ? () => { setActionFile(null); handleView(actionFile) } : undefined}
+          onDownload={() => handleDownload(actionFile)}
+          onDelete={actionFile.can_delete ? () => { const f = actionFile; setActionFile(null); void handleDelete(f) } : undefined}
+          deleting={deleting === actionFile.id}
+          onClose={() => setActionFile(null)}
+        />
+      )}
 
       {/* Viewer: read-only, over the member routes (never an owner URL). */}
       {viewing && (

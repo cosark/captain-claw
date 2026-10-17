@@ -85,14 +85,14 @@ export function KioskInfoDialog({ agents, onClose, onOpenProfile, onOpenConnecti
   const maxAgents = info?.account.limits.max_agents
 
   return createPortal(
-    <div className="fixed inset-0 z-50 flex items-stretch justify-center bg-black/60 sm:items-center sm:p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-stretch justify-center bg-black/60 wide:items-center wide:p-4" onClick={onClose}>
       <div
         role="dialog"
         aria-label="Info"
-        className="relative flex h-[100dvh] w-full flex-col overflow-hidden bg-zinc-950 shadow-2xl sm:h-[85vh] sm:max-w-2xl sm:rounded-2xl sm:border sm:border-zinc-800"
+        className="relative flex h-[100dvh] w-full flex-col overflow-hidden bg-zinc-950 shadow-2xl wide:h-[85vh] wide:max-w-2xl wide:rounded-2xl wide:border wide:border-zinc-800"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex h-14 shrink-0 items-center justify-between border-b border-zinc-800 px-4 sm:px-5">
+        <div className="flex h-14 shrink-0 items-center justify-between border-b border-zinc-800 px-4 wide:px-5">
           <h2 className="flex items-center gap-2 text-base font-semibold text-zinc-100">
             <Info className="h-4 w-4 text-violet-400" />
             Info
@@ -102,7 +102,7 @@ export function KioskInfoDialog({ agents, onClose, onOpenProfile, onOpenConnecti
           </button>
         </div>
 
-        <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain p-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:p-5">
+        <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain p-4 pb-[max(1rem,env(safe-area-inset-bottom))] wide:p-5">
           {/* The deck */}
           <div className="flex items-center gap-3 rounded-xl border border-zinc-800 bg-zinc-900/60 p-4">
             {branding.logo

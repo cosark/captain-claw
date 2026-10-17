@@ -3,6 +3,7 @@ import { Database, Table2, ChevronRight, Loader2, AlertTriangle, RefreshCw, Chev
 import { useAuthStore, refreshAccessToken } from '../../stores/authStore'
 import { CreatorBadge } from './CreatorBadge'
 import { CREATED_BY_COLUMN, type Creator } from '../../utils/sharedWorkspace'
+import { useIsMobile } from '../../hooks/useMediaQuery'
 
 interface TableInfo {
   name: string
@@ -175,6 +176,9 @@ export function DatastoreBrowser({ host, port, auth, agentName, vfsProject, titl
     setExportOpen(false)
   }
 
+  // A phone (either way up): the whole screen, and each row a card.
+  const { isMobile: phone } = useIsMobile()
+
   const selectedTableInfo = tables.find((t) => t.name === selectedTable)
   const totalPages = rows ? Math.ceil(rows.total / pageSize) : 0
   // Who added each row: always in a member's view; in the owner's only when a
@@ -185,15 +189,15 @@ export function DatastoreBrowser({ host, port, auth, agentName, vfsProject, titl
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={onClose}>
       <div
-        className="flex flex-col rounded-xl border border-zinc-700/50 bg-zinc-900 shadow-2xl"
-        style={{ width: '80vw', height: '80vh' }}
+        className={`flex flex-col bg-zinc-900 shadow-2xl ${phone ? '' : 'rounded-xl border border-zinc-700/50'}`}
+        style={phone ? { width: '100%', height: '100dvh' } : { width: '80vw', height: '80vh' }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-5 py-3.5 border-b border-zinc-800 shrink-0">
-          <div className="flex items-center gap-2.5">
-            <Database className="h-4 w-4 text-emerald-400" />
-            <span className="text-sm font-medium text-zinc-200">
+        <div className={`flex items-center justify-between border-b border-zinc-800 shrink-0 ${phone ? 'gap-2 px-4 py-2 [&_button]:p-2' : 'px-5 py-3.5'}`}>
+          <div className="flex min-w-0 items-center gap-2.5">
+            <Database className="h-4 w-4 shrink-0 text-emerald-400" />
+            <span className="min-w-0 truncate text-sm font-medium text-zinc-200">
               {heading}
               {selectedTable && (
                 <span className="text-zinc-500"> / {selectedTable}</span>
@@ -245,7 +249,7 @@ export function DatastoreBrowser({ host, port, auth, agentName, vfsProject, titl
                           <span className="min-w-0 truncate text-sm font-medium text-zinc-200">{table.name}</span>
                           <CreatorBadge mode={sharedRef ? 'member' : 'owner'} creator={table.created_by} ownerName={ownerName} />
                         </div>
-                        <div className="text-[11px] text-zinc-500 mt-0.5">
+                        <div className={`text-[11px] text-zinc-500 mt-0.5 ${phone ? 'line-clamp-2 break-words' : ''}`}>
                           {table.columns.length} columns · {table.row_count} rows
                           {table.columns.length > 0 && (
                             <span className="ml-2 text-zinc-600">
@@ -267,13 +271,13 @@ export function DatastoreBrowser({ host, port, auth, agentName, vfsProject, titl
               <div className="flex items-center gap-2 px-4 py-2 border-b border-zinc-800 bg-zinc-950/30 shrink-0">
                 <button
                   onClick={() => { setSelectedTable(null); setRows(null); setError('') }}
-                  className="flex items-center gap-1 text-xs text-zinc-400 hover:text-zinc-200"
+                  className={`flex shrink-0 items-center gap-1 text-xs text-zinc-400 hover:text-zinc-200 ${phone ? 'py-2 pr-1' : ''}`}
                 >
-                  <ChevronLeft className="h-3 w-3" /> Tables
+                  <ChevronLeft className={phone ? 'h-4 w-4' : 'h-3 w-3'} /> Tables
                 </button>
                 <span className="text-xs text-zinc-600">|</span>
-                <span className="text-xs font-medium text-zinc-300">{selectedTable}</span>
-                {selectedTableInfo && (
+                <span className="min-w-0 truncate text-xs font-medium text-zinc-300">{selectedTable}</span>
+                {selectedTableInfo && !phone && (
                   <span className="text-[10px] text-zinc-500">
                     {selectedTableInfo.row_count} rows · {selectedTableInfo.columns.length} columns
                   </span>
@@ -313,7 +317,34 @@ export function DatastoreBrowser({ host, port, auth, agentName, vfsProject, titl
 
               {/* Data table */}
               <div className="flex-1 overflow-auto">
-                {rows && rowColumns.length > 0 && rows.rows.length > 0 ? (
+                {rows && rowColumns.length > 0 && rows.rows.length > 0 && phone ? (
+                  /* A phone: each row a card, every value in full. */
+                  <ul className="space-y-2 p-3">
+                    {rows.rows.map((row, i) => (
+                      <li key={i} className="rounded-lg border border-zinc-800 bg-zinc-950/40 p-3">
+                        <dl className="space-y-1.5">
+                          {rowColumns.map((col) => {
+                            const cell = row[col]
+                            return (
+                              <div key={col} className="min-w-0">
+                                <dt className="text-[10px] font-medium uppercase tracking-wide text-zinc-500">{col}</dt>
+                                <dd className="whitespace-pre-wrap break-words font-mono text-xs text-zinc-200">
+                                  {cell === null || cell === undefined ? <span className="text-zinc-600 italic">null</span> : String(cell)}
+                                </dd>
+                              </div>
+                            )
+                          })}
+                          {showCreator && (
+                            <div>
+                              <dt className="text-[10px] font-medium uppercase tracking-wide text-zinc-500">{CREATED_BY_COLUMN}</dt>
+                              <dd><CreatorBadge mode={isShared ? 'member' : 'owner'} creator={row._creator} ownerName={ownerName} /></dd>
+                            </div>
+                          )}
+                        </dl>
+                      </li>
+                    ))}
+                  </ul>
+                ) : rows && rowColumns.length > 0 && rows.rows.length > 0 ? (
                   <table className="w-full text-xs">
                     <thead className="sticky top-0 bg-zinc-900 z-10">
                       <tr>
