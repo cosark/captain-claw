@@ -114,11 +114,11 @@ export function ArchetypeSpawnDialog({ takenSlugs, onClose, onSpawned, asUser, o
   }
 
   return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={() => { if (!busy) onClose() }}>
+    <div className="fixed inset-0 z-50 flex items-stretch justify-center bg-black/60 sm:items-center sm:p-4" onClick={() => { if (!busy) onClose() }}>
       <div
         role="dialog"
         aria-label="New agent from an archetype"
-        className="flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900 shadow-2xl"
+        className="flex h-[100dvh] w-full flex-col overflow-hidden bg-zinc-900 shadow-2xl sm:h-auto sm:max-h-[85vh] sm:max-w-2xl sm:rounded-xl sm:border sm:border-zinc-800"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -130,8 +130,8 @@ export function ArchetypeSpawnDialog({ takenSlugs, onClose, onSpawned, asUser, o
             <h3 className="text-sm font-semibold text-zinc-200">New agent{asUser && ownerLabel ? ` for ${ownerLabel}` : ''}</h3>
             <p className="text-[11px] text-zinc-500">Pick an archetype — its role, tools and model come with it.</p>
           </div>
-          <button onClick={onClose} disabled={busy} className="ml-auto rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200 disabled:opacity-50" title="Close">
-            <X className="h-4 w-4" />
+          <button onClick={onClose} disabled={busy} aria-label="Close" className="ml-auto rounded-lg p-2 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200 disabled:opacity-50 sm:p-1" title="Close">
+            <X className="h-5 w-5 sm:h-4 sm:w-4" />
           </button>
         </div>
 
@@ -140,11 +140,12 @@ export function ArchetypeSpawnDialog({ takenSlugs, onClose, onSpawned, asUser, o
           <div className="relative">
             <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-600" />
             <input
-              autoFocus
+              // Not on a phone: the keyboard would cover the list first thing.
+              autoFocus={!touchScreen()}
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="Search archetypes…"
-              className="w-full rounded-md border border-zinc-700 bg-zinc-950 py-1.5 pl-8 pr-2 text-sm text-zinc-200 placeholder-zinc-600 focus:border-violet-500/60 focus:outline-none"
+              className="w-full rounded-md border border-zinc-700 bg-zinc-950 py-2.5 pl-8 pr-2 text-base text-zinc-200 placeholder-zinc-600 focus:border-violet-500/60 focus:outline-none sm:py-1.5 sm:text-sm"
             />
           </div>
         </div>
@@ -195,7 +196,7 @@ export function ArchetypeSpawnDialog({ takenSlugs, onClose, onSpawned, asUser, o
         </div>
 
         {/* Name + create */}
-        <div className="shrink-0 border-t border-zinc-800 px-4 py-3">
+        <div className="shrink-0 border-t border-zinc-800 px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
           {err && <p className="mb-2 text-xs text-red-600 dark:text-red-400">{err}</p>}
           <form
             className="flex items-center gap-2"
@@ -208,12 +209,12 @@ export function ArchetypeSpawnDialog({ takenSlugs, onClose, onSpawned, asUser, o
               disabled={!picked || busy}
               placeholder={picked ? 'Agent name' : 'Pick an archetype first'}
               aria-label="Agent name"
-              className="min-w-0 flex-1 rounded-md border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-sm text-zinc-200 placeholder-zinc-600 focus:border-violet-500/60 focus:outline-none disabled:opacity-60"
+              className="min-w-0 flex-1 rounded-md border border-zinc-700 bg-zinc-950 px-2.5 py-2.5 text-base text-zinc-200 placeholder-zinc-600 focus:border-violet-500/60 focus:outline-none disabled:opacity-60 sm:py-1.5 sm:text-sm"
             />
             <button
               type="submit"
               disabled={!picked || !name.trim() || busy}
-              className="flex shrink-0 items-center gap-1.5 rounded-lg bg-violet-600 px-4 py-1.5 text-sm font-medium text-white transition-colors hover:bg-violet-500 disabled:opacity-50"
+              className="flex shrink-0 items-center gap-1.5 rounded-lg bg-violet-600 px-4 py-2.5 text-sm font-medium text-white transition-colors hover:bg-violet-500 disabled:opacity-50 sm:py-1.5"
             >
               {busy && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
               {busy ? 'Creating…' : 'Create agent'}
@@ -224,4 +225,9 @@ export function ArchetypeSpawnDialog({ takenSlugs, onClose, onSpawned, asUser, o
     </div>,
     document.body,
   )
+}
+
+// A touch-first device (phone, tablet): no on-screen keyboard until asked for.
+function touchScreen(): boolean {
+  return typeof window !== 'undefined' && window.matchMedia('(pointer: coarse) and (hover: none)').matches
 }

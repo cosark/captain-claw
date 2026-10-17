@@ -105,7 +105,7 @@ export function AuthField({ label, icon: Icon, hint, type = 'text', id, ...input
         <input
           id={fieldId}
           type={isPassword && shown ? 'text' : type}
-          className={`fd-auth-input h-11 w-full rounded-xl pl-10 text-[15px] ${isPassword ? 'pr-11' : 'pr-3.5'}`}
+          className={`fd-auth-input h-11 w-full rounded-xl pl-10 text-base sm:text-[15px] ${isPassword ? 'pr-11' : 'pr-3.5'}`}
           {...input}
         />
         {isPassword && (

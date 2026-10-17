@@ -23,6 +23,7 @@ import {
   IdCard,
   Users,
   X,
+  Info,
 } from 'lucide-react'
 import { useUIStore } from '../../stores/uiStore'
 import { useAgentStore } from '../../stores/agentStore'
@@ -49,6 +50,8 @@ import ConnectionsPage from '../../pages/ConnectionsPage'
 import { ProfilePage } from '../../pages/ProfilePage'
 import { NotificationBell } from '../common/NotificationCenter'
 import { BrandMark } from '../common/BrandMark'
+import { KioskInfoDialog, type InfoAgent } from './KioskInfoDialog'
+import { useIsMobile } from '../../hooks/useMediaQuery'
 
 // ── Simple layout ────────────────────────────────────────────────────
 //
@@ -156,6 +159,10 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
   const [profileOpen, setProfileOpen] = useState(false)
   // Kiosk Settings dialog — theme, connections, profile, refresh, sign-out.
   const [settingsOpen, setSettingsOpen] = useState(false)
+  // Kiosk Info dialog — models, agents, archetypes, profile, plan, connections.
+  const [infoOpen, setInfoOpen] = useState(false)
+  // A phone gets its own layout: the agent list, or one chat, full screen.
+  const { isMobile } = useIsMobile()
 
   // Keep the agent list fresh — the Desktop page normally does this polling,
   // and it isn't mounted here. Same auth guard as there: with auth on and no
@@ -238,6 +245,15 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
 
   const activeAgentId = hasActiveSession ? parseLaneKey(activeChatId!).containerId : null
   const activeAgent = activeAgentId ? agents.find((a) => a.id === activeAgentId) ?? null : null
+
+  // What the Info dialog lists: each agent, and the model a process agent runs on.
+  const infoAgents: InfoAgent[] = useMemo(() => agents.map((a) => {
+    const p = a.kind === 'process' ? processes.find((x) => `proc-${x.slug}` === a.id) : undefined
+    return {
+      id: a.id, name: a.name, running: a.state === 'running', shared: a.kind === 'shared',
+      ownerName: a.ownerName, model: p?.model || undefined, provider: p?.provider || undefined,
+    }
+  }), [agents, processes])
 
   const handleOpen = (a: SimpleAgent) => {
     // An existing session survives the agent stopping; openChat just
@@ -377,36 +393,8 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [anyBooting])
 
-  return (
-    <div className="flex h-screen overflow-hidden">
-      <AgentsColumn
-        agents={agents}
-        activeAgentId={activeAgentId}
-        sessionInfo={sessionInfo}
-        switching={switching}
-        booting={booting}
-        onOpen={handleOpen}
-        onPower={handlePower}
-        onLeave={handleLeave}
-        onRefresh={refresh}
-        onSpawn={goSpawn}
-        onOptions={setOptionsAgent}
-        onSettings={locked ? () => setSettingsOpen(true) : undefined}
-        locked={locked}
-      />
-
-      <main className="flex min-w-0 flex-1 flex-col overflow-hidden" style={{ minWidth: 320 }}>
-        {hasActiveSession
-          ? <ChatPanel variant="simple" />
-          : <EmptyChat hasAgents={agents.length > 0} onSpawn={goSpawn} locked={locked} />}
-      </main>
-
-      <ContextColumn
-        agentId={activeAgentId}
-        agentName={activeSessionName}
-        onOptions={!locked && activeAgent && activeAgent.kind !== 'shared' ? () => setOptionsAgent(activeAgent) : undefined}
-      />
-
+  const dialogs = (
+    <>
       {archetypeOpen && (
         <ArchetypeSpawnDialog
           takenSlugs={new Set(processes.map((p) => p.slug))}
@@ -427,6 +415,14 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
           onProfile={() => { setSettingsOpen(false); setProfileOpen(true) }}
         />
       )}
+      {locked && infoOpen && (
+        <KioskInfoDialog
+          agents={infoAgents}
+          onClose={() => setInfoOpen(false)}
+          onOpenProfile={() => { setInfoOpen(false); setProfileOpen(true) }}
+          onOpenConnections={() => { setInfoOpen(false); setConnectionsOpen(true) }}
+        />
+      )}
       {locked && connectionsOpen && <KioskConnectionsDialog onClose={() => setConnectionsOpen(false)} />}
       {locked && profileOpen && <KioskProfileDialog onClose={() => setProfileOpen(false)} />}
 
@@ -439,6 +435,65 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
         />,
         document.body,
       )}
+    </>
+  )
+
+  if (isMobile) {
+    return (
+      <>
+        <PhoneLayout
+          agents={agents}
+          activeAgent={activeAgent}
+          activeAgentId={activeAgentId}
+          activeSessionName={activeSessionName}
+          sessionInfo={sessionInfo}
+          switching={switching}
+          booting={booting}
+          onOpen={handleOpen}
+          onPower={handlePower}
+          onLeave={handleLeave}
+          onSpawn={goSpawn}
+          onSettings={locked ? () => setSettingsOpen(true) : undefined}
+          onInfo={locked ? () => setInfoOpen(true) : undefined}
+          locked={locked}
+        />
+        {dialogs}
+      </>
+    )
+  }
+
+  return (
+    <div className="flex h-screen overflow-hidden">
+      <AgentsColumn
+        agents={agents}
+        activeAgentId={activeAgentId}
+        sessionInfo={sessionInfo}
+        switching={switching}
+        booting={booting}
+        onOpen={handleOpen}
+        onPower={handlePower}
+        onLeave={handleLeave}
+        onRefresh={refresh}
+        onSpawn={goSpawn}
+        onOptions={setOptionsAgent}
+        onSettings={locked ? () => setSettingsOpen(true) : undefined}
+        onInfo={locked ? () => setInfoOpen(true) : undefined}
+        locked={locked}
+      />
+
+      <main className="flex min-w-0 flex-1 flex-col overflow-hidden" style={{ minWidth: 320 }}>
+        {hasActiveSession
+          ? <ChatPanel variant="simple" />
+          : <EmptyChat hasAgents={agents.length > 0} onSpawn={goSpawn} locked={locked} />}
+      </main>
+
+      <ContextColumn
+        agentId={activeAgentId}
+        agentName={activeSessionName}
+        onOptions={!locked && activeAgent && activeAgent.kind !== 'shared' ? () => setOptionsAgent(activeAgent) : undefined}
+      />
+
+      {dialogs}
     </div>
   )
 }
@@ -475,11 +530,11 @@ function KioskSettingsDialog({ onClose, onRefresh, onConnections, onProfile }: {
   ]
 
   return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/60 sm:items-center sm:p-4" onClick={onClose}>
       <div
         role="dialog"
         aria-label="Settings"
-        className="relative w-full max-w-md overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-950 shadow-2xl"
+        className="relative max-h-[100dvh] w-full max-w-md overflow-y-auto rounded-t-2xl border border-zinc-800 bg-zinc-950 pb-[env(safe-area-inset-bottom)] shadow-2xl sm:rounded-2xl sm:pb-0"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-zinc-800 px-5 py-4">
@@ -487,8 +542,8 @@ function KioskSettingsDialog({ onClose, onRefresh, onConnections, onProfile }: {
             <Settings className="h-4 w-4 text-violet-400" />
             Settings
           </h2>
-          <button onClick={onClose} title="Close" className="rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200">
-            <X className="h-4 w-4" />
+          <button onClick={onClose} title="Close" aria-label="Close" className="rounded-lg p-2 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200 sm:p-1">
+            <X className="h-5 w-5 sm:h-4 sm:w-4" />
           </button>
         </div>
 
@@ -581,19 +636,20 @@ function KioskDialog({ label, onClose, children }: { label: string; onClose: () 
   }, [onClose])
 
   return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex items-stretch justify-center bg-black/60 sm:items-center sm:p-4" onClick={onClose}>
       <div
         role="dialog"
         aria-label={label}
-        className="relative flex h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-xl border border-zinc-800 bg-zinc-950 shadow-2xl"
+        className="relative flex h-[100dvh] w-full flex-col overflow-hidden bg-zinc-950 shadow-2xl sm:h-[85vh] sm:max-w-3xl sm:rounded-xl sm:border sm:border-zinc-800"
         onClick={(e) => e.stopPropagation()}
       >
         <button
           onClick={onClose}
           title="Close"
-          className="absolute right-3 top-3 z-10 rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
+          aria-label="Close"
+          className="absolute right-2 top-2 z-10 rounded-lg p-2 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200 sm:right-3 sm:top-3 sm:p-1"
         >
-          <X className="h-4 w-4" />
+          <X className="h-5 w-5 sm:h-4 sm:w-4" />
         </button>
         <div className="min-h-0 flex-1">
           {children}
@@ -607,7 +663,7 @@ function KioskDialog({ label, onClose, children }: { label: string; onClose: () 
 // ── Left: agents ─────────────────────────────────────────────────────
 
 function AgentsColumn({
-  agents, activeAgentId, sessionInfo, switching, booting, onOpen, onPower, onLeave, onRefresh, onSpawn, onOptions, onSettings, locked = false,
+  agents, activeAgentId, sessionInfo, switching, booting, onOpen, onPower, onLeave, onRefresh, onSpawn, onOptions, onSettings, onInfo, locked = false,
 }: {
   agents: SimpleAgent[]
   activeAgentId: string | null
@@ -625,6 +681,8 @@ function AgentsColumn({
   onOptions: (a: SimpleAgent) => void
   /** Kiosk only: the footer is one Settings button opening this dialog. */
   onSettings?: () => void
+  /** Kiosk only: the Info button beside Settings. */
+  onInfo?: () => void
   locked?: boolean
 }) {
   const open = useUIStore((s) => s.simpleLeftOpen)
@@ -706,7 +764,17 @@ function AgentsColumn({
           </button>
         </div>
         {onSettings ? (
-          <div className="flex flex-col items-center border-t border-zinc-800 py-2">
+          <div className="flex flex-col items-center gap-0.5 border-t border-zinc-800 py-2">
+            {onInfo && (
+              <button
+                onClick={onInfo}
+                title="Info"
+                aria-label="Info"
+                className="flex h-10 w-10 items-center justify-center rounded-lg text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-100"
+              >
+                <Info className="h-5 w-5" />
+              </button>
+            )}
             <button
               onClick={onSettings}
               title="Settings"
@@ -911,10 +979,10 @@ function AgentsColumn({
 
       {/* Footer — the kiosk's is one Settings button (KioskSettingsDialog). */}
       {onSettings ? (
-        <div className="border-t border-zinc-800 p-2">
+        <div className="flex items-center gap-1 border-t border-zinc-800 p-2">
           <button
             onClick={onSettings}
-            className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm font-medium text-zinc-300 transition-colors hover:bg-zinc-800 hover:text-zinc-100"
+            className="flex min-w-0 flex-1 items-center gap-2.5 rounded-lg px-3 py-2.5 text-sm font-medium text-zinc-300 transition-colors hover:bg-zinc-800 hover:text-zinc-100"
           >
             <Settings className="h-[18px] w-[18px] text-zinc-400" />
             Settings
@@ -927,6 +995,16 @@ function AgentsColumn({
               </span>
             )}
           </button>
+          {onInfo && (
+            <button
+              onClick={onInfo}
+              title="Info — models, agents, profile, plan"
+              aria-label="Info"
+              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-100"
+            >
+              <Info className="h-[18px] w-[18px]" />
+            </button>
+          )}
         </div>
       ) : (
         <div className="flex items-center justify-between gap-2 border-t border-zinc-800 px-2 py-1.5">
@@ -1163,5 +1241,307 @@ function ContextColumn({ agentId, agentName, onOptions }: { agentId: string | nu
         </div>
       )}
     </aside>
+  )
+}
+
+// ── Phone ────────────────────────────────────────────────────────────
+//
+// One screen at a time: the agent list, or one chat filling the screen with a
+// back arrow to the list (the phone's own Back gesture does the same). The
+// active agent's files and datastore open as a full-screen sheet. Touch
+// targets are at least 40px, the layout follows the visible viewport (dvh),
+// and the bottom bar keeps clear of the home indicator.
+
+function PhoneLayout({
+  agents, activeAgent, activeAgentId, activeSessionName, sessionInfo, switching, booting,
+  onOpen, onPower, onLeave, onSpawn, onSettings, onInfo, locked,
+}: {
+  agents: SimpleAgent[]
+  activeAgent: SimpleAgent | null
+  activeAgentId: string | null
+  activeSessionName: string
+  sessionInfo: Map<string, { busy: boolean; unread: boolean }>
+  switching: Set<string>
+  booting: Set<string>
+  onOpen: (a: SimpleAgent) => void
+  onPower: (a: SimpleAgent, on: boolean) => void
+  onLeave: (a: SimpleAgent) => void
+  onSpawn: () => void
+  onSettings?: () => void
+  onInfo?: () => void
+  locked: boolean
+}) {
+  const wsConnected = useAgentStore((s) => s.wsConnected)
+  const activeChatId = useChatStore((s) => s.activeChatId)
+  const [search, setSearch] = useState('')
+  const [filesOpen, setFilesOpen] = useState(false)
+  // Back to the list keeps the chat open; opening any chat (a tap, or a new
+  // agent that just came up) shows it again.
+  const [atList, setAtList] = useState(false)
+  useEffect(() => { setAtList(false) }, [activeChatId])
+  const showChat = !!activeAgentId && !atList
+
+  // The phone's Back: while a chat is open it returns to the list instead of
+  // leaving Flight Deck.
+  const pushed = useRef(false)
+  useEffect(() => {
+    if (showChat && !pushed.current) {
+      window.history.pushState({ fdPhoneChat: true }, '')
+      pushed.current = true
+    } else if (!showChat && pushed.current) {
+      pushed.current = false
+      if (window.history.state?.fdPhoneChat) window.history.back()
+    }
+  }, [showChat])
+  useEffect(() => {
+    const onPop = () => {
+      if (!pushed.current) return
+      pushed.current = false
+      setFilesOpen(false)
+      setAtList(true)
+    }
+    window.addEventListener('popstate', onPop)
+    return () => window.removeEventListener('popstate', onPop)
+  }, [])
+
+  const searchable = agents.length > 6
+  const shown = useMemo(() => {
+    const q = searchable ? search.trim().toLowerCase() : ''
+    if (!q) return agents
+    return agents.filter((a) => a.name.toLowerCase().includes(q) || a.description.toLowerCase().includes(q))
+  }, [agents, search, searchable])
+
+  const phoneBtn = 'flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-zinc-400 transition-colors active:bg-zinc-800 hover:bg-zinc-800 hover:text-zinc-100'
+
+  if (showChat) {
+    const a = activeAgent
+    const info = activeAgentId ? sessionInfo.get(activeAgentId) : undefined
+    return (
+      <div className="flex h-[100dvh] flex-col overflow-hidden bg-zinc-950">
+        <header className="flex h-14 shrink-0 items-center gap-1 border-b border-zinc-800 px-1.5">
+          <button onClick={() => setAtList(true)} className={phoneBtn} aria-label="Back to agents" title="Agents">
+            <ChevronLeft className="h-6 w-6" />
+          </button>
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            {a && <StateDot agent={a} className="shrink-0" />}
+            <div className="min-w-0">
+              <div className="truncate text-[15px] font-semibold text-zinc-100">{a?.name || activeSessionName}</div>
+              <div className="truncate text-[11px] text-zinc-500">
+                {info?.busy ? 'Working…' : a ? (a.kind === 'shared' ? `Shared by ${a.ownerName || 'another user'}` : stateLabel(a)) : ''}
+              </div>
+            </div>
+          </div>
+          <button onClick={() => setFilesOpen(true)} className={phoneBtn} aria-label="Files and data" title="Files and data">
+            <FolderOpen className="h-5 w-5" />
+          </button>
+        </header>
+        <main className="flex min-h-0 flex-1 flex-col overflow-hidden pb-[env(safe-area-inset-bottom)]">
+          <ChatPanel variant="simple" />
+        </main>
+        {filesOpen && activeAgentId && (
+          <PhoneFilesSheet agentId={activeAgentId} agentName={a?.name || activeSessionName} onClose={() => setFilesOpen(false)} />
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex h-[100dvh] flex-col overflow-hidden bg-zinc-950">
+      <header className="flex h-14 shrink-0 items-center gap-1 border-b border-zinc-800 pl-3 pr-1.5">
+        <div className="min-w-0 flex-1"><BrandMark connected={wsConnected} /></div>
+        <NotificationBell />
+        {onInfo && (
+          <button onClick={onInfo} className={phoneBtn} aria-label="Info" title="Info">
+            <Info className="h-5 w-5" />
+          </button>
+        )}
+        {onSettings && (
+          <button onClick={onSettings} className={phoneBtn} aria-label="Settings" title="Settings">
+            <Settings className="h-5 w-5" />
+          </button>
+        )}
+      </header>
+
+      <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 pb-4 pt-3">
+        <div className="mb-2 flex items-center justify-between px-1">
+          <span className="text-xs font-medium uppercase tracking-wider text-zinc-500">Agents ({agents.length})</span>
+        </div>
+        {searchable && (
+          <div className="relative mb-3">
+            <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500" />
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="Search agents…"
+              className="h-11 w-full rounded-xl border border-zinc-800 bg-zinc-900 pl-9 pr-3 text-base text-zinc-200 placeholder-zinc-600 focus:border-violet-500/60 focus:outline-none"
+            />
+          </div>
+        )}
+
+        {agents.length === 0 && (
+          <div className="mt-6 rounded-2xl border border-zinc-800 bg-zinc-900/60 p-6 text-center">
+            <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-violet-600/20 text-violet-400">
+              <MessagesSquare className="h-6 w-6" />
+            </div>
+            <h2 className="text-base font-semibold text-zinc-100">No agents yet</h2>
+            <p className="mt-1 text-sm text-zinc-400">
+              {locked ? 'Create an agent from an archetype to start chatting.' : 'Spawn your first agent to start chatting.'}
+            </p>
+          </div>
+        )}
+        {agents.length > 0 && shown.length === 0 && (
+          <p className="py-8 text-center text-sm text-zinc-500">No agents match your search.</p>
+        )}
+
+        <ul className="flex flex-col gap-2">
+          {shown.map((a) => {
+            const info = sessionInfo.get(a.id)
+            const busy = !!info?.busy
+            const shared = a.kind === 'shared'
+            const hasChat = sessionInfo.has(a.id)
+            const isBooting = booting.has(a.id) && a.state !== 'stopped'
+            const working = switching.has(a.id)
+            const openable = !working && ((a.reachable && !isBooting) || hasChat)
+            const powered = a.state === 'running'
+            const canPower = a.kind !== 'local' && !shared && !a.managed && (powered || a.state === 'stopped')
+            return (
+              <li
+                key={a.id}
+                className={`flex items-center gap-1 rounded-xl border pr-1 transition-colors ${
+                  a.id === activeAgentId ? 'border-violet-500/40 bg-violet-500/10' : busy ? 'border-amber-500/30 bg-amber-500/10' : 'border-zinc-800 bg-zinc-900/60'
+                }`}
+              >
+                <button
+                  onClick={() => onOpen(a)}
+                  disabled={!openable}
+                  className="flex min-w-0 flex-1 items-center gap-3 py-3.5 pl-3.5 text-left disabled:opacity-60"
+                >
+                  <span className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-zinc-800 text-xs font-semibold text-zinc-300">
+                    {working || isBooting ? <Loader2 className="h-4 w-4 animate-spin" /> : initials(a.name)}
+                    <StateDot agent={a} className="absolute -bottom-0.5 -right-0.5 ring-2 ring-zinc-900" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="flex items-center gap-1.5">
+                      <span className="truncate text-[15px] font-medium text-zinc-100">{a.name}</span>
+                      {busy && <span className="h-2 w-2 shrink-0 animate-pulse rounded-full bg-amber-500 dark:bg-amber-400" title="Working" />}
+                      {info?.unread && !busy && <span className="h-2 w-2 shrink-0 rounded-full bg-sky-400" title="New reply" />}
+                    </span>
+                    <span className="block truncate text-xs text-zinc-500">
+                      {isBooting ? 'Starting…'
+                        : busy ? 'Working…'
+                          : shared && a.state === 'running' ? `Shared by ${a.ownerName || 'another user'}`
+                            : a.state === 'running' && a.reachable && a.description ? a.description : stateLabel(a)}
+                    </span>
+                  </span>
+                </button>
+                {canPower && (
+                  <button
+                    onClick={() => onPower(a, !powered)}
+                    disabled={working}
+                    role="switch"
+                    aria-checked={powered}
+                    aria-label={`${a.name} power`}
+                    title={powered ? `Power off ${a.name}` : `Power on ${a.name}`}
+                    className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-lg transition-colors active:bg-zinc-800 disabled:opacity-60 ${
+                      powered ? 'text-emerald-600 dark:text-emerald-400' : 'text-zinc-500'
+                    }`}
+                  >
+                    {working ? <Loader2 className="h-5 w-5 animate-spin" /> : <Power className="h-5 w-5" />}
+                  </button>
+                )}
+                {shared && (
+                  <button
+                    onClick={() => onLeave(a)}
+                    aria-label={`Leave ${a.name}`}
+                    title={`Leave ${a.name}`}
+                    className="flex h-11 w-11 shrink-0 items-center justify-center rounded-lg text-zinc-500 active:bg-zinc-800"
+                  >
+                    <LogOut className="h-5 w-5" />
+                  </button>
+                )}
+              </li>
+            )
+          })}
+        </ul>
+      </div>
+
+      <div className="shrink-0 border-t border-zinc-800 bg-zinc-950 p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+        <button
+          onClick={onSpawn}
+          className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-violet-600 text-[15px] font-medium text-white transition-colors active:bg-violet-700 hover:bg-violet-500"
+        >
+          <Plus className="h-5 w-5" />
+          New agent
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// The active agent's files and datastore, full screen, one at a time.
+function PhoneFilesSheet({ agentId, agentName, onClose }: { agentId: string; agentName: string; onClose: () => void }) {
+  const [tab, setTab] = useState<'files' | 'data'>('files')
+  const shared = agentId.startsWith(SHARED_PREFIX)
+  const memberWorkspace = useSharedAgentStore((s) => s.memberWorkspace)
+  const sharedRow = useSharedAgentStore((s) =>
+    shared ? s.agents.find((a) => sharedContainerId(a.agent_ref) === agentId) : undefined)
+  const vis = workspaceVisible(memberWorkspace, sharedCaps(sharedRow))
+  const hasFiles = !shared || (!!sharedRow && vis.files)
+  const hasData = !shared || (!!sharedRow && vis.datastore)
+  const current = tab === 'files' ? (hasFiles ? 'files' : 'data') : (hasData ? 'data' : 'files')
+  const owner = sharedRow ? sharedRow.owner_name || sharedRow.owner_email : ''
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  return createPortal(
+    <div role="dialog" aria-label="Files and data" className="fixed inset-0 z-50 flex h-[100dvh] flex-col bg-zinc-950">
+      <header className="flex h-14 shrink-0 items-center gap-2 border-b border-zinc-800 pl-4 pr-1.5">
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-[15px] font-semibold text-zinc-100">Files &amp; data</div>
+          <div className="truncate text-[11px] text-zinc-500">{agentName}</div>
+        </div>
+        <button onClick={onClose} aria-label="Close" className="flex h-10 w-10 items-center justify-center rounded-lg text-zinc-400 active:bg-zinc-800">
+          <X className="h-5 w-5" />
+        </button>
+      </header>
+      {hasFiles && hasData && (
+        <div className="shrink-0 border-b border-zinc-800 p-2">
+          <div className="grid grid-cols-2 rounded-xl bg-zinc-900 p-1" role="tablist">
+            {(['files', 'data'] as const).map((k) => (
+              <button
+                key={k}
+                role="tab"
+                aria-selected={current === k}
+                onClick={() => setTab(k)}
+                className={`flex h-9 items-center justify-center gap-1.5 rounded-lg text-sm font-medium transition-colors ${
+                  current === k ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-500'
+                }`}
+              >
+                {k === 'files' ? <FolderOpen className="h-4 w-4 text-violet-400" /> : <Database className="h-4 w-4 text-emerald-400" />}
+                {k === 'files' ? 'Files' : 'Datastore'}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+      <div className="min-h-0 flex-1 overflow-hidden pb-[env(safe-area-inset-bottom)]">
+        {!hasFiles && !hasData ? (
+          <div className="flex h-full items-center justify-center px-8 text-center text-sm text-zinc-500">{CHAT_ONLY_TEXT}</div>
+        ) : shared && sharedRow ? (
+          current === 'files'
+            ? <SharedFilesPanel key={agentId} agentRef={sharedRow.agent_ref} agentName={agentName} ownerName={owner} />
+            : <SharedDatastorePanel key={agentId} agentRef={sharedRow.agent_ref} agentName={agentName} ownerName={owner} />
+        ) : current === 'files' ? (
+          <AgentFilesPanel key={agentId} containerId={agentId} />
+        ) : (
+          <AgentDatastorePanel key={agentId} containerId={agentId} />
+        )}
+      </div>
+    </div>,
+    document.body,
   )
 }

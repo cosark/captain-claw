@@ -1383,6 +1383,7 @@ from captain_claw.flight_deck.microsoft_oauth_routes import router as microsoft_
 from captain_claw.flight_deck.jev_routes import router as jev_router
 from captain_claw.flight_deck.telegram_shared_routes import router as telegram_shared_router
 from captain_claw.flight_deck.branding_routes import router as branding_router
+from captain_claw.flight_deck.info_routes import router as info_router
 from captain_claw.flight_deck.codex_oauth_routes import router as codex_oauth_router
 from captain_claw.flight_deck.antigravity_routes import router as antigravity_router
 from captain_claw.flight_deck.games_routes import router as games_router
@@ -1449,6 +1450,7 @@ app.include_router(microsoft_oauth_router)
 app.include_router(jev_router)
 app.include_router(telegram_shared_router)
 app.include_router(branding_router)
+app.include_router(info_router)
 app.include_router(codex_oauth_router)
 app.include_router(antigravity_router)
 app.include_router(games_router)
