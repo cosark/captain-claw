@@ -935,20 +935,27 @@ async def _request_api_key(provider: str, api_key: str | None, base_url: str | N
     return tier_api_key({"provider": provider, "api_key": api_key, "base_url": base_url})
 
 
-async def _load_shared_default_tiers(db) -> tuple[dict, list]:
-    """The admin-published team-default tier set (api_keys are @system sentinels)."""
+async def _load_shared_default_set(db) -> dict:
+    """The admin-published team-default tier set (api_keys are @system
+    sentinels), or {} when none is published."""
     try:
         raw = await db.get_system_setting("fd:shared-tier-sets")
         blob = json.loads(raw) if raw else None
     except Exception:
-        return {}, []
+        return {}
     if not isinstance(blob, dict):
-        return {}, []
+        return {}
     sets = blob.get("sets")
     if not (isinstance(sets, list) and sets):
-        return {}, []
+        return {}
     default_id = blob.get("defaultSetId")
     chosen = next((s for s in sets if s.get("id") == default_id), sets[0])
+    return chosen if isinstance(chosen, dict) else {}
+
+
+async def _load_shared_default_tiers(db) -> tuple[dict, list]:
+    """The team-default set's (tiers, env_vars)."""
+    chosen = await _load_shared_default_set(db)
     return chosen.get("tiers") or {}, chosen.get("envVars") or []
 
 
@@ -996,6 +1003,15 @@ async def _load_owner_tiers(db, owner_id: str) -> tuple[dict, list]:
     cache so `@system` tier keys resolve.
     """
     await _refresh_system_provider_keys(db)
+    resolved = await owner_tier_set(db, owner_id)
+    return resolved["tiers"], resolved["env_vars"]
+
+
+async def owner_tier_set(db, owner_id: str) -> dict:
+    """Which tier set *owner_id*'s agents run on, as `_load_owner_tiers`
+    resolves it: ``source`` ("own" — their active Library set, "team" — the
+    admin's team default, "none"), the set's ``name``, its ``tiers`` and
+    ``env_vars``. The tiers are raw (keys included): never send them on."""
     try:
         settings = await db.get_all_settings(owner_id)
     except Exception:
@@ -1007,6 +1023,13 @@ async def _load_owner_tiers(db, owner_id: str) -> tuple[dict, list]:
             blob = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             blob = None
+
+    async def _team() -> dict:
+        team = await _load_shared_default_set(db)
+        tiers = team.get("tiers") or {}
+        return {"source": "team" if tiers else "none", "name": str(team.get("name") or ""),
+                "tiers": tiers, "env_vars": team.get("envVars") or []}
+
     if isinstance(blob, dict):
         sets = blob.get("sets")
         if isinstance(sets, list) and sets:
@@ -1016,10 +1039,11 @@ async def _load_owner_tiers(db, owner_id: str) -> tuple[dict, list]:
             # first visit: no key, no endpoint, no extra keys — is not a
             # choice: such a user rides the team default like one with no set.
             if _set_is_unconfigured(chosen):
-                team = await _load_shared_default_tiers(db)
-                if team[0]:
+                team = await _team()
+                if team["tiers"]:
                     return team
-            return chosen.get("tiers") or {}, chosen.get("envVars") or []
+            return {"source": "own", "name": str(chosen.get("name") or ""),
+                    "tiers": chosen.get("tiers") or {}, "env_vars": chosen.get("envVars") or []}
         # Legacy single-set shape: {tiers, forgeTier} + separate env-vars key.
         if isinstance(blob.get("tiers"), dict):
             env: list = []
@@ -1029,9 +1053,9 @@ async def _load_owner_tiers(db, owner_id: str) -> tuple[dict, list]:
                     env = ev
             except (json.JSONDecodeError, TypeError):
                 pass
-            return blob["tiers"], env
+            return {"source": "own", "name": "", "tiers": blob["tiers"], "env_vars": env}
     # No personal tier set — ride the admin-published team default.
-    return await _load_shared_default_tiers(db)
+    return await _team()
 
 
 async def _notify_source_agent(

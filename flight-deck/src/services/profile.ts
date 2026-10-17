@@ -186,3 +186,49 @@ export function guardUnload(
   target.addEventListener('beforeunload', onBeforeUnload)
   return () => target.removeEventListener('beforeunload', onBeforeUnload)
 }
+
+// ── The kiosk Info dialog (/fd/info) ──
+// The signed-in user's corner of the deck in one read: the tier set their
+// agents are created on (never a key), archetypes, what their agents receive,
+// plan, connections. Their agents come from the agent lists the SPA has.
+
+export interface InfoTier {
+  id: string
+  label: string
+  use: string
+  provider: string
+  model: string
+  endpoint: string      // custom endpoint host, '' for the provider's own
+  input_ctx: number
+  output_ctx: number
+  vision: boolean
+  from_set: boolean     // false: the set leaves it out, the deck's built-in applies
+  archetypes: number    // archetypes that default to this tier
+}
+
+export interface MyInfo {
+  tiers: { source: 'own' | 'team' | 'none'; set_name: string; tiers: InfoTier[] }
+  archetypes: { total: number; base: number; own: number; shared: number }
+  profile: {
+    own: ProfileFields
+    deck: DeckProfileDefaults
+    preview: { full: string; compact: string }
+  } | null
+  account: {
+    email: string
+    display_name: string
+    role: string
+    created_at: string
+    plan: string
+    limits: Partial<Record<'max_agents' | 'max_storage_mb' | 'requests_per_minute' | 'spawns_per_hour', number>>
+    kiosk: boolean
+  }
+  connections: {
+    google?: { configured: boolean; connected: boolean }
+    microsoft?: { configured: boolean; connected: boolean }
+    telegram?: { configured: boolean; status: string; linked: boolean; agent: string }
+    jev?: { connected: boolean; source: string }
+  }
+}
+
+export const getMyInfo = () => fdFetch<MyInfo>('/info')

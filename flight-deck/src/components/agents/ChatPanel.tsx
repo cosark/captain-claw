@@ -65,6 +65,7 @@ import { AgentFilesPanel } from './AgentFilesPanel'
 import { AgentDatastorePanel } from './AgentDatastorePanel'
 import { QueuePlannerModal } from './QueuePlannerModal'
 import { usePersistedSize } from '../../hooks/usePersistedSize'
+import { useIsMobile } from '../../hooks/useMediaQuery'
 import { imageRef, type ChatMessage, type TokenUsage } from '../../services/agentChat'
 
 // Plugin arrays hoisted to module scope so they keep a stable identity across
@@ -236,8 +237,14 @@ export function ChatPanel({ variant = 'default' }: { variant?: 'default' | 'simp
   const kiosk = useAuthStore(selectKioskLocked)  // admins are exempt from the kiosk lock
   // Simple layout only: the queue column can be tucked away so the
   // conversation gets the whole centre. Fullscreen (full layout) is unchanged.
-  const simpleQueueOpen = useUIStore((s) => s.simpleQueueOpen)
-  const setSimpleQueueOpen = useUIStore((s) => s.setSimpleQueueOpen)
+  // On a phone the queue is a view of its own (it would squeeze the chat to
+  // nothing beside it), starting closed — not the desktop column's setting.
+  const { isMobile } = useIsMobile()
+  const desktopQueueOpen = useUIStore((s) => s.simpleQueueOpen)
+  const setDesktopQueueOpen = useUIStore((s) => s.setSimpleQueueOpen)
+  const [phoneQueueOpen, setPhoneQueueOpen] = useState(false)
+  const simpleQueueOpen = isMobile ? phoneQueueOpen : desktopQueueOpen
+  const setSimpleQueueOpen = isMobile ? setPhoneQueueOpen : setDesktopQueueOpen
   // Narrow subscriptions instead of `useChatStore()` (whole store). A bare
   // whole-store read re-renders ChatPanel on EVERY event of EVERY agent/lane,
   // including background agents the user isn't looking at. Actions are stable
@@ -364,9 +371,28 @@ export function ChatPanel({ variant = 'default' }: { variant?: 'default' | 'simp
       .map((a) => ({ id: a.id, name: a.name, host: a.host, port: a.port, auth: a.authToken })),
   ]
 
+  // On a phone the simple layout's own header names the agent: the tab bar
+  // goes, and its queue button moves onto the lane row.
+  const phoneSimple = simple && isMobile
+  const queueToggle = (
+    <button
+      onClick={() => setSimpleQueueOpen(!simpleQueueOpen)}
+      title={simpleQueueOpen ? 'Hide queue' : 'Show queue'}
+      aria-label={simpleQueueOpen ? 'Hide queue' : 'Show queue'}
+      className={`mr-1 shrink-0 rounded transition-colors ${phoneSimple ? 'p-2' : 'p-1'} ${
+        simpleQueueOpen
+          ? 'bg-violet-600/20 text-violet-400'
+          : 'text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300'
+      }`}
+    >
+      <ListTodo className="h-4 w-4" />
+    </button>
+  )
+
   return (
     <div className={`flex h-full flex-col bg-zinc-950/80 ${simple ? '' : 'border-l border-zinc-800'}`}>
       {/* Tab bar */}
+      {!phoneSimple && (
       <div className="flex items-center border-b border-zinc-800 bg-zinc-900/60">
         <div className="flex flex-1 items-center gap-0.5 overflow-x-auto px-1 py-1">
           {chatTabs.map((s) => (
@@ -400,19 +426,7 @@ export function ChatPanel({ variant = 'default' }: { variant?: 'default' | 'simp
             Shared · {shared.ownerName || 'another user'}
           </span>
         )}
-        {simple && (
-          <button
-            onClick={() => setSimpleQueueOpen(!simpleQueueOpen)}
-            title={simpleQueueOpen ? 'Hide queue' : 'Show queue'}
-            className={`mr-1 rounded p-1 transition-colors ${
-              simpleQueueOpen
-                ? 'bg-violet-600/20 text-violet-400'
-                : 'text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300'
-            }`}
-          >
-            <ListTodo className="h-4 w-4" />
-          </button>
-        )}
+        {simple && queueToggle}
         {!kiosk && !shared && (
           <button
             onClick={() => setShowFlows(true)}
@@ -559,6 +573,7 @@ export function ChatPanel({ variant = 'default' }: { variant?: 'default' | 'simp
           </button>
         )}
       </div>
+      )}
 
       {/* Trace panel (replaces chat when active) */}
       {/* Lanes: three parallel contexts on this one agent. */}
@@ -566,6 +581,7 @@ export function ChatPanel({ variant = 'default' }: { variant?: 'default' | 'simp
         agentId={session.containerId}
         activeLane={session.lane}
         agentName={session.containerName}
+        trailing={phoneSimple ? queueToggle : undefined}
       />
 
       {shared && (
@@ -644,16 +660,19 @@ export function ChatPanel({ variant = 'default' }: { variant?: 'default' | 'simp
         /* Chat content (optionally with queue panel on the left in fullscreen) */
         <div className="flex flex-1 overflow-hidden">
           {(simple ? simpleQueueOpen : chatFullscreen) && (
-            <QueueSidebar sessionKey={session.key} agentId={session.containerId} queueOnly={simple || !!shared} shared={!!shared} />
+            <QueueSidebar sessionKey={session.key} agentId={session.containerId} queueOnly={simple || !!shared} shared={!!shared}
+              fill={simple && isMobile} />
           )}
-          <ChatContent
-            session={session}
-            sessionKey={session.key}
-            shared={!!shared}
-            minWidth={simple ? 300 : undefined}
-            onSend={(content) => sendMessage(session.key, content)}
-            onCancel={() => cancelTask(session.key)}
-          />
+          {!(simple && isMobile && simpleQueueOpen) && (
+            <ChatContent
+              session={session}
+              sessionKey={session.key}
+              shared={!!shared}
+              minWidth={simple && !isMobile ? 300 : undefined}
+              onSend={(content) => sendMessage(session.key, content)}
+              onCancel={() => cancelTask(session.key)}
+            />
+          )}
         </div>
       )}
 
@@ -720,6 +739,7 @@ function ChatContent({
   onSend: (content: string) => void
   onCancel: () => void
 }) {
+  const { isMobile } = useIsMobile()
   const [input, setInput] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -779,11 +799,13 @@ function ChatContent({
     const content = appendAttachmentRefs(text, uploadedFiles)
     onSend(content)
     setInput('')
+    // The box grew with what was typed: back to one line.
+    if (inputRef.current) inputRef.current.style.height = 'auto'
     clearAttachments()
   }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && !touchKeyboard()) {
       e.preventDefault()
       handleSend()
     }
@@ -840,7 +862,9 @@ function ChatContent({
           <div className="mt-12 text-center">
             <MessageSquare className="mx-auto h-8 w-8 text-zinc-700" />
             <p className="mt-2 text-sm text-zinc-500">Send a message to start chatting with this agent.</p>
-            {!shared && <p className="mt-1 text-xs text-zinc-600">You can drag & drop files or paste images from clipboard.</p>}
+            {!shared && <p className="mt-1 text-xs text-zinc-600">
+              {isMobile ? 'Attach files and pictures with the paperclip.' : 'You can drag & drop files or paste images from clipboard.'}
+            </p>}
           </div>
         )}
 
@@ -939,10 +963,10 @@ function ChatContent({
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             onPaste={shared ? undefined : handlePasteEvent}
-            placeholder={closed ? 'Disconnected' : !session.connected ? 'Connecting...' : shared ? 'Message…' : 'Message, paste image, or drop files...'}
+            placeholder={closed ? 'Disconnected' : !session.connected ? 'Connecting...' : shared || isMobile ? 'Message…' : 'Message, paste image, or drop files...'}
             disabled={!session.connected || closed}
             rows={1}
-            className="max-h-32 min-h-[38px] min-w-0 flex-1 resize-none rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-200 placeholder-zinc-600 focus:border-violet-500/50 focus:outline-none disabled:opacity-40"
+            className="max-h-32 min-h-[38px] min-w-0 flex-1 resize-none rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-base text-zinc-200 sm:text-sm placeholder-zinc-600 focus:border-violet-500/50 focus:outline-none disabled:opacity-40"
             style={{ height: 'auto', overflow: 'hidden' }}
             onInput={(e) => {
               const el = e.currentTarget
@@ -972,6 +996,12 @@ function ChatContent({
       </div>
     </div>
   )
+}
+
+// A phone or tablet's on-screen keyboard: Enter there starts a new line (the
+// Send button sends), as in any messaging app.
+function touchKeyboard(): boolean {
+  return typeof window !== 'undefined' && window.matchMedia('(pointer: coarse) and (hover: none)').matches
 }
 
 function AttachmentChip({ attachment, onRemove }: { attachment: Attachment; onRemove: (id: string) => void }) {
@@ -1053,10 +1083,12 @@ function NextStepsBar({
 // Three parallel contexts on ONE agent (docs/queue-lanes-plan.md). Lane A is
 // the agent's existing context, so switching to A shows the conversation that
 // was always there; B and C are additional rooms that run at the same time.
-function LaneStrip({ agentId, activeLane, agentName }: {
+function LaneStrip({ agentId, activeLane, agentName, trailing }: {
   agentId: string
   activeLane: string
   agentName: string
+  /** Phone: the chat's queue button, at the end of the row. */
+  trailing?: React.ReactNode
 }) {
   const sessions = useChatStore((s) => s.sessions)
   const setActiveLane = useChatStore((s) => s.setActiveLane)
@@ -1067,7 +1099,7 @@ function LaneStrip({ agentId, activeLane, agentName }: {
   const lanes = shared ? LANES.filter((l) => l !== LANE_AUTO) : LANES
 
   return (
-    <div className="flex items-center gap-1 border-b border-zinc-800 bg-zinc-900/40 px-2 py-1">
+    <div className="flex items-center gap-1 overflow-x-auto border-b border-zinc-800 bg-zinc-900/40 px-2 py-1">
       {lanes.map((lane) => {
         const s = sessions.get(laneKey(agentId, lane))
         const isActive = lane === activeLane
@@ -1084,7 +1116,7 @@ function LaneStrip({ agentId, activeLane, agentName }: {
                 : s.busy ? `Lane ${lane} — running`
                 : `Lane ${lane} — idle`
             }
-            className={`flex items-center gap-1.5 rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
+            className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors sm:px-2 sm:py-1 sm:text-[11px] ${
               isActive
                 ? 'bg-violet-600/20 text-violet-700 dark:text-violet-200'
                 : 'text-zinc-500 hover:bg-zinc-800/60 hover:text-zinc-300'
@@ -1099,7 +1131,8 @@ function LaneStrip({ agentId, activeLane, agentName }: {
                   : 'bg-emerald-400'
               }`}
             />
-            <span>{lane === LANE_AUTO ? 'Auto' : lane} - {agentName}</span>
+            {/* A phone has the agent's name in its header already. */}
+            <span>{lane === LANE_AUTO ? 'Auto' : lane}<span className="hidden sm:inline"> - {agentName}</span></span>
             {pending > 0 && (
               <span className="rounded-full bg-zinc-800 px-1 text-[9px] text-zinc-400">{pending}</span>
             )}
@@ -1115,25 +1148,33 @@ function LaneStrip({ agentId, activeLane, agentName }: {
         onClick={() => activeSession && newSession(activeSession.key)}
         disabled={!activeSession || activeSession.busy}
         title="Start a new session on this lane"
-        className="ml-auto rounded-md px-2 py-1 text-[11px] font-medium text-zinc-500 transition-colors hover:bg-zinc-800/60 hover:text-zinc-300 disabled:opacity-40 disabled:hover:bg-transparent"
+        className="ml-auto shrink-0 whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-800/60 hover:text-zinc-300 disabled:opacity-40 disabled:hover:bg-transparent sm:px-2 sm:py-1 sm:text-[11px]"
       >
-        + New session
+        + New<span className="hidden sm:inline"> session</span>
       </button>}
+      {trailing}
     </div>
   )
 }
 
 // `queueOnly` (simple layout): skip the files + datastore sections — the
 // layout shows them in its own right-hand column — and keep just the queue.
-function QueueSidebar({ sessionKey, agentId, queueOnly = false, shared = false }: { sessionKey: string; agentId: string; queueOnly?: boolean; shared?: boolean }) {
+function QueueSidebar({ sessionKey, agentId, queueOnly = false, shared = false, fill = false }: {
+  sessionKey: string
+  agentId: string
+  queueOnly?: boolean
+  shared?: boolean
+  /** Phone: the queue takes the whole chat area instead of a column. */
+  fill?: boolean
+}) {
   const width = usePersistedSize('fd:queue-sidebar-width', 288, 220, 640, 'x')
   const filesH = usePersistedSize('fd:queue-sidebar-files-height', 260, 96, 900, 'y')
   const dsH = usePersistedSize('fd:queue-sidebar-datastore-height', 200, 96, 900, 'y')
 
   return (
     <aside
-      className={`relative flex flex-col border-r border-zinc-800 bg-zinc-950/40 ${queueOnly ? 'min-w-[180px] shrink' : 'shrink-0'}`}
-      style={{ width: width.size }}
+      className={`relative flex flex-col bg-zinc-950/40 ${fill ? 'w-full flex-1' : `border-r border-zinc-800 ${queueOnly ? 'min-w-[180px] shrink' : 'shrink-0'}`}`}
+      style={fill ? undefined : { width: width.size }}
     >
       {!queueOnly && (
         <>
@@ -1164,11 +1205,13 @@ function QueueSidebar({ sessionKey, agentId, queueOnly = false, shared = false }
         <QueuePanel sessionKey={sessionKey} agentId={agentId} shared={shared} />
       </div>
       {/* Right edge (drag to resize the whole column) */}
-      <div
-        onMouseDown={width.onResizeStart}
-        title="Drag to resize"
-        className="absolute right-0 top-0 z-20 h-full w-1.5 cursor-col-resize transition-colors hover:bg-violet-500/30 active:bg-violet-500/40"
-      />
+      {!fill && (
+        <div
+          onMouseDown={width.onResizeStart}
+          title="Drag to resize"
+          className="absolute right-0 top-0 z-20 h-full w-1.5 cursor-col-resize transition-colors hover:bg-violet-500/30 active:bg-violet-500/40"
+        />
+      )}
     </aside>
   )
 }
@@ -1365,7 +1408,7 @@ function QueuePanel({ sessionKey, agentId, shared = false }: { sessionKey: strin
           onPaste={shared ? undefined : handlePasteEvent}
           rows={5}
           placeholder={shared ? 'Queue a message…' : 'Queue a message, paste image, or drop files…'}
-          className="w-full resize-y overflow-y-auto rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-xs leading-relaxed text-zinc-200 placeholder-zinc-600 focus:border-violet-500/60 focus:outline-none"
+          className="w-full resize-y overflow-y-auto rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-base leading-relaxed sm:text-xs text-zinc-200 placeholder-zinc-600 focus:border-violet-500/60 focus:outline-none"
           style={{ minHeight: QUEUE_INPUT_MIN_PX }}
         />
         {!shared && <input

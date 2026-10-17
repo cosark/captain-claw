@@ -285,3 +285,11 @@ html.light .bg-violet-500\/5 { background-color: rgba(139,92,246,0.06) !importan
 .fd-auth-primary:hover:not(:disabled) { filter: brightness(1.1); }
 .fd-auth-primary:active:not(:disabled) { transform: translateY(1px); }
 .fd-auth-primary:disabled { opacity: 0.6; cursor: not-allowed; }
+
+/* Phones: iOS zooms the page into any text field under 16px on focus (and
+   stays zoomed). Every form field is 16px on a touch-only small screen. */
+@media (max-width: 767px) and (hover: none) and (pointer: coarse) {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]), textarea, select {
+    font-size: 16px !important;
+  }
+}
