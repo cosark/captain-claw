@@ -17,7 +17,7 @@ import { useCodexAuthStore } from '../stores/codexAuthStore'
 import { useMCPStore } from '../stores/mcpStore'
 import { useJevStore } from '../stores/jevStore'
 
-type TabId = 'google' | 'microsoft' | 'telegram' | 'codex' | 'antigravity' | 'mcp' | 'jev' | 'whatsapp' | 'typesense'
+export type TabId = 'google' | 'microsoft' | 'telegram' | 'codex' | 'antigravity' | 'mcp' | 'jev' | 'whatsapp' | 'typesense'
 
 interface TabDef {
   id: TabId
@@ -81,11 +81,13 @@ function useTabDots(telegram: MyTelegram | null): Partial<Record<TabId, 'on' | '
 // The ChatGPT subscription and the deep-memory server are deck setup, left to
 // the full view; WhatsApp nudges come from Autonomous Work, which the kiosk
 // doesn't expose.
-export default function ConnectionsPage({ kiosk = false }: { kiosk?: boolean }) {
+// `initialTab` — open on that tab (the kiosk guide's "Connect Google" and the
+// like) rather than the one this viewer last had open.
+export default function ConnectionsPage({ kiosk = false, initialTab }: { kiosk?: boolean; initialTab?: TabId }) {
   const tabs = TABS.filter((t) => !(kiosk && t.deckOnly))
   const [active, setActive] = useState<TabId>(() => {
-    const saved = savedTab()
-    return (tabs.find((t) => t.id === saved)?.id) ?? tabs[0].id
+    const wanted = initialTab || savedTab()
+    return (tabs.find((t) => t.id === wanted)?.id) ?? tabs[0].id
   })
   const [telegram, setTelegram] = useState<MyTelegram | null>(null)
   const dots = useTabDots(telegram)
