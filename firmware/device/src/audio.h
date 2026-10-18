@@ -25,15 +25,25 @@ void micStop(void (*sink)(const int16_t* samples, size_t count));
 bool micActive();
 
 // ── speaker (one stream at a time, PCM s16le mono) ──
-// A new stream (drops any old one); sound starts no earlier than holdMs from
-// now — room for the beep/flash cue before speech.
-void playBegin(uint32_t rate, uint32_t holdMs = 0);
+// The streams of one answer (its speech, then any sound the agent made) are
+// kept back to back as the answer's clip, which replay() plays again.
+//
+// A new stream; sound starts no earlier than holdMs from now — room for the
+// beep/flash cue before speech. Returns true when it carries straight on from
+// the answer's previous stream, which is still sounding (no cue then).
+bool playBegin(uint32_t rate, uint32_t holdMs = 0);
 void playFeed(const uint8_t* data, size_t len);
 void playEnd();                            // no more data for this stream
-void playStop();                           // stop now, drop everything
+void playStop();                           // stop now (the clip is kept)
 void playPoll();                           // keep the speaker fed; call from loop()
 bool playing();                            // a stream is buffered or sounding
 bool sounding();                           // the speaker is actually outputting it
 int outputLevel();                         // 0..100 loudness of what's sounding now
+
+// ── the last answer's clip ──
+void newClip();   // a new answer: its first stream replaces the clip
+bool hasClip();   // there is sound to replay
+bool clipCut();   // a stream stopped arriving before its end (stopped, link lost)
+void replay();    // play the clip again from its start, at once (no cue)
 
 }  // namespace audio

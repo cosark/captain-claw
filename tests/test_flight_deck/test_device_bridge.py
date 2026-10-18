@@ -271,6 +271,63 @@ async def test_turn_media_trailing_the_reply_is_delivered(monkeypatch):
     assert conn._audio_q.get_nowait()[0] == "file"
 
 
+def _queued(conn):
+    items = []
+    while not conn._audio_q.empty():
+        items.append(conn._audio_q.get_nowait())
+    return items
+
+
+@pytest.mark.asyncio
+async def test_replay_sends_the_last_answer_again(monkeypatch):
+    monkeypatch.setattr(db, "_answers", {})
+    conn = _conn(speak=True)
+    conn.pending = True
+    await conn.on_bus({"type": "agent", "text": "Sunny, 24°C."})
+    conn.last_reply_at = time.monotonic()
+    await conn.on_bus({"type": "media", "items": [{"kind": "audio", "path": "/w/b.mp3", "name": "b.mp3"}]})
+    played = _queued(conn)
+    assert [kind for kind, _ in played] == ["tts", "file"]
+
+    assert await conn.replay() is True
+    assert _queued(conn) == played  # the speech and the sound, in order
+
+
+@pytest.mark.asyncio
+async def test_a_new_answer_replaces_the_one_to_replay(monkeypatch):
+    monkeypatch.setattr(db, "_answers", {})
+    conn = _conn(speak=True)
+    conn.pending = True
+    await conn.on_bus({"type": "agent", "text": "First."})
+    await conn.on_bus({"type": "agent", "text": "Second."})
+    _queued(conn)
+    await conn.replay()
+    assert _queued(conn) == [("tts", "Second.")]
+
+
+@pytest.mark.asyncio
+async def test_replay_with_nothing_kept_says_so(monkeypatch):
+    monkeypatch.setattr(db, "_answers", {})
+    conn = _conn(speak=False)
+    conn.pending = True
+    await conn.on_bus({"type": "agent", "text": "Shown, not spoken."})
+    assert await conn.replay() is False
+    assert conn.ws.sent[-1] == {"type": "replay_none"}
+    assert conn._audio_q.empty()
+
+
+@pytest.mark.asyncio
+async def test_the_answer_to_replay_survives_a_reconnect(monkeypatch):
+    monkeypatch.setattr(db, "_answers", {})
+    first = _conn(speak=True)
+    first.pending = True
+    await first.on_bus({"type": "agent", "text": "Cut short by the link."})
+    again = _conn(speak=True)  # same owner and device id: the same channel
+    assert await again.replay() is True
+    assert _queued(again) == [("tts", "Cut short by the link.")]
+    assert await _watch().replay() is False  # another device has its own
+
+
 @pytest.mark.asyncio
 async def test_stream_pcm_frames_audio_and_keeps_samples_whole():
     conn = _conn()

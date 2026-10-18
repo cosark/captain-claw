@@ -438,6 +438,12 @@ static void drawGlyph(Glyph g, int cx, int cy) {
       canvas.fillSmoothCircle(cx, cy - 22, 7, c);
       canvas.fillSmoothRoundRect(cx - 6, cy - 8, 12, 38, 5, c);
       break;
+    case Glyph::Replay:  // a circle arrow round a play triangle
+      canvas.fillArc(cx, cy, 25, 31, 270, 360, c);
+      canvas.fillArc(cx, cy, 25, 31, 0, 200, c);
+      canvas.fillTriangle(cx - 13, cy - 28, cx + 3, cy - 40, cx + 3, cy - 16, c);
+      canvas.fillTriangle(cx - 7, cy - 12, cx - 7, cy + 12, cx + 13, cy, c);
+      break;
     default:
       break;
   }
