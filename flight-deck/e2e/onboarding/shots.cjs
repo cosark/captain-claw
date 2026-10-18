@@ -10,6 +10,8 @@ const path = require('path')
 const BASE = process.env.BASE || 'http://127.0.0.1:25191'
 const RUN = process.env.E2E_RUN_DIR || path.join(__dirname, '.run')
 const MODE = process.env.MODE || 'assets'
+// Which layouts to shoot (assets mode): the desktop one, the phone one, or both.
+const FORMS = (process.env.FORMS || 'wide,phone').split(',')
 const OUT = path.join(RUN, MODE === 'guide' ? 'guide' : 'png')
 const EMAIL = 'maya@example.com', PASSWORD = 'correct-horse-battery'
 fs.mkdirSync(OUT, { recursive: true })
@@ -55,14 +57,38 @@ async function shootDialog(page, dialog, name, bottom, pad = 20) {
   await page.screenshot({ path: path.join(OUT, name + '.png'), clip: { x: box.x, y: box.y, width: box.width, height } })
 }
 
+// A context for one pass. Flight Deck's copy of each chat stays out of it: the
+// queued task the dark pass sends would otherwise come back in the light one.
+async function passContext(browser, theme, phone) {
+  const context = await browser.newContext(phone
+    ? { viewport: { width: 390, height: 700 }, deviceScaleFactor: 2, colorScheme: theme, isMobile: true, hasTouch: true }
+    : { viewport: { width: 1280, height: 800 }, deviceScaleFactor: 2, colorScheme: theme })
+  await context.route('**/fd/chat/sessions**', (route) =>
+    route.fulfill({ status: 200, contentType: 'application/json', body: route.request().method() === 'GET' ? '[]' : '{}' }))
+  return context
+}
+
+// The archetype picker with Deep Researcher picked (its name filled in, not
+// selected: a caret and a highlight read as noise in a picture).
+async function pickArchetype(page, theme) {
+  const spawn = page.locator('[role=dialog][aria-label="New agent from an archetype"]')
+  await spawn.locator('ul button').first().waitFor()
+  if (theme === 'dark') console.log('archetypes:', (await spawn.locator('ul button span.font-medium').allTextContents()).join(' | '))
+  const pick = spawn.locator('ul button', { hasText: /research/i }).first()
+  const target = (await pick.count()) ? pick : spawn.locator('ul button').first()
+  await target.click()
+  await target.scrollIntoViewIfNeeded()
+  await spawn.locator('input[aria-label="Agent name"]').evaluate((el) => { el.setSelectionRange(0, 0); el.blur() })
+  await sleep(300)
+  return spawn
+}
+
 async function assets(browser) {
   for (const theme of ['dark', 'light']) {
     await settings(theme, true)
-    const context = await browser.newContext({ viewport: { width: 1280, height: 800 }, deviceScaleFactor: 2, colorScheme: theme })
-    // Flight Deck's copy of each chat stays out of it: the queued task the dark
-    // pass sends would otherwise come back in the light one.
-    await context.route('**/fd/chat/sessions**', (route) =>
-      route.fulfill({ status: 200, contentType: 'application/json', body: route.request().method() === 'GET' ? '[]' : '{}' }))
+    if (FORMS.includes('phone')) await phoneAssets(browser, theme)
+    if (!FORMS.includes('wide')) continue
+    const context = await passContext(browser, theme, false)
     const page = current = await context.newPage()
     await signIn(page)
 
@@ -90,15 +116,7 @@ async function assets(browser) {
 
     // New agent: an archetype picked, its name filled in.
     await page.locator('button[title="New agent from an archetype"]').first().click()
-    const spawn = page.locator('[role=dialog][aria-label="New agent from an archetype"]')
-    await spawn.locator('ul button').first().waitFor()
-    const roles = await spawn.locator('ul button span.font-medium').allTextContents()
-    if (theme === 'dark') console.log('archetypes:', roles.join(' | '))
-    const pick = spawn.locator('ul button', { hasText: /research/i }).first()
-    await ((await pick.count()) ? pick : spawn.locator('ul button').first()).click()
-    await (await pick.count() ? pick : spawn.locator('ul button').first()).scrollIntoViewIfNeeded()
-    await sleep(300)
-    await shootDialog(page, spawn, `new-agent-${theme}`)
+    await shootDialog(page, await pickArchetype(page, theme), `new-agent-${theme}`)
     await page.keyboard.press('Escape')
 
     // Settings.
@@ -138,17 +156,108 @@ async function assets(browser) {
   }
 }
 
+// The same screens in the phone layout: each one full screen, as a phone shows it.
+async function phoneAssets(browser, theme) {
+  const context = await passContext(browser, theme, true)
+  const page = current = await context.newPage()
+  const shoot = async (name) => { await sleep(500); await page.screenshot({ path: path.join(OUT, `${name}-phone-${theme}.png`) }) }
+  await signIn(page)
+  await shoot('overview')
+
+  await page.getByRole('button', { name: 'New agent', exact: true }).click()
+  await pickArchetype(page, theme)
+  await shoot('new-agent')
+  await page.locator('[role=dialog][aria-label="New agent from an archetype"]').getByRole('button', { name: 'Close' }).click()
+
+  await page.locator('button', { hasText: 'Research Assistant' }).first().click()
+  await page.getByText('position against').waitFor()
+  await page.locator('textarea[placeholder^="Message"]').fill('Which of the three has the best repair service in Munich?')
+  await page.locator('textarea[placeholder^="Message"]').evaluate((el) => el.blur())
+  await shoot('chat')
+  await page.getByRole('button', { name: 'Back to agents' }).click()
+
+  const openSettings = async () => {
+    await page.getByRole('button', { name: 'Settings', exact: true }).click()
+    const set = page.locator('[role=dialog][aria-label="Settings"]')
+    await set.waitFor()
+    return set
+  }
+  await openSettings()
+  await shoot('settings')
+  await page.locator('[role=dialog][aria-label="Settings"]').getByRole('button', { name: /Profile/ }).click()
+  const prof = page.locator('[role=dialog][aria-label="Profile"]')
+  await prof.getByText('My company').waitFor()
+  await shoot('profile')
+  await prof.getByRole('button', { name: 'Close' }).first().click()
+
+  await (await openSettings()).getByRole('button', { name: /Connections/ }).click()
+  const conn = page.locator('[role=dialog][aria-label="Connections"]')
+  await conn.locator('#connections-tab-google').click()
+  await conn.locator('#connections-panel-google').getByRole('button', { name: 'Connect Google' }).waitFor()
+  await shoot('google')
+  await conn.locator('#connections-tab-telegram').click()
+  await conn.locator('#connections-panel-telegram').getByRole('button', { name: 'Connect', exact: true }).waitFor()
+  await shoot('telegram')
+  await context.close()
+}
+
 const results = []
 function check(name, ok, detail) {
   results.push({ name, ok: !!ok })
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail !== undefined ? '  — ' + JSON.stringify(detail) : ''}`)
 }
 
+// How one step of the guide sits on a phone: nothing wider than the screen, the
+// footer on one row, the title in view without scrolling, tap targets of 44 px.
+async function phoneLayout(g) {
+  return g.evaluate((dialog) => {
+    const vw = window.innerWidth
+    const vh = window.innerHeight
+    const page = dialog.querySelector('.overflow-y-auto:not(nav)')
+    const footer = dialog.lastElementChild
+    const title = dialog.querySelector('h3')
+    const img = page.querySelector('img')
+    const buttons = [...footer.querySelectorAll('button')].map((b) => Math.round(b.getBoundingClientRect().height))
+    const wide = [...dialog.querySelectorAll('*')].some((el) => el.getBoundingClientRect().right > vw + 1)
+    return {
+      overflow: wide || page.scrollWidth > page.clientWidth || document.documentElement.scrollWidth > vw,
+      footerRows: footer.getBoundingClientRect().height > 80 ? 2 : 1,
+      titleInView: title.getBoundingClientRect().bottom <= footer.getBoundingClientRect().top,
+      phoneShot: img ? img.currentSrc.includes('-phone-') : null,
+      tap: Math.min(...buttons),
+      vh,
+    }
+  })
+}
+
+// A finger dragged sideways across the page.
+async function swipe(page, g, dx) {
+  await g.evaluate((dialog, dx) => {
+    const el = dialog.querySelector('.overflow-y-auto:not(nav)')
+    const r = el.getBoundingClientRect()
+    const at = (x) => new Touch({ identifier: 1, target: el, clientX: x, clientY: r.top + r.height / 2 })
+    const x0 = r.left + r.width / 2 - dx / 2
+    el.dispatchEvent(new TouchEvent('touchstart', { bubbles: true, touches: [at(x0)], changedTouches: [at(x0)] }))
+    el.dispatchEvent(new TouchEvent('touchend', { bubbles: true, touches: [], changedTouches: [at(x0 + dx)] }))
+  }, dx)
+  await sleep(300)
+}
+
 async function guide(browser) {
   const guideDialog = (page) => page.locator('[role=dialog][aria-label="Getting started"]')
-  for (const [form, viewport, theme] of [['wide', { width: 1280, height: 800 }, 'dark'], ['wide', { width: 1280, height: 800 }, 'light'], ['phone', { width: 390, height: 844 }, 'dark']]) {
+  const runs = [
+    ['wide', { width: 1280, height: 800 }, 'dark'],
+    ['wide', { width: 1280, height: 800 }, 'light'],
+    ['phone', { width: 390, height: 844 }, 'dark'],
+    ['phone', { width: 390, height: 844 }, 'light'],
+    ['phone-small', { width: 360, height: 640 }, 'dark'],
+    ['phone-se', { width: 375, height: 667 }, 'light'],
+    ['phone-landscape', { width: 844, height: 390 }, 'dark'],
+  ]
+  for (const [form, viewport, theme] of runs) {
+    const phone = form.startsWith('phone')
     await settings(theme, false)
-    const context = await browser.newContext({ viewport, deviceScaleFactor: 2, colorScheme: theme, hasTouch: form === 'phone', isMobile: form === 'phone' })
+    const context = await browser.newContext({ viewport, deviceScaleFactor: 2, colorScheme: theme, hasTouch: phone, isMobile: phone })
     const page = current = await context.newPage()
     await signIn(page)
     const g = guideDialog(page)
@@ -157,15 +266,42 @@ async function guide(browser) {
     await sleep(1200)  // /fd/info: steps for what the deck offers
     const total = Number((await g.locator('h2 + span').textContent()).split(' of ')[1])
     check(`${form}/${theme}: all seven topics on a deck with Google, Microsoft and Telegram`, total === 7, total)
+    const bad = []
     for (let i = 1; i <= total; i++) {
       await sleep(400)
       await page.screenshot({ path: path.join(OUT, `${form}-${theme}-${i}.png`) })
       const img = g.locator('img').first()
       if (await img.count()) {
         const loaded = await img.evaluate((el) => el.complete && el.naturalWidth > 100)
-        check(`${form}/${theme}: step ${i} screenshot loads`, loaded)
+        if (!loaded) bad.push(`step ${i}: screenshot didn't load`)
+      }
+      if (phone) {
+        const l = await phoneLayout(g)
+        if (l.overflow) bad.push(`step ${i}: wider than the screen`)
+        if (l.footerRows !== 1) bad.push(`step ${i}: footer wraps`)
+        if (l.phoneShot === false) bad.push(`step ${i}: desktop screenshot on a phone`)
+        if (l.tap < 44) bad.push(`step ${i}: footer button ${l.tap}px tall`)
+        if (!l.titleInView) bad.push(`step ${i}: title below the fold`)
       }
       if (i < total) await g.getByRole('button', { name: 'Next', exact: true }).click()
+    }
+    check(`${form}/${theme}: every step${phone ? ' fits the phone and' : ''} loads its screenshot`, bad.length === 0, bad.length ? bad : undefined)
+    if (form === 'phone' && theme === 'dark') {
+      // Swipe back and forth; enlarge shows the phone screenshot across the screen.
+      await swipe(page, g, 160)
+      check('swipe right goes back a step', (await g.locator('h2 + span').textContent()).startsWith('6 '))
+      await swipe(page, g, -160)
+      check('swipe left goes forward a step', (await g.locator('h2 + span').textContent()).startsWith('7 '))
+      await g.locator('.overflow-y-auto').first().evaluate((el) => el.scrollBy(0, 40))
+      await swipe(page, g, 30)
+      check('a small drag does not turn the page', (await g.locator('h2 + span').textContent()).startsWith('7 '))
+      await g.getByRole('button', { name: 'Enlarge screenshot' }).click()
+      await sleep(400)
+      const zoomed = await page.locator('img.shadow-2xl').evaluate((el) => el.getBoundingClientRect().width / window.innerWidth)
+      check('enlarge shows the phone screenshot across the screen', zoomed > 0.9, Math.round(zoomed * 100) + '%')
+      await page.screenshot({ path: path.join(OUT, 'phone-dark-zoom.png') })
+      await page.getByRole('button', { name: 'Close screenshot' }).click()
+      check('closing the enlarged screenshot keeps the guide', await g.isVisible())
     }
     if (form === 'wide' && theme === 'dark') {
       // Enlarge, then a step's button: the guide gives way to Connections on Google.

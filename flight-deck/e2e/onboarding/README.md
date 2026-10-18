@@ -1,8 +1,9 @@
 # Kiosk guide screenshots
 
 The kiosk's Getting started guide (`src/components/layout/KioskOnboardingDialog.tsx`)
-shows real screenshots of the kiosk, in the viewer's theme:
-`src/assets/onboarding/<screen>-{dark,light}.webp`. When those screens change,
+shows real screenshots of the kiosk, of the viewer's layout in their theme:
+`src/assets/onboarding/<screen>-{dark,light}.webp` for a larger screen and
+`<screen>-phone-{dark,light}.webp` for a phone. When those screens change,
 regenerate them here.
 
 `run.sh` does the following:
@@ -16,14 +17,20 @@ regenerate them here.
    conversation already in them) and records them, plus a stopped one, as
    Maya's agents.
 4. Runs `shots.cjs`, which signs in as Maya and shoots each screen in both
-   themes; `to_webp.py` writes them into `src/assets/onboarding/`.
+   themes, at 1280×800 and as a 390×700 phone; `to_webp.py` writes them into
+   `src/assets/onboarding/`. `FORMS=wide` or `FORMS=phone` shoots one layout only.
 
-With `MODE=guide`, `shots.cjs` instead shoots the guide itself (wide in both
-themes, and a phone) into `.run/guide/` and checks how it behaves: it opens by
+With `MODE=guide`, `shots.cjs` instead shoots the guide itself into
+`.run/guide/` — wide in both themes; phones at 390×844 in both themes, 360×640,
+375×667 and 844×390 (landscape) — and checks how it behaves: it opens by
 itself on a first visit, every step's screenshot loads, a step's button opens
 the right Connections tab, Info and Settings reopen it, and "Do not show
-again" is saved to the user's settings and holds across a reload. The results
-land in `.run/report.json`.
+again" is saved to the user's settings and holds across a reload. On every
+phone, each step must also fit: nothing wider than the screen, the footer on
+one row, the title in view without scrolling, the phone screenshot (not the
+desktop one), 44 px footer buttons; and a swipe turns the page, a small drag
+doesn't, and an enlarged screenshot spans the screen. The results land in
+`.run/report.json`.
 
 ## Run
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ComponentType, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import {
   ArrowLeft,
@@ -34,6 +34,20 @@ import profileDark from '../../assets/onboarding/profile-dark.webp'
 import profileLight from '../../assets/onboarding/profile-light.webp'
 import settingsDark from '../../assets/onboarding/settings-dark.webp'
 import settingsLight from '../../assets/onboarding/settings-light.webp'
+import overviewPhoneDark from '../../assets/onboarding/overview-phone-dark.webp'
+import overviewPhoneLight from '../../assets/onboarding/overview-phone-light.webp'
+import newAgentPhoneDark from '../../assets/onboarding/new-agent-phone-dark.webp'
+import newAgentPhoneLight from '../../assets/onboarding/new-agent-phone-light.webp'
+import chatPhoneDark from '../../assets/onboarding/chat-phone-dark.webp'
+import chatPhoneLight from '../../assets/onboarding/chat-phone-light.webp'
+import googlePhoneDark from '../../assets/onboarding/google-phone-dark.webp'
+import googlePhoneLight from '../../assets/onboarding/google-phone-light.webp'
+import telegramPhoneDark from '../../assets/onboarding/telegram-phone-dark.webp'
+import telegramPhoneLight from '../../assets/onboarding/telegram-phone-light.webp'
+import profilePhoneDark from '../../assets/onboarding/profile-phone-dark.webp'
+import profilePhoneLight from '../../assets/onboarding/profile-phone-light.webp'
+import settingsPhoneDark from '../../assets/onboarding/settings-phone-dark.webp'
+import settingsPhoneLight from '../../assets/onboarding/settings-phone-light.webp'
 
 // ── Kiosk: Getting started ───────────────────────────────────────────
 //
@@ -43,8 +57,9 @@ import settingsLight from '../../assets/onboarding/settings-light.webp'
 // opens by itself until "Do not show again" is ticked (a per-user setting,
 // so it holds on a shared machine and across devices); Info and Settings
 // open it again. Steps for a connection the deck doesn't offer are left out.
-// The screenshots are real ones (e2e/onboarding regenerates them), in the
-// viewer's theme. Full-screen on a phone, a panel on a larger screen.
+// The screenshots are real ones (e2e/onboarding regenerates them), of the
+// layout the viewer has (phone or larger) in their theme. Full-screen on a
+// phone, where a swipe turns the page; a panel on a larger screen.
 
 /** What a step's button asks the kiosk to open once the guide is closed. */
 export type OnboardingAction =
@@ -54,7 +69,16 @@ export type OnboardingAction =
   | 'connections-telegram'
   | 'profile'
 
-interface Shot { dark: string; light: string; alt: string }
+/** One screen, shot in both layouts and both themes. */
+interface Shot {
+  dark: string
+  light: string
+  phoneDark: string
+  phoneLight: string
+  alt: string
+  /** When the phone screen shows something else than the larger one. */
+  phoneAlt?: string
+}
 
 interface Step {
   id: string
@@ -71,19 +95,42 @@ interface Step {
 }
 
 const SHOTS = {
-  overview: { dark: overviewDark, light: overviewLight, alt: 'The deck: agents on the left, the chat in the middle, files and data on the right' },
-  newAgent: { dark: newAgentDark, light: newAgentLight, alt: 'New agent: pick an archetype, name it, Create agent' },
-  chat: { dark: chatDark, light: chatLight, alt: 'At work: a conversation, two tasks in the queue, the next request typed, files on the right' },
-  google: { dark: googleDark, light: googleLight, alt: 'Settings → Connections, Google tab, with the Connect Google button' },
-  telegram: { dark: telegramDark, light: telegramLight, alt: 'Settings → Connections, Telegram tab: pick an agent and connect' },
-  profile: { dark: profileDark, light: profileLight, alt: 'Profile: about you, your company, your preferences' },
-  settings: { dark: settingsDark, light: settingsLight, alt: 'Settings: theme, Connections, Profile, Refresh agents and Sign out' },
+  overview: {
+    dark: overviewDark, light: overviewLight, phoneDark: overviewPhoneDark, phoneLight: overviewPhoneLight,
+    alt: 'The deck: agents on the left, the chat in the middle, files and data on the right',
+    phoneAlt: 'Your agents, one per row, with New agent at the bottom',
+  },
+  newAgent: {
+    dark: newAgentDark, light: newAgentLight, phoneDark: newAgentPhoneDark, phoneLight: newAgentPhoneLight,
+    alt: 'New agent: pick an archetype, name it, Create agent',
+  },
+  chat: {
+    dark: chatDark, light: chatLight, phoneDark: chatPhoneDark, phoneLight: chatPhoneLight,
+    alt: 'At work: a conversation, two tasks in the queue, the next request typed, files on the right',
+    phoneAlt: 'A chat: the conversation, and the next request typed in the message box',
+  },
+  google: {
+    dark: googleDark, light: googleLight, phoneDark: googlePhoneDark, phoneLight: googlePhoneLight,
+    alt: 'Settings → Connections, Google tab, with the Connect Google button',
+  },
+  telegram: {
+    dark: telegramDark, light: telegramLight, phoneDark: telegramPhoneDark, phoneLight: telegramPhoneLight,
+    alt: 'Settings → Connections, Telegram tab: pick an agent and connect',
+  },
+  profile: {
+    dark: profileDark, light: profileLight, phoneDark: profilePhoneDark, phoneLight: profilePhoneLight,
+    alt: 'Profile: about me, my company, my standing preferences',
+  },
+  settings: {
+    dark: settingsDark, light: settingsLight, phoneDark: settingsPhoneDark, phoneLight: settingsPhoneLight,
+    alt: 'Settings: theme, Connections, Profile, Refresh agents, Getting started and Sign out',
+  },
 } satisfies Record<string, Shot>
 
 const B = ({ children }: { children: ReactNode }) => <span className="font-medium text-zinc-100">{children}</span>
 
 export function KioskOnboardingDialog({ phone, onClose, onAction }: {
-  /** The phone layout: its words for where things are. */
+  /** The phone layout: its screenshots, and its words for where things are. */
   phone: boolean
   onClose: () => void
   /** A step's button: the guide closes, then that part of the kiosk opens. */
@@ -98,6 +145,8 @@ export function KioskOnboardingDialog({ phone, onClose, onAction }: {
   const [info, setInfo] = useState<MyInfo | null>(null)
   const [index, setIndex] = useState(0)
   const [zoom, setZoom] = useState<Shot | null>(null)
+  // Where a touch on the page started: a sideways swipe turns the page.
+  const touch = useRef<{ x: number; y: number } | null>(null)
 
   // Which connections this deck offers, and the user's own state of each.
   // Best effort: until (or unless) it answers, every step shows.
@@ -131,7 +180,10 @@ export function KioskOnboardingDialog({ phone, onClose, onAction }: {
     return () => window.removeEventListener('keydown', onKey)
   }, [at, go, onClose, zoom])
 
-  const src = (s: Shot) => (theme === 'light' ? s.light : s.dark)
+  const src = (s: Shot) => (phone
+    ? (theme === 'light' ? s.phoneLight : s.phoneDark)
+    : (theme === 'light' ? s.light : s.dark))
+  const alt = (s: Shot) => (phone && s.phoneAlt) || s.alt
   const Icon = step.icon
 
   return createPortal(
@@ -184,20 +236,41 @@ export function KioskOnboardingDialog({ phone, onClose, onAction }: {
           </nav>
 
           {/* The step */}
-          <div key={step.id} className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4 wide:p-6">
+          <div
+            key={step.id}
+            className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4 wide:p-6"
+            onTouchStart={(e) => { touch.current = { x: e.touches[0].clientX, y: e.touches[0].clientY } }}
+            onTouchEnd={(e) => {
+              const from = touch.current
+              touch.current = null
+              if (!from) return
+              const dx = e.changedTouches[0].clientX - from.x
+              const dy = e.changedTouches[0].clientY - from.y
+              // Clearly sideways, not a scroll that drifted.
+              if (Math.abs(dx) > 60 && Math.abs(dx) > 2 * Math.abs(dy)) go(at + (dx < 0 ? 1 : -1))
+            }}
+          >
             {step.shot && (
               <button
                 onClick={() => setZoom(step.shot!)}
                 title="Enlarge"
                 aria-label="Enlarge screenshot"
-                className="group relative mb-5 flex w-full items-center justify-center overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900/60 p-2"
+                className={`group relative mb-5 flex w-full items-center justify-center overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900/60 p-2 ${
+                  // A phone on its side: the screen beside the text, not above it,
+                  // with a strip under it for the badge (the box hugs the image there).
+                  phone ? '[@media(max-height:500px)]:float-right [@media(max-height:500px)]:mb-2 [@media(max-height:500px)]:ml-4 [@media(max-height:500px)]:w-auto [@media(max-height:500px)]:pb-8' : ''
+                }`}
               >
                 <img
                   src={src(step.shot)}
-                  alt={step.shot.alt}
+                  alt={alt(step.shot)}
                   decoding="async"
-                  // Small enough on a short screen to leave the step's text in view.
-                  className="max-h-[28dvh] w-auto max-w-full rounded-lg object-contain wide:max-h-[min(270px,30vh)]"
+                  // Small enough on a short screen to leave the step's title
+                  // and first lines in view; a phone's own (portrait) screen
+                  // gets a little more height.
+                  className={`w-auto max-w-full object-contain ${phone
+                    ? 'max-h-[min(36dvh,340px)] rounded-xl border border-zinc-800 [@media(max-height:500px)]:max-h-[50dvh]'
+                    : 'max-h-[28dvh] rounded-lg wide:max-h-[min(270px,30vh)]'}`}
                 />
                 <span className="absolute bottom-2 right-2 flex items-center gap-1 rounded-md bg-black/60 p-1 text-[11px] text-white opacity-80 transition-opacity group-hover:opacity-100 wide:px-1.5">
                   <Maximize2 className="h-3 w-3" />
@@ -241,7 +314,7 @@ export function KioskOnboardingDialog({ phone, onClose, onAction }: {
                   <button
                     key={a.action}
                     onClick={() => onAction(a.action)}
-                    className="flex items-center gap-1.5 rounded-lg border border-violet-500/40 bg-violet-500/10 px-3.5 py-2 text-sm font-medium text-violet-700 transition-colors hover:bg-violet-500/20 dark:text-violet-300"
+                    className="flex h-11 items-center gap-1.5 rounded-lg border border-violet-500/40 bg-violet-500/10 px-4 text-sm font-medium text-violet-700 transition-colors hover:bg-violet-500/20 dark:text-violet-300 wide:h-auto wide:px-3.5 wide:py-2"
                   >
                     {a.label}
                     <ArrowRight className="h-3.5 w-3.5" />
@@ -251,14 +324,14 @@ export function KioskOnboardingDialog({ phone, onClose, onAction }: {
             )}
 
             {step.note && (
-              <p className="mt-5 rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-2.5 text-xs leading-relaxed text-zinc-400">{step.note}</p>
+              <p className="mt-5 flow-root rounded-lg border border-zinc-800 bg-zinc-900/60 px-3 py-2.5 text-xs leading-relaxed text-zinc-400">{step.note}</p>
             )}
           </div>
         </div>
 
         {/* Footer */}
         <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-t border-zinc-800 px-4 py-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] wide:px-5">
-          <label className="flex cursor-pointer select-none items-center gap-2 py-1 text-sm text-zinc-400">
+          <label className="flex cursor-pointer select-none items-center gap-2 py-2 text-sm text-zinc-400 wide:py-1">
             <input
               type="checkbox"
               checked={optedOut}
@@ -271,15 +344,18 @@ export function KioskOnboardingDialog({ phone, onClose, onAction }: {
             {at > 0 && (
               <button
                 onClick={() => go(at - 1)}
-                className="flex items-center gap-1.5 rounded-lg border border-zinc-700 px-3.5 py-2 text-sm font-medium text-zinc-300 transition-colors hover:bg-zinc-800"
+                aria-label="Back"
+                title="Back"
+                // Just the arrow on a phone: the footer stays one row on a narrow screen.
+                className="flex h-11 items-center gap-1.5 rounded-lg border border-zinc-700 px-3 text-sm font-medium text-zinc-300 transition-colors hover:bg-zinc-800 wide:h-auto wide:px-3.5 wide:py-2"
               >
                 <ArrowLeft className="h-4 w-4" />
-                Back
+                <span className="hidden wide:inline">Back</span>
               </button>
             )}
             <button
               onClick={() => (last ? onClose() : go(at + 1))}
-              className="flex items-center gap-1.5 rounded-lg bg-violet-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-violet-500"
+              className="flex h-11 items-center gap-1.5 rounded-lg bg-violet-600 px-5 text-sm font-medium text-white transition-colors hover:bg-violet-500 wide:h-auto wide:px-4 wide:py-2"
             >
               {last ? 'Done' : 'Next'}
               {last ? <Check className="h-4 w-4" /> : <ArrowRight className="h-4 w-4" />}
@@ -293,7 +369,7 @@ export function KioskOnboardingDialog({ phone, onClose, onAction }: {
           className="fixed inset-0 z-[60] flex items-center justify-center bg-black/85 p-3 wide:p-8"
           onClick={(e) => { e.stopPropagation(); setZoom(null) }}
         >
-          <img src={src(zoom)} alt={zoom.alt} className="max-h-full max-w-full rounded-lg object-contain shadow-2xl" />
+          <img src={src(zoom)} alt={alt(zoom)} className="max-h-full max-w-full rounded-lg object-contain shadow-2xl" />
           <button
             onClick={(e) => { e.stopPropagation(); setZoom(null) }}
             aria-label="Close screenshot"
@@ -341,6 +417,8 @@ function buildSteps({ name, phone, authEnabled, sharingEnabled, info }: {
   const microsoft = offered(c?.microsoft)
   const telegram = authEnabled && c?.telegram?.configured !== false
   const steps: Step[] = []
+  // Where Settings and Info are: the top of a phone's agent list, the foot of the agents column.
+  const settingsAt = phone ? <>Tap <B>Settings</B> (the gear, top right)</> : <>Open <B>Settings</B> (bottom left)</>
 
   steps.push({
     id: 'welcome',
@@ -391,8 +469,10 @@ function buildSteps({ name, phone, authEnabled, sharingEnabled, info }: {
       phone
         ? <><B>Attach files</B> with the paperclip: documents, spreadsheets, photos.</>
         : <><B>Attach files</B> with the paperclip, or drop or paste them into the message: documents, spreadsheets, images.</>,
-      <><B>Line up several tasks</B> in the queue beside the chat (the list icon at the top shows or hides it). On <B>Auto</B>, the agent works through them one after another.</>,
-      <><B>Start fresh</B> with <B>+ New session</B> when you change topic. The agent keeps its memory and files.</>,
+      phone
+        ? <><B>Line up several tasks</B> in the queue: the list icon on the row above the chat switches to it. On <B>Auto</B>, the agent works through them one after another.</>
+        : <><B>Line up several tasks</B> in the queue beside the chat (the list icon at the top shows or hides it). On <B>Auto</B>, the agent works through them one after another.</>,
+      <><B>Start fresh</B> with <B>{phone ? '+ New' : '+ New session'}</B> when you change topic. The agent keeps its memory and files.</>,
       <><B>What it makes</B> lands in {phone ? 'files and data (the folder icon)' : 'Files and data on the right'}: open, preview or download it.</>,
     ],
     note: 'It keeps working while you chat with another agent: a blue dot tells you a reply is waiting.',
@@ -416,7 +496,7 @@ function buildSteps({ name, phone, authEnabled, sharingEnabled, info }: {
       lead: `Connected, your agents work with your own email, calendar and documents: read and draft mail, find a free slot, pull a file from ${both ? 'Drive or OneDrive' : google ? 'Drive' : 'OneDrive'}.`,
       numbered: true,
       points: [
-        <>Open <B>Settings</B> → <B>Connections</B>.</>,
+        <>{settingsAt}, then <B>Connections</B>.</>,
         both
           ? <>Choose the <B>Google</B> or <B>Microsoft</B> tab and press <B>Connect Google</B> or <B>Connect Microsoft</B>.</>
           : <>On the <B>{which}</B> tab, press <B>Connect {which}</B>.</>,
@@ -444,7 +524,7 @@ function buildSteps({ name, phone, authEnabled, sharingEnabled, info }: {
       lead: "Talk to one of your agents from your phone, through this deck's Telegram bot: handy when you're away from the screen.",
       numbered: true,
       points: [
-        <>Open <B>Settings</B> → <B>Connections</B> → <B>Telegram</B>.</>,
+        <>{settingsAt}, then <B>Connections</B> → <B>Telegram</B>.</>,
         <>Pick the agent that should answer you and press <B>Connect</B> (or <B>Request access</B>, where an admin approves new people).</>,
         <>Press <B>Open … in Telegram</B> and tap <B>Start</B> in the bot. The link works once: it ties your Telegram to your account here.</>,
       ],
@@ -475,7 +555,7 @@ function buildSteps({ name, phone, authEnabled, sharingEnabled, info }: {
   })
 
   const tips: ReactNode[] = [
-    <><B>Info</B> (the ⓘ button) shows your plan and limits, the models your agents run on, and what they know about you.</>,
+    <><B>Info</B> (the ⓘ {phone ? 'at the top' : 'next to Settings'}) shows your plan and limits, the models your agents run on, and what they know about you.</>,
     <><B>Settings</B> holds the light and dark theme, Connections, Profile{authEnabled ? ' and Sign out' : ''}.</>,
     <><B>The bell</B> tells you when an agent finishes something or needs you.</>,
   ]
