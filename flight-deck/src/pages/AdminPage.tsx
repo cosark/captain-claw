@@ -29,6 +29,7 @@ import { SharedTelegramBotAdmin } from '../components/admin/SharedTelegramBotAdm
 import { SharedCredentialsAdmin } from '../components/admin/SharedCredentialsAdmin'
 import { WaitlistAdmin, fetchWaitlist } from '../components/admin/WaitlistAdmin'
 import { BrandingAdmin } from '../components/admin/BrandingAdmin'
+import { InvitesAdmin } from '../components/admin/InvitesAdmin'
 import { ADMIN_TAB_KEY } from '../services/sharedIntegrations'
 
 type AdminTab = 'users' | 'waitlist' | 'usage' | 'plans' | 'settings' | 'integrations'
@@ -1044,6 +1045,11 @@ export function AdminPage() {
         {/* Users tab */}
         {!loading && tab === 'users' && (
           <div className="space-y-2">
+            <InvitesAdmin
+              refreshTick={refreshTick}
+              kioskDefault={config.kiosk_new_users}
+              kioskNote={kioskModeNote(config.kiosk_mode)}
+            />
             <CreateUserForm onCreated={loadUsers} config={config} />
             {users.map((u) => (
               <UserRow

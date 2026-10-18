@@ -248,6 +248,34 @@ class FlightDeckDB:
             CREATE INDEX IF NOT EXISTS idx_waitlist_status
                 ON waitlist(status, created_at);
 
+            -- Invitations an admin sent (invite_routes). The invitee opens
+            -- the link — only its sha256 is kept here — picks a password,
+            -- and the account is created then. kiosk NULL = the deck's
+            -- "new users start in kiosk" at acceptance. One pending
+            -- invitation per email.
+            CREATE TABLE IF NOT EXISTS invites (
+                id           TEXT PRIMARY KEY,
+                email        TEXT NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '',
+                role         TEXT NOT NULL DEFAULT 'user',
+                kiosk        INTEGER,
+                note         TEXT NOT NULL DEFAULT '',
+                token_hash   TEXT NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'pending',
+                invited_by   TEXT NOT NULL DEFAULT '',
+                created_at   TEXT NOT NULL,
+                expires_at   TEXT NOT NULL,
+                sent_via     TEXT NOT NULL DEFAULT '',
+                sent_from    TEXT NOT NULL DEFAULT '',
+                sent_at      TEXT NOT NULL DEFAULT '',
+                accepted_at  TEXT NOT NULL DEFAULT '',
+                user_id      TEXT NOT NULL DEFAULT ''
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_invites_pending_email
+                ON invites(email) WHERE status = 'pending';
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_invites_token
+                ON invites(token_hash);
+
             CREATE TABLE IF NOT EXISTS chat_sessions (
                 id         TEXT PRIMARY KEY,
                 user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1019,6 +1047,122 @@ class FlightDeckDB:
     async def delete_waitlist_entry(self, entry_id: str) -> bool:
         assert self._db is not None
         cur = await self._db.execute("DELETE FROM waitlist WHERE id = ?", (entry_id,))
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    # ── Invitations ──────────────────────────────────────────────────
+
+    _INVITE_COLS = ("id, email, display_name, role, kiosk, note, status, invited_by, created_at,"
+                    " expires_at, sent_via, sent_from, sent_at, accepted_at, user_id")
+
+    async def create_invite(
+        self, *, email: str, display_name: str, role: str, kiosk: bool | None,
+        note: str, token_hash: str, invited_by: str, expires_at: str,
+    ) -> dict:
+        """A pending invitation. Raises ``sqlite3.IntegrityError`` when this
+        email already has one pending."""
+        iid = _uuid()
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT INTO invites (id, email, display_name, role, kiosk, note, token_hash,"
+            " status, invited_by, created_at, expires_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+            (iid, email.lower().strip(), display_name, role,
+             None if kiosk is None else int(kiosk), note, token_hash, invited_by,
+             _utcnow(), expires_at),
+        )
+        await self._db.commit()
+        return await self.get_invite(iid) or {}
+
+    async def get_invite(self, invite_id: str) -> dict | None:
+        """One invitation, never its token hash."""
+        assert self._db is not None
+        async with self._db.execute(
+            f"SELECT {self._INVITE_COLS} FROM invites WHERE id = ?", (invite_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def get_invite_by_token_hash(self, token_hash: str) -> dict | None:
+        assert self._db is not None
+        async with self._db.execute(
+            f"SELECT {self._INVITE_COLS} FROM invites WHERE token_hash = ?", (token_hash,)
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def get_pending_invite(self, email: str) -> dict | None:
+        assert self._db is not None
+        async with self._db.execute(
+            f"SELECT {self._INVITE_COLS} FROM invites WHERE email = ? AND status = 'pending'",
+            (email.lower().strip(),),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def list_invites(self, status: str | None = None, limit: int = 500) -> list[dict]:
+        """Newest first; *status* None = every invitation."""
+        assert self._db is not None
+        if status:
+            sql, args = (f"SELECT {self._INVITE_COLS} FROM invites WHERE status = ?"
+                         " ORDER BY created_at DESC LIMIT ?", (status, limit))
+        else:
+            sql, args = (f"SELECT {self._INVITE_COLS} FROM invites"
+                         " ORDER BY created_at DESC LIMIT ?", (limit,))
+        async with self._db.execute(sql, args) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def renew_invite(self, invite_id: str, token_hash: str, expires_at: str) -> bool:
+        """A new link (the old one stops working) and expiry for a pending
+        invitation. False when it isn't pending."""
+        assert self._db is not None
+        cur = await self._db.execute(
+            "UPDATE invites SET token_hash = ?, expires_at = ? WHERE id = ? AND status = 'pending'",
+            (token_hash, expires_at, invite_id),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    async def mark_invite_sent(self, invite_id: str, via: str, sent_from: str) -> None:
+        assert self._db is not None
+        await self._db.execute(
+            "UPDATE invites SET sent_via = ?, sent_from = ?, sent_at = ? WHERE id = ?",
+            (via, sent_from, _utcnow(), invite_id),
+        )
+        await self._db.commit()
+
+    async def claim_invite(self, invite_id: str) -> bool:
+        """Mark a pending invitation accepted — before its account is made, so
+        two tabs can't both use one link. False when it was not pending (used
+        a moment ago, or removed)."""
+        assert self._db is not None
+        cur = await self._db.execute(
+            "UPDATE invites SET status = 'accepted', accepted_at = ?"
+            " WHERE id = ? AND status = 'pending'",
+            (_utcnow(), invite_id),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    async def finish_invite(self, invite_id: str, user_id: str) -> None:
+        """The account a claimed invitation made."""
+        assert self._db is not None
+        await self._db.execute("UPDATE invites SET user_id = ? WHERE id = ?", (user_id, invite_id))
+        await self._db.commit()
+
+    async def release_invite(self, invite_id: str) -> None:
+        """Back to pending: the account could not be made after the claim."""
+        assert self._db is not None
+        await self._db.execute(
+            "UPDATE invites SET status = 'pending', accepted_at = ''"
+            " WHERE id = ? AND status = 'accepted' AND user_id = ''",
+            (invite_id,),
+        )
+        await self._db.commit()
+
+    async def delete_invite(self, invite_id: str) -> bool:
+        assert self._db is not None
+        cur = await self._db.execute("DELETE FROM invites WHERE id = ?", (invite_id,))
         await self._db.commit()
         return cur.rowcount > 0
 

@@ -19,6 +19,7 @@ import { ForgePage } from './pages/ForgePage'
 import { LibraryPage } from './pages/LibraryPage'
 import { LoginPage } from './pages/LoginPage'
 import { ChoosePasswordPage } from './pages/ChoosePasswordPage'
+import { AcceptInvitePage, INVITE_PATH } from './pages/AcceptInvitePage'
 import { AdminPage } from './pages/AdminPage'
 import { CouncilPage } from './pages/CouncilPage'
 import { BasnaPage } from './pages/BasnaPage'
@@ -581,6 +582,8 @@ function App() {
   const instanceName = useAuthStore((s) => s.branding.name)
   const [authChecked, setAuthChecked] = useState(false)
   const [fdUnreachable, setFdUnreachable] = useState(false)
+  // An invitation link (<deck>/invite#<token>): choose a password, get an account.
+  const [onInvitePage, setOnInvitePage] = useState(() => window.location.pathname === INVITE_PATH)
 
   // The public square (plan §9) is the one surface that lives OUTSIDE auth:
   // /village and /b/<slug> render for anyone, logged in or not, before the
@@ -644,6 +647,10 @@ function App() {
         </div>
       </div>
     )
+  }
+
+  if (authEnabled && onInvitePage) {
+    return <AcceptInvitePage onLeave={() => setOnInvitePage(false)} />
   }
 
   // Auth enabled but not logged in → show login page
