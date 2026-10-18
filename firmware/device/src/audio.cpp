@@ -14,14 +14,17 @@ static int nextBlock = 0;
 static bool micOn = false;
 static int lastLevel = 0;
 
-// ── speaker: one append-only PSRAM buffer per stream ──
+// ── speaker: one append-only PSRAM buffer holds the last answer's clip ──
 static constexpr size_t kPlayCap = 1600 * 1024;  // samples (~66 s at 24 kHz)
 static int16_t* playBuf = nullptr;
-static size_t writePos = 0, playPos = 0;  // in samples
+static size_t writePos = 0, playPos = 0;  // in samples; the clip is [0, writePos)
 static uint32_t playRate = 24000;
 static bool streamOpen = false, streamEnded = false, started = false;
+static bool freshClip = true;             // the next stream starts a new clip
+static bool cut = false;                  // a stream of this clip stopped before its end
 static uint32_t holdUntilMs = 0;
-static uint32_t soundStartMs = 0;         // when the first segment went to the speaker
+static uint32_t soundStartMs = 0;         // when the speaker last started from silence…
+static size_t soundStartPos = 0;          // …and from which sample
 static int carry = -1;                    // odd byte waiting for its pair
 
 // Speech boost: gain, then a soft knee above half scale so loud syllables
@@ -117,18 +120,38 @@ void micStop(void (*sink)(const int16_t*, size_t)) {
 
 bool micActive() { return micOn; }
 
-void playBegin(uint32_t rate, uint32_t holdMs) {
-  playStop();
+// The codec does one thing at a time: the speaker takes over from the mic.
+static void speakerOn() {
   if (micOn) micStop([](const int16_t*, size_t) {});
   M5.Mic.end();
   if (!M5.Speaker.isEnabled()) M5.Speaker.begin();
-  playRate = rate ? rate : 24000;
-  writePos = playPos = 0;
+}
+
+bool playBegin(uint32_t rate, uint32_t holdMs) {
+  rate = rate ? rate : 24000;
+  bool fresh = freshClip || rate != playRate;
+  // The answer's previous stream has all arrived and is still sounding:
+  // carry straight on, so the two play back to back.
+  if (!fresh && streamOpen && streamEnded) {
+    streamEnded = false;
+    carry = -1;
+    return true;
+  }
+  playStop();
+  speakerOn();
+  if (fresh) {
+    writePos = 0;
+    cut = false;
+    freshClip = false;
+  }
+  playRate = rate;
+  playPos = writePos;
   carry = -1;
   streamOpen = true;
   streamEnded = false;
   started = false;
   holdUntilMs = millis() + holdMs;
+  return false;
 }
 
 void playFeed(const uint8_t* data, size_t len) {
@@ -150,14 +173,16 @@ void playFeed(const uint8_t* data, size_t len) {
   if ((len - i) % 2 && n == pairs) carry = data[len - 1];
 }
 
-void playEnd() { streamEnded = true; }
+void playEnd() {
+  if (streamOpen) streamEnded = true;
+}
 
 void playStop() {
   if (M5.Speaker.isEnabled()) M5.Speaker.stop(0);
+  if (streamOpen && !streamEnded) cut = true;  // the rest of it won't arrive
   streamOpen = false;
   streamEnded = false;
   started = false;
-  writePos = playPos = 0;
 }
 
 void playPoll() {
@@ -169,14 +194,17 @@ void playPoll() {
     // Buffer a little first so a slow network doesn't stutter the start.
     if (avail < playRate * 3 / 10 && !streamEnded) return;
     started = true;
-    soundStartMs = millis();
   }
   if (queued < 2 && avail > 0 && (avail >= playRate / 10 || streamEnded)) {
     size_t n = min(avail, (size_t)(playRate / 2));
+    if (queued == 0) {  // from silence: outputLevel() counts from here
+      soundStartMs = millis();
+      soundStartPos = playPos;
+    }
     M5.Speaker.playRaw(playBuf + playPos, n, playRate, false, 1, 0, false);
     playPos += n;
   }
-  if (streamEnded && playPos == writePos && queued == 0) {
+  if (streamEnded && playPos == writePos && M5.Speaker.isPlaying(0) == 0) {
     streamOpen = false;  // stream finished and fully played
   }
 }
@@ -187,15 +215,34 @@ bool sounding() { return streamOpen && started; }
 
 int outputLevel() {
   // Where the speaker is now, assuming it has played without gaps since it
-  // started (good enough to move a mouth).
+  // last started from silence (good enough to move a mouth).
   if (!sounding() || !playBuf) return 0;
-  size_t at = (size_t)((millis() - soundStartMs) * (uint64_t)playRate / 1000);
+  size_t at = soundStartPos + (size_t)((millis() - soundStartMs) * (uint64_t)playRate / 1000);
   if (at >= playPos) return 0;
   size_t win = playRate / 50;  // 20 ms
-  size_t from = at > win ? at - win : 0;
+  size_t from = at > soundStartPos + win ? at - win : soundStartPos;
   int peak = 0;
   for (size_t i = from; i < at; i += 2) peak = max(peak, abs((int)playBuf[i]));
   return min(100, peak * 100 / 20000);
+}
+
+void newClip() { freshClip = true; }
+
+bool hasClip() { return playBuf && writePos > 0 && !freshClip; }
+
+bool clipCut() { return cut && !freshClip; }
+
+void replay() {
+  if (!hasClip()) return;
+  bool arriving = streamOpen && !streamEnded;  // its last stream is still coming in
+  if (M5.Speaker.isEnabled()) M5.Speaker.stop(0);
+  speakerOn();
+  playPos = 0;
+  if (!arriving) carry = -1;
+  streamOpen = true;
+  streamEnded = !arriving;
+  started = false;
+  holdUntilMs = millis();
 }
 
 }  // namespace audio

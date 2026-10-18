@@ -87,7 +87,7 @@ void showStoredImage();
 // round screen shows a card: `badge` big in a glowing badge (a value like
 // "75%"), or a glyph — Initials turns `badge` (a name) into its initials —
 // with `title` under it, then `note`.
-enum class Glyph : uint8_t { None, Initials, Wifi, Back, Info };
+enum class Glyph : uint8_t { None, Initials, Wifi, Back, Info, Replay };
 struct Item {
   String label;
   String title;

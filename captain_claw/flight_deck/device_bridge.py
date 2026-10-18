@@ -21,6 +21,8 @@ Device → Flight Deck
   text  {"type":"rec_cancel"}                    drop the recording
   text  {"type":"text","text":"…"}               send typed words instead
   text  {"type":"stop"}                          stop playback, clear the queue
+  text  {"type":"replay"}                        play the last answer's sounds again (its speech
+                                                 is synthesized afresh) → audio, or {"type":"replay_none"}
   text  {"type":"agents"} / {"type":"select","agent":"<slug>"}
   text  {"type":"prefs","voice":"male|female|<name>","speak":bool}   change voice / speaking live
   text  {"type":"ping","t":<device ms>}          echoed back (round-trip time)
@@ -39,6 +41,7 @@ Flight Deck → device
         (img=chunks: bin 0x03 + part … while more follow, then 0x02 + the last part)
   text  {"type":"error","text":"…"} | {"type":"pong","t":<echoed>}
   text  {"type":"update","version","size","sha256","sig","notes","url"} | {"type":"update_none"}
+  text  {"type":"replay_none"}                   nothing to replay (the device plays what it kept)
 
 Auth: a personal access token (Profile → MCP agent access) names the owner;
 the device only ever reaches that owner's agents. With Flight Deck auth off
@@ -102,6 +105,12 @@ MEDIA_WINDOW_S = 180.0           # turn_media trails the reply; accept it this l
 AUDIO_FILE_MAX_S = 300
 MAX_JPEG_BYTES = 14000           # the device's WebSocket library takes ≤15 KB frames
 MAX_CHUNKED_JPEG_BYTES = 120_000  # a picture sent in parts (img=chunks)
+
+# The last answer's sounds per device channel, for a replay — kept here, not
+# on the connection, so it survives a reconnect (a dropped link cuts an
+# answer short just like a stop does). The device replays a complete answer
+# from its own memory; it asks for this one only when part never arrived.
+_answers: dict[str, list[tuple[str, Any]]] = {}
 
 
 # ── Small pure helpers (tested) ───────────────────────────────────────
@@ -401,9 +410,11 @@ class _DeviceConn:
             # Round screens are the StopWatch, whose font has Đ.
             await self.send_json({"type": "reply", "text": screen_text(text, has_dj=self.round_screen),
                                   "proactive": proactive})
+            sounds = _answers[self.channel_id] = []  # a new answer
             if self.speak:
                 spoken = speakable(text)
                 if spoken:
+                    sounds.append(("tts", spoken))
                     await self._audio_q.put(("tts", spoken))
         elif etype == "narration":
             if self.pending and ev.get("text"):
@@ -441,6 +452,7 @@ class _DeviceConn:
                 if kind == "image":
                     self._spawn(self._send_image(item))
                 elif kind == "audio":
+                    _answers.setdefault(self.channel_id, []).append(("file", item))
                     await self._audio_q.put(("file", item))
 
     async def _send_activity(self, text: str, tool: str) -> None:
@@ -559,6 +571,17 @@ class _DeviceConn:
                 log.warning("device audio failed: %s", exc)
             finally:
                 self._audio_task = None
+
+    async def replay(self) -> bool:
+        """Play the last answer's sounds again, from the start."""
+        sounds = list(_answers.get(self.channel_id) or [])
+        if not sounds:
+            await self.send_json({"type": "replay_none"})
+            return False
+        await self.stop_audio()
+        for sound in sounds:
+            await self._audio_q.put(sound)
+        return True
 
     async def stop_audio(self) -> None:
         while not self._audio_q.empty():
@@ -721,6 +744,8 @@ async def device_ws(ws: WebSocket) -> None:
                     conn._spawn(conn.send_to_agent(text))
             elif mtype == "stop":
                 await conn.stop_audio()
+            elif mtype == "replay":
+                await conn.replay()
             elif mtype == "agents":
                 items = [{"slug": a.get("slug"), "name": a.get("name")} for a in _running_agents(conn.user_id)]
                 await conn.send_json({"type": "agents", "items": items,

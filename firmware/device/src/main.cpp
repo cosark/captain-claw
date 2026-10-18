@@ -5,6 +5,7 @@
 //             in the menu: choose / change the row
 //   Button B  (StickS3 side, StopWatch the other one)
 //             click = next page / next row · hold = menu (hold again = close)
+//             double-click on an answer = hear it again (also Menu → Replay answer)
 //   Hold A while switching on (or no Wi-Fi saved) = setup hotspot
 //
 // Talks to Flight Deck's /device/ws (captain_claw/flight_deck/device_bridge.py):
@@ -27,7 +28,7 @@
 #include "settings.h"
 #include "ui.h"
 
-#define FW_VERSION "0.8.1"
+#define FW_VERSION "0.9.0"
 
 enum class Mode { Idle, Listening, Waiting, Reply, Image, Menu, Agents, CharPick, Status, Notice };
 
@@ -62,8 +63,15 @@ static uint32_t lastPingMs = 0, lastReplyMs = 0, turns = 0;
 static uint8_t* imgPart = nullptr;  // a picture arriving in parts (PSRAM)
 static size_t imgPartLen = 0;
 static uint32_t buzzOffMs = 0;       // vibration motor runs until then (0 = off)
+static bool deckReplay = false;      // asked the deck to send the last answer again
+static uint32_t deckReplayMs = 0;
+static bool quietSpeech = false;     // replayed speech comes without the cue
+static uint32_t sideClickMs = 0;     // a side click on an answer, waiting for a second one (0 = none)
+static Mode sideClickMode = Mode::Idle;
+static bool sideClickWoke = false;   // that click only woke the screen
 
 static constexpr uint32_t kTapMs = 300;      // shorter press = tap, not talk
+static constexpr uint32_t kDoubleMs = 350;   // a second click within this = double-click
 static constexpr uint32_t kDimLeadMs = 2000;  // dims this long before the screen goes off
 static constexpr uint8_t kBright = 128;
 static constexpr uint32_t kFlashMs = 700;    // white / normal, every 100 ms
@@ -254,17 +262,26 @@ static void showIdle() {
 
 // ── menu ─────────────────────────────────────────────────────────────
 
-enum MenuRow { MStatus, MAgent, MVolume, MBoost, MVoice, MDisplay, MTextSize, MCharacter, MBeep, MFlash, MBuzz,
-               MLead, MScreenOff, MPowerOff, MUpdate, MAutoUpdate, MSetup, MCount };
+enum MenuRow { MReplay, MStatus, MAgent, MVolume, MBoost, MVoice, MDisplay, MTextSize, MCharacter, MBeep, MFlash,
+               MBuzz, MLead, MScreenOff, MPowerOff, MUpdate, MAutoUpdate, MSetup, MCount };
 
-// Rows this device has (only a device with a motor can buzz).
-static bool rowShown(int row) { return row != MBuzz || board::kHasMotor; }
+// The last answer can be heard again: from memory, or (part of it never
+// arrived) from the deck.
+static bool canReplay() { return audio::hasClip() || (audio::clipCut() && wsUp); }
+
+// Rows this device has now (only a device with a motor can buzz; Replay only
+// while there's an answer to replay).
+static bool rowShown(int row) {
+  if (row == MReplay) return canReplay();
+  return row != MBuzz || board::kHasMotor;
+}
 
 static constexpr uint8_t kVolumeSteps[] = {64, 128, 191, 255};  // 25 / 50 / 75 / 100 %
 static constexpr uint8_t kBoostSteps[] = {0, 6, 10};
 
 static String menuLabel(int row) {
   switch (row) {
+    case MReplay: return "Replay answer";
     case MStatus: return "Status";
     case MAgent: return "Agent: " + (agentName.length() ? agentName : String("none")) + " »";
     case MVolume: return "Volume " + String((settings.volume * 100 + 127) / 255) + "%";
@@ -296,6 +313,7 @@ static ui::Item menuItem(int row) {
   it.label = menuLabel(row);
   it.note = "yellow = change";
   switch (row) {
+    case MReplay: it.title = "Replay answer"; it.glyph = ui::Glyph::Replay; it.note = "yellow = hear it again"; break;
     case MStatus: it.title = "Status"; it.glyph = ui::Glyph::Info; it.note = "Wi-Fi, deck, battery…"; break;
     case MAgent:
       it.title = "Agent";
@@ -383,6 +401,7 @@ static uint8_t nextStep(const uint8_t (&steps)[N], uint8_t now) {
 static void backToMain();
 static void startInstall();
 static void connectServer();
+static void replayAnswer();
 
 static void redraw() {
   setBarState();
@@ -449,7 +468,7 @@ static void backToMain() {
 }
 
 static void openMenu() {
-  menuSel = 0;
+  menuSel = canReplay() ? MReplay : MStatus;
   menuOpenedMs = millis();
   mode = Mode::Menu;
   redraw();
@@ -458,6 +477,10 @@ static void openMenu() {
 static void chooseMenuRow() {
   menuOpenedMs = millis();
   switch (menuSel) {
+    case MReplay:
+      backToMain();
+      replayAnswer();
+      return;
     case MStatus:
       statusPage = 0;
       mode = Mode::Status;
@@ -557,6 +580,7 @@ static void startTalking() {
     return;
   }
   flashing = false;
+  quietSpeech = false;
   audio::micStart();  // also stops any playback
   JsonDocument d;
   d["type"] = "rec_start";
@@ -585,10 +609,12 @@ static void stopTalking(bool send) {
 // ── speech cue: beep + flash, then the speech ────────────────────────
 
 static void startSpeech(uint32_t rate) {
-  bool cue = settings.cueBeep || settings.cueFlash;
-  bool buzzCue = board::kHasMotor && settings.cueBuzz;
-  audio::playBegin(rate, (cue || buzzCue) ? settings.cueLeadS * 1000UL : 0);
+  bool quiet = quietSpeech;  // a replay the user asked for needs no cue
+  bool cue = !quiet && (settings.cueBeep || settings.cueFlash);
+  bool buzzCue = !quiet && board::kHasMotor && settings.cueBuzz;
+  bool goesOn = audio::playBegin(rate, (cue || buzzCue) ? settings.cueLeadS * 1000UL : 0);
   touch();
+  if (goesOn || quiet) return;  // goesOn: the answer's next sound, straight after the last
   if (settings.cueBeep) audio::cue();
   if (buzzCue) buzz(160);
   if (settings.cueFlash) {
@@ -614,6 +640,33 @@ static void pollFlash() {
     lastPhase = phase;
     if (phase % 2 == 0) ui::flashFrame(true);
     else redraw();
+  }
+}
+
+// ── replay: the last answer again ────────────────────────────────────
+
+// From memory, at once. A picture stays up while it plays, except in icon
+// mode, where the character speaks.
+static void replayLocal() {
+  if (!audio::hasClip()) {
+    notice("Nothing to replay", "The last answer had no sound.", kText);
+    return;
+  }
+  audio::replay();
+  if (settings.iconMode && mode == Mode::Image) mode = Mode::Reply;
+  if (!flashing) redraw();
+}
+
+static void replayAnswer() {
+  if (audio::clipCut() && wsUp) {
+    // Part of it never arrived (stopped early, or the link dropped): the
+    // deck sends the whole answer again.
+    deckReplay = true;
+    deckReplayMs = millis();
+    quietSpeech = true;
+    sendType("replay");
+  } else {
+    replayLocal();
   }
 }
 
@@ -687,13 +740,24 @@ static void onText(const char* payload, size_t len) {
     String said = doc["text"] | "";
     ui::setReply(said);
     face::setText(said);
+    audio::newClip();  // this answer's sound replaces the last one's
+    deckReplay = quietSpeech = false;
     mode = Mode::Reply;
     if (!flashing) redraw();
   } else if (type == "audio_start") {
+    if (deckReplay) {  // the deck's copy of the answer replaces what arrived
+      deckReplay = false;
+      audio::newClip();
+    }
     startSpeech(doc["rate"] | 24000);
     setBarState();
   } else if (type == "audio_end") {
     audio::playEnd();
+  } else if (type == "replay_none") {
+    if (deckReplay) {  // the deck no longer has it: play what did arrive
+      deckReplay = quietSpeech = false;
+      replayLocal();
+    }
   } else if (type == "update") {
     ota::Offer o;
     o.version = doc["version"] | "";
@@ -782,6 +846,7 @@ static void onWs(WStype_t type, uint8_t* payload, size_t length) {
         if (audio::micActive()) audio::micStop([](const int16_t*, size_t) {});
         audio::playStop();
         dropImagePart();
+        deckReplay = false;
         if (mode == Mode::Listening || mode == Mode::Waiting) mode = ui::hasReply() ? Mode::Reply : Mode::Idle;
         redraw();
       }
@@ -949,6 +1014,58 @@ static void noteButtonActivity() {
   }
 }
 
+// ── side button ──────────────────────────────────────────────────────
+
+// An answer on screen: a side double-click there replays it, so a single
+// click waits kDoubleMs to see whether a second follows.
+static bool onAnswer() { return mode == Mode::Reply || mode == Mode::Image; }
+
+static void noteSideClick(bool wokeOnly) {
+  sideClickMs = millis();
+  if (!sideClickMs) sideClickMs = 1;
+  sideClickMode = mode;
+  sideClickWoke = wokeOnly;
+}
+
+// One side click: next row / page, or back to the main screen.
+static void sideClick() {
+  if (mode == Mode::Menu) {
+    do menuSel = (menuSel + 1) % MCount;
+    while (!rowShown(menuSel));
+    menuOpenedMs = millis();
+    redraw();
+  } else if (mode == Mode::CharPick) {
+    charSel = (charSel + 1) % face::KindCount;
+    menuOpenedMs = millis();
+    redraw();
+  } else if (mode == Mode::Agents) {
+    if (!agentsLoading) agentSel = (agentSel + 1) % agentNames.size();
+    menuOpenedMs = millis();
+    redraw();
+  } else if (mode == Mode::Status) {
+    if (statusPage + 1 < statusPages) {
+      ++statusPage;
+      redraw();
+    } else {
+      backToMain();  // after the last page
+    }
+  } else if (mode == Mode::Image || mode == Mode::Notice) {
+    backToMain();
+  } else if (mode == Mode::Reply) {
+    if (audio::playing() && settings.iconMode) {
+      audio::playStop();  // the character gives way to the text
+      sendType("stop");
+      redraw();
+    } else {
+      ui::nextPage();
+    }
+  } else if (mode == Mode::Idle) {
+    statusPage = 0;
+    mode = Mode::Status;
+    redraw();
+  }
+}
+
 // ── setup / loop ─────────────────────────────────────────────────────
 
 void setup() {
@@ -1050,7 +1167,8 @@ void loop() {
 
   // Side button: page / next row · hold = menu (hold again = close).
   if (dark && (M5.BtnB.wasHold() || M5.BtnB.wasClicked())) {
-    touch();  // woken only
+    touch();  // woken only — though a second click makes it a double-click
+    if (M5.BtnB.wasClicked() && onAnswer()) noteSideClick(true);
   } else if (M5.BtnB.wasHold()) {
     touch();
     if (mode == Mode::CharPick) {  // back to the menu, keeping the old character
@@ -1064,44 +1182,27 @@ void loop() {
     }
   } else if (M5.BtnB.wasClicked()) {
     touch();
-    if (mode == Mode::Menu) {
-      do menuSel = (menuSel + 1) % MCount;
-      while (!rowShown(menuSel));
-      menuOpenedMs = millis();
-      redraw();
-    } else if (mode == Mode::CharPick) {
-      charSel = (charSel + 1) % face::KindCount;
-      menuOpenedMs = millis();
-      redraw();
-    } else if (mode == Mode::Agents) {
-      if (!agentsLoading) agentSel = (agentSel + 1) % agentNames.size();
-      menuOpenedMs = millis();
-      redraw();
-    } else if (mode == Mode::Status) {
-      if (statusPage + 1 < statusPages) {
-        ++statusPage;
-        redraw();
-      } else {
-        backToMain();  // after the last page
-      }
-    } else if (mode == Mode::Image || mode == Mode::Notice) {
-      backToMain();
-    } else if (mode == Mode::Reply) {
-      if (audio::playing() && settings.iconMode) {
-        audio::playStop();  // the character gives way to the text
-        sendType("stop");
-        redraw();
-      } else {
-        ui::nextPage();
-      }
-    } else if (mode == Mode::Idle) {
-      statusPage = 0;
-      mode = Mode::Status;
-      redraw();
+    if (sideClickMs && mode == sideClickMode) {  // the second click: hear the answer again
+      sideClickMs = 0;
+      replayAnswer();
+    } else if (onAnswer()) {
+      noteSideClick(false);  // it may be the first of two
+    } else {
+      sideClick();
     }
+  }
+  if (sideClickMs && millis() - sideClickMs > kDoubleMs) {
+    sideClickMs = 0;  // just the one click
+    if (!sideClickWoke && mode == sideClickMode) sideClick();
   }
   if ((mode == Mode::Menu || mode == Mode::Agents) && millis() - menuOpenedMs > 20000) backToMain();
   if (mode == Mode::CharPick && millis() - menuOpenedMs > 60000) backToMain();
+
+  // A deck too old to replay never answers: play what did arrive.
+  if (deckReplay && millis() - deckReplayMs > 4000) {
+    deckReplay = quietSpeech = false;
+    replayLocal();
+  }
 
   // Keep a round-trip time for the status page.
   if (wsUp && millis() - lastPingMs > 15000) {

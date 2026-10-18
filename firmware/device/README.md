@@ -42,7 +42,17 @@ uv run --no-project --with pillow python preview/render.py   # → preview/out/s
 |---|---|---|
 | hold | talk (release sends) | menu (hold again closes) |
 | tap / click | stop speaking · flip picture ↔ text | next page · back |
+| double-click (on an answer) | | hear the answer again |
 | in the agent list | choose | move down |
+
+**Replay.** Double-click the side button on an answer (its text or its picture), or
+choose Menu → *Replay answer* (the first row, while there's an answer with sound), to
+hear the last answer again, without the cue. The device keeps the whole answer in
+memory (its speech, then any sound the agent made, up to ~66 s), so a replay plays
+at once and needs no network. If part of the answer never arrived (you stopped it
+early, or the link dropped), the device asks Flight Deck to send it again instead
+(`{"type":"replay"}`; the speech is synthesized afresh). Powering off forgets it.
+A single side click on an answer now waits 0.35 s to make sure it isn't a double-click.
 
 In the side-button list, *Volume* (25/50/75/100%) and *Boost* (off, +6, +10 dB —
 extra speech gain with a soft limiter) change with each front-button press and

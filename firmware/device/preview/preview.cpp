@@ -100,6 +100,7 @@ static ui::Item card(const char* title, const String& badge, const char* note, b
 
 static std::vector<ui::Item> menu() {
   return {
+      card("Replay answer", "", "yellow = hear it again", true, ui::Glyph::Replay),
       card("Status", "", "Wi-Fi, deck, battery…", true, ui::Glyph::Info),
       card("Agent", "Captain Claw", "Captain Claw · change", true, ui::Glyph::Initials),
       card("Volume", "75%", "yellow = change"),
@@ -177,14 +178,16 @@ int main(int argc, char** argv) {
 
   auto items = menu();
   bar("menu", kText);
-  ui::showPicker(items, 2, -1);
-  save("08_menu_volume");
   ui::showPicker(items, 3, -1);
+  save("08_menu_volume");
+  ui::showPicker(items, 4, -1);
   save("09_menu_boost_off");
-  ui::showPicker(items, 1, -1);
+  ui::showPicker(items, 2, -1);
   save("10_menu_agent");
-  ui::showPicker(items, 14, -1);
+  ui::showPicker(items, 15, -1);
   save("11_menu_wifi");
+  ui::showPicker(items, 0, -1);
+  save("11b_menu_replay");
 
   std::vector<ui::Item> agents = {card("Captain Claw", "Captain Claw", "current agent", true, ui::Glyph::Initials),
                                   card("Research desk", "Research desk", "yellow = choose", true, ui::Glyph::Initials),
