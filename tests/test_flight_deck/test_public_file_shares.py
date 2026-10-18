@@ -38,7 +38,7 @@ def env(tmp_path, monkeypatch):
 
     def agent(request: httpx.Request) -> httpx.Response:
         seen.append(request)
-        if request.url.params.get("token") != "agent-secret-token":
+        if request.url.params.get("token") not in ("agent-secret-token", "tok-A", "tok-B"):
             return httpx.Response(401, json={"error": "Unauthorized"})
         body = files.get(request.url.params.get("path", ""))
         if body is None:
@@ -48,7 +48,10 @@ def env(tmp_path, monkeypatch):
     real = httpx.AsyncClient
     monkeypatch.setattr(pfs.httpx, "AsyncClient",
                         lambda **kw: real(transport=httpx.MockTransport(agent), **kw))
-    pfs.configure(data_dir=tmp_path, resolve_auth=lambda port: "agent-secret-token")
+    endpoints = {"tok-A": {"port": 24123, "agent_ref": "proc-secret-agent", "name": "Secret Agent"},
+                 "tok-B": {"port": 24124, "agent_ref": "proc-other", "name": "Other"}}
+    pfs.configure(data_dir=tmp_path, resolve_auth=lambda port: "agent-secret-token",
+                  resolve_agent_endpoint=endpoints.get)
 
     app = FastAPI()
     app.include_router(pfs.owner_router)
@@ -222,3 +225,79 @@ def test_owner_route_is_port_addressed_for_the_ownership_guard():
     from captain_claw.flight_deck import server
 
     assert server._agent_proxy_port(AGENT) == 24123
+
+
+# ── Agent routes (the `public_link` tool) ────────────────────────────
+
+@pytest.fixture()
+def agents(env, monkeypatch):
+    """Two agents of OWNER, identified by X-Agent-Auth as the real check does."""
+    from captain_claw.flight_deck import server
+
+    owners = {"tok-A": OWNER["id"], "tok-B": OWNER["id"], "tok-orphan": ""}
+    monkeypatch.setattr(server, "_agent_caller_ok", lambda request: True)
+    monkeypatch.setattr(server, "_find_agent_by_auth",
+                        lambda t: (t in owners, owners.get(t, ""), "slug"))
+    return env
+
+
+def _agent(client, tok, route, **body):
+    return client.post(f"/fd/public-shares/agent/{route}", json=body, headers={"X-Agent-Auth": tok})
+
+
+def test_agent_share_lands_in_the_owners_links(agents, monkeypatch):
+    client, files, seen, *_ = agents
+    files[SRC + "report.md"] = b"# Hi"
+    monkeypatch.setenv("FD_PUBLIC_URL", "https://deck.example.com/")
+    r = _agent(client, "tok-A", "share", path=SRC + "report.md", expires_days=7)
+    assert r.status_code == 200, r.text
+    share = r.json()["share"]
+    assert share["url"] == f"https://deck.example.com/s/{share['token']}"
+    assert share["local_only"] is False and share["expires_at"]
+    # Pulled from the calling agent's own file server, with its own token.
+    assert seen[-1].url.port == 24123 and seen[-1].url.params["token"] == "tok-A"
+    assert client.get(f"/s/{share['token']}").status_code == 200
+    # The owner's Share dialog finds it for that agent + file.
+    got = client.get(AGENT, params={"path": SRC + "report.md", "agent_ref": "proc-secret-agent"})
+    assert got.json()["share"]["token"] == share["token"]
+    # Sharing again (from the UI or the agent) keeps the URL.
+    assert _share(client, SRC + "report.md")["token"] == share["token"]
+
+
+def test_agent_link_without_public_url_is_flagged_local(agents, monkeypatch):
+    client, files, *_ = agents
+    monkeypatch.delenv("FD_PUBLIC_URL", raising=False)
+    files[SRC + "a.md"] = b"x"
+    share = client.post("/fd/public-shares/agent/share", json={"path": SRC + "a.md"},
+                        headers={"X-Agent-Auth": "tok-A"}, ).json()["share"]
+    assert share["url"].startswith("http://testserver/s/")
+    assert pfs._private_host("127.0.0.1") and pfs._private_host("localhost")
+    assert not pfs._private_host("deck.example.com")
+
+
+def test_agent_sees_and_stops_only_its_own_links(agents):
+    client, files, *_ = agents
+    files[SRC + "a.md"] = b"x"
+    a = _agent(client, "tok-A", "share", path=SRC + "a.md").json()["share"]
+    assert [s["token"] for s in _agent(client, "tok-B", "list").json()["shares"]] == []
+    assert [s["token"] for s in _agent(client, "tok-A", "list").json()["shares"]] == [a["token"]]
+    assert _agent(client, "tok-B", "unshare", token=a["token"]).status_code == 404
+    assert _agent(client, "tok-B", "unshare", path=SRC + "a.md").status_code == 404
+    assert client.get(f"/s/{a['token']}").status_code == 200
+    r = _agent(client, "tok-A", "unshare", path=SRC + "a.md")
+    assert r.json() == {"ok": True, "filename": "a.md"}
+    assert client.get(f"/s/{a['token']}").status_code == 404
+
+
+def test_agent_routes_refuse_browsers_strangers_and_ownerless(agents, monkeypatch):
+    client, files, *_ = agents
+    files[SRC + "a.md"] = b"x"
+    browser = client.post("/fd/public-shares/agent/share", json={"path": SRC + "a.md"},
+                          headers={"X-Agent-Auth": "tok-A", "Sec-Fetch-Site": "same-origin"})
+    assert browser.status_code == 403
+    assert _agent(client, "", "share", path=SRC + "a.md").status_code == 403
+    assert _agent(client, "tok-stranger", "share", path=SRC + "a.md").status_code == 403
+    monkeypatch.setenv("FD_AUTH_ENABLED", "true")
+    assert _agent(client, "tok-orphan", "share", path=SRC + "a.md").status_code == 403
+    monkeypatch.setenv("FD_PUBLIC_FILE_LINKS", "off")
+    assert _agent(client, "tok-A", "share", path=SRC + "a.md").status_code == 403

@@ -1487,7 +1487,9 @@ app.include_router(system_router)
 app.include_router(share_router)
 # Public file links: owner API (port-addressed → the ownership guard above
 # covers it) + the account-free /s/{token} viewer. Before spa_catch_all.
-public_file_shares.configure(data_dir=DATA_DIR, resolve_auth=lambda port: _resolve_agent_auth(port))
+public_file_shares.configure(
+    data_dir=DATA_DIR, resolve_auth=lambda port: _resolve_agent_auth(port),
+    resolve_agent_endpoint=lambda token: _find_agent_endpoint_by_auth(token))
 app.include_router(public_file_shares.owner_router)
 app.include_router(public_file_shares.public_router)
 app.include_router(agent_sharing_router)
@@ -4400,6 +4402,32 @@ def _find_agent_by_auth(token: str) -> tuple[bool, str, str]:
     except Exception:
         pass
     return found
+
+
+def _find_agent_endpoint_by_auth(token: str) -> dict | None:
+    """Where this deck's agent holding web_auth ``token`` serves its files:
+    ``{"port", "agent_ref", "name"}``, with ``agent_ref`` the id the SPA keys
+    that agent by (``proc-<slug>`` / the container's short id). None when the
+    token isn't one this deck issued or the agent has no web port."""
+    if not token:
+        return None
+    for slug, entry in _load_process_registry().items():
+        wa = str(entry.get("web_auth") or "")
+        if wa and _token_eq(wa, token) and entry.get("web_port"):
+            return {"port": int(entry["web_port"]), "agent_ref": f"proc-{slug}",
+                    "name": str(entry.get("name") or slug)}
+    try:
+        for c in _deck_containers():
+            labels = c.labels or {}
+            wa = str(labels.get("flight-deck.web-auth", "") or "")
+            if wa and _token_eq(wa, token):
+                info = _container_info(c)
+                if info.web_port:
+                    return {"port": int(info.web_port), "agent_ref": info.id,
+                            "name": info.agent_name or info.name}
+    except Exception:
+        pass
+    return None
 
 
 def _resolve_agent_identity_by_auth(token: str) -> tuple[bool, str]:
