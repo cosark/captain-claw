@@ -24,6 +24,7 @@ import {
   Users,
   X,
   Info,
+  Compass,
 } from 'lucide-react'
 import { useUIStore } from '../../stores/uiStore'
 import { useAgentStore } from '../../stores/agentStore'
@@ -34,6 +35,7 @@ import { useContainerStore } from '../../stores/containerStore'
 import { useLocalAgentStore } from '../../stores/localAgentStore'
 import { useProcessStore } from '../../stores/processStore'
 import { useThemeStore } from '../../stores/themeStore'
+import { useOnboardingStore } from '../../stores/onboardingStore'
 import { useSharedAgentStore } from '../../stores/sharedAgentStore'
 import { isManagedAgent } from '../../utils/managedAgents'
 import { SHARED_PREFIX, sharedCaps, sharedContainerId } from '../../utils/sharedAgent'
@@ -46,11 +48,12 @@ import { SharedFilesPanel } from '../agents/SharedFilesPanel'
 import { SharedDatastorePanel } from '../agents/SharedDatastorePanel'
 import { AgentConfigEditor } from '../agents/AgentConfigEditor'
 import { ArchetypeSpawnDialog } from './ArchetypeSpawnDialog'
-import ConnectionsPage from '../../pages/ConnectionsPage'
+import ConnectionsPage, { type TabId as ConnectionsTab } from '../../pages/ConnectionsPage'
 import { ProfilePage } from '../../pages/ProfilePage'
 import { NotificationBell } from '../common/NotificationCenter'
 import { BrandMark } from '../common/BrandMark'
 import { KioskInfoDialog, type InfoAgent } from './KioskInfoDialog'
+import { KioskOnboardingDialog, type OnboardingAction } from './KioskOnboardingDialog'
 import { useIsMobile } from '../../hooks/useMediaQuery'
 
 // ── Simple layout ────────────────────────────────────────────────────
@@ -155,12 +158,27 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
   // Kiosk Connections dialog — the full layout's Connections page, which the
   // lock otherwise puts out of reach.
   const [connectionsOpen, setConnectionsOpen] = useState(false)
+  // The tab it opens on: the guide's "Connect Google" and the like; otherwise
+  // the one this viewer last had open.
+  const [connectionsTab, setConnectionsTab] = useState<ConnectionsTab | undefined>(undefined)
+  const openConnections = (tab?: ConnectionsTab) => { setConnectionsTab(tab); setConnectionsOpen(true) }
   // Kiosk Profile dialog — the owner profile every agent of theirs receives.
   const [profileOpen, setProfileOpen] = useState(false)
   // Kiosk Settings dialog — theme, connections, profile, refresh, sign-out.
   const [settingsOpen, setSettingsOpen] = useState(false)
   // Kiosk Info dialog — models, agents, archetypes, profile, plan, connections.
   const [infoOpen, setInfoOpen] = useState(false)
+  // Kiosk Getting started guide. It opens by itself once per page load (so
+  // once per person on a shared kiosk: sign-out reloads) until its "Do not
+  // show again" is ticked — which is per user, so it waits for their settings.
+  const [guideOpen, setGuideOpen] = useState(false)
+  const [guideDecided, setGuideDecided] = useState(false)
+  const settingsHydrated = useOnboardingStore((s) => s.hydrated)
+  const guideOptedOut = useOnboardingStore((s) => s.completed.kiosk)
+  if (locked && settingsHydrated && !guideDecided) {
+    setGuideDecided(true)
+    if (!guideOptedOut) setGuideOpen(true)
+  }
   // A phone gets its own layout: the agent list, or one chat, full screen.
   const { isMobile } = useIsMobile()
 
@@ -347,6 +365,14 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
 
   const refresh = () => { fetchContainers(); fetchProcesses(); fetchShared(); probeAll() }
 
+  // A guide step's button: the guide gives way to that part of the kiosk.
+  const guideAction = (action: OnboardingAction) => {
+    setGuideOpen(false)
+    if (action === 'new-agent') setArchetypeOpen(true)
+    else if (action === 'profile') setProfileOpen(true)
+    else openConnections(action === 'connections-google' ? 'google' : action === 'connections-microsoft' ? 'microsoft' : 'telegram')
+  }
+
   // The full Spawner leaves the chat surface, which the kiosk lock can't — so
   // there spawning means the archetype picker instead.
   const goSpawn = () => {
@@ -411,8 +437,9 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
         <KioskSettingsDialog
           onClose={() => setSettingsOpen(false)}
           onRefresh={() => { refresh(); setSettingsOpen(false) }}
-          onConnections={() => { setSettingsOpen(false); setConnectionsOpen(true) }}
+          onConnections={() => { setSettingsOpen(false); openConnections() }}
           onProfile={() => { setSettingsOpen(false); setProfileOpen(true) }}
+          onGuide={() => { setSettingsOpen(false); setGuideOpen(true) }}
         />
       )}
       {locked && infoOpen && (
@@ -420,10 +447,14 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
           agents={infoAgents}
           onClose={() => setInfoOpen(false)}
           onOpenProfile={() => { setInfoOpen(false); setProfileOpen(true) }}
-          onOpenConnections={() => { setInfoOpen(false); setConnectionsOpen(true) }}
+          onOpenConnections={() => { setInfoOpen(false); openConnections() }}
+          onOpenGuide={() => { setInfoOpen(false); setGuideOpen(true) }}
         />
       )}
-      {locked && connectionsOpen && <KioskConnectionsDialog onClose={() => setConnectionsOpen(false)} />}
+      {locked && guideOpen && (
+        <KioskOnboardingDialog phone={isMobile} onClose={() => setGuideOpen(false)} onAction={guideAction} />
+      )}
+      {locked && connectionsOpen && <KioskConnectionsDialog initialTab={connectionsTab} onClose={() => setConnectionsOpen(false)} />}
       {locked && profileOpen && <KioskProfileDialog onClose={() => setProfileOpen(false)} />}
 
       {!locked && optionsAgent && optionsAgent.kind !== 'shared' && createPortal(
@@ -484,7 +515,7 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
       <main className="flex min-w-0 flex-1 flex-col overflow-hidden" style={{ minWidth: 320 }}>
         {hasActiveSession
           ? <ChatPanel variant="simple" />
-          : <EmptyChat hasAgents={agents.length > 0} onSpawn={goSpawn} locked={locked} />}
+          : <EmptyChat hasAgents={agents.length > 0} onSpawn={goSpawn} locked={locked} onGuide={locked ? () => setGuideOpen(true) : undefined} />}
       </main>
 
       <ContextColumn
@@ -502,13 +533,15 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
 //
 // The kiosk keeps its whole footer behind one Settings button: this dialog
 // holds the theme switch, Connections, Profile, a refresh of the agent list,
-// and sign-out (how a shared kiosk hands the screen to the next person).
+// the Getting started guide, and sign-out (how a shared kiosk hands the
+// screen to the next person).
 
-function KioskSettingsDialog({ onClose, onRefresh, onConnections, onProfile }: {
+function KioskSettingsDialog({ onClose, onRefresh, onConnections, onProfile, onGuide }: {
   onClose: () => void
   onRefresh: () => void
   onConnections: () => void
   onProfile: () => void
+  onGuide: () => void
 }) {
   const { theme, toggle: toggleTheme } = useThemeStore()
   const authEnabled = useAuthStore((s) => s.authEnabled)
@@ -527,6 +560,7 @@ function KioskSettingsDialog({ onClose, onRefresh, onConnections, onProfile }: {
     { icon: Plug, title: 'Connections', detail: 'Google, Microsoft, MCP and Jev', onClick: onConnections },
     { icon: IdCard, title: 'Profile', detail: 'About you, your company, your preferences', onClick: onProfile },
     { icon: RefreshCw, title: 'Refresh agents', detail: 'Check every agent again', onClick: onRefresh },
+    { icon: Compass, title: 'Getting started', detail: 'A short tour: agents, connections, Telegram and more', onClick: onGuide },
   ]
 
   return createPortal(
@@ -560,11 +594,14 @@ function KioskSettingsDialog({ onClose, onRefresh, onConnections, onProfile }: {
         )}
 
         <div className="grid grid-cols-2 gap-2.5 p-5">
-          {tiles.map(({ icon: Icon, title, detail, onClick }) => (
+          {tiles.map(({ icon: Icon, title, detail, onClick }, i) => (
             <button
               key={title}
               onClick={onClick}
-              className="flex flex-col items-start gap-3 rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 text-left transition-colors hover:border-violet-500/50 hover:bg-zinc-800/60"
+              // An odd one out at the end takes the whole row.
+              className={`flex flex-col items-start gap-3 rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 text-left transition-colors hover:border-violet-500/50 hover:bg-zinc-800/60 ${
+                i === tiles.length - 1 && tiles.length % 2 ? 'col-span-2' : ''
+              }`}
             >
               <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-violet-500/10 text-violet-400">
                 <Icon className="h-[18px] w-[18px]" />
@@ -601,10 +638,10 @@ function KioskSettingsDialog({ onClose, onRefresh, onConnections, onProfile }: {
 // ConnectionsPage's `kiosk`), so a kiosk user can link their own Google
 // account and the MCP servers without leaving the chat surface.
 
-function KioskConnectionsDialog({ onClose }: { onClose: () => void }) {
+function KioskConnectionsDialog({ initialTab, onClose }: { initialTab?: ConnectionsTab; onClose: () => void }) {
   return (
     <KioskDialog label="Connections" onClose={onClose}>
-      <ConnectionsPage kiosk />
+      <ConnectionsPage kiosk initialTab={initialTab} />
     </KioskDialog>
   )
 }
@@ -1050,7 +1087,13 @@ function StateDot({ agent, className = '' }: { agent: SimpleAgent; className?: s
 
 // ── Centre: nothing open yet ─────────────────────────────────────────
 
-function EmptyChat({ hasAgents, onSpawn, locked = false }: { hasAgents: boolean; onSpawn: () => void; locked?: boolean }) {
+function EmptyChat({ hasAgents, onSpawn, locked = false, onGuide }: {
+  hasAgents: boolean
+  onSpawn: () => void
+  locked?: boolean
+  /** Kiosk only: open the Getting started guide. */
+  onGuide?: () => void
+}) {
   return (
     <div className="flex h-full items-center justify-center bg-zinc-950/80 p-6">
       <div className="w-full max-w-sm rounded-2xl border border-zinc-800 bg-zinc-900/60 p-8 text-center">
@@ -1073,6 +1116,15 @@ function EmptyChat({ hasAgents, onSpawn, locked = false }: { hasAgents: boolean;
             className="mt-6 rounded-lg bg-violet-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-violet-500"
           >
             {locked ? 'New agent' : 'Spawn an agent'}
+          </button>
+        )}
+        {onGuide && (
+          <button
+            onClick={onGuide}
+            className="mx-auto mt-4 flex items-center gap-1.5 text-xs font-medium text-zinc-500 transition-colors hover:text-violet-600 dark:hover:text-violet-400"
+          >
+            <Compass className="h-3.5 w-3.5" />
+            New here? Getting started
           </button>
         )}
       </div>

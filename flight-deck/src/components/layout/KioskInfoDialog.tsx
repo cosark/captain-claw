@@ -4,6 +4,8 @@ import {
   Bot,
   BookOpen,
   ChevronDown,
+  ChevronRight,
+  Compass,
   Cpu,
   Eye,
   Info,
@@ -56,11 +58,12 @@ function ctx(t: InfoTier): string {
     .filter(Boolean).join(' · ')
 }
 
-export function KioskInfoDialog({ agents, onClose, onOpenProfile, onOpenConnections }: {
+export function KioskInfoDialog({ agents, onClose, onOpenProfile, onOpenConnections, onOpenGuide }: {
   agents: InfoAgent[]
   onClose: () => void
   onOpenProfile: () => void
   onOpenConnections: () => void
+  onOpenGuide: () => void
 }) {
   const branding = useAuthStore((s) => s.branding)
   const [info, setInfo] = useState<MyInfo | null>(null)
@@ -114,6 +117,19 @@ export function KioskInfoDialog({ agents, onClose, onOpenProfile, onOpenConnecti
               <div className="mt-0.5 text-[11px] text-zinc-600">Flight Deck v{APP_VERSION} · {BUILD_DATE}</div>
             </div>
           </div>
+
+          {/* The guide every kiosk user gets on their first visit */}
+          <button
+            onClick={onOpenGuide}
+            className="flex w-full items-center gap-3 rounded-xl border border-violet-500/30 bg-violet-500/5 p-4 text-left transition-colors hover:bg-violet-500/10"
+          >
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-violet-500/15 text-violet-400"><Compass className="h-[18px] w-[18px]" /></span>
+            <span className="min-w-0 flex-1">
+              <span className="block text-sm font-medium text-zinc-100">Getting started</span>
+              <span className="block text-xs text-zinc-500">How to create an agent, connect Google, Microsoft and Telegram, and more</span>
+            </span>
+            <ChevronRight className="h-4 w-4 shrink-0 text-zinc-500" />
+          </button>
 
           {error && (
             <div className="rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-700 dark:text-red-300">
