@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo } from 'react'
 import {
   FileText, Loader2, AlertCircle, FolderOpen, RefreshCw, Download, Eye,
   Search, Image, FileCode, FileSpreadsheet, Film, Music, Archive,
-  Pin, MonitorPlay, Pencil,
+  Pin, MonitorPlay, Pencil, Globe,
 } from 'lucide-react'
 import type { AgentFile, AgentEndpoint } from '../../services/fileTransfer'
 import {
@@ -11,6 +11,8 @@ import {
 } from '../../services/fileTransfer'
 import { FileViewer } from './FileViewer'
 import { FileActionSheet } from './FileActionSheet'
+import { PublicLinkDialog } from './PublicLinkDialog'
+import { usePublicLinksEnabled } from '../../services/publicLinks'
 import { useIsMobile } from '../../hooks/useMediaQuery'
 import { CreatorBadge } from './CreatorBadge'
 import { isMemberCreated } from '../../utils/sharedWorkspace'
@@ -97,6 +99,8 @@ export function AgentFilesPanel({ containerId }: { containerId: string }) {
   // A phone has no hover: a tap on a file opens its actions in a sheet.
   const { isMobile: phone } = useIsMobile()
   const [actionFile, setActionFile] = useState<AgentFile | null>(null)
+  const [sharingFile, setSharingFile] = useState<AgentFile | null>(null)
+  const publicLinks = usePublicLinksEnabled()
 
   const agentId = agent?.id
   const loadFiles = async () => {
@@ -263,6 +267,7 @@ export function AgentFilesPanel({ containerId }: { containerId: string }) {
                   {isEditable(f) && <IconBtn onClick={() => handleEdit(f)} title="Edit" Icon={Pencil} hoverClass="hover:text-amber-400" />}
                   {isDeckable(f) && <IconBtn onClick={() => handleDeck(f)} title="Present as deck" Icon={MonitorPlay} hoverClass="hover:text-emerald-400" />}
                   <IconBtn onClick={() => handleDownload(f)} title="Download" Icon={Download} />
+                  {publicLinks && <IconBtn onClick={() => setSharingFile(f)} title="Share — public link" Icon={Globe} hoverClass="hover:text-violet-400" />}
                 </div>
               </li>
             ))}
@@ -281,8 +286,13 @@ export function AgentFilesPanel({ containerId }: { containerId: string }) {
           downloadUrl={getDownloadUrl(agent.host, agent.port, actionFile.physical, agent.auth)}
           onView={isViewable(actionFile) ? () => { setActionFile(null); handleView(actionFile) } : undefined}
           onDownload={() => handleDownload(actionFile)}
+          onPublicLink={publicLinks ? () => { setActionFile(null); setSharingFile(actionFile) } : undefined}
           onClose={() => setActionFile(null)}
         />
+      )}
+
+      {sharingFile && (
+        <PublicLinkDialog agent={agent} file={sharingFile} onClose={() => setSharingFile(null)} />
       )}
 
       {/* Viewer modal */}

@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
-import { AlertCircle, Download, Eye, Loader2, Share2, Trash2, type LucideIcon } from 'lucide-react'
+import { AlertCircle, Download, Eye, Globe, Loader2, Share2, Trash2, type LucideIcon } from 'lucide-react'
 import { formatSize } from '../../services/fileTransfer'
 
 // ── A file, tapped on a phone ────────────────────────────────────────
@@ -52,7 +52,7 @@ function canShareFiles(): boolean {
 }
 
 export function FileActionSheet({
-  filename, size, mime, icon, detail, downloadUrl, onView, onDownload, onDelete, deleting = false, onClose,
+  filename, size, mime, icon, detail, downloadUrl, onView, onDownload, onPublicLink, onDelete, deleting = false, onClose,
 }: {
   filename: string
   size: number
@@ -66,6 +66,8 @@ export function FileActionSheet({
   /** Absent: the file has no preview. */
   onView?: () => void
   onDownload: () => void
+  /** Absent: public links are off, or not this viewer's to publish. */
+  onPublicLink?: () => void
   /** Absent: not this viewer's to delete. */
   onDelete?: () => void
   deleting?: boolean
@@ -165,6 +167,7 @@ export function FileActionSheet({
               {shareNote}
             </p>
           )}
+          {onPublicLink && <SheetButton icon={Globe} label="Public link" onClick={onPublicLink} />}
           {onDelete && (
             <SheetButton
               icon={deleting ? Loader2 : Trash2}

@@ -5429,7 +5429,9 @@ Flight Deck uses environment variables:
 | `FD_JWT_SECRET` | (auto-generated per boot) | Secret key for JWT token signing. Set a fixed value on any shared deck — otherwise every login dies on restart; the inbound MCP OAuth and Lupa need it stable (Lupa's BFF must share it) |
 | `FD_DOCKER_SPAWN` | `true` | Allow Docker container spawning (can be disabled by admin) |
 | `FD_ALLOWED_HOSTS` | (unset) | **NEW in 0.8.0.** Extra host names this deck answers to, comma-separated (`.example.com` / `*.example.com` allow subdomains, `*` turns the check off). `localhost`, IP literals, this machine's hostnames, `FD_PUBLIC_URL`'s host and `FD_CORS_ORIGINS` hosts are always allowed. **A deck reached through its own domain must set this or `FD_PUBLIC_URL`, or every request is refused** |
-| `FD_PUBLIC_URL` | (unset) | The deck's public base URL (`https://claw.example.com`); allowed by the Host guard and used for OAuth redirect/discovery URLs (Google, Microsoft, inbound MCP) |
+| `FD_PUBLIC_URL` | (unset) | The deck's public base URL (`https://claw.example.com`); allowed by the Host guard and used for OAuth redirect/discovery URLs (Google, Microsoft, inbound MCP) and for public file links |
+| `FD_PUBLIC_FILE_LINKS` | `on` | Public file links: a file's Share button publishes a copy of that one file at `/s/<token>` for anyone with the link (Markdown rendered, HTML run sandboxed). `off` hides the button and stops every existing link from serving |
+| `FD_PUBLIC_FILE_LINK_MAX_MB` | `50` | Largest file a public link may publish |
 | `FD_CORS_ORIGINS` | (deck's own origins) | Extra browser origins allowed to call the deck. Since 0.8.0 the default is no longer `*`; `*` is the explicit legacy opt-out |
 | `FD_LOCKDOWN` | (unset) | `1` = hosted mode: agent shared secret required even from loopback, host-filesystem routes off, `Secure` refresh cookie |
 | `FD_REGISTRATION_OPEN` / `FD_REGISTRATION_DISABLED` | (unset) | Self-registration is closed once the first (admin) account exists; `_OPEN=1` reopens it, `_DISABLED=1` forces it closed. Admins add users in Admin → Users |

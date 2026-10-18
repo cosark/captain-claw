@@ -597,6 +597,29 @@ class FlightDeckDB:
                 SELECT resource_id, owner_id, MIN(created_at) FROM resource_shares
                 WHERE resource_type = 'agent' GROUP BY resource_id, owner_id;
 
+            -- Public file links (public_file_shares.py): one agent file,
+            -- snapshotted into <data dir>/public_shares/<token>, readable by
+            -- anyone holding the token. No FK on owner_id: an auth-disabled
+            -- deck's owner is the synthetic "local" user (delete_user drops
+            -- a removed user's links instead).
+            CREATE TABLE IF NOT EXISTS public_file_shares (
+                token          TEXT PRIMARY KEY,
+                owner_id       TEXT NOT NULL,
+                agent_ref      TEXT NOT NULL DEFAULT '',
+                agent_name     TEXT NOT NULL DEFAULT '',
+                source_path    TEXT NOT NULL,
+                filename       TEXT NOT NULL,
+                kind           TEXT NOT NULL,
+                size           INTEGER NOT NULL DEFAULT 0,
+                created_at     TEXT NOT NULL,
+                updated_at     TEXT NOT NULL,
+                expires_at     TEXT,
+                view_count     INTEGER NOT NULL DEFAULT 0,
+                last_viewed_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_public_file_shares_owner
+                ON public_file_shares(owner_id, agent_ref, source_path);
+
             -- The one Flight Deck that runs the auto-reply engine on this
             -- database (two decks can share one fd-data): pid + host, and a
             -- heartbeat; a cold claim is taken over.
@@ -1453,6 +1476,9 @@ class FlightDeckDB:
     async def delete_user(self, user_id: str) -> bool:
         assert self._db is not None
         cur = await self._db.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        # A removed user's public links stop working (their snapshots are
+        # swept by public_file_shares once no row names them).
+        await self._db.execute("DELETE FROM public_file_shares WHERE owner_id = ?", (user_id,))
         await self._db.commit()
         return cur.rowcount > 0
 
@@ -2589,6 +2615,76 @@ class FlightDeckDB:
         ) as cur:
             await self._db.commit()
             return (cur.rowcount or 0) > 0
+
+    # ── Public file links (anyone with the token) ────────────────────
+
+    async def save_public_file_share(self, row: dict) -> dict | None:
+        """Insert a public link, or update one (same token) after a re-snapshot."""
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT INTO public_file_shares"
+            " (token, owner_id, agent_ref, agent_name, source_path, filename, kind, size,"
+            "  created_at, updated_at, expires_at)"
+            " VALUES (:token, :owner_id, :agent_ref, :agent_name, :source_path, :filename, :kind,"
+            "  :size, :created_at, :updated_at, :expires_at)"
+            " ON CONFLICT(token) DO UPDATE SET"
+            "  agent_name = excluded.agent_name, filename = excluded.filename,"
+            "  kind = excluded.kind, size = excluded.size,"
+            "  updated_at = excluded.updated_at, expires_at = excluded.expires_at",
+            row,
+        )
+        await self._db.commit()
+        return await self.get_public_file_share(row["token"])
+
+    async def get_public_file_share(self, token: str) -> dict | None:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT * FROM public_file_shares WHERE token = ?", (token,),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def find_public_file_share(
+        self, owner_id: str, agent_ref: str, source_path: str,
+    ) -> dict | None:
+        """``owner_id``'s link to this agent file, if they made one."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT * FROM public_file_shares"
+            " WHERE owner_id = ? AND agent_ref = ? AND source_path = ?"
+            " ORDER BY created_at DESC LIMIT 1",
+            (owner_id, agent_ref, source_path),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def list_public_file_shares(self, owner_id: str | None = None) -> list[dict]:
+        """One owner's links (newest first), or every link when ``owner_id`` is None."""
+        assert self._db is not None
+        q = "SELECT * FROM public_file_shares"
+        params: tuple = ()
+        if owner_id is not None:
+            q += " WHERE owner_id = ?"
+            params = (owner_id,)
+        async with self._db.execute(q + " ORDER BY created_at DESC", params) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def delete_public_file_share(self, token: str) -> bool:
+        assert self._db is not None
+        async with self._db.execute(
+            "DELETE FROM public_file_shares WHERE token = ?", (token,),
+        ) as cur:
+            await self._db.commit()
+            return (cur.rowcount or 0) > 0
+
+    async def note_public_file_share_view(self, token: str) -> None:
+        assert self._db is not None
+        await self._db.execute(
+            "UPDATE public_file_shares SET view_count = view_count + 1, last_viewed_at = ?"
+            " WHERE token = ?",
+            (_utcnow(), token),
+        )
+        await self._db.commit()
 
     # ── Resource shares (cross-user access grants) ───────────────────
 
