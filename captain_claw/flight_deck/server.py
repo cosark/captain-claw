@@ -1410,6 +1410,7 @@ from captain_claw.flight_deck.delivery_routes import router as delivery_router
 from captain_claw.flight_deck.agents_fs_routes import router as agents_fs_router
 from captain_claw.flight_deck.system_routes import router as system_router
 from captain_claw.flight_deck.share_routes import router as share_router
+from captain_claw.flight_deck import public_file_shares
 from captain_claw.flight_deck.agent_sharing_routes import router as agent_sharing_router
 from captain_claw.flight_deck.context_pack_routes import router as context_pack_router
 from captain_claw.flight_deck.shared_workspace_routes import router as shared_workspace_router
@@ -1487,6 +1488,11 @@ app.include_router(delivery_router)
 app.include_router(agents_fs_router)
 app.include_router(system_router)
 app.include_router(share_router)
+# Public file links: owner API (port-addressed → the ownership guard above
+# covers it) + the account-free /s/{token} viewer. Before spa_catch_all.
+public_file_shares.configure(data_dir=DATA_DIR, resolve_auth=lambda port: _resolve_agent_auth(port))
+app.include_router(public_file_shares.owner_router)
+app.include_router(public_file_shares.public_router)
 app.include_router(agent_sharing_router)
 app.include_router(context_pack_router)
 app.include_router(shared_workspace_router)

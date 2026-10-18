@@ -3,7 +3,7 @@ import {
   X, FileText, Send, Loader2, Check, AlertCircle, FolderOpen, RefreshCw,
   Download, Eye, Search, ChevronDown, ChevronRight, Image, FileCode,
   FileSpreadsheet, Film, Music, Archive, Filter, Pin, MonitorPlay,
-  Copy, ExternalLink, Pencil,
+  Copy, ExternalLink, Pencil, Globe,
 } from 'lucide-react'
 
 // File groups whose text content can be edited in place (mirrors FileViewer).
@@ -14,6 +14,8 @@ import {
   getFileCategory, getFileTypeGroup, isViewable,
 } from '../../services/fileTransfer'
 import { FileViewer } from './FileViewer'
+import { PublicLinkDialog } from './PublicLinkDialog'
+import { usePublicLinksEnabled } from '../../services/publicLinks'
 import { CreatorBadge } from './CreatorBadge'
 import { isMemberCreated } from '../../utils/sharedWorkspace'
 import { usePinnedFilesStore } from '../../stores/pinnedFilesStore'
@@ -90,6 +92,9 @@ export function FileBrowser({ agent, allAgents, onClose }: FileBrowserProps) {
   // clickable link (popup blockers stop an automatic window.open).
   const [deckLink, setDeckLink] = useState<{ file: AgentFile; channel: string } | null>(null)
   const [deckCopied, setDeckCopied] = useState(false)
+  // The file whose public-link dialog is open.
+  const [sharingFile, setSharingFile] = useState<AgentFile | null>(null)
+  const publicLinks = usePublicLinksEnabled()
 
   const { pin: pinFile, isPinned: isFilePinned } = usePinnedFilesStore()
   const otherAgents = allAgents.filter((a) => a.id !== agent.id)
@@ -535,6 +540,15 @@ export function FileBrowser({ agent, allAgents, onClose }: FileBrowserProps) {
                           >
                             <Download className="h-3.5 w-3.5" />
                           </button>
+                          {publicLinks && (
+                            <button
+                              onClick={() => setSharingFile(f)}
+                              className="rounded p-1 text-zinc-600 hover:bg-zinc-800 hover:text-violet-400"
+                              title="Share — public link"
+                            >
+                              <Globe className="h-3.5 w-3.5" />
+                            </button>
+                          )}
                         </div>
                       </div>
                       {/* Transfer status */}
@@ -682,6 +696,10 @@ export function FileBrowser({ agent, allAgents, onClose }: FileBrowserProps) {
           </div>
         </div>
       </div>
+
+      {sharingFile && (
+        <PublicLinkDialog agent={agent} file={sharingFile} onClose={() => setSharingFile(null)} />
+      )}
 
       {/* File Viewer modal */}
       {viewingFile && (
