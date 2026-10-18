@@ -234,6 +234,44 @@ export async function joinWaitlist(application: WaitlistApplication): Promise<st
   return typeof data.cohort === 'string' ? data.cohort : ''
 }
 
+// ── Invitations (Admin → Users → Invite by email) ──
+// The link in the email is <deck>/invite#<token>; the invitee chooses their
+// password and the account is created then (captain_claw/flight_deck/invite_routes.py).
+
+export interface InviteDetails {
+  email: string
+  display_name: string
+  inviter: string
+  expires_at: string
+}
+
+async function _inviteCall<T>(path: string, body: unknown, fallback: string): Promise<T> {
+  const res = await fetch(`${FD}/auth/invite/${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({ detail: fallback }))
+    throw new Error(typeof data.detail === 'string' ? data.detail : fallback)
+  }
+  return res.json()
+}
+
+/** Who invited whom — or throws why the link can't be used. */
+export function lookupInvite(token: string): Promise<InviteDetails> {
+  return _inviteCall('lookup', { token }, 'Could not open this invitation')
+}
+
+/** Create the invited account with the chosen password and sign in. */
+export async function acceptInvite(token: string, password: string, displayName: string): Promise<User> {
+  const data = await _inviteCall<{ user: User; access_token: string }>(
+    'accept', { token, password, display_name: displayName }, 'Could not accept the invitation')
+  useAuthStore.getState().setAuth(data.user, data.access_token)
+  return data.user
+}
+
 // ── Session hand-off (sign-out / expiry) ──
 //
 // Signing out has to hand the whole TAB over, not just drop the token: agent
