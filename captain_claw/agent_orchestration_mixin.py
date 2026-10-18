@@ -252,6 +252,12 @@ _ECO_INTENT_PATTERNS: list[tuple[_re.Pattern[str], frozenset[str]]] = [
         r"\bhost(?:ing)?\b|\bpublish\b|\bdeploy\b|\bgo\s+live\b|\bput\s+(?:it\s+)?online\b"
         r"|\bpublic\s+url\b|\bserve\b|/vfs(?:-apps)?/", _re.I),
      frozenset({"hosting", "app_runner"})),
+    # Public file links ("share that file", "give me a link to the report",
+    # HR "podijeli", "javni link", "poveznica").
+    (_re.compile(
+        r"\bshar(?:e|ed|es|ing|eable)\b|\bpublic\b|\bpublish\w*|\blinks?\b|\bpodijel\w*|\bpoveznic\w*"
+        r"|\bjavn\w*\s+link", _re.I),
+     frozenset({"public_link"})),
     # Audio / TTS
     (_re.compile(r"\bspeak\b|\bsay\b|\baudio\b|\btts\b|\bvoice\b|\bread\s+aloud\b", _re.I),
      frozenset({"pocket_tts"})),

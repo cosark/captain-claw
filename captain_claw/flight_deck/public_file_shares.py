@@ -39,7 +39,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel
 
@@ -57,14 +57,19 @@ _PREVIEW_MAX_BYTES = 2 * 1024 * 1024  # text/markdown rendered inline up to this
 
 _data_dir: Path | None = None
 _resolve_auth: Callable[[int], str] = lambda _port: ""  # noqa: E731
+_resolve_agent_endpoint: Callable[[str], dict | None] = lambda _token: None  # noqa: E731
 
 
-def configure(*, data_dir: Path, resolve_auth: Callable[[int], str]) -> None:
-    """Wire the deck's data dir (snapshots live beside its DB) and the agent
-    auth resolver the download proxy uses."""
-    global _data_dir, _resolve_auth
+def configure(*, data_dir: Path, resolve_auth: Callable[[int], str],
+              resolve_agent_endpoint: Callable[[str], dict | None] | None = None) -> None:
+    """Wire the deck's data dir (snapshots live beside its DB), the agent auth
+    resolver the download proxy uses, and — for the agent routes — the lookup
+    from an agent's web_auth to ``{"port", "agent_ref", "name"}``."""
+    global _data_dir, _resolve_auth, _resolve_agent_endpoint
     _data_dir = Path(data_dir)
     _resolve_auth = resolve_auth
+    if resolve_agent_endpoint is not None:
+        _resolve_agent_endpoint = resolve_agent_endpoint
 
 
 def enabled() -> bool:
@@ -317,30 +322,41 @@ async def create_agent_file_share(host: str, port: int, req: ShareRequest,
                                   user: dict = Depends(get_current_user)):
     """Copy the file out of the agent and publish it (or refresh the copy and
     expiry of the caller's existing link to it — the URL stays the same)."""
+    row = await _publish(owner=user["id"], agent_ref=req.agent_ref, agent_name=req.agent_name,
+                         host=host, port=port, agent_auth=req.agent_auth or _resolve_auth(port),
+                         path=req.path, expires_days=req.expires_days, via="ui")
+    return {"share": _owner_view(row), **_config()}
+
+
+async def _publish(*, owner: str, agent_ref: str, agent_name: str, host: str, port: int,
+                   agent_auth: str, path: str, expires_days: int | None, via: str) -> dict:
+    """Snapshot ``path`` from the agent and save the owner's link to it — a new
+    token, or the existing link's token when this owner already shared this
+    file from this agent (the URL stays the same)."""
     _require_enabled()
-    path = req.path.strip()
+    path = path.strip()
     if not path:
         raise HTTPException(400, "Missing path")
-    if req.expires_days is not None and req.expires_days not in _EXPIRY_DAYS:
+    if expires_days is not None and expires_days not in _EXPIRY_DAYS:
         raise HTTPException(400, f"expires_days must be one of {list(_EXPIRY_DAYS)}")
     db = get_db()
     await _sweep(db)
 
-    existing = await db.find_public_file_share(user["id"], req.agent_ref, path)
+    existing = await db.find_public_file_share(owner, agent_ref, path)
     token = existing["token"] if existing else secrets.token_urlsafe(24)
     filename = _clean_filename(path)
-    size = await _snapshot_from_agent(host, port, req.agent_auth or _resolve_auth(port), path, token)
+    size = await _snapshot_from_agent(host, port, agent_auth, path, token)
 
     now = _utcnow()
-    if req.expires_days is None:
+    if expires_days is None:
         expires = existing["expires_at"] if existing else None
     else:
-        expires = (now + timedelta(days=req.expires_days)).isoformat() if req.expires_days else None
+        expires = (now + timedelta(days=expires_days)).isoformat() if expires_days else None
     row = await db.save_public_file_share({
         "token": token,
-        "owner_id": user["id"],
-        "agent_ref": req.agent_ref[:200],
-        "agent_name": req.agent_name[:200],
+        "owner_id": owner,
+        "agent_ref": agent_ref[:200],
+        "agent_name": agent_name[:200],
         "source_path": path,
         "filename": filename,
         "kind": file_kind(filename),
@@ -349,9 +365,101 @@ async def create_agent_file_share(host: str, port: int, req: ShareRequest,
         "updated_at": now.isoformat(),
         "expires_at": expires,
     })
-    log.info("Public file link saved", token=token[:6], owner=user["id"], kind=row["kind"],
-             size=size, refreshed=bool(existing))
-    return {"share": _owner_view(row), **_config()}
+    log.info("Public file link saved", token=token[:6], owner=owner, kind=row["kind"],
+             size=size, refreshed=bool(existing), via=via)
+    return row
+
+
+# ── Agent API (the `public_link` tool) ───────────────────────────────
+#
+# The calling agent proves who it is with X-Agent-Auth (its own web_auth, which
+# this deck minted): require_agent_caller refuses browsers, unknown tokens and
+# callers without the transport secret. The link belongs to that agent's OWNER,
+# keyed by the same agent_ref the SPA uses, so it shows up in the owner's Share
+# dialog and "All your public links". The file is pulled through the agent's
+# own /api/files/download, so the agent can publish only what its Files panel
+# could already hand out (saved/, output/, workflows/, or a registered file).
+# An agent sees and stops only its own links. A shared-agent member's turn
+# never gets here: the tool isn't on the member allowlist, and member markers
+# are refused off the grant-aware routes.
+
+class AgentShareRequest(BaseModel):
+    path: str = ""
+    expires_days: int | None = None
+    token: str = ""            # unshare: the link's token (from list), instead of path
+
+
+def _agent_caller(request: Request) -> tuple[str, str, dict]:
+    """(owner, agent web_auth, endpoint) for the agent making this request."""
+    from captain_claw.flight_deck.agent_identity import require_agent_caller
+    from captain_claw.flight_deck.auth import _fd_auth_enabled
+
+    caller = require_agent_caller(request, what="public file links")
+    auth = request.headers.get("X-Agent-Auth", "")
+    endpoint = _resolve_agent_endpoint(auth)
+    if not endpoint:
+        raise HTTPException(403, "Flight Deck can't find this agent's file server")
+    owner = caller.owner or ("" if _fd_auth_enabled() else "local")
+    if not owner:
+        raise HTTPException(403, "This agent has no owner on record, so it can't publish links")
+    return owner, auth, endpoint
+
+
+def _agent_view(row: dict, request: Request) -> dict:
+    """What the agent gets back: enough to tell the user, with an absolute URL."""
+    base = _public_base() or str(request.base_url).rstrip("/")
+    host = urllib.parse.urlsplit(base).hostname or ""
+    return {
+        **_owner_view(row),
+        "url": f"{base}/s/{row['token']}",
+        # The link only works where this host resolves (no FD_PUBLIC_URL set and
+        # the agent reached the deck on a loopback / private address).
+        "local_only": not _public_base() and _private_host(host),
+    }
+
+
+def _private_host(host: str) -> bool:
+    import ipaddress
+
+    if host in ("localhost", "") or host.endswith((".localhost", ".local")):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_private
+    except ValueError:
+        return False
+
+
+@owner_router.post("/fd/public-shares/agent/share")
+async def agent_share(req: AgentShareRequest, request: Request):
+    owner, auth, ep = _agent_caller(request)
+    row = await _publish(owner=owner, agent_ref=ep["agent_ref"], agent_name=ep["name"],
+                         host="localhost", port=ep["port"], agent_auth=auth,
+                         path=req.path, expires_days=req.expires_days, via="agent")
+    return {"share": _agent_view(row, request)}
+
+
+@owner_router.post("/fd/public-shares/agent/list")
+async def agent_list(request: Request):
+    owner, _auth, ep = _agent_caller(request)
+    db = get_db()
+    await _sweep(db)
+    rows = [r for r in await db.list_public_file_shares(owner) if r["agent_ref"] == ep["agent_ref"]]
+    return {"shares": [_agent_view(r, request) for r in rows], "enabled": enabled()}
+
+
+@owner_router.post("/fd/public-shares/agent/unshare")
+async def agent_unshare(req: AgentShareRequest, request: Request):
+    owner, _auth, ep = _agent_caller(request)
+    db = get_db()
+    if req.token:
+        row = await db.get_public_file_share(req.token) if _TOKEN_RE.match(req.token) else None
+    else:
+        row = await db.find_public_file_share(owner, ep["agent_ref"], req.path.strip())
+    if not row or row["owner_id"] != owner or row["agent_ref"] != ep["agent_ref"]:
+        raise HTTPException(404, "No public link from this agent for that file")
+    await _drop(db, row["token"])
+    log.info("Public file link revoked", token=row["token"][:6], owner=owner, via="agent")
+    return {"ok": True, "filename": row["filename"]}
 
 
 async def _snapshot_from_agent(host: str, port: int, auth: str, path: str, token: str) -> int:

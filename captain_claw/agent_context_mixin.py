@@ -2638,6 +2638,11 @@ class AgentContextMixin:
             # FD_URL / owner is unavailable, so registration cost is negligible).
             from captain_claw.tools.hosting import HostingTool
             self.tools.register(HostingTool())
+            # Public file links — "share that file": Flight Deck publishes a
+            # copy of one of this agent's files at /s/<token> (clear error
+            # when this agent wasn't spawned by a Flight Deck).
+            from captain_claw.tools.public_link import PublicLinkTool
+            self.tools.register(PublicLinkTool())
             # Code-app authoring — always registered; calls return a clear error
             # if FD_URL isn't available, so registration cost is negligible.
             from captain_claw.tools.app_runner import AppRunnerTool
