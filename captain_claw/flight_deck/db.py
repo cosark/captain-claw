@@ -619,6 +619,14 @@ class FlightDeckDB:
             );
             CREATE INDEX IF NOT EXISTS idx_public_file_shares_owner
                 ON public_file_shares(owner_id, agent_ref, source_path);
+            -- The address each user's browser reaches this deck at (its
+            -- Origin), so a link an AGENT makes points where people can open
+            -- it — the agent itself only knows the deck's internal URL.
+            CREATE TABLE IF NOT EXISTS public_link_origins (
+                owner_id  TEXT PRIMARY KEY,
+                origin    TEXT NOT NULL,
+                seen_at   TEXT NOT NULL
+            );
 
             -- The one Flight Deck that runs the auto-reply engine on this
             -- database (two decks can share one fd-data): pid + host, and a
@@ -1479,6 +1487,7 @@ class FlightDeckDB:
         # A removed user's public links stop working (their snapshots are
         # swept by public_file_shares once no row names them).
         await self._db.execute("DELETE FROM public_file_shares WHERE owner_id = ?", (user_id,))
+        await self._db.execute("DELETE FROM public_link_origins WHERE owner_id = ?", (user_id,))
         await self._db.commit()
         return cur.rowcount > 0
 
@@ -2676,6 +2685,27 @@ class FlightDeckDB:
         ) as cur:
             await self._db.commit()
             return (cur.rowcount or 0) > 0
+
+    async def set_public_link_origin(self, owner_id: str, origin: str) -> None:
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT INTO public_link_origins (owner_id, origin, seen_at) VALUES (?, ?, ?)"
+            " ON CONFLICT(owner_id) DO UPDATE SET origin = excluded.origin,"
+            " seen_at = excluded.seen_at",
+            (owner_id, origin, _utcnow()),
+        )
+        await self._db.commit()
+
+    async def get_public_link_origin(self, owner_id: str | None = None) -> str:
+        """``owner_id``'s browser origin, or (None) the most recently seen one."""
+        assert self._db is not None
+        if owner_id is None:
+            q, params = "SELECT origin FROM public_link_origins ORDER BY seen_at DESC LIMIT 1", ()
+        else:
+            q, params = "SELECT origin FROM public_link_origins WHERE owner_id = ?", (owner_id,)
+        async with self._db.execute(q, params) as cur:
+            row = await cur.fetchone()
+            return str(row[0]) if row else ""
 
     async def note_public_file_share_view(self, token: str) -> None:
         assert self._db is not None

@@ -29,6 +29,9 @@ AGENT = "/fd/agent-file-share/localhost/24123"
 def env(tmp_path, monkeypatch):
     monkeypatch.delenv("FD_PUBLIC_FILE_LINKS", raising=False)
     monkeypatch.delenv("FD_PUBLIC_FILE_LINK_MAX_MB", raising=False)
+    monkeypatch.delenv("FD_PUBLIC_URL", raising=False)
+    monkeypatch.delenv("FD_ALLOWED_HOSTS", raising=False)
+    pfs._origin_cache.clear()
     db = FlightDeckDB(tmp_path / "flight-deck.db")
     asyncio.run(db.init())
     auth.set_auth_db(db)
@@ -301,3 +304,54 @@ def test_agent_routes_refuse_browsers_strangers_and_ownerless(agents, monkeypatc
     assert _agent(client, "tok-orphan", "share", path=SRC + "a.md").status_code == 403
     monkeypatch.setenv("FD_PUBLIC_FILE_LINKS", "off")
     assert _agent(client, "tok-A", "share", path=SRC + "a.md").status_code == 403
+
+
+# ── Where an agent's link points (the browser's origin, not FD_URL) ──
+
+def test_agent_link_uses_the_origin_the_owners_browser_reported(agents, monkeypatch):
+    client, files, _, current, *_ = agents
+    files[SRC + "a.md"] = b"x"
+    # Before any browser reported in (and no domain configured): the agent's
+    # own base URL.
+    first = _agent(client, "tok-A", "share", path=SRC + "a.md").json()["share"]
+    assert first["url"].startswith("http://testserver/s/")
+
+    monkeypatch.setenv("FD_ALLOWED_HOSTS", "glasses.example.com")
+    r = client.post("/fd/public-shares/origin", headers={"Origin": "https://glasses.example.com"})
+    assert r.json() == {"origin": "https://glasses.example.com"}
+    share = _agent(client, "tok-A", "share", path=SRC + "a.md").json()["share"]
+    assert share["url"] == f"https://glasses.example.com/s/{share['token']}"
+    assert share["local_only"] is False
+    listed = _agent(client, "tok-A", "list").json()["shares"]
+    assert listed[0]["url"] == share["url"]
+    # FD_PUBLIC_URL, when set, still wins.
+    monkeypatch.setenv("FD_PUBLIC_URL", "https://deck.example.com")
+    again = _agent(client, "tok-A", "share", path=SRC + "a.md").json()["share"]
+    assert again["url"].startswith("https://deck.example.com/s/")
+
+
+def test_only_public_origins_this_deck_answers_to_are_learned(agents, monkeypatch):
+    client, *_ , db, _ = agents
+    for bad in ("http://localhost:8765", "http://127.0.0.1:25080", "http://192.168.1.20:8765",
+                "https://evil.example.net", "javascript:alert(1)", ""):
+        r = client.post("/fd/public-shares/origin", headers={"Origin": bad} if bad else {})
+        assert r.json() == {"origin": None}, bad
+    assert asyncio.run(db.get_public_link_origin()) == ""
+    monkeypatch.setenv("FD_ALLOWED_HOSTS", ".example.com")
+    r = client.post("/fd/public-shares/origin", headers={"Origin": "https://glasses.example.com:8443"})
+    assert r.json() == {"origin": "https://glasses.example.com:8443"}
+
+
+def test_link_base_fallbacks(agents, monkeypatch):
+    client, files, _, current, db, _ = agents
+    files[SRC + "a.md"] = b"x"
+    # Another user's browser was seen on the public address: used when this
+    # owner never opened the deck from a browser (WhatsApp-only users).
+    asyncio.run(db.set_public_link_origin("someone-else", "https://glasses.example.com"))
+    share = _agent(client, "tok-A", "share", path=SRC + "a.md").json()["share"]
+    assert share["url"].startswith("https://glasses.example.com/s/")
+    # No origin seen at all: a concrete FD_ALLOWED_HOSTS domain, as https.
+    asyncio.run(db._db.execute("DELETE FROM public_link_origins"))
+    monkeypatch.setenv("FD_ALLOWED_HOSTS", "*.example.com, deck.example.org")
+    share = _agent(client, "tok-A", "share", path=SRC + "a.md").json()["share"]
+    assert share["url"].startswith("https://deck.example.org/s/")

@@ -104,6 +104,12 @@ export function revokeLink(token: string) {
   return fdFetch<{ ok: boolean }>(`/public-shares/${encodeURIComponent(token)}`, { method: 'DELETE' })
 }
 
+/** Report this page's origin (sent by the browser as the POST's Origin) so links
+ *  an agent makes use the address people reach the deck at. Best-effort. */
+export function reportPublicOrigin(): void {
+  void fdFetch('/public-shares/origin', { method: 'POST' }).catch(() => {})
+}
+
 // Whether this deck allows public links at all (FD_PUBLIC_FILE_LINKS) — asked
 // once per page load; the file lists hide the button when it's off.
 let _enabled: Promise<boolean> | null = null

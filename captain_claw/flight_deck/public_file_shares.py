@@ -286,6 +286,12 @@ async def public_share_config(user: dict = Depends(get_current_user)):
     return _config()
 
 
+@owner_router.post("/fd/public-shares/origin")
+async def report_browser_origin(request: Request, user: dict = Depends(get_current_user)):
+    """The SPA's "this is where people reach me" — see note_browser_origin."""
+    return {"origin": await note_browser_origin(request, user["id"]) or None}
+
+
 @owner_router.get("/fd/public-shares")
 async def list_my_public_shares(user: dict = Depends(get_current_user)):
     db = get_db()
@@ -318,10 +324,11 @@ async def get_agent_file_share(host: str, port: int, path: str, agent_ref: str =
 
 
 @owner_router.post("/fd/agent-file-share/{host}/{port}")
-async def create_agent_file_share(host: str, port: int, req: ShareRequest,
+async def create_agent_file_share(host: str, port: int, req: ShareRequest, request: Request,
                                   user: dict = Depends(get_current_user)):
     """Copy the file out of the agent and publish it (or refresh the copy and
     expiry of the caller's existing link to it — the URL stays the same)."""
+    await note_browser_origin(request, user["id"])
     row = await _publish(owner=user["id"], agent_ref=req.agent_ref, agent_name=req.agent_name,
                          host=host, port=port, agent_auth=req.agent_auth or _resolve_auth(port),
                          path=req.path, expires_days=req.expires_days, via="ui")
@@ -405,17 +412,82 @@ def _agent_caller(request: Request) -> tuple[str, str, dict]:
     return owner, auth, endpoint
 
 
-def _agent_view(row: dict, request: Request) -> dict:
+def _agent_view(row: dict, base: str) -> dict:
     """What the agent gets back: enough to tell the user, with an absolute URL."""
-    base = _public_base() or str(request.base_url).rstrip("/")
     host = urllib.parse.urlsplit(base).hostname or ""
     return {
         **_owner_view(row),
         "url": f"{base}/s/{row['token']}",
-        # The link only works where this host resolves (no FD_PUBLIC_URL set and
-        # the agent reached the deck on a loopback / private address).
-        "local_only": not _public_base() and _private_host(host),
+        # Only reachable where this host resolves: nothing better than the
+        # address the agent itself used (loopback / private) was known.
+        "local_only": _private_host(host),
     }
+
+
+# ── The deck's public address, for links an agent makes ──────────────
+#
+# A browser shows a link under its own window.location; an agent only knows the
+# deck's internal URL (FD_URL, e.g. http://localhost:8765). So the SPA reports
+# the Origin it runs on (POST /fd/public-shares/origin, once it's signed in)
+# and agent links use, in order: FD_PUBLIC_URL; that owner's browser origin;
+# the origin any user's browser was seen on most recently; a concrete domain
+# from FD_ALLOWED_HOSTS (as https); the agent's own base URL (flagged
+# local_only). A learned origin must be one this deck answers to
+# (origin_guard.host_allowed) and not a loopback / private address.
+
+_origin_cache: dict[str, str] = {}
+
+
+def _parse_origin(value: str) -> tuple[str, str] | None:
+    """(normalised origin, hostname) of an http(s) Origin / URL, else None."""
+    try:
+        u = urllib.parse.urlsplit(str(value or "").strip())
+    except ValueError:
+        return None
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return None
+    try:
+        port = u.port
+    except ValueError:
+        return None
+    default = 443 if u.scheme == "https" else 80
+    host = u.hostname.lower()
+    shown = f"[{host}]" if ":" in host else host
+    return f"{u.scheme}://{shown}{'' if port in (None, default) else f':{port}'}", host
+
+
+async def note_browser_origin(request: Request, owner: str) -> str:
+    """Remember the public Origin ``owner``'s browser reached the deck at;
+    returns it ("" when the request carries none worth keeping)."""
+    from captain_claw.flight_deck import origin_guard
+
+    parsed = _parse_origin(request.headers.get("origin", ""))
+    if not parsed or not owner:
+        return ""
+    origin, host = parsed
+    if _private_host(host) or not origin_guard.host_allowed(host):
+        return ""
+    if _origin_cache.get(owner) != origin:
+        await get_db().set_public_link_origin(owner, origin)
+        _origin_cache[owner] = origin
+    return origin
+
+
+def _allowed_hosts_base() -> str:
+    """https://<first concrete domain in FD_ALLOWED_HOSTS>, else ""."""
+    for raw in os.environ.get("FD_ALLOWED_HOSTS", "").split(","):
+        host = raw.strip().lower()
+        if host and "*" not in host and not host.startswith(".") and not _private_host(host):
+            return f"https://{host}"
+    return ""
+
+
+async def _agent_link_base(request: Request, owner: str) -> str:
+    if _public_base():
+        return _public_base()
+    db = get_db()
+    learned = await db.get_public_link_origin(owner) or await db.get_public_link_origin()
+    return learned or _allowed_hosts_base() or str(request.base_url).rstrip("/")
 
 
 def _private_host(host: str) -> bool:
@@ -435,7 +507,7 @@ async def agent_share(req: AgentShareRequest, request: Request):
     row = await _publish(owner=owner, agent_ref=ep["agent_ref"], agent_name=ep["name"],
                          host="localhost", port=ep["port"], agent_auth=auth,
                          path=req.path, expires_days=req.expires_days, via="agent")
-    return {"share": _agent_view(row, request)}
+    return {"share": _agent_view(row, await _agent_link_base(request, owner))}
 
 
 @owner_router.post("/fd/public-shares/agent/list")
@@ -444,7 +516,8 @@ async def agent_list(request: Request):
     db = get_db()
     await _sweep(db)
     rows = [r for r in await db.list_public_file_shares(owner) if r["agent_ref"] == ep["agent_ref"]]
-    return {"shares": [_agent_view(r, request) for r in rows], "enabled": enabled()}
+    base = await _agent_link_base(request, owner)
+    return {"shares": [_agent_view(r, base) for r in rows], "enabled": enabled()}
 
 
 @owner_router.post("/fd/public-shares/agent/unshare")

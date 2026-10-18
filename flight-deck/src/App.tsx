@@ -55,6 +55,7 @@ import { useLocalAgentStore } from './stores/localAgentStore'
 import { useNotificationStore } from './stores/notificationStore'
 import { usePipelineStore } from './stores/pipelineStore'
 import { hydrateAllStores } from './services/settingsSync'
+import { reportPublicOrigin } from './services/publicLinks'
 import { useConnectionStore } from './stores/connectionStore'
 import { useIsMobile } from './hooks/useMediaQuery'
 import { botportWS } from './services/ws'
@@ -605,6 +606,8 @@ function App() {
           // Hydrate stores from server-side settings
           await hydrateAllStores()
         }
+      } else {
+        reportPublicOrigin()   // auth-off deck: no login to wait for
       }
       setAuthChecked(true)
     }
@@ -623,6 +626,9 @@ function App() {
   useEffect(() => {
     if (isAuthenticated && !prevAuth.current) {
       hydrateAllStores()
+      // Tell Flight Deck the address this deck is reached at, so a public link
+      // an agent makes points here rather than at the agent's internal FD URL.
+      reportPublicOrigin()
     } else if (!isAuthenticated && prevAuth.current) {
       reloadAfterSessionEnd()
     }
