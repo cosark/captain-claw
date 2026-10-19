@@ -735,7 +735,7 @@ function ChatContent({
   onSend,
   onCancel,
 }: {
-  session: { containerId: string; containerName: string; messages: ChatMessage[]; connected: boolean; busy: boolean; statusText: string; nextStepOptions?: NextStepOption[]; liveTurnUsage?: TokenUsage | null; closed?: { code: number; reason: string } | null; unreachable?: string | null; hasOlder?: boolean; holdScrollUntil?: number }
+  session: { containerId: string; containerName: string; messages: ChatMessage[]; connected: boolean; busy: boolean; statusText: string; nextStepOptions?: NextStepOption[]; liveTurnUsage?: TokenUsage | null; closed?: { code: number; reason: string } | null; unreachable?: string | null; hasOlder?: boolean; hasNewer?: boolean; holdScrollUntil?: number }
   /** This lane's store key — for anything that reads or writes session state.
    *  The agent id lives on `session.containerId`. */
   sessionKey: string
@@ -754,6 +754,7 @@ function ChatContent({
   const conn = useAgentConnection(session.containerId)
   const { attachments, addFiles, removeAttachment, clearAttachments, handlePasteEvent, pasteFromClipboard } = useFileAttachments(conn)
   const loadOlder = useChatStore((s) => s.loadOlder)
+  const loadNewer = useChatStore((s) => s.loadNewer)
 
   // Auto-scroll to bottom when new messages arrive. Deliberately keyed only on
   // message COUNT — not statusText, which changes many times per turn and would
@@ -911,6 +912,18 @@ function ChatContent({
           ) : (
             <MessageBubble key={grp.items[0].id} message={grp.items[0]} sourceName={session.containerName} agentId={session.containerId} />
           )
+        )}
+
+        {/* The window stops before newer rows (a jump, or paging back). */}
+        {session.hasNewer && (
+          <div className="mb-3 mt-1 flex justify-center">
+            <button
+              onClick={() => loadNewer(sessionKey)}
+              className="rounded-md px-2.5 py-1 text-xs text-zinc-500 transition-colors hover:bg-zinc-800/60 hover:text-zinc-300"
+            >
+              Later messages
+            </button>
+          </div>
         )}
 
         {/* Busy indicator */}

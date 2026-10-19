@@ -31,6 +31,13 @@ async function serverUpsertSession(id: string, agentId: string, agentName: strin
 
 /** Rows per page of the lane's chat log. */
 const HISTORY_PAGE = 500
+/** Rows the loaded window may hold. Beyond it the far end is dropped — the
+ *  log keeps everything: the oldest rows when the chat grows at the bottom,
+ *  the newest when the reader pages back — down to WINDOW_MAX - WINDOW_SLACK,
+ *  so a busy chat isn't trimmed on every message. Mounting costs about a
+ *  millisecond and 20 DOM nodes per row; 2,000 keeps a day of chat in view. */
+const WINDOW_MAX = 2000
+const WINDOW_SLACK = 100
 
 interface LogRow { id: number; role: string; content: string; metadata: string; created_at: string }
 
@@ -874,6 +881,14 @@ interface ChatSession {
   /** The loaded window of the log starts after older rows ("Earlier
    *  messages" fetches the page before it). */
   hasOlder: boolean
+  /** The window stops before newer rows of the log — the reader jumped to
+   *  or paged back into the past ("Later messages" fetches the page after
+   *  it). While set, the window is not the end of the transcript: nothing
+   *  reconciles against it or merges the agent's replay into it. */
+  hasNewer: boolean
+  /** With `hasNewer`: the highest log row id of the window's contiguous
+   *  block, where "Later messages" continues from. */
+  windowEndRowId: number
   /** Until this time, a change in message count must not auto-scroll to the
    *  bottom: older rows were prepended, or the view jumped to a topic. */
   holdScrollUntil: number
@@ -924,6 +939,9 @@ interface ChatStore {
   resumeTopic: (containerId: string, agentSessionId: string) => void
   /** Prepend the page of the chat log before the loaded window. */
   loadOlder: (containerId: string) => Promise<void>
+  /** Append the page of the chat log after the loaded window (after a jump
+   *  or paging back trimmed the newest rows). */
+  loadNewer: (containerId: string) => Promise<void>
   /** Make the divider with this log row id part of the loaded window —
    *  fetching the log from it on when it isn't — and return that message's
    *  id to scroll to (null when it can't be found). */
@@ -1029,6 +1047,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       agentSessionId: '',
       historyLoaded: false,
       hasOlder: false,
+      hasNewer: false,
+      windowEndRowId: 0,
       holdScrollUntil: 0,
       connected: false,
       busy: false,
@@ -2071,10 +2091,41 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       const s = state.sessions.get(containerId)
       if (!s) return state
       const sessions = new Map(state.sessions)
-      sessions.set(containerId, {
+      // Paging back: the window may shed its newest rows to stay bounded.
+      sessions.set(containerId, trimWindow({
         ...s, messages: [...rows, ...s.messages],
         hasOlder: rows.length >= HISTORY_PAGE, holdScrollUntil: Date.now() + 1500,
-      })
+      }, 'oldest'))
+      return { sessions }
+    })
+  },
+
+  loadNewer: async (containerId) => {
+    const session = get().sessions.get(containerId)
+    if (!session || !session.hasNewer) return
+    const rows = await serverFetchMessages(containerId, { since: session.windowEndRowId + 1, limit: HISTORY_PAGE })
+    if (rows === null) return
+    useChatStore.setState((state) => {
+      const s = state.sessions.get(containerId)
+      if (!s) return state
+      // Rows the window already holds (sent from here after the jump and
+      // persisted since) are not repeated; the rest goes in right after the
+      // contiguous block, ahead of anything newer that sits at the end.
+      const have = new Set(s.messages.map((m) => m.rowId).filter((id): id is number => id !== undefined))
+      const fresh = rows.filter((m) => m.rowId !== undefined && !have.has(m.rowId))
+      let at = s.messages.length
+      for (let i = s.messages.length - 1; i >= 0; i--) {
+        const id = s.messages[i].rowId
+        if (id !== undefined && id <= s.windowEndRowId) { at = i + 1; break }
+      }
+      const more = rows.length >= HISTORY_PAGE
+      const endRowId = rows.reduce((mx, m) => Math.max(mx, m.rowId ?? 0), s.windowEndRowId)
+      const sessions = new Map(state.sessions)
+      // Moving forward: the window may shed its oldest rows to stay bounded.
+      sessions.set(containerId, trimWindow({
+        ...s, messages: [...s.messages.slice(0, at), ...fresh, ...s.messages.slice(at)],
+        hasNewer: more, windowEndRowId: more ? endRowId : 0, holdScrollUntil: Date.now() + 1500,
+      }, 'newest'))
       return { sessions }
     })
   },
@@ -2087,17 +2138,20 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       updateSession(containerId, { holdScrollUntil: Date.now() + 1500 })
       return have.id
     }
-    const rows = await serverFetchMessages(containerId, { since: rowId, limit: 2000 })
+    const rows = await serverFetchMessages(containerId, { since: rowId, limit: HISTORY_PAGE })
     if (!rows || rows.length === 0) return null
+    const more = rows.length >= HISTORY_PAGE
+    const endRowId = rows.reduce((mx, m) => Math.max(mx, m.rowId ?? 0), 0)
     useChatStore.setState((state) => {
       const s = state.sessions.get(containerId)
       if (!s) return state
-      // The window becomes the log from that divider on; rows that only
-      // exist here so far (not persisted yet) stay at the end.
+      // The window becomes a page of the log from that divider on; rows
+      // that only exist here so far (not persisted yet) stay at the end.
       const live = s.messages.filter((m) => m.rowId === undefined && !m.replay)
       const sessions = new Map(state.sessions)
       sessions.set(containerId, {
-        ...s, messages: [...rows, ...live], hasOlder: true, holdScrollUntil: Date.now() + 1500,
+        ...s, messages: [...rows, ...live], hasOlder: true,
+        hasNewer: more, windowEndRowId: more ? endRowId : 0, holdScrollUntil: Date.now() + 1500,
       })
       return { sessions }
     })
@@ -2541,7 +2595,39 @@ function reconcileTopic(key: string) {
   if (!useAuthStore.getState().authEnabled) return
   const s = useChatStore.getState().sessions.get(key)
   if (!s || !s.historyLoaded || !s.agentSessionId) return
+  // A window into the past says nothing about where the transcript ends.
+  if (s.hasNewer) return
   markTopic(key, { id: s.agentSessionId, name: '', action: 'new', source: 'agent' })
+}
+
+/** Keep the window within WINDOW_MAX rows by dropping persisted rows from
+ *  the far end. `keep: 'newest'` drops from the top (the chat grew at the
+ *  bottom, or the reader moved forward) — never the current session's last
+ *  divider or anything after it, which the replay merge is anchored on.
+ *  `keep: 'oldest'` drops from the bottom (the reader paged back) — never a
+ *  row not yet persisted — and marks that newer rows exist. */
+function trimWindow(s: ChatSession, keep: 'newest' | 'oldest'): ChatSession {
+  const n = s.messages.length
+  if (n <= WINDOW_MAX) return s
+  const excess = n - (WINDOW_MAX - WINDOW_SLACK)
+  if (keep === 'newest') {
+    const anchor = s.hasNewer ? -1 : lastTopicIndex(s.messages, s.agentSessionId || undefined)
+    let drop = 0
+    while (drop < excess && s.messages[drop].rowId !== undefined && (anchor < 0 || drop < anchor)) drop++
+    if (drop === 0) return s
+    return { ...s, messages: s.messages.slice(drop), hasOlder: true }
+  }
+  const kept: ChatMessage[] = []
+  let dropped = 0
+  for (let i = n - 1; i >= 0; i--) {
+    const m = s.messages[i]
+    if (dropped < excess && m.rowId !== undefined) { dropped++; continue }
+    kept.push(m)
+  }
+  if (dropped === 0) return s
+  kept.reverse()
+  const endRowId = kept.reduce((mx, m) => Math.max(mx, m.rowId ?? 0), 0)
+  return { ...s, messages: kept, hasNewer: true, windowEndRowId: endRowId }
 }
 
 /** What identifies a turn when matching the agent's replay against the log:
@@ -2565,6 +2651,9 @@ function turnKey(m: ChatMessage): string {
 function mergeReplay(key: string, replayed: ChatMessage[]) {
   const s = useChatStore.getState().sessions.get(key)
   if (!s) return
+  // A window into the past doesn't hold the current session: merging would
+  // re-add (and re-persist) turns the log already has further down.
+  if (s.hasNewer) return
   const start = lastTopicIndex(s.messages, s.agentSessionId || undefined)
   const seen = new Set<string>()
   for (let i = start + 1; i < s.messages.length; i++) {
@@ -2653,7 +2742,8 @@ function addMessage(containerId: string, msg: ChatMessage) {
   useChatStore.setState((state) => {
     const session = state.sessions.get(containerId)
     if (!session) return state
-    const updated = { ...session, messages: [...session.messages, msg] }
+    // A chat left open for days keeps growing at the bottom: shed the top.
+    const updated = trimWindow({ ...session, messages: [...session.messages, msg] }, 'newest')
     const sessions = new Map(state.sessions)
     sessions.set(containerId, updated)
     return { sessions }
