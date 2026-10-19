@@ -19,6 +19,7 @@ using std::min;
 // The preview sets the clock so every frame renders the same.
 extern uint32_t g_previewMillis;
 inline uint32_t millis() { return g_previewMillis; }
+inline void delay(uint32_t) {}
 inline void* ps_malloc(size_t n) { return malloc(n); }
 inline void* ps_realloc(void* p, size_t n) { return realloc(p, n); }
 
@@ -73,6 +74,12 @@ class String {
     s_ = a == std::string::npos ? "" : s_.substr(a, b - a + 1);
   }
   long toInt() const { return atol(s_.c_str()); }
+  void replace(const String& from, const String& to) {
+    if (from.s_.empty()) return;
+    for (size_t p = s_.find(from.s_); p != std::string::npos; p = s_.find(from.s_, p + to.s_.size())) {
+      s_.replace(p, from.s_.size(), to.s_);
+    }
+  }
 
   String& operator+=(const String& o) { s_ += o.s_; return *this; }
   String& operator+=(const char* o) { s_ += o; return *this; }

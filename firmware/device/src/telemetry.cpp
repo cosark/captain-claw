@@ -1,0 +1,189 @@
+#include "telemetry.h"
+
+#include <M5Unified.h>
+#include <WiFi.h>
+#include <esp_sntp.h>
+#include <math.h>
+#include <time.h>
+
+#include "board.h"
+
+namespace telemetry {
+
+static constexpr time_t kSane = 1700000000;  // before this the clock was never set
+
+// ── motion (StickS3, StopWatch: BMI270) ──────────────────────────────
+
+static bool haveImu = false;
+static float gx = 0, gy = 0, gz = 1;  // gravity, low-passed (in g)
+static float shake = 0;               // recent deviation of |a| from 1 g (in g)
+static uint32_t lastSampleMs = 0;
+static int samples = 0;
+
+static void sampleImu() {
+  float ax, ay, az;
+  if (!M5.Imu.getAccel(&ax, &ay, &az)) return;
+  float mag = sqrtf(ax * ax + ay * ay + az * az);
+  if (mag < 0.2f || mag > 8.0f) return;  // a glitch, not a reading
+  const float k = samples < 5 ? 1.0f : 0.25f;
+  gx += (ax - gx) * k;
+  gy += (ay - gy) * k;
+  gz += (az - gz) * k;
+  float dev = fabsf(mag - 1.0f);
+  shake = shake * 0.85f + dev * 0.15f;  // ~1.5 s memory at 10 Hz
+  ++samples;
+}
+
+// The IMU lies parallel to the screen, so the angle between gravity and its
+// z axis is how far the screen is from lying flat, whichever way the chip
+// is mounted (which side is up isn't known for every board, so it isn't said).
+static const char* orientation() {
+  float mag = sqrtf(gx * gx + gy * gy + gz * gz);
+  if (mag < 0.5f) return "";
+  float flat = fabsf(gz) / mag;  // 1 = flat, 0 = upright
+  return flat > 0.9f ? "lying flat" : flat < 0.4f ? "held upright" : "tilted";
+}
+
+static const char* movement() {
+  return shake < 0.015f ? "still" : shake < 0.08f ? "moving gently" : shake < 0.3f ? "moving" : "shaking";
+}
+
+// ── room climate (PaperColor: SHT40) ─────────────────────────────────
+
+static constexpr uint8_t kSht40 = 0x44;
+static bool haveClimate = board::kHasClimate;
+static float lastT = NAN, lastRh = NAN;
+static uint32_t climateAt = 0;
+
+static bool readSht40(float* t, float* rh) {
+  uint8_t cmd = 0xFD;  // measure, high precision (~8.3 ms)
+  uint8_t buf[6];
+  if (!M5.In_I2C.start(kSht40, false, 400000)) return false;
+  M5.In_I2C.write(&cmd, 1);
+  M5.In_I2C.stop();
+  delay(10);
+  if (!M5.In_I2C.start(kSht40, true, 400000)) return false;
+  bool ok = M5.In_I2C.read(buf, 6);
+  M5.In_I2C.stop();
+  if (!ok) return false;
+  uint16_t rawT = (buf[0] << 8) | buf[1], rawH = (buf[3] << 8) | buf[4];
+  *t = -45.0f + 175.0f * rawT / 65535.0f;
+  *rh = constrain(-6.0f + 125.0f * rawH / 65535.0f, 0.0f, 100.0f);
+  return true;
+}
+
+bool climate(float* tempC, float* humidity) {
+  if (!haveClimate) return false;
+  if (isnan(lastT) || millis() - climateAt > 30000) {
+    climateAt = millis();
+    float t, rh;
+    if (readSht40(&t, &rh)) {
+      lastT = t;
+      lastRh = rh;
+    }
+  }
+  if (isnan(lastT)) return false;
+  *tempC = lastT;
+  *humidity = lastRh;
+  return true;
+}
+
+// ── clock ────────────────────────────────────────────────────────────
+
+static volatile bool ntpSynced = false;
+
+static void onNtpSync(struct timeval*) { ntpSynced = true; }  // SNTP task: only a flag
+
+bool clockSet() { return time(nullptr) > kSane; }
+
+// ── battery ──────────────────────────────────────────────────────────
+
+bool onUsbPower() {
+  int vbus = M5.Power.getVBUSVoltage();
+  if (vbus > 0) return vbus > 4000;
+  return M5.Power.isCharging() == m5::Power_Class::is_charging || M5.Power.getBatteryLevel() >= 99;
+}
+
+// ── public ───────────────────────────────────────────────────────────
+
+void begin() {
+  haveImu = M5.Imu.isEnabled();
+  if (M5.Rtc.isEnabled()) {
+    m5::rtc_datetime_t dt;
+    // An RTC that kept time (set from NTP on an earlier boot) gives the clock
+    // at once — before Wi-Fi, and after a deep sleep.
+    if (M5.Rtc.getDateTime(&dt) && dt.date.year >= 2025 && dt.date.year < 2100) {
+      // M5Unified switches TZ to GMT0 for this and means to put it back,
+      // but newlib reuses the string it kept: restore our own copy.
+      const char* tz = getenv("TZ");
+      String keep = tz ? tz : "";
+      M5.Rtc.setSystemTimeFromRtc();
+      if (keep.length()) setenv("TZ", keep.c_str(), 1);
+      else unsetenv("TZ");
+      tzset();
+    }
+  }
+  sntp_set_time_sync_notification_cb(onNtpSync);
+  if (haveClimate) {
+    float t, rh;
+    haveClimate = readSht40(&t, &rh);  // not there: never ask again
+    if (haveClimate) {
+      lastT = t, lastRh = rh;
+      climateAt = millis();
+    }
+  }
+}
+
+void poll() {
+  if (haveImu && millis() - lastSampleMs >= 100) {
+    lastSampleMs = millis();
+    sampleImu();
+  }
+  if (ntpSynced) {  // keep the RTC (UTC) in step, from the main loop's I2C
+    ntpSynced = false;
+    if (M5.Rtc.isEnabled()) {
+      time_t now = time(nullptr);
+      struct tm utc;
+      gmtime_r(&now, &utc);
+      M5.Rtc.setDateTime(&utc);
+    }
+  }
+}
+
+void fill(JsonObject ctx) {
+  JsonObject bat = ctx["battery"].to<JsonObject>();
+  int pct = M5.Power.getBatteryLevel();
+  if (pct >= 0) bat["percent"] = pct;
+  int mv = M5.Power.getBatteryVoltage();
+  if (mv > 0) bat["mv"] = mv;
+  bat["charging"] = M5.Power.isCharging() == m5::Power_Class::is_charging;
+  bat["usb"] = onUsbPower();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    JsonObject wifi = ctx["wifi"].to<JsonObject>();
+    wifi["ssid"] = WiFi.SSID();
+    wifi["rssi"] = WiFi.RSSI();
+  }
+  if (haveImu && samples >= 5) {
+    JsonObject motion = ctx["motion"].to<JsonObject>();
+    const char* o = orientation();
+    if (*o) motion["orientation"] = o;
+    motion["movement"] = movement();
+  }
+  float t, rh;
+  if (climate(&t, &rh)) {
+    JsonObject env = ctx["environment"].to<JsonObject>();
+    env["temperature_c"] = roundf(t * 10) / 10;
+    env["humidity"] = roundf(rh);
+  }
+  if (clockSet()) {
+    time_t now = time(nullptr);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    char buf[40];
+    strftime(buf, sizeof(buf), "%a %Y-%m-%d %H:%M (%z)", &tm);
+    ctx["local_time"] = buf;
+  }
+}
+
+}  // namespace telemetry

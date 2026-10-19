@@ -27,6 +27,15 @@ static uint32_t soundStartMs = 0;         // when the speaker last started from 
 static size_t soundStartPos = 0;          // …and from which sample
 static int carry = -1;                    // odd byte waiting for its pair
 
+// ── a line spoken aside: its own small buffer and speaker channel ──
+static constexpr size_t kAsideCap = 6 * 24000;  // samples (6 s at 24 kHz)
+static constexpr uint8_t kAsideChannel = 2;     // 0 = the answer, 1 = beeps
+static int16_t* asideBuf = nullptr;
+static size_t asideLen = 0;
+static uint32_t asideRate = 24000;
+static bool asideOn = false;
+static int asideCarry = -1;
+
 // Speech boost: gain, then a soft knee above half scale so loud syllables
 // round off instead of clipping (TTS peaks near -3 dBFS, averages ~-20 dBFS).
 static float boostGain = 1.0f;
@@ -64,6 +73,12 @@ void cue() {
   if (!M5.Speaker.isEnabled()) M5.Speaker.begin();
   M5.Speaker.tone(1046, 110, 1, true);   // C6
   M5.Speaker.tone(1568, 160, 1, false);  // then G6
+}
+
+void click() {
+  if (micOn || streamOpen) return;  // never over the mic or a voice
+  if (!M5.Speaker.isEnabled()) M5.Speaker.begin();
+  M5.Speaker.tone(2600, 14, 1);
 }
 
 static void submitNext() {
@@ -178,7 +193,10 @@ void playEnd() {
 }
 
 void playStop() {
-  if (M5.Speaker.isEnabled()) M5.Speaker.stop(0);
+  if (M5.Speaker.isEnabled()) {
+    M5.Speaker.stop(0);
+    M5.Speaker.stop(kAsideChannel);  // a menu line gives way too
+  }
   if (streamOpen && !streamEnded) cut = true;  // the rest of it won't arrive
   streamOpen = false;
   streamEnded = false;
@@ -224,6 +242,40 @@ int outputLevel() {
   int peak = 0;
   for (size_t i = from; i < at; i += 2) peak = max(peak, abs((int)playBuf[i]));
   return min(100, peak * 100 / 20000);
+}
+
+void asideBegin(uint32_t rate) {
+  asideOn = false;
+  if (micOn || streamOpen) return;  // never over the mic or an answer
+  if (!asideBuf) asideBuf = (int16_t*)heap_caps_malloc(kAsideCap * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!asideBuf) return;
+  if (M5.Speaker.isEnabled()) M5.Speaker.stop(kAsideChannel);  // the buffer is about to change
+  asideLen = 0;
+  asideRate = rate ? rate : 24000;
+  asideCarry = -1;
+  asideOn = true;
+}
+
+void asideFeed(const uint8_t* data, size_t len) {
+  if (!asideOn) return;
+  size_t i = 0;
+  if (asideCarry >= 0 && len) {
+    if (asideLen < kAsideCap) asideBuf[asideLen++] = shape((int16_t)(asideCarry | (data[0] << 8)));
+    asideCarry = -1;
+    i = 1;
+  }
+  for (; i + 1 < len && asideLen < kAsideCap; i += 2) {
+    asideBuf[asideLen++] = shape((int16_t)(data[i] | (data[i + 1] << 8)));
+  }
+  if (i < len && asideLen < kAsideCap) asideCarry = data[i];
+}
+
+void asideEnd() {
+  if (!asideOn) return;
+  asideOn = false;
+  if (!asideLen || micOn || streamOpen) return;
+  speakerOn();
+  M5.Speaker.playRaw(asideBuf, asideLen, asideRate, false, 1, kAsideChannel, true);
 }
 
 void newClip() { freshClip = true; }

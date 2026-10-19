@@ -1,7 +1,9 @@
 // The screen. Each device has its own implementation of this interface:
 //   ui_stick.cpp  StickS3: 240×135 landscape LCD, efont, trimmed efontJA (has č ć š ž đ)
 //   ui_round.cpp  StopWatch: 466×466 round AMOLED, smooth Inter fonts
-// Both draw into an off-screen canvas and push it whole (no flicker).
+//   ui_paper.cpp  PaperColor: 400×600 colour e-paper, Inter; slow to redraw, so
+//                 show…() only asks for a screen and tick() draws it once settled
+// All draw into an off-screen canvas and push it whole (no flicker).
 //
 // Colours are RGB565 (uint16_t) throughout — M5GFX reads a uint32_t colour
 // as RGB888, so passing TFT_* constants through uint32_t draws wrong colours.
@@ -25,6 +27,15 @@ enum Health : uint8_t { Down = 0, Partial = 1, Up = 2 };
 void begin();
 void brightness(uint8_t level);
 
+// Every loop pass: a screen that draws later (e-paper) does it from here.
+void tick();
+// Until what was asked last is on the screen (e-paper: a redraw, up to ~30 s).
+void flush();
+// The screen is redrawing (e-paper), for the status lights.
+bool busy();
+// Screen orientation 0..3 (e-paper; the others have one way up).
+void setRotation(uint8_t rotation);
+
 // True when screens animate on their own (the round screen's ring and
 // timers): the main loop then redraws them at frame rate.
 bool animated();
@@ -32,6 +43,11 @@ bool animated();
 // Full-screen notices.
 void showSetup(const char* reason, const char* apName, const char* ip);
 void showMessage(const char* title, const String& body, uint16_t color = 0xFFFF);
+// An address to open on a phone: a QR code, the address and a note.
+void showLink(const char* title, const String& url, const String& note);
+// What the screen shows while the device sleeps (e-paper keeps it, with the
+// character on it when there's no answer to keep).
+void showSleeping(const String& hint, uint8_t character);
 
 // Status bar: Wi-Fi + agent health, agent name, state, battery (redrawn with every view).
 void setBar(const String& agent, const char* state, uint16_t stateColor);
@@ -56,6 +72,7 @@ struct Home {
   uint16_t color;          // the title's / hint's colour
   String hint;             // "hold the yellow button to talk", "waiting for agent"…
   std::vector<Row> rows;   // device, Wi-Fi, deck, agent
+  uint8_t character = 0;   // e-paper: shown when there's no answer to keep
 };
 void showHome(const Home& home);
 
@@ -66,10 +83,20 @@ void showListening(int level, uint32_t elapsedMs);
 void showWorking(const String& heard, const std::vector<String>& activity, const String& status,
                  uint32_t elapsedMs, int steps);
 void setReply(const String& text);  // wraps into pages (shown by showReply)
+// What the user asked, shown over the answer where there's room (e-paper).
+void setQuestion(const String& text);
+// Keep the current answer on the home screen (e-paper), or let it go.
+bool canPin();
+bool pinned();
+void pin(bool on);
+// The answer kept in flash from before a sleep (e-paper) becomes the current
+// one again; false when there's none (or the device keeps none).
+bool restoreAnswer();
 // Reading text size: 0 small, 1 medium, 2 large (re-wraps the current reply).
 void setTextSize(uint8_t size);
 void showReply();                   // redraw the current page
 bool nextPage();                    // false when it wrapped back to page 1
+bool prevPage();                    // false on page 1 (stays there)
 bool hasReply();
 
 // Icon mode: the character in a pose.
@@ -96,7 +123,7 @@ struct Item {
   Glyph glyph = Glyph::None;
   bool on = true;  // false: a switched-off setting (a dim badge)
 };
-void showPicker(const std::vector<Item>& items, int selected, int current);
+void showPicker(const std::vector<Item>& items, int selected, int current, const char* title = "");
 
 // Attention flash before speech: on = the screen (stick) / ring (round) is white.
 void flashFrame(bool on);

@@ -551,6 +551,11 @@ void brightness(uint8_t level) { M5.Display.setBrightness(level); }
 
 bool animated() { return true; }
 
+void tick() {}
+void flush() {}
+bool busy() { return false; }
+void setRotation(uint8_t) {}
+
 void setBar(const String& agent, const char* state, uint16_t stateColor) {
   barAgent = agent;
   barState = state ? state : "";
@@ -576,6 +581,24 @@ void showSetup(const char* reason, const char* apName, const char* ip) {
   text(String("then open http://") + ip, CX, 404, kDim);
   push();
 }
+
+void showLink(const char* title, const String& url, const String& note) {
+  canvas.fillScreen(kBlack);
+  font(vlw::Title);
+  text(fit(title, lineRoom(52, 92)), CX, 70, kCyan);
+  const int q = 190;
+  canvas.fillRoundRect(CX - q / 2 - 10, 100, q + 20, q + 20, 14, kWhite);
+  canvas.qrcode(url.c_str(), CX - q / 2, 110, q, 4);
+  font(vlw::Small);
+  String u = url.startsWith("http://") ? url.substring(7) : url;
+  text(fit(u, lineRoom(326, 354)), CX, 340, kText);
+  int first = 0;
+  auto lines = wrapCentred(note, 358, 430, 26, 3, &first);
+  drawLines(lines, first, 26, kDim);
+  push();
+}
+
+void showSleeping(const String& hint, uint8_t) { showMessage("Sleeping", hint, TFT_DARKGREY); }
 
 // Notices: a round alert mark, the title, then the text.
 void showMessage(const char* title, const String& body, uint16_t color) {
@@ -760,6 +783,12 @@ static void layoutReply() {
   }
 }
 
+void setQuestion(const String&) {}
+bool canPin() { return false; }
+bool pinned() { return false; }
+void pin(bool) {}
+bool restoreAnswer() { return false; }
+
 void setReply(const String& t) {
   replyText = t;
   replyPage = 0;
@@ -793,6 +822,13 @@ bool nextPage() {
   replyPage = (replyPage + 1) % replyPages.size();
   showReply();
   return replyPage != 0;
+}
+
+bool prevPage() {
+  if (replyPage == 0) return false;
+  --replyPage;
+  showReply();
+  return true;
 }
 
 // Characters are drawn for the stick's 240×135 screen (under its 16 px bar),
@@ -848,7 +884,7 @@ void showStoredImage() {
   push();
 }
 
-void showPicker(const std::vector<Item>& items, int selected, int current) {
+void showPicker(const std::vector<Item>& items, int selected, int current, const char*) {
   canvas.fillScreen(kBlack);
   if (!items.empty()) {
     selected = constrain(selected, 0, (int)items.size() - 1);

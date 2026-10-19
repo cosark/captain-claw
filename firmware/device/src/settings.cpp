@@ -43,7 +43,22 @@ void Settings::load() {
   lastFw = p.getString("lastfw", "");
   tz = p.getString("tz", kDefaultTz);
   if (tz.isEmpty()) tz = kDefaultTz;
+  rotation = p.getUChar("rot", 0) & 3;
+  ledLevel = min<uint8_t>(p.getUChar("leds", 1), 2);
+  keyClicks = p.getBool("clicks", true);
+  powerOffMin = p.getUChar("pwroffm", 3);
+  if (powerOffMin != 1 && powerOffMin != 3 && powerOffMin != 10) powerOffMin = 3;
+  asleepRefreshMin = p.getUChar("slpref", 60);
+  if (asleepRefreshMin != 0 && asleepRefreshMin != 30 && asleepRefreshMin != 60 && asleepRefreshMin != 180) {
+    asleepRefreshMin = 60;
+  }
+  speakMenu = p.getBool("saymenu", true);
+  if (board::kEpaper) iconMode = false;  // a character can't move on paper
   p.end();
+}
+
+uint32_t Settings::powerOffMs() const {
+  return board::kEpaper ? powerOffMin * 60000UL : powerOffS * 1000UL;
 }
 
 void Settings::save() const {
@@ -81,6 +96,12 @@ void Settings::save() const {
   p.putBool("autoupd", autoUpdate);
   p.putString("lastfw", lastFw);
   p.putString("tz", tz);
+  p.putUChar("rot", rotation);
+  p.putUChar("leds", ledLevel);
+  p.putBool("clicks", keyClicks);
+  p.putUChar("pwroffm", powerOffMin);
+  p.putUChar("slpref", asleepRefreshMin);
+  p.putBool("saymenu", speakMenu);
   p.end();
 }
 

@@ -35,6 +35,16 @@ struct Settings {
   String lastFw;            // the version that last ran (shows "Updated to …" once)
   uint8_t textSize = 0;     // reading text: 0 small, 1 medium, 2 large
   String tz;                // POSIX time zone for the clock ("" = kDefaultTz)
+  // PaperColor (e-paper):
+  uint8_t rotation = 0;     // 0 portrait, 1 landscape, 2 portrait flipped, 3 landscape flipped
+  uint8_t ledLevel = 1;     // status lights: 0 off, 1 low, 2 bright
+  bool keyClicks = true;    // a click for every button press (the paper changes slowly)
+  uint8_t powerOffMin = 3;  // deep sleep after this many idle minutes: 1, 3 or 10
+  uint8_t asleepRefreshMin = 60;  // redraw the sleeping screen every 30 / 60 / 180 min (0 = never)
+  bool speakMenu = true;    // read the highlighted menu row aloud (the paper shows it ~20 s later)
+
+  // Idle time before deep sleep, for this device.
+  uint32_t powerOffMs() const;
 
   void load();
   void save() const;
