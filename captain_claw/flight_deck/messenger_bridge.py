@@ -62,6 +62,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from captain_claw.flight_deck import face_index
+from captain_claw.flight_deck import usage_quota
 from captain_claw.flight_deck.glasses_bridge import (
     _GLASSES_SYSTEM_CONTEXT,
     _broadcast,
@@ -287,6 +288,12 @@ async def _handle_message(psid: str, message: dict[str, Any]) -> None:
     if image_path:
         user_event["image_path"] = image_path
     await _broadcast(ch, user_event)
+
+    # It counts against the agent owner's plan allowance for today.
+    allowed, quota = await usage_quota.admit_message(usage_quota.owner_of_port(agent_port), text)
+    if not allowed:
+        await _send_messenger_text(psid, usage_quota.limit_text(quota))
+        return
 
     # 6. Send to the agent. Same shape as glasses_bridge's /glasses/send.
     for _ in range(50):  # up to ~5s for first-time bind

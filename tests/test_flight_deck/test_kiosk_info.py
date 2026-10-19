@@ -104,7 +104,9 @@ async def test_profile_account_and_connections(fd_db):
     assert "Drafts first." in profile["preview"]["full"] and profile["preview"]["compact"]
 
     account = info["account"]
-    assert account["email"] == "member@example.com" and account["plan"] == "pro"
+    # "pro" is "premium" now; today's allowances come along.
+    assert account["email"] == "member@example.com" and account["plan"] == "premium"
+    assert account["usage"]["plan_label"] == "Premium" and account["usage"]["messages"]["used"] == 0
     assert account["kiosk"] is False  # kiosk mode is off on this deck, whatever the mark says
     assert account["limits"]["max_agents"] > 0
 

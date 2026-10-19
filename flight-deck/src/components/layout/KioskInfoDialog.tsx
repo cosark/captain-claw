@@ -18,6 +18,7 @@ import {
 import { useAuthStore } from '../../stores/authStore'
 import { getMyInfo, type InfoTier, type MyInfo } from '../../services/profile'
 import { fmtCtxTokens } from '../../services/tierConfig'
+import { PlanUsageMeters } from '../common/PlanUsage'
 import { APP_VERSION, BUILD_DATE } from '../../version'
 
 // ── Kiosk: Info ──────────────────────────────────────────────────────
@@ -149,7 +150,7 @@ export function KioskInfoDialog({ agents, onClose, onOpenProfile, onOpenConnecti
                   {info.account.display_name && <span className="text-zinc-500">{info.account.email}</span>}
                 </div>
                 <div className="mt-2 flex flex-wrap gap-1.5">
-                  <Pill>{info.account.plan} plan</Pill>
+                  <Pill>{info.account.usage?.plan_label || info.account.plan} plan</Pill>
                   {info.account.role === 'admin' && <Pill>admin</Pill>}
                   {info.account.kiosk && <Pill>simple chat</Pill>}
                   {info.account.created_at && <Pill>since {new Date(info.account.created_at).toLocaleDateString()}</Pill>}
@@ -164,6 +165,7 @@ export function KioskInfoDialog({ agents, onClose, onOpenProfile, onOpenConnecti
                     </div>
                   ))}
                 </dl>
+                <PlanUsageMeters initial={info.account.usage} />
               </Section>
 
               {/* Agents */}

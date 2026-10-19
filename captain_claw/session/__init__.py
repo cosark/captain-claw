@@ -3179,6 +3179,10 @@ class SessionManager:
             ),
         )
         await self._db.commit()
+        # The plan's daily token allowance is kept by Flight Deck.
+        from captain_claw.fd_usage_report import report_tokens
+
+        report_tokens(total_tokens or (prompt_tokens + completion_tokens), byok=byok)
 
     async def query_llm_usage(
         self,

@@ -7,11 +7,11 @@ import json
 import os
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from captain_claw.flight_deck.auth import get_current_user, get_db, hash_password
 from captain_claw.flight_deck.rate_limiter import (
-    PLAN_LIMITS, PLAN_FIELDS, update_plan_limits, get_plan_limits_json,
+    PLAN_LIMITS, PLAN_FIELDS, canonical_plan, update_plan_limits, get_plan_limits_json,
 )
 
 router = APIRouter(prefix="/fd/admin", tags=["admin"])
@@ -46,6 +46,8 @@ class UpdateUserRequest(BaseModel):
     max_storage_mb: int | None = None
     requests_per_minute: int | None = None
     spawns_per_hour: int | None = None
+    messages_per_day: int | None = None
+    tokens_per_day: int | None = None
     password: str | None = None  # admin password reset (min 6 chars)
     sign_out: bool | None = None  # with a reset: end the user's sessions everywhere
     # They pick their own password at their next sign-in (set with a reset).
@@ -163,11 +165,12 @@ async def update_user(
             meta.pop("kiosk", None)
         changed_meta = True
     if body.plan is not None:
-        if body.plan not in PLAN_LIMITS:
+        plan = canonical_plan(body.plan)
+        if plan not in PLAN_LIMITS:
             raise HTTPException(400, f"Plan must be one of: {', '.join(PLAN_LIMITS.keys())}")
-        meta["plan"] = body.plan
+        meta["plan"] = plan
         changed_meta = True
-    for field in ("max_agents", "max_storage_mb", "requests_per_minute", "spawns_per_hour"):
+    for field in PLAN_FIELDS:
         val = getattr(body, field, None)
         if val is not None:
             meta[field] = val
@@ -365,10 +368,12 @@ async def get_cost_rollup(
 
 
 class UpdatePlanRequest(BaseModel):
-    max_agents: int | None = None
-    max_storage_mb: int | None = None
-    requests_per_minute: int | None = None
-    spawns_per_hour: int | None = None
+    max_agents: int | None = Field(None, ge=0)
+    max_storage_mb: int | None = Field(None, ge=0)
+    requests_per_minute: int | None = Field(None, ge=0)
+    spawns_per_hour: int | None = Field(None, ge=0)
+    messages_per_day: int | None = Field(None, ge=0)  # 0 = unlimited
+    tokens_per_day: int | None = Field(None, ge=0)  # 0 = unlimited
 
 
 class UpdateConfigRequest(BaseModel):
@@ -1075,6 +1080,7 @@ async def recover_team_keys(db) -> dict:
 @router.put("/plans/{plan}")
 async def update_plan(plan: str, body: UpdatePlanRequest, admin: dict = Depends(require_admin)):
     """Update limits for a plan tier (admin only)."""
+    plan = canonical_plan(plan)
     if plan not in PLAN_LIMITS:
         raise HTTPException(400, f"Unknown plan '{plan}'. Available: {', '.join(PLAN_LIMITS.keys())}")
     changes = {k: v for k, v in body.model_dump().items() if v is not None}

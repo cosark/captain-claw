@@ -220,8 +220,9 @@ export interface MyInfo {
     role: string
     created_at: string
     plan: string
-    limits: Partial<Record<'max_agents' | 'max_storage_mb' | 'requests_per_minute' | 'spawns_per_hour', number>>
+    limits: Partial<Record<PlanLimitKey, number>>
     kiosk: boolean
+    usage?: QuotaStatus
   }
   connections: {
     google?: { configured: boolean; connected: boolean }
@@ -234,3 +235,31 @@ export interface MyInfo {
 }
 
 export const getMyInfo = () => fdFetch<MyInfo>('/info')
+
+// ── Daily plan allowances (/fd/quota) ──
+// Messages and AI tokens a user may spend per UTC day on their plan. A limit
+// of 0 is unlimited; admins are exempt (their usage is still counted).
+
+export type PlanLimitKey =
+  | 'max_agents' | 'max_storage_mb' | 'requests_per_minute' | 'spawns_per_hour'
+  | 'messages_per_day' | 'tokens_per_day'
+
+export interface QuotaAllowance {
+  used: number
+  limit: number             // 0 = unlimited
+  remaining: number | null  // null when unlimited
+}
+
+export interface QuotaStatus {
+  plan: string
+  plan_label: string
+  day: string
+  resets_at: string         // ISO, the next UTC midnight
+  exempt: boolean
+  messages: QuotaAllowance
+  tokens: QuotaAllowance
+  blocked: 'messages' | 'tokens' | null
+  warning: 'messages' | 'tokens' | null
+}
+
+export const getMyQuota = () => fdFetch<QuotaStatus>('/quota')

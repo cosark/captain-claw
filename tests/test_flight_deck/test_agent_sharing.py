@@ -988,9 +988,14 @@ def _recv(sess, timeout: float = 5.0) -> dict:
 
 
 def _recv_json(sess, timeout: float = 5.0) -> dict:
-    msg = _recv(sess, timeout)
-    assert msg["type"] == "websocket.send", msg
-    return json.loads(msg["text"])
+    """The next frame, past ``fd_quota`` — the member's daily-allowance totals
+    after a counted chat (TestMemberSocketFrames.test_member_daily_allowance)."""
+    while True:
+        msg = _recv(sess, timeout)
+        assert msg["type"] == "websocket.send", msg
+        frame = json.loads(msg["text"])
+        if frame.get("type") != "fd_quota":
+            return frame
 
 
 def _expect_close(sess, code: int, timeout: float = 5.0) -> list[dict]:
@@ -1287,6 +1292,36 @@ class TestMemberSocketFrames:
             s.send_json({"type": "chat", "content": "four"})
             chats = [f for f in ws_deck.agent.wait_frames(4) if f["type"] == "chat"]
             assert [c["content"] for c in chats] == ["one", "two", "four"]
+        finally:
+            cm.__exit__(None, None, None)
+
+    def test_member_daily_allowance(self, ws_deck):
+        """A member's chat counts against THEIR plan's daily allowance; over
+        it, the turn is refused before it reaches the agent."""
+        import functools
+
+        from captain_claw.flight_deck import usage_quota
+
+        cm, s, _ = _open(ws_deck)
+        try:
+            s.send_json({"type": "chat", "content": "one"})
+            msg = _recv(s, 5.0)
+            quota = json.loads(msg["text"])
+            assert quota["type"] == "fd_quota" and quota["quota"]["messages"]["used"] == 1
+            limit = quota["quota"]["messages"]["limit"]
+            ws_deck.portal.call(functools.partial(
+                ws_deck.db.add_daily_usage, MEMBER, usage_quota.today(), messages=limit))
+            s.send_json({"type": "chat", "content": "two"})
+            refused = _recv_json(s)
+            assert refused["type"] == "error" and refused["code"] == "quota_exceeded"
+            assert refused["quota"]["blocked"] == "messages" and "Free plan" in refused["message"]
+            end = _recv_json(s)
+            assert end["type"] == "status" and end["status"] == "ready" and end["turn_end"]
+            chats = [f for f in ws_deck.agent.wait_frames(1) if f["type"] == "chat"]
+            assert [c["content"] for c in chats] == ["one"]
+            # The owner's allowance is untouched.
+            used = ws_deck.portal.call(ws_deck.db.get_daily_usage, OWNER, usage_quota.today())
+            assert used["messages"] == 0
         finally:
             cm.__exit__(None, None, None)
 

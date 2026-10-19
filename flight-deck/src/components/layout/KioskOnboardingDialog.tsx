@@ -560,6 +560,7 @@ function buildSteps({ name, phone, authEnabled, sharingEnabled, info }: {
     <><B>Settings</B> holds the light and dark theme, Connections, Profile{authEnabled ? ' and Sign out' : ''}.</>,
     <><B>The bell</B> tells you when an agent finishes something or needs you.</>,
   ]
+  if (authEnabled) tips.push(<><B>Daily limits:</B> your plan allows a number of messages and some AI usage each day. The line above the message box shows what's left; it starts over every day at midnight UTC.</>)
   if (sharingEnabled) tips.push(<><B>Shared with you:</B> agents a colleague shares show “Shared by …” in your list. You can leave one any time.</>)
   if (authEnabled) tips.push(<><B>On a shared screen</B>, sign out when you're done (<B>Settings</B> → <B>Sign out</B>): the next person starts clean, and your agents stay yours.</>)
   tips.push(<><B>This guide</B> is always one click away: <B>Info</B> or <B>Settings</B> → <B>Getting started</B>.</>)

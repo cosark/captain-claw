@@ -53,6 +53,7 @@ from captain_claw.flight_deck import agent_sharing
 from captain_claw.flight_deck import context_packs
 from captain_claw.flight_deck import speaker_grants
 from captain_claw.flight_deck import shared_workspace
+from captain_claw.flight_deck import usage_quota
 
 
 # ── Console logging: timestamps + ANSI colors ──────────────────────────
@@ -1431,6 +1432,7 @@ from captain_claw.flight_deck.notification_routes import router as notification_
 from captain_claw.flight_deck.mcp_server_routes import router as mcp_inbound_router
 from captain_claw.flight_deck.mcp_oauth_routes import router as mcp_oauth_router
 from captain_claw.flight_deck.costs_routes import router as costs_router
+from captain_claw.flight_deck.usage_quota import router as usage_quota_router
 from captain_claw.flight_deck.llm_routes import router as llm_router
 from captain_claw.flight_deck.being_routes import router as being_router
 from captain_claw.flight_deck.being_public_routes import router as being_public_router
@@ -1519,6 +1521,7 @@ app.include_router(notification_router)
 app.include_router(mcp_inbound_router)
 app.include_router(mcp_oauth_router)
 app.include_router(costs_router)
+app.include_router(usage_quota_router)
 app.include_router(llm_router)
 app.include_router(being_router)
 app.include_router(being_public_router)
@@ -4226,6 +4229,7 @@ async def agent_ws_proxy(ws: WebSocket, host: str, port: int, token: str = "", l
         entry = None
 
     # Ownership guard (HTTP middleware does not run for WebSockets).
+    speaker_id = ""  # whose daily allowance this socket's messages count against
     if AUTH_ENABLED:
         payload = None
         if fd_token:
@@ -4246,6 +4250,7 @@ async def agent_ws_proxy(ws: WebSocket, host: str, port: int, token: str = "", l
             if owner and owner != payload.get("sub", ""):
                 await ws.close(code=4403, reason="This agent belongs to another user")
                 return
+        speaker_id = str(payload.get("sub") or "")
 
     await ws.accept()
     # Auto-resolve auth token if the caller didn't provide one
@@ -4324,17 +4329,26 @@ async def agent_ws_proxy(ws: WebSocket, host: str, port: int, token: str = "", l
             except Exception:
                 pass
 
+        async def forward(data: str) -> None:
+            # A chat message counts against the speaker's plan allowance for
+            # today; over it, the turn is refused and the client told why.
+            ok, reply = await usage_quota.screen_chat_frame(speaker_id, data)
+            if reply is not None:
+                await ws.send_text(json.dumps(reply))
+            if ok:
+                await agent_ws.send(data)
+
         async def client_to_agent():
             nonlocal from_client
             try:
                 for data in held:
-                    await agent_ws.send(data)
+                    await forward(data)
                 while True:
                     msg = await from_client
                     if msg.get("type") == "websocket.disconnect":
                         return
                     if msg.get("text") is not None:
-                        await agent_ws.send(msg["text"])
+                        await forward(msg["text"])
                     from_client = asyncio.create_task(ws.receive())
             except Exception:
                 pass

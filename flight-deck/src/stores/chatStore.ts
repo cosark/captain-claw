@@ -5,6 +5,8 @@ import { useContainerStore } from './containerStore'
 import { useLocalAgentStore } from './localAgentStore'
 import { useProcessStore } from './processStore'
 import { useTraceStore } from './traceStore'
+import { useQuotaStore } from './quotaStore'
+import type { QuotaStatus } from '../services/profile'
 import type { TraceSpan } from '../types'
 import { sanitizeAgentContent } from '../utils/sanitizeAgentContent'
 import { SHARED_PREFIX, sharedContainerId, sharedSliceId } from '../utils/sharedAgent'
@@ -1611,6 +1613,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     })
 
     ws.on('error', (data) => {
+      // Flight Deck refused the turn: today's plan allowance is spent. The
+      // composer shows it from the totals that come with the refusal.
+      if (data.code === 'quota_exceeded' && data.quota) {
+        useQuotaStore.getState().set(data.quota as QuotaStatus)
+      }
       // Before the agent's welcome an error is about reaching it (Flight
       // Deck's proxy could not connect), not about a turn. Every retry would
       // add one: keep a single line on the chat instead.
@@ -2010,7 +2017,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       })
     })
 
+    // Flight Deck counted a message against today's plan allowance.
+    ws.on('fd_quota', (data) => {
+      if (data.quota) useQuotaStore.getState().set(data.quota as QuotaStatus)
+    })
+
     ws.on('usage', (data) => {
+      // The turn's tokens reach Flight Deck from the agent: read the new total.
+      useQuotaStore.getState().refreshSoon()
       const last = data.last as Record<string, number> | undefined
       if (!last) return
       // Turn-final usage lands exactly where next_steps would have. A

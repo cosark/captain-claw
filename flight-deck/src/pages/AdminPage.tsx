@@ -127,6 +127,8 @@ interface PlanLimits {
   max_storage_mb: number
   requests_per_minute: number
   spawns_per_hour: number
+  messages_per_day: number  // 0 = unlimited
+  tokens_per_day: number    // 0 = unlimited
 }
 
 interface CostUserRow {
@@ -295,6 +297,44 @@ async function fetchPlans(): Promise<Record<string, PlanLimits>> {
   if (!res.ok) throw new Error('Failed to fetch plans')
   const data = await res.json()
   return data.plans
+}
+
+// What each user spent today against their plan's daily allowances.
+interface DayUsage { messages: number; tokens: number }
+
+async function fetchUsageToday(): Promise<Record<string, DayUsage>> {
+  const res = await fetch('/fd/admin/usage/today', { headers: _headers(), credentials: 'include' })
+  if (!res.ok) throw new Error("Failed to fetch today's usage")
+  return (await res.json()).usage
+}
+
+async function resetUsageToday(userId: string): Promise<void> {
+  const res = await fetch(`/fd/admin/users/${userId}/usage/today`, {
+    method: 'DELETE', headers: _headers(), credentials: 'include',
+  })
+  if (!res.ok) throw new Error("Failed to reset today's usage")
+}
+
+function fmtTok(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`
+  if (n >= 1_000) return `${Math.round(n / 1_000)}k`
+  return String(n)
+}
+
+const perDay = (n: number | undefined, fmt: (n: number) => string = String) => (n ? fmt(n) : 'unlimited')
+
+/** A user's limits as Flight Deck applies them: their plan's, with any
+ *  per-user override from their metadata on top. */
+function effectiveLimits(plan: PlanLimits | undefined, metadata: string): { limits?: PlanLimits; custom: Set<string> } {
+  if (!plan) return { custom: new Set() }
+  let meta: Record<string, unknown> = {}
+  try { meta = JSON.parse(metadata || '{}') } catch { /* plan limits only */ }
+  const limits = { ...plan }
+  const custom = new Set<string>()
+  for (const key of Object.keys(plan) as (keyof PlanLimits)[]) {
+    if (typeof meta[key] === 'number') { limits[key] = meta[key] as number; custom.add(key) }
+  }
+  return { limits, custom }
 }
 
 async function updatePlan(plan: string, limits: Partial<PlanLimits>): Promise<void> {
@@ -519,10 +559,11 @@ function Switch({ on, onToggle, disabled = false, label }: {
 }
 
 function UserRow({
-  user, plans, onUpdate, onDelete, currentUserId, kioskMode,
+  user, plans, usage, onUpdate, onDelete, currentUserId, kioskMode,
 }: {
   user: UserInfo
   plans: Record<string, PlanLimits>
+  usage?: DayUsage
   onUpdate: () => void
   onDelete: (id: string) => void
   currentUserId: string
@@ -530,14 +571,34 @@ function UserRow({
 }) {
   const [expanded, setExpanded] = useState(false)
   const [plan, setPlan] = useState(() => {
-    try { return JSON.parse(user.metadata || '{}').plan || 'free' } catch { return 'free' }
+    try {
+      const p = JSON.parse(user.metadata || '{}').plan || 'free'
+      return p === 'pro' ? 'premium' : p  // "pro" is "premium" now
+    } catch { return 'free' }
   })
   const [role, setRole] = useState(user.role)
   const [kiosk, setKiosk] = useState(() => userKioskFlag(user))
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState('')
   const [agentsOpen, setAgentsOpen] = useState(false)
+  const [resetting, setResetting] = useState(false)
   const isSelf = user.id === currentUserId
+  const { limits, custom } = effectiveLimits(plans[plan], user.metadata)
+  const mark = (key: string) => (custom.has(key) ? ' (custom)' : '')
+  const spent = user.role !== 'admin' && !!limits && !!usage && (
+    (limits.messages_per_day > 0 && usage.messages >= limits.messages_per_day)
+    || (limits.tokens_per_day > 0 && usage.tokens >= limits.tokens_per_day))
+
+  const handleResetUsage = async () => {
+    setResetting(true); setSaveError('')
+    try {
+      await resetUsageToday(user.id)
+      onUpdate()
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : "Failed to reset today's usage")
+    }
+    setResetting(false)
+  }
 
   const handleSave = async () => {
     setSaving(true); setSaveError('')
@@ -583,6 +644,14 @@ function UserRow({
             kiosk
           </span>
         )}
+        {usage && (usage.messages > 0 || usage.tokens > 0) && (
+          <span
+            title={spent ? "Today's allowance is spent" : 'Used today'}
+            className={`hidden sm:inline text-xs px-2 py-0.5 rounded-full ${spent ? 'bg-red-500/15 text-red-700 dark:text-red-300' : 'bg-zinc-800 text-zinc-500'}`}
+          >
+            {usage.messages} msg · {fmtTok(usage.tokens)} tok today
+          </span>
+        )}
         <span className="text-xs px-2 py-0.5 rounded-full bg-zinc-800 text-zinc-400 capitalize">{plan}</span>
       </button>
 
@@ -621,14 +690,34 @@ function UserRow({
             <KioskCheckbox checked={kiosk} onChange={setKiosk} note={kioskModeNote(kioskMode)} />
           )}
 
-          {plans[plan] && (
+          {limits && (
             <div className="text-xs text-zinc-500 grid grid-cols-2 gap-1">
-              <span>Max agents: {plans[plan].max_agents}</span>
-              <span>Storage: {plans[plan].max_storage_mb} MB</span>
-              <span>Requests/min: {plans[plan].requests_per_minute}</span>
-              <span>Spawns/hour: {plans[plan].spawns_per_hour}</span>
+              <span>Max agents: {limits.max_agents}{mark('max_agents')}</span>
+              <span>Storage: {limits.max_storage_mb} MB{mark('max_storage_mb')}</span>
+              <span>Requests/min: {limits.requests_per_minute}{mark('requests_per_minute')}</span>
+              <span>Spawns/hour: {limits.spawns_per_hour}{mark('spawns_per_hour')}</span>
+              <span>Messages/day: {perDay(limits.messages_per_day)}{mark('messages_per_day')}</span>
+              <span>Tokens/day: {perDay(limits.tokens_per_day, fmtTok)}{mark('tokens_per_day')}</span>
             </div>
           )}
+
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <span className={spent ? 'text-red-700 dark:text-red-300' : 'text-zinc-400'}>
+              Today: {usage?.messages ?? 0} message{(usage?.messages ?? 0) === 1 ? '' : 's'} · {fmtTok(usage?.tokens ?? 0)} tokens
+              {spent && ' — limit reached'}
+              {user.role === 'admin' && ' (admins have no daily limits)'}
+            </span>
+            {usage && (usage.messages > 0 || usage.tokens > 0) && (
+              <button
+                onClick={handleResetUsage}
+                disabled={resetting}
+                title="Give this user today's messages and tokens back"
+                className="rounded-md border border-zinc-700 px-2 py-0.5 text-[11px] text-zinc-300 hover:border-violet-500/40 hover:text-zinc-100 disabled:opacity-50"
+              >
+                {resetting ? 'Resetting…' : 'Reset today'}
+              </button>
+            )}
+          </div>
 
           <div className="text-xs text-zinc-600">
             Joined: {new Date(user.created_at).toLocaleDateString()}
@@ -801,6 +890,8 @@ const PLAN_FIELD_LABELS: Record<string, string> = {
   max_storage_mb: 'Storage (MB)',
   requests_per_minute: 'Requests / min',
   spawns_per_hour: 'Spawns / hour',
+  messages_per_day: 'Messages / day',
+  tokens_per_day: 'AI tokens / day',
 }
 
 function PlanCard({
@@ -839,6 +930,9 @@ function PlanCard({
           </div>
         ))}
       </div>
+      <p className="text-[11px] text-zinc-500">
+        Daily limits: 0 is unlimited. A day is a UTC day; admins are never held to them.
+      </p>
       {changed && (
         <button
           onClick={handleSave}
@@ -860,6 +954,7 @@ export function AdminPage() {
   const [users, setUsers] = useState<UserInfo[]>([])
   const [totalUsers, setTotalUsers] = useState(0)
   const [plans, setPlans] = useState<Record<string, PlanLimits>>({})
+  const [usageToday, setUsageToday] = useState<Record<string, DayUsage>>({})
   const [config, setConfig] = useState<SystemConfig>({ ...CONFIG_DEFAULTS })
   const [providerKeys, setProviderKeys] = useState<Record<string, string>>({})
   const [providerKeysDraft, setProviderKeysDraft] = useState<Record<string, string>>({})
@@ -877,10 +972,12 @@ export function AdminPage() {
 
   const loadUsers = useCallback(async () => {
     try {
-      const [usersData, plansData, cfgData, keys, waitlist] = await Promise.all([
+      const [usersData, plansData, cfgData, keys, waitlist, today] = await Promise.all([
         fetchUsers(), fetchPlans(), fetchConfig(), fetchProviderKeys(), fetchWaitlist().catch(() => null),
+        fetchUsageToday().catch(() => ({})),
       ])
       setUsers(usersData.users)
+      setUsageToday(today)
       setTotalUsers(usersData.total)
       setPlans(plansData)
       setConfig(cfgData)
@@ -1056,6 +1153,7 @@ export function AdminPage() {
                 key={u.id}
                 user={u}
                 plans={plans}
+                usage={usageToday[u.id]}
                 onUpdate={loadUsers}
                 onDelete={handleDelete}
                 currentUserId={currentUser.id}

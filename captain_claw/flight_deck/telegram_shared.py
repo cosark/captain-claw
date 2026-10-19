@@ -513,6 +513,18 @@ async def route_update(db, update: dict[str, Any]) -> str:
         await _notice(chat_id, tg_user, "rejected", _NOTICE_REJECTED)
         return "rejected"
 
+    if isinstance(msg, dict):
+        # A message counts against the linked user's plan allowance for today.
+        from captain_claw.flight_deck import usage_quota
+
+        allowed, quota = await usage_quota.admit_message(str(link.get("user_id") or ""), text)
+        if not allowed:
+            try:
+                await send_text(chat_id, usage_quota.limit_text(quota))
+            except Exception:
+                pass
+            return "over_limit"
+
     slug = str(link["agent_slug"])
     box = _box(slug)
     box.expire()

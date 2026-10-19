@@ -318,6 +318,19 @@ class FlightDeckDB:
             CREATE INDEX IF NOT EXISTS idx_usage_logs_created
                 ON usage_logs(created_at);
 
+            -- What each user spent per UTC day against their plan's daily
+            -- allowances (usage_quota): human messages and LLM tokens.
+            CREATE TABLE IF NOT EXISTS daily_usage (
+                user_id    TEXT NOT NULL,
+                day        TEXT NOT NULL,
+                messages   INTEGER NOT NULL DEFAULT 0,
+                tokens     INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, day)
+            );
+            CREATE INDEX IF NOT EXISTS idx_daily_usage_day
+                ON daily_usage(day);
+
             CREATE TABLE IF NOT EXISTS council_sessions (
                 id              TEXT PRIMARY KEY,
                 user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -968,6 +981,10 @@ class FlightDeckDB:
                 await self._db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
             except Exception:
                 pass  # column already exists
+        # The "pro" plan is "premium" now.
+        await self._db.execute(
+            "UPDATE users SET metadata = json_set(metadata, '$.plan', 'premium')"
+            " WHERE json_valid(metadata) AND json_extract(metadata, '$.plan') = 'pro'")
         await self._db.commit()
 
     # ── Users ────────────────────────────────────────────────────────
@@ -1772,6 +1789,51 @@ class FlightDeckDB:
         params.append(limit)
         async with self._db.execute(query, params) as cur:
             return [dict(r) for r in await cur.fetchall()]
+
+    async def add_daily_usage(
+        self, user_id: str, day: str, *, messages: int = 0, tokens: int = 0,
+    ) -> dict:
+        """Add to *user_id*'s counters for *day*; returns the new totals."""
+        assert self._db is not None
+        now = _utcnow()
+        await self._db.execute(
+            "INSERT INTO daily_usage (user_id, day, messages, tokens, updated_at)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(user_id, day) DO UPDATE SET"
+            " messages = messages + excluded.messages,"
+            " tokens = tokens + excluded.tokens,"
+            " updated_at = excluded.updated_at",
+            (user_id, day, max(0, int(messages)), max(0, int(tokens)), now),
+        )
+        await self._db.commit()
+        return await self.get_daily_usage(user_id, day)
+
+    async def get_daily_usage(self, user_id: str, day: str) -> dict:
+        """*user_id*'s counters for *day* (zeros when nothing was spent)."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT messages, tokens FROM daily_usage WHERE user_id = ? AND day = ?",
+            (user_id, day),
+        ) as cur:
+            row = await cur.fetchone()
+        return {"messages": int(row["messages"]), "tokens": int(row["tokens"])} if row \
+            else {"messages": 0, "tokens": 0}
+
+    async def reset_daily_usage(self, user_id: str, day: str) -> None:
+        """Zero *user_id*'s counters for *day*."""
+        assert self._db is not None
+        await self._db.execute(
+            "DELETE FROM daily_usage WHERE user_id = ? AND day = ?", (user_id, day))
+        await self._db.commit()
+
+    async def list_daily_usage(self, day: str) -> dict[str, dict]:
+        """Every user's counters for *day*, by user id."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT user_id, messages, tokens FROM daily_usage WHERE day = ?", (day,),
+        ) as cur:
+            return {r["user_id"]: {"messages": int(r["messages"]), "tokens": int(r["tokens"])}
+                    for r in await cur.fetchall()}
 
     async def get_usage_summary(
         self, user_id: str | None = None, since: str | None = None,

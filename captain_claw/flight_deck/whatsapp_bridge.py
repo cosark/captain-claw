@@ -115,6 +115,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from captain_claw.flight_deck import face_index
+from captain_claw.flight_deck import usage_quota
 from captain_claw.flight_deck import whatsapp_inbound as _wa_in
 from captain_claw.flight_deck.glasses_bridge import (
     _GLASSES_SYSTEM_CONTEXT,
@@ -1579,6 +1580,11 @@ async def _human_turn(
 ) -> bool:
     """Send a turn the user's own words (or files) started, carrying every
     pending file. True once it reached the agent's socket."""
+    # It counts against the agent owner's plan allowance for today.
+    allowed, quota = await usage_quota.admit_message(usage_quota.owner_of_port(target[1]), text)
+    if not allowed:
+        await _send_whatsapp_text(waid, usage_quota.limit_text(quota))
+        return False
     items: list[_Item] = (_take_pending(waid) if take_pending else []) + list(extra or [])
     quoted = _RECENT_ITEMS.get(quoted_id) if quoted_id and take_pending else None
     if quoted is not None and all(i.wamid != quoted.wamid for i in items):

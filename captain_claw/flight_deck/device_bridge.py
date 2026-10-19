@@ -73,6 +73,7 @@ from typing import Any
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from captain_claw.flight_deck import glasses_bridge as gb
+from captain_claw.flight_deck import usage_quota
 
 log = logging.getLogger(__name__)
 
@@ -576,6 +577,11 @@ class _DeviceConn:
         if ch.agent_ws is None:
             await self.send_json({"type": "error", "text": "Agent isn't reachable."})
             return
+        allowed, quota = await usage_quota.admit_message(self.user_id, text)
+        if not allowed:
+            await self.send_json({"type": "error", "text": usage_quota.short_limit_text(quota)})
+            await self.send_json({"type": "state", "state": "ready"})
+            return
         async with ch.send_lock:
             content = text if ch.context_sent else self.system_context() + text
             payload = {
@@ -601,6 +607,11 @@ class _DeviceConn:
         seconds = len(pcm) / (2 * self.rec_rate)
         if seconds < MIN_REC_SECONDS:
             await self.send_json({"type": "error", "text": "Too short — hold the button while you talk."})
+            await self.send_json({"type": "state", "state": "ready"})
+            return
+        quota = await usage_quota.spent(self.user_id)
+        if quota is not None:  # don't transcribe what can't be sent
+            await self.send_json({"type": "error", "text": usage_quota.short_limit_text(quota)})
             await self.send_json({"type": "state", "state": "ready"})
             return
         await self.send_json({"type": "state", "state": "transcribing"})

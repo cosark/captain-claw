@@ -293,6 +293,7 @@ export function explainStatus(status: string): string {
   if (status.startsWith('error:interrupted')) return 'Flight Deck restarted while this ran.'
   if (status.startsWith('error:delivery')) return 'The agent answered, but it could not be delivered.'
   if (status.startsWith('skipped:quiet')) return 'Skipped during quiet hours — it runs when they end.'
+  if (status.startsWith('skipped:limit')) return "Skipped: today's AI token allowance on your plan is used up. Tasks run again after it resets at midnight UTC."
   if (status.startsWith('partial')) return 'Delivered, but not everywhere.'
   return status.replace(/^error:/, '')
 }

@@ -20,6 +20,10 @@ if TYPE_CHECKING:
     from captain_claw.flight_deck.db import FlightDeckDB
 
 # ── Plan tier definitions ──
+#
+# ``messages_per_day`` and ``tokens_per_day`` are the daily allowances a user's
+# agents may spend (``usage_quota``): human messages from any channel, and LLM
+# tokens of every turn their agents run. 0 means unlimited. A day is a UTC day.
 
 DEFAULT_PLAN_LIMITS: dict[str, dict] = {
     "free": {
@@ -27,8 +31,10 @@ DEFAULT_PLAN_LIMITS: dict[str, dict] = {
         "max_storage_mb": 500,
         "requests_per_minute": 60,
         "spawns_per_hour": 5,
+        "messages_per_day": 30,
+        "tokens_per_day": 300_000,
     },
-    "pro": {
+    "premium": {
         # Raised from 10 → 20 so a single Agent Forge run can stand up a large
         # 10–15 agent team without the tail agents hitting the concurrent cap.
         # Per-user overrides (admin_routes) still apply on top of this.
@@ -37,21 +43,36 @@ DEFAULT_PLAN_LIMITS: dict[str, dict] = {
         "requests_per_minute": 300,
         # A 15-agent forge is one burst; give headroom to iterate within an hour.
         "spawns_per_hour": 100,
+        "messages_per_day": 300,
+        "tokens_per_day": 3_000_000,
     },
     "enterprise": {
         "max_agents": 100,
         "max_storage_mb": 50000,
         "requests_per_minute": 1000,
         "spawns_per_hour": 500,
+        "messages_per_day": 0,
+        "tokens_per_day": 0,
     },
 }
+
+# Plan names that were renamed: users and stored limits under the old name
+# read as the new one ("pro" became "premium").
+PLAN_ALIASES: dict[str, str] = {"pro": "premium"}
 
 # Runtime plan limits — starts as defaults, overwritten from DB on startup
 PLAN_LIMITS: dict[str, dict] = {k: {**v} for k, v in DEFAULT_PLAN_LIMITS.items()}
 
-PLAN_FIELDS = ("max_agents", "max_storage_mb", "requests_per_minute", "spawns_per_hour")
+PLAN_FIELDS = ("max_agents", "max_storage_mb", "requests_per_minute", "spawns_per_hour",
+               "messages_per_day", "tokens_per_day")
 
 DEFAULT_PLAN = "free"
+
+
+def canonical_plan(plan: str | None) -> str:
+    """*plan* under its current name (an old name maps to its new one)."""
+    name = str(plan or "").strip().lower()
+    return PLAN_ALIASES.get(name, name)
 
 
 def load_plan_limits_from_db_sync(raw: str | None) -> None:
@@ -61,6 +82,7 @@ def load_plan_limits_from_db_sync(raw: str | None) -> None:
     try:
         stored = json.loads(raw)
         for plan_name, limits in stored.items():
+            plan_name = canonical_plan(plan_name)
             if plan_name in PLAN_LIMITS and isinstance(limits, dict):
                 for field in PLAN_FIELDS:
                     if field in limits:
@@ -86,9 +108,10 @@ def get_plan_limits_json() -> str:
 def get_user_plan(user: dict) -> str:
     """Extract plan from user metadata, default to free."""
     try:
-        meta = json.loads(user.get("metadata", "{}"))
-        return meta.get("plan", DEFAULT_PLAN)
-    except (json.JSONDecodeError, TypeError):
+        meta = json.loads(user.get("metadata") or "{}")
+        plan = canonical_plan(meta.get("plan") or DEFAULT_PLAN)
+        return plan if plan in PLAN_LIMITS else DEFAULT_PLAN
+    except (json.JSONDecodeError, TypeError, AttributeError):
         return DEFAULT_PLAN
 
 
@@ -103,8 +126,8 @@ def get_user_limits(user: dict) -> dict:
     limits = {**get_plan_limits(plan)}
     # Allow per-user overrides in metadata
     try:
-        meta = json.loads(user.get("metadata", "{}"))
-        for key in ("max_agents", "max_storage_mb", "requests_per_minute", "spawns_per_hour"):
+        meta = json.loads(user.get("metadata") or "{}")
+        for key in PLAN_FIELDS:
             if key in meta:
                 limits[key] = meta[key]
     except (json.JSONDecodeError, TypeError):

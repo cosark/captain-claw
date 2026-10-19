@@ -770,6 +770,12 @@ async def glasses_send(request: Request) -> JSONResponse:
             )
     if not host:
         host = "localhost"
+    # It counts against the agent owner's plan allowance for today.
+    from captain_claw.flight_deck import usage_quota
+
+    allowed, quota = await usage_quota.admit_message(usage_quota.owner_of_port(port), text)
+    if not allowed:
+        raise HTTPException(status_code=429, detail=usage_quota.limit_text(quota))
     await _ensure_agent_binding(ch, host, port)
 
     # Echo the user's message onto the bus immediately — mobile and glasses

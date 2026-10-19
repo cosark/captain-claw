@@ -66,6 +66,7 @@ GRANT_AWARE_PATHS = frozenset({
     "/fd/deep-memory/agent/search", "/fd/deep-memory/agent/index",
     "/fd/deep-memory/agent/delete",
     "/fd/context-packs/agent/vfs",
+    "/fd/quota/agent/usage",
 })  # exact match on the path with root_path removed, rstrip("/")
 
 NO_TURN_DETAIL = "No active shared-agent turn for this request"

@@ -1246,6 +1246,11 @@ async def execute_job(job: dict[str, Any], *, force: bool = False) -> tuple[str,
     """
     if not force and not job.get("ignore_quiet_hours") and _in_quiet_hours():
         return ("skipped:quiet", "")
+    # The owner's daily token allowance is spent: no runs until it resets.
+    from captain_claw.flight_deck import usage_quota
+
+    if await usage_quota.automation_blocked(str(job.get("owner_id") or "")):
+        return ("skipped:limit", "")
 
     # A job runs either a Flow or a text prompt.
     flow_id = str(job.get("flow_id") or "").strip()
@@ -1375,6 +1380,18 @@ async def _run_due_job(store: SchedulerStore, job: dict[str, Any]) -> None:
             last_run_at=time.time(), next_run_at=_quiet_hours_end_epoch(),
         )
         return
+
+    if is_one_shot(job["schedule"]):
+        # Its owner's daily token allowance is spent: retry when it resets,
+        # don't consume the one-shot. (A recurring job skips this occurrence.)
+        from captain_claw.flight_deck import usage_quota
+
+        if await usage_quota.automation_blocked(str(job.get("owner_id") or "")):
+            store.mark_run(
+                job["id"], status="skipped:limit", result="",
+                last_run_at=time.time(), next_run_at=usage_quota.resets_at().timestamp(),
+            )
+            return
 
     # Consumed before it runs (a long run must not fire again on the next
     # poll): one-shots disable, recurring jobs move to their next time.

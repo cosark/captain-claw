@@ -75,6 +75,8 @@ import { AgentDatastorePanel } from './AgentDatastorePanel'
 import { QueuePlannerModal } from './QueuePlannerModal'
 import { usePersistedSize } from '../../hooks/usePersistedSize'
 import { useIsMobile } from '../../hooks/useMediaQuery'
+import { useQuotaStore } from '../../stores/quotaStore'
+import { PlanUsageBar } from '../common/PlanUsage'
 import { imageRef, type ChatMessage, type TokenUsage } from '../../services/agentChat'
 
 // Plugin arrays hoisted to module scope so they keep a stable identity across
@@ -678,6 +680,7 @@ export function ChatPanel({ variant = 'default' }: { variant?: 'default' | 'simp
               sessionKey={session.key}
               shared={!!shared}
               minWidth={simple && !isMobile ? 300 : undefined}
+              simple={simple}
               onSend={(content) => sendMessage(session.key, content)}
               onCancel={() => cancelTask(session.key)}
             />
@@ -734,6 +737,7 @@ function ChatContent({
   sessionKey,
   shared = false,
   minWidth,
+  simple = false,
   onSend,
   onCancel,
 }: {
@@ -745,6 +749,8 @@ function ChatContent({
   shared?: boolean
   /** Conversation floor (simple layout): the queue column shrinks before this. */
   minWidth?: number
+  /** The simple (kiosk) layout: the daily-allowance line is always shown. */
+  simple?: boolean
   onSend: (content: string) => void
   onCancel: () => void
 }) {
@@ -804,12 +810,14 @@ function ChatContent({
     ? { onDragOver: swallowDrop, onDrop: swallowDrop }
     : { onDragOver: handleDragOver, onDragLeave: handleDragLeave, onDrop: handleDrop }
   const closed = !!session.closed
+  // Today's plan allowance is spent: Flight Deck would refuse the message.
+  const quotaSpent = useQuotaStore((s) => !!s.status?.blocked && !s.status.exempt)
 
   const handleSend = () => {
     const text = input.trim()
     const uploadedFiles = attachments.filter((a) => a.status === 'uploaded' && a.uploadedPath)
     const hasContent = text || uploadedFiles.length > 0
-    if (!hasContent || !session.connected) return
+    if (!hasContent || !session.connected || quotaSpent) return
 
     const content = appendAttachmentRefs(text, uploadedFiles)
     onSend(content)
@@ -963,6 +971,9 @@ function ChatContent({
         </div>
       )}
 
+      {/* Today's plan allowance; when it's spent the composer stays closed */}
+      <PlanUsageBar simple={simple} />
+
       {/* Input */}
       <div className="border-t border-zinc-800 p-3">
         <div className="flex items-end gap-2">
@@ -1003,8 +1014,8 @@ function ChatContent({
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             onPaste={shared ? undefined : handlePasteEvent}
-            placeholder={closed ? 'Disconnected' : !session.connected ? 'Connecting...' : shared || isMobile ? 'Message…' : 'Message, paste image, or drop files...'}
-            disabled={!session.connected || closed}
+            placeholder={closed ? 'Disconnected' : !session.connected ? 'Connecting...' : quotaSpent ? 'Daily limit reached' : shared || isMobile ? 'Message…' : 'Message, paste image, or drop files...'}
+            disabled={!session.connected || closed || quotaSpent}
             rows={1}
             className="max-h-32 min-h-[38px] min-w-0 flex-1 resize-none rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-base text-zinc-200 wide:text-sm placeholder-zinc-600 focus:border-violet-500/50 focus:outline-none disabled:opacity-40"
             style={{ height: 'auto', overflow: 'hidden' }}
@@ -1025,7 +1036,7 @@ function ChatContent({
           ) : (
             <button
               onClick={handleSend}
-              disabled={(!input.trim() && attachments.filter((a) => a.status === 'uploaded').length === 0) || !session.connected || closed || pendingUploads > 0}
+              disabled={(!input.trim() && attachments.filter((a) => a.status === 'uploaded').length === 0) || !session.connected || closed || pendingUploads > 0 || quotaSpent}
               className="flex h-[38px] items-center gap-1.5 rounded-lg bg-violet-600 px-3 text-xs font-medium text-white hover:bg-violet-500 disabled:opacity-40"
               title={pendingUploads > 0 ? 'Waiting for uploads...' : 'Send'}
             >

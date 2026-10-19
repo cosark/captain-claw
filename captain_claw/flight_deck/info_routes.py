@@ -166,5 +166,11 @@ async def my_info(user: dict = Depends(get_current_user)) -> dict[str, Any]:
         "limits": get_user_limits(row),
         "kiosk": await user_kiosk_locked(db, row) if db is not None else False,
     }
+    try:
+        from captain_claw.flight_deck import usage_quota
+
+        out["account"]["usage"] = await usage_quota.status(db, row)
+    except Exception as exc:
+        log.warning("info: usage unavailable", error=type(exc).__name__)
     out["connections"] = await _connections(db, uid)
     return out

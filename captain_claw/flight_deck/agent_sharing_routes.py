@@ -41,7 +41,7 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket
 from pydantic import BaseModel
 
 from captain_claw.flight_deck import agent_sharing as sharing
-from captain_claw.flight_deck import speaker_grants, tenant_profile
+from captain_claw.flight_deck import speaker_grants, tenant_profile, usage_quota
 from captain_claw.flight_deck.auth import decode_access_token, get_current_user, get_db
 from captain_claw.logging import get_logger
 
@@ -514,6 +514,15 @@ async def _client_to_agent(conn: _MemberConn, db, rec: sharing.AgentRecord,
                 await conn.send({"type": "status", "status": "ready",
                                  "turn_end": secrets.token_hex(8)})
                 continue
+            # The member's own plan allowance for today, not the owner's.
+            allowed, quota = await usage_quota.admit_message(sub, content)
+            if not allowed:
+                await conn.send(usage_quota.refusal_frame(quota))
+                await conn.send({"type": "status", "status": "ready",
+                                 "turn_end": secrets.token_hex(8)})
+                continue
+            if quota is not None:
+                await conn.send({"type": "fd_quota", "quota": quota})
             # The optional chat keys keep only the types the wire contract gives them.
             for key, kind in _CHAT_OPTIONAL_TYPES.items():
                 if key in frame and not isinstance(frame[key], kind):
