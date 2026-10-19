@@ -1594,6 +1594,30 @@ def _extract_usage(usage_obj: Any) -> dict[str, int]:
     }
 
 
+def input_tokens_total(provider: str, usage: dict | None) -> int:
+    """Every input token a call sent: fresh input, cache writes and cache
+    reads. LiteLLM's Anthropic usage already folds cache reads and writes
+    into ``prompt_tokens``, and so does its Gemini usage (promptTokenCount
+    includes cached content); elsewhere ``prompt_tokens`` is the uncached
+    part (``_extract_usage`` takes OpenAI-style cached tokens out of it)."""
+    u = usage or {}
+    prompt = int(u.get("prompt_tokens", 0) or 0)
+    cached = int(u.get("cache_read_input_tokens", 0) or 0)
+    created = int(u.get("cache_creation_input_tokens", 0) or 0)
+    if provider in ("anthropic", "gemini") and prompt >= cached + created:
+        return prompt
+    return prompt + cached + created
+
+
+def uncached_tokens(provider: str, usage: dict | None) -> int:
+    """A call's tokens that missed the prompt cache: all of its input except
+    the cache reads (cache writes are fresh input), plus its output."""
+    u = usage or {}
+    cached = int(u.get("cache_read_input_tokens", 0) or 0)
+    fresh = max(0, input_tokens_total(provider, u) - cached)
+    return fresh + int(u.get("completion_tokens", 0) or 0)
+
+
 # ── ChatGPT Responses API helpers ─────────────────────────────────────────
 
 
@@ -2069,6 +2093,13 @@ class ChatGPTResponsesProvider(LLMProvider):
         }
         if usage["total_tokens"] <= 0:
             usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+        # Cached input is counted inside input_tokens here: normalise like
+        # _extract_usage (prompt_tokens = the uncached part).
+        details = usage_raw.get("input_tokens_details") or {}
+        cached = int(details.get("cached_tokens", 0) or 0) if isinstance(details, dict) else 0
+        if cached > 0:
+            usage["cache_read_input_tokens"] = cached
+            usage["prompt_tokens"] = max(0, usage["prompt_tokens"] - cached)
 
         # An answer stopped by the output cap comes back "incomplete".
         incomplete = str(response_data.get("status") or "") == "incomplete" and str(

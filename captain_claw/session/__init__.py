@@ -3179,10 +3179,17 @@ class SessionManager:
             ),
         )
         await self._db.commit()
-        # The plan's daily token allowance is kept by Flight Deck.
+        # The plan's daily token allowance is kept by Flight Deck. It counts
+        # what missed the prompt cache: a long conversation re-reads its whole
+        # cached history every call, and those reads would swallow the day.
         from captain_claw.fd_usage_report import report_tokens
+        from captain_claw.llm import uncached_tokens
 
-        report_tokens(total_tokens or (prompt_tokens + completion_tokens), byok=byok)
+        report_tokens(uncached_tokens(provider, {
+            "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
+            "cache_creation_input_tokens": cache_creation_input_tokens,
+            "cache_read_input_tokens": cache_read_input_tokens,
+        }), byok=byok)
 
     async def query_llm_usage(
         self,

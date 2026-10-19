@@ -316,3 +316,59 @@ async def test_member_report_falls_back_to_owner_after_the_turn(monkeypatch):
     monkeypatch.setattr(rep, "_client", lambda: FakeClient())
     await rep._post(10, {"X-FD-Speaker-Grant": "g"}, {"fd_member": "1"})
     assert calls == [{"X-FD-Speaker-Grant": "g"}, None]
+
+
+# ── Only tokens that missed the prompt cache count ───────────────────
+
+
+def test_uncached_tokens_per_provider_shape():
+    from captain_claw.llm import input_tokens_total, uncached_tokens
+
+    # LiteLLM folds Anthropic / Gemini cache reads and writes into prompt_tokens.
+    folded = {"prompt_tokens": 50_000, "completion_tokens": 300,
+              "cache_read_input_tokens": 48_000, "cache_creation_input_tokens": 1_500}
+    assert input_tokens_total("anthropic", folded) == 50_000
+    assert uncached_tokens("anthropic", folded) == 2_300  # 500 fresh + 1500 written + 300 out
+    assert uncached_tokens("gemini", folded) == 2_300
+    # OpenAI-style: _extract_usage already took the cached part out of prompt_tokens.
+    split = {"prompt_tokens": 2_000, "completion_tokens": 300, "cache_read_input_tokens": 48_000}
+    assert input_tokens_total("openai", split) == 50_000
+    assert uncached_tokens("openai", split) == 2_300
+    # An Anthropic-named usage that is NOT folded (prompt < cache) is read as split.
+    assert uncached_tokens("anthropic", {"prompt_tokens": 500, "completion_tokens": 300,
+                                         "cache_read_input_tokens": 48_000}) == 800
+    # No cache at all (Ollama): everything counts.
+    assert uncached_tokens("ollama", {"prompt_tokens": 9_000, "completion_tokens": 40}) == 9_040
+    assert uncached_tokens("ollama", None) == 0
+
+
+def test_responses_api_cached_input_is_split_out():
+    from captain_claw.llm import ChatGPTResponsesProvider, uncached_tokens
+
+    provider = ChatGPTResponsesProvider.__new__(ChatGPTResponsesProvider)
+    provider.model = "gpt-test"
+    event = {"type": "response.completed", "response": {
+        "status": "completed",
+        "output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}],
+        "usage": {"input_tokens": 30_000, "output_tokens": 50, "total_tokens": 30_050,
+                  "input_tokens_details": {"cached_tokens": 28_000}},
+    }}
+    usage = provider._parse_response_output(event).usage
+    assert usage["prompt_tokens"] == 2_000 and usage["cache_read_input_tokens"] == 28_000
+    assert uncached_tokens("chatgpt", usage) == 2_050
+
+
+async def test_agent_reports_only_uncached_tokens(tmp_path, monkeypatch):
+    from captain_claw import fd_usage_report
+    from captain_claw.session import SessionManager
+
+    reported: list = []
+    monkeypatch.setattr(fd_usage_report, "report_tokens",
+                        lambda tokens, *, byok=False: reported.append((tokens, byok)))
+    sm = SessionManager(tmp_path / "s.db")
+    await sm.record_llm_usage(provider="anthropic", prompt_tokens=50_000, completion_tokens=300,
+                              total_tokens=50_300, cache_read_input_tokens=48_000,
+                              cache_creation_input_tokens=1_500)
+    await sm.record_llm_usage(provider="openai", prompt_tokens=100, completion_tokens=20,
+                              total_tokens=120, byok=True)
+    assert reported == [(2_300, False), (120, True)]

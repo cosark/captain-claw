@@ -613,18 +613,10 @@ class AgentGuardMixin:
             if interaction_label.startswith("turn_"):
                 window = getattr(self, "last_context_window", None)
                 if isinstance(window, dict):
-                    _prompt = int(usage.get("prompt_tokens", 0) or 0)
-                    _cached = int(usage.get("cache_read_input_tokens", 0) or 0)
-                    _created = int(usage.get("cache_creation_input_tokens", 0) or 0)
-                    # LiteLLM's Anthropic usage already folds cache reads and
-                    # writes into prompt_tokens, and so does its Gemini usage
-                    # (promptTokenCount includes cached content); elsewhere
-                    # prompt_tokens is the uncached part.
-                    if provider_name in ("anthropic", "gemini") and _prompt >= _cached + _created:
-                        window["provider_input_tokens"] = _prompt
-                    else:
-                        window["provider_input_tokens"] = _prompt + _cached + _created
-                    window["provider_cached_tokens"] = _cached
+                    from captain_claw.llm import input_tokens_total
+
+                    window["provider_input_tokens"] = input_tokens_total(provider_name, usage)
+                    window["provider_cached_tokens"] = int(usage.get("cache_read_input_tokens", 0) or 0)
                     # Governed: calibrate the budget from what the server
                     # actually received.
                     if window.get("governor") and hasattr(self, "_observe_ctx_calibration"):
