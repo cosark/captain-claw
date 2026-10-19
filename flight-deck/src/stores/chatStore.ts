@@ -32,6 +32,13 @@ async function serverUpsertSession(id: string, agentId: string, agentName: strin
 
 /** Rows per page of the lane's chat log. */
 const HISTORY_PAGE = 500
+/** Rows the loaded window may hold. Beyond it the far end is dropped — the
+ *  log keeps everything: the oldest rows when the chat grows at the bottom,
+ *  the newest when the reader pages back — down to WINDOW_MAX - WINDOW_SLACK,
+ *  so a busy chat isn't trimmed on every message. Mounting costs about a
+ *  millisecond and 20 DOM nodes per row; 2,000 keeps a day of chat in view. */
+const WINDOW_MAX = 2000
+const WINDOW_SLACK = 100
 
 interface LogRow { id: number; role: string; content: string; metadata: string; created_at: string }
 
@@ -79,6 +86,86 @@ function logRowToMessage(r: LogRow): ChatMessage {
     model: meta.model as string | undefined,
     peer_name: meta.peer_name as string | undefined,
     ...(topic ? { topic } : {}),
+    ...(meta.via ? { via: String(meta.via) } : {}),
+    ...(taskMark(meta.task) ? { task: taskMark(meta.task) } : {}),
+  }
+}
+
+/** A scheduled task's marker from a frame or a log row, or undefined. */
+function taskMark(raw: unknown): ChatMessage['task'] {
+  if (!raw || typeof raw !== 'object') return undefined
+  const t = raw as Record<string, unknown>
+  const id = String(t.id || '')
+  if (!id) return undefined
+  return {
+    id, name: String(t.name || 'Scheduled task'),
+    ...(t.session_id ? { session_id: String(t.session_id) } : {}),
+  }
+}
+
+/** Message ids withdrawn from the transcript before or while their flush
+ *  ran: skipped if still queued, deleted from the log once their row id is
+ *  known. */
+const _dropped = new Set<string>()
+
+async function serverDeleteMessage(sessionId: string, rowId: number): Promise<void> {
+  if (!useAuthStore.getState().authEnabled) return
+  try {
+    await fetch(`/fd/chat/sessions/${encodeURIComponent(sessionId)}/messages/${rowId}`, {
+      method: 'DELETE',
+      headers: _chatHeaders(),
+      credentials: 'include',
+    })
+  } catch { /* ignore */ }
+}
+
+/** Whether a user frame the agent broadcast is this socket's own turn: the
+ *  echoed client_msg_id says so; an agent build that sends neither an id nor
+ *  a surface is read as an echo, as before. */
+function isOwnTurn(ws: AgentChatWS, data: Record<string, unknown>): boolean {
+  const id = String(data.client_msg_id || '')
+  if (id) return ws.isOwnMessage(id)
+  return !data.via
+}
+
+// The agent's new-session cues (config `session.rotation_cues` defaults):
+// "new topic: …" opening a message starts a new session, then the rest is
+// re-sent as the turn. The composer already echoed the whole line.
+const CUE_RE = /^(?:new topic|new conversation|nova tema|novi razgovor)(?:\s*(?:$|\n)|\s*[:\-–—.,!]\s*)/i
+
+function stripCue(text: string): string | null {
+  const t = text.trimStart()
+  const m = CUE_RE.exec(t)
+  return m ? t.slice(m[0].length).trim() : null
+}
+
+const foldSpace = (s: string) => s.replace(/\s+/g, ' ').trim()
+
+/** The composer's echo of a "new topic: <rest>" line — sitting above the
+ *  divider the cue produced — is withdrawn once the agent re-sends <rest>
+ *  as the new topic's first turn, so the message shows once, below. */
+function dropCueEcho(key: string, rest: string) {
+  const s = useChatStore.getState().sessions.get(key)
+  if (!s) return
+  const want = foldSpace(rest)
+  for (let i = s.messages.length - 1; i >= 0 && i >= s.messages.length - 8; i--) {
+    const m = s.messages[i]
+    if (m.role !== 'user' || m.replay || m.via) continue
+    const stripped = stripCue(m.content)
+    if (stripped === null || foldSpace(stripped) !== want) continue
+    _dropped.add(m.id)
+    useChatStore.setState((state) => {
+      const cur = state.sessions.get(key)
+      if (!cur) return state
+      const sessions = new Map(state.sessions)
+      sessions.set(key, { ...cur, messages: cur.messages.filter((x) => x.id !== m.id) })
+      return { sessions }
+    })
+    if (m.rowId !== undefined) {
+      _dropped.delete(m.id)
+      void serverDeleteMessage(key, m.rowId)
+    }
+    return
   }
 }
 
@@ -235,7 +322,15 @@ async function _flushMessages() {
   _msgTimer = null
   const batches = new Map(_msgQueue)
   _msgQueue.clear()
-  for (const [sessionId, msgs] of batches) {
+  for (const [sessionId, queued] of batches) {
+    // Serialize the latest version of each row: a divider may have been
+    // titled or renamed since it was queued. A row withdrawn meanwhile (a
+    // "new topic:" echo) is not written at all.
+    const live = useChatStore.getState().sessions.get(sessionId)?.messages
+    const msgs = queued
+      .filter((m) => { if (_dropped.has(m.id)) { _dropped.delete(m.id); return false } return true })
+      .map((m) => live?.find((x) => x.id === m.id) ?? m)
+    if (msgs.length === 0) continue
     try {
       const res = await fetch(`/fd/chat/sessions/${encodeURIComponent(sessionId)}/messages`, {
         method: 'POST',
@@ -252,6 +347,8 @@ async function _flushMessages() {
               ...(m.model ? { model: m.model } : {}),
               ...(m.peer_name ? { peer_name: m.peer_name } : {}),
               ...(m.topic ? { topic: m.topic } : {}),
+              ...(m.via ? { via: m.via } : {}),
+              ...(m.task ? { task: m.task } : {}),
             }),
           })),
         }),
@@ -262,6 +359,13 @@ async function _flushMessages() {
       const body = await res.json().catch(() => null) as { ids?: number[] } | null
       const ids = body?.ids
       if (!ids || ids.length !== msgs.length) continue
+      // A row withdrawn while this batch was in flight is deleted now.
+      msgs.forEach((m, i) => {
+        if (_dropped.has(m.id)) {
+          _dropped.delete(m.id)
+          void serverDeleteMessage(sessionId, ids[i])
+        }
+      })
       const rowIds = new Map(msgs.map((m, i) => [m.id, ids[i]] as const))
       useChatStore.setState((state) => {
         const s = state.sessions.get(sessionId)
@@ -871,6 +975,14 @@ interface ChatSession {
   /** The loaded window of the log starts after older rows ("Earlier
    *  messages" fetches the page before it). */
   hasOlder: boolean
+  /** The window stops before newer rows of the log — the reader jumped to
+   *  or paged back into the past ("Later messages" fetches the page after
+   *  it). While set, the window is not the end of the transcript: nothing
+   *  reconciles against it or merges the agent's replay into it. */
+  hasNewer: boolean
+  /** With `hasNewer`: the highest log row id of the window's contiguous
+   *  block, where "Later messages" continues from. */
+  windowEndRowId: number
   /** Until this time, a change in message count must not auto-scroll to the
    *  bottom: older rows were prepended, or the view jumped to a topic. */
   holdScrollUntil: number
@@ -921,10 +1033,15 @@ interface ChatStore {
   resumeTopic: (containerId: string, agentSessionId: string) => void
   /** Prepend the page of the chat log before the loaded window. */
   loadOlder: (containerId: string) => Promise<void>
+  /** Append the page of the chat log after the loaded window (after a jump
+   *  or paging back trimmed the newest rows). */
+  loadNewer: (containerId: string) => Promise<void>
   /** Make the divider with this log row id part of the loaded window —
    *  fetching the log from it on when it isn't — and return that message's
    *  id to scroll to (null when it can't be found). */
   jumpToTopic: (containerId: string, rowId: number) => Promise<string | null>
+  /** Name one topic divider (the user's own title; overrides a generated one). */
+  renameTopic: (containerId: string, ref: { rowId?: number; messageId?: string }, title: string) => void
   /** Append a local system note to the chat (no agent turn) — e.g. "started flow X". */
   addLocalNote: (containerId: string, content: string) => void
   cancelTask: (containerId: string) => void
@@ -1024,6 +1141,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       agentSessionId: '',
       historyLoaded: false,
       hasOlder: false,
+      hasNewer: false,
+      windowEndRowId: 0,
       holdScrollUntil: 0,
       connected: false,
       busy: false,
@@ -1141,6 +1260,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         id, name: String(data.name ?? ''),
         action: count > 0 ? 'resume' : 'new', source: 'agent',
       })
+      if (data.title) applyTopicTitle(key, id, String(data.title))
+    })
+
+    // The agent named a session it was asked to leave (a short title from
+    // its opening turns): the Topics list and that session's dividers show it.
+    ws.on('session_title', (data) => {
+      const id = String(data.id ?? '')
+      const title = String(data.title ?? '')
+      if (id && title) applyTopicTitle(key, id, title)
     })
 
     ws.on('welcome', (data) => {
@@ -1275,11 +1403,23 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     })
 
     ws.on('chat_message', (data) => {
-      // Skip echoed user messages — we already add them locally in sendMessage
-      // — except the rest of a "new topic" message: the transcript was just
-      // cleared for the new session, so it goes back in.
-      if (data.role === 'user' && !data.replay && !data.rotation_cue) return
       const rawContent = (data.content as string) || ''
+      let via = ''
+      if (data.role === 'user' && !data.replay) {
+        if (data.rotation_cue) {
+          // The rest of a "new topic" message, re-sent after the divider:
+          // the composer's echo of the whole line, above it, goes.
+          dropCueEcho(key, rawContent)
+        } else if (isOwnTurn(ws, data)) {
+          // Our own send — already on screen from sendMessage.
+          return
+        } else {
+          // Another surface's turn on this lane (WhatsApp, the stick, another
+          // tab): part of the transcript, labelled where it came from.
+          const from = String(data.via || '')
+          via = from && from !== 'web' ? from : ''
+        }
+      }
       // Sanitize assistant content: strip thinking blocks, council protocol
       // headers (SUITABILITY/ACTION/TARGET), insight echoes, and other
       // instruction/memory leaks. User content is left as-is.
@@ -1291,6 +1431,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         timestamp: data.timestamp as string || new Date().toISOString(),
         replay: data.replay as boolean || false,
         model: data.model as string || '',
+        ...(via ? { via } : {}),
+        ...(taskMark(data.task) ? { task: taskMark(data.task) } : {}),
       }
       addMessage(key, msg)
       // A result the automation lane mirrored here is a note: it ends no turn
@@ -1500,7 +1642,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       const isSessionNew = /^\/session new\b/.test(command) && content.startsWith('Created and switched')
       const isSwitch = /^\/session (switch|load)\b/.test(command) && content.startsWith('Switched to session')
       const isClear = command === '/clear'
-      const after = data.session as { id?: unknown; name?: unknown } | undefined
+      const after = data.session as { id?: unknown; name?: unknown; title?: unknown } | undefined
       const afterId = after?.id ? String(after.id) : ''
       let marked = false
       if (afterId && (isNew || isSessionNew || isSwitch || isClear)) {
@@ -1512,6 +1654,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         // An agent build that doesn't report its session: wipe, as before.
         clearMessages(key)
       }
+      if (afterId && after?.title) applyTopicTitle(key, afterId, String(after.title))
       // The divider says it; the agent's one-liner would only repeat it.
       if (!marked) {
         addMessage(key, { id: nextId(), role: 'system', content, timestamp: new Date().toISOString() })
@@ -2059,10 +2202,41 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       const s = state.sessions.get(containerId)
       if (!s) return state
       const sessions = new Map(state.sessions)
-      sessions.set(containerId, {
+      // Paging back: the window may shed its newest rows to stay bounded.
+      sessions.set(containerId, trimWindow({
         ...s, messages: [...rows, ...s.messages],
         hasOlder: rows.length >= HISTORY_PAGE, holdScrollUntil: Date.now() + 1500,
-      })
+      }, 'oldest'))
+      return { sessions }
+    })
+  },
+
+  loadNewer: async (containerId) => {
+    const session = get().sessions.get(containerId)
+    if (!session || !session.hasNewer) return
+    const rows = await serverFetchMessages(containerId, { since: session.windowEndRowId + 1, limit: HISTORY_PAGE })
+    if (rows === null) return
+    useChatStore.setState((state) => {
+      const s = state.sessions.get(containerId)
+      if (!s) return state
+      // Rows the window already holds (sent from here after the jump and
+      // persisted since) are not repeated; the rest goes in right after the
+      // contiguous block, ahead of anything newer that sits at the end.
+      const have = new Set(s.messages.map((m) => m.rowId).filter((id): id is number => id !== undefined))
+      const fresh = rows.filter((m) => m.rowId !== undefined && !have.has(m.rowId))
+      let at = s.messages.length
+      for (let i = s.messages.length - 1; i >= 0; i--) {
+        const id = s.messages[i].rowId
+        if (id !== undefined && id <= s.windowEndRowId) { at = i + 1; break }
+      }
+      const more = rows.length >= HISTORY_PAGE
+      const endRowId = rows.reduce((mx, m) => Math.max(mx, m.rowId ?? 0), s.windowEndRowId)
+      const sessions = new Map(state.sessions)
+      // Moving forward: the window may shed its oldest rows to stay bounded.
+      sessions.set(containerId, trimWindow({
+        ...s, messages: [...s.messages.slice(0, at), ...fresh, ...s.messages.slice(at)],
+        hasNewer: more, windowEndRowId: more ? endRowId : 0, holdScrollUntil: Date.now() + 1500,
+      }, 'newest'))
       return { sessions }
     })
   },
@@ -2075,21 +2249,49 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       updateSession(containerId, { holdScrollUntil: Date.now() + 1500 })
       return have.id
     }
-    const rows = await serverFetchMessages(containerId, { since: rowId, limit: 2000 })
+    const rows = await serverFetchMessages(containerId, { since: rowId, limit: HISTORY_PAGE })
     if (!rows || rows.length === 0) return null
+    const more = rows.length >= HISTORY_PAGE
+    const endRowId = rows.reduce((mx, m) => Math.max(mx, m.rowId ?? 0), 0)
     useChatStore.setState((state) => {
       const s = state.sessions.get(containerId)
       if (!s) return state
-      // The window becomes the log from that divider on; rows that only
-      // exist here so far (not persisted yet) stay at the end.
+      // The window becomes a page of the log from that divider on; rows
+      // that only exist here so far (not persisted yet) stay at the end.
       const live = s.messages.filter((m) => m.rowId === undefined && !m.replay)
       const sessions = new Map(state.sessions)
       sessions.set(containerId, {
-        ...s, messages: [...rows, ...live], hasOlder: true, holdScrollUntil: Date.now() + 1500,
+        ...s, messages: [...rows, ...live], hasOlder: true,
+        hasNewer: more, windowEndRowId: more ? endRowId : 0, holdScrollUntil: Date.now() + 1500,
       })
       return { sessions }
     })
     return rows[0].id
+  },
+
+  renameTopic: (containerId, ref, title) => {
+    const clean = title.replace(/\s+/g, ' ').trim().slice(0, 120)
+    let rowId: number | undefined
+    useChatStore.setState((state) => {
+      const s = state.sessions.get(containerId)
+      if (!s) return state
+      let changed = false
+      const messages = s.messages.map((m) => {
+        if (!m.topic) return m
+        const hit = (ref.messageId !== undefined && m.id === ref.messageId)
+          || (ref.rowId !== undefined && m.rowId === ref.rowId)
+        if (!hit || m.topic.title === clean) return m
+        changed = true
+        rowId = m.rowId
+        return { ...m, topic: { ...m.topic, title: clean } }
+      })
+      if (!changed) return state
+      const sessions = new Map(state.sessions)
+      sessions.set(containerId, { ...s, messages })
+      return { sessions }
+    })
+    const persisted = rowId ?? ref.rowId
+    if (persisted !== undefined) void serverSetTopicTitle(containerId, persisted, clean)
   },
 
   addLocalNote: (containerId, content) => {
@@ -2403,6 +2605,7 @@ function replayToMessage(d: Record<string, unknown>): ChatMessage {
     timestamp: (d.timestamp as string) || new Date().toISOString(),
     replay: true,
     model: (d.model as string) || '',
+    ...(taskMark(d.task) ? { task: taskMark(d.task) } : {}),
   }
 }
 
@@ -2447,13 +2650,54 @@ function markTopic(
     if (s.agentSessionId !== t.id) updateSession(key, { agentSessionId: t.id })
     return 'present'
   }
-  const topic: TopicMark = { action: t.action, agentSessionId: t.id, source: t.source }
+  // A topic resumed or re-entered keeps the name it already has.
+  const known = s.messages.find((m) => m.topic?.agentSessionId === t.id && m.topic.title)?.topic?.title
+  const topic: TopicMark = {
+    action: t.action, agentSessionId: t.id, source: t.source, ...(known ? { title: known } : {}),
+  }
   addMessage(key, {
     id: nextId(), role: 'system', content: topicLabel(t.action, t.name),
     timestamp: new Date().toISOString(), topic,
   })
   updateSession(key, { agentSessionId: t.id, nextStepOptions: [] })
   return 'inserted'
+}
+
+/** The agent named session `agentSessionId`: every loaded divider of that
+ *  session without a title gets it (a title the user typed stays), and the
+ *  persisted ones are renamed in the log. */
+function applyTopicTitle(key: string, agentSessionId: string, title: string) {
+  const clean = title.replace(/\s+/g, ' ').trim().slice(0, 120)
+  if (!clean) return
+  const rowIds: number[] = []
+  useChatStore.setState((state) => {
+    const s = state.sessions.get(key)
+    if (!s) return state
+    let changed = false
+    const messages = s.messages.map((m) => {
+      if (!m.topic || m.topic.agentSessionId !== agentSessionId || m.topic.title) return m
+      changed = true
+      if (m.rowId !== undefined) rowIds.push(m.rowId)
+      return { ...m, topic: { ...m.topic, title: clean } }
+    })
+    if (!changed) return state
+    const sessions = new Map(state.sessions)
+    sessions.set(key, { ...s, messages })
+    return { sessions }
+  })
+  for (const rowId of rowIds) void serverSetTopicTitle(key, rowId, clean)
+}
+
+async function serverSetTopicTitle(sessionId: string, rowId: number, title: string): Promise<void> {
+  if (!useAuthStore.getState().authEnabled) return
+  try {
+    await fetch(`/fd/chat/sessions/${encodeURIComponent(sessionId)}/topics/${rowId}`, {
+      method: 'PATCH',
+      headers: _chatHeaders(),
+      credentials: 'include',
+      body: JSON.stringify({ title }),
+    })
+  } catch { /* ignore */ }
 }
 
 /** With the log loaded and the agent's session known: when the transcript
@@ -2463,7 +2707,39 @@ function reconcileTopic(key: string) {
   if (!useAuthStore.getState().authEnabled) return
   const s = useChatStore.getState().sessions.get(key)
   if (!s || !s.historyLoaded || !s.agentSessionId) return
+  // A window into the past says nothing about where the transcript ends.
+  if (s.hasNewer) return
   markTopic(key, { id: s.agentSessionId, name: '', action: 'new', source: 'agent' })
+}
+
+/** Keep the window within WINDOW_MAX rows by dropping persisted rows from
+ *  the far end. `keep: 'newest'` drops from the top (the chat grew at the
+ *  bottom, or the reader moved forward) — never the current session's last
+ *  divider or anything after it, which the replay merge is anchored on.
+ *  `keep: 'oldest'` drops from the bottom (the reader paged back) — never a
+ *  row not yet persisted — and marks that newer rows exist. */
+function trimWindow(s: ChatSession, keep: 'newest' | 'oldest'): ChatSession {
+  const n = s.messages.length
+  if (n <= WINDOW_MAX) return s
+  const excess = n - (WINDOW_MAX - WINDOW_SLACK)
+  if (keep === 'newest') {
+    const anchor = s.hasNewer ? -1 : lastTopicIndex(s.messages, s.agentSessionId || undefined)
+    let drop = 0
+    while (drop < excess && s.messages[drop].rowId !== undefined && (anchor < 0 || drop < anchor)) drop++
+    if (drop === 0) return s
+    return { ...s, messages: s.messages.slice(drop), hasOlder: true }
+  }
+  const kept: ChatMessage[] = []
+  let dropped = 0
+  for (let i = n - 1; i >= 0; i--) {
+    const m = s.messages[i]
+    if (dropped < excess && m.rowId !== undefined) { dropped++; continue }
+    kept.push(m)
+  }
+  if (dropped === 0) return s
+  kept.reverse()
+  const endRowId = kept.reduce((mx, m) => Math.max(mx, m.rowId ?? 0), 0)
+  return { ...s, messages: kept, hasNewer: true, windowEndRowId: endRowId }
 }
 
 /** What identifies a turn when matching the agent's replay against the log:
@@ -2487,6 +2763,9 @@ function turnKey(m: ChatMessage): string {
 function mergeReplay(key: string, replayed: ChatMessage[]) {
   const s = useChatStore.getState().sessions.get(key)
   if (!s) return
+  // A window into the past doesn't hold the current session: merging would
+  // re-add (and re-persist) turns the log already has further down.
+  if (s.hasNewer) return
   const start = lastTopicIndex(s.messages, s.agentSessionId || undefined)
   const seen = new Set<string>()
   for (let i = start + 1; i < s.messages.length; i++) {
@@ -2575,7 +2854,8 @@ function addMessage(containerId: string, msg: ChatMessage) {
   useChatStore.setState((state) => {
     const session = state.sessions.get(containerId)
     if (!session) return state
-    const updated = { ...session, messages: [...session.messages, msg] }
+    // A chat left open for days keeps growing at the bottom: shed the top.
+    const updated = trimWindow({ ...session, messages: [...session.messages, msg] }, 'newest')
     const sessions = new Map(state.sessions)
     sessions.set(containerId, updated)
     return { sessions }

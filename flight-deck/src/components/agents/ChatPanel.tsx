@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo, memo } from 'react'
 import {
+  AlarmClock,
   X,
   Send,
   Loader2,
@@ -39,6 +40,7 @@ import {
   Undo2,
   Sparkles,
   Eraser,
+  Pencil,
 } from 'lucide-react'
 import { createPortal } from 'react-dom'
 import { fetchTopics, type TopicInfo } from '../../stores/chatStore'
@@ -56,6 +58,7 @@ import { useClipboardStore } from '../../stores/clipboardStore'
 import { useTraceStore, selectSpanCount } from '../../stores/traceStore'
 import { useUIStore } from '../../stores/uiStore'
 import { useAuthStore, selectKioskLocked } from '../../stores/authStore'
+import { useScheduledStore } from '../../stores/scheduledStore'
 import { useSharedAgentStore } from '../../stores/sharedAgentStore'
 import { sharedCaps, sharedCloseInfo } from '../../utils/sharedAgent'
 import { SharedAgentNotice } from './SharedAgentNotice'
@@ -737,7 +740,7 @@ function ChatContent({
   onSend,
   onCancel,
 }: {
-  session: { containerId: string; containerName: string; messages: ChatMessage[]; connected: boolean; busy: boolean; statusText: string; nextStepOptions?: NextStepOption[]; liveTurnUsage?: TokenUsage | null; closed?: { code: number; reason: string } | null; unreachable?: string | null; hasOlder?: boolean; holdScrollUntil?: number }
+  session: { containerId: string; containerName: string; messages: ChatMessage[]; connected: boolean; busy: boolean; statusText: string; nextStepOptions?: NextStepOption[]; liveTurnUsage?: TokenUsage | null; closed?: { code: number; reason: string } | null; unreachable?: string | null; hasOlder?: boolean; hasNewer?: boolean; holdScrollUntil?: number }
   /** This lane's store key — for anything that reads or writes session state.
    *  The agent id lives on `session.containerId`. */
   sessionKey: string
@@ -756,6 +759,7 @@ function ChatContent({
   const conn = useAgentConnection(session.containerId)
   const { attachments, addFiles, removeAttachment, clearAttachments, handlePasteEvent, pasteFromClipboard } = useFileAttachments(conn)
   const loadOlder = useChatStore((s) => s.loadOlder)
+  const loadNewer = useChatStore((s) => s.loadNewer)
 
   // Auto-scroll to bottom when new messages arrive. Deliberately keyed only on
   // message COUNT — not statusText, which changes many times per turn and would
@@ -920,6 +924,18 @@ function ChatContent({
             <MessageBubble key={grp.items[0].id} message={grp.items[0]} sourceName={session.containerName} agentId={session.containerId} />
           )
         })}
+
+        {/* The window stops before newer rows (a jump, or paging back). */}
+        {session.hasNewer && (
+          <div className="mb-3 mt-1 flex justify-center">
+            <button
+              onClick={() => loadNewer(sessionKey)}
+              className="rounded-md px-2.5 py-1 text-xs text-zinc-500 transition-colors hover:bg-zinc-800/60 hover:text-zinc-300"
+            >
+              Later messages
+            </button>
+          </div>
+        )}
 
         {/* Busy indicator */}
         {session.busy && (
@@ -1228,12 +1244,25 @@ function TopicsMenu({ sessionKey, anchor, onClose }: {
   const busy = useChatStore((s) => s.sessions.get(sessionKey)?.busy ?? false)
   const jumpToTopic = useChatStore((s) => s.jumpToTopic)
   const resumeTopic = useChatStore((s) => s.resumeTopic)
+  const renameTopic = useChatStore((s) => s.renameTopic)
+  // The row being renamed (by its log row id, else its message id) and the draft.
+  const [editing, setEditing] = useState<{ id: string; value: string } | null>(null)
 
   useEffect(() => {
     let alive = true
     fetchTopics(sessionKey).then((list) => { if (alive) setTopics(list) })
     return () => { alive = false }
   }, [sessionKey])
+
+  const rowKey = (t: TopicInfo) => (t.rowId !== undefined ? `r${t.rowId}` : (t.messageId ?? ''))
+  const commitRename = (t: TopicInfo) => {
+    if (!editing) return
+    const value = editing.value.replace(/\s+/g, ' ').trim().slice(0, 120)
+    setEditing(null)
+    if (value === (t.title || '')) return
+    renameTopic(sessionKey, { rowId: t.rowId, messageId: t.messageId }, value)
+    setTopics((prev) => prev ? prev.map((x) => (x === t ? { ...x, title: value } : x)) : prev)
+  }
 
   // Newest first; the current topic is the newest row on the agent's session.
   const rows = useMemo(() => (topics ? [...topics].reverse() : null), [topics])
@@ -1284,20 +1313,48 @@ function TopicsMenu({ sessionKey, anchor, onClose }: {
           {rows?.map((t, i) => {
             const current = i === currentIdx
             const canResume = !!t.agentSessionId && t.agentSessionId !== agentSessionId
+            const isEditing = editing?.id === rowKey(t)
             return (
               <div key={t.rowId ?? t.messageId ?? i} className="flex items-center gap-1 px-2 py-0.5">
-                <button
-                  onClick={() => jump(t)}
-                  title="Jump to this topic"
-                  className="min-w-0 flex-1 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-zinc-800/60"
-                >
-                  <div className="truncate text-sm text-zinc-200">{topicTitle(t)}</div>
-                  <div className="truncate text-[11px] text-zinc-500">
-                    {fmtTopicWhen(t.startedAt)} · {t.messageCount} message{t.messageCount === 1 ? '' : 's'}
-                    {current && <span className="ml-1.5 rounded bg-violet-600/20 px-1 text-[10px] text-violet-700 dark:text-violet-300">current</span>}
-                  </div>
-                </button>
-                {canResume && (
+                {isEditing ? (
+                  <input
+                    autoFocus
+                    value={editing.value}
+                    maxLength={120}
+                    placeholder={topicTitle(t)}
+                    aria-label="Topic title"
+                    onChange={(e) => setEditing({ id: rowKey(t), value: e.target.value })}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') { e.preventDefault(); commitRename(t) }
+                      if (e.key === 'Escape') { e.preventDefault(); setEditing(null) }
+                    }}
+                    onBlur={() => commitRename(t)}
+                    className="min-w-0 flex-1 rounded-md border border-violet-500/50 bg-zinc-950 px-2 py-1.5 text-sm text-zinc-100 outline-none"
+                  />
+                ) : (
+                  <button
+                    onClick={() => jump(t)}
+                    title="Jump to this topic"
+                    className="min-w-0 flex-1 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-zinc-800/60"
+                  >
+                    <div className="truncate text-sm text-zinc-200">{topicTitle(t)}</div>
+                    <div className="truncate text-[11px] text-zinc-500">
+                      {fmtTopicWhen(t.startedAt)} · {t.messageCount} message{t.messageCount === 1 ? '' : 's'}
+                      {current && <span className="ml-1.5 rounded bg-violet-600/20 px-1 text-[10px] text-violet-700 dark:text-violet-300">current</span>}
+                    </div>
+                  </button>
+                )}
+                {!isEditing && (
+                  <button
+                    onClick={() => setEditing({ id: rowKey(t), value: t.title || '' })}
+                    title="Rename this topic"
+                    aria-label="Rename topic"
+                    className="shrink-0 rounded-md p-1.5 text-zinc-600 transition-colors hover:bg-zinc-800/60 hover:text-zinc-200"
+                  >
+                    <Pencil className="h-3.5 w-3.5" />
+                  </button>
+                )}
+                {canResume && !isEditing && (
                   <button
                     onClick={() => resume(t)}
                     disabled={busy}
@@ -1325,6 +1382,17 @@ function topicTitle(t: TopicInfo): string {
   if (t.action === 'clear') return 'Context cleared'
   if (t.action === 'resume') return 'Back on an earlier topic'
   return 'New topic'
+}
+
+/** Where a turn came from, as the person would say it. */
+function viaLabel(via: string): string {
+  switch (via) {
+    case 'whatsapp': return 'WhatsApp'
+    case 'telegram': return 'Telegram'
+    case 'device': return 'stick'
+    case 'glasses': return 'glasses'
+    default: return via
+  }
 }
 
 function fmtTopicWhen(ts: string): string {
@@ -1994,6 +2062,7 @@ const MessageBubble = memo(function MessageBubble({ message, sourceName, agentId
             <MarkdownMessage content={processImagePaths(message.content, agentConn?.host, agentConn?.port, agentConn?.auth)} />
           </div>
           <span className="mt-1 block text-right text-[10px] text-zinc-500">
+            {message.via && <span className="mr-1.5 text-zinc-400">via {viaLabel(message.via)}</span>}
             {formatTime(message.timestamp)}
           </span>
         </div>
@@ -2035,10 +2104,16 @@ const MessageBubble = memo(function MessageBubble({ message, sourceName, agentId
       return (
         <div id={`fd-msg-${message.id}`} data-topic={action} className="my-4 flex items-center gap-3 text-[11px] text-zinc-500">
           <div className="h-px flex-1 bg-zinc-800" />
-          <span className="flex items-center gap-1.5 whitespace-nowrap font-medium">
-            <Icon className="h-3.5 w-3.5 text-zinc-600" />
-            {message.content || 'New topic'}
-            <span className="font-normal text-zinc-600">{formatTime(message.timestamp)}</span>
+          <span className="flex min-w-0 items-center gap-1.5 whitespace-nowrap font-medium">
+            <Icon className="h-3.5 w-3.5 shrink-0 text-zinc-600" />
+            <span className="truncate">
+              {message.content || 'New topic'}
+              {/* A session named like its title (a scheduled task's) says it once. */}
+              {message.topic.title && !(message.content || '').endsWith(message.topic.title) && (
+                <span className="text-zinc-400"> · {message.topic.title}</span>
+              )}
+            </span>
+            <span className="shrink-0 font-normal text-zinc-600">{formatTime(message.timestamp)}</span>
           </span>
           <div className="h-px flex-1 bg-zinc-800" />
         </div>
@@ -2109,7 +2184,17 @@ const MessageBubble = memo(function MessageBubble({ message, sourceName, agentId
 
   return (
     <div className="group mb-3 flex flex-col items-start gap-0.5">
-      <div className={`max-w-[85%] rounded-xl rounded-bl-sm bg-zinc-800/60 px-3.5 py-2.5 ${message.replay ? 'opacity-60' : ''}`}>
+      <div className={`max-w-[85%] rounded-xl rounded-bl-sm bg-zinc-800/60 px-3.5 py-2.5 ${message.replay ? 'opacity-60' : ''} ${message.task ? 'border-l-2 border-amber-500/60' : ''}`}>
+        {message.task && (
+          <button
+            onClick={() => useScheduledStore.getState().openTasks(message.task!.id)}
+            className="mb-1.5 flex items-center gap-1.5 text-[11px] font-medium text-amber-700 hover:underline dark:text-amber-400"
+            title="Open this scheduled task and its history"
+          >
+            <AlarmClock className="h-3.5 w-3.5" />
+            Scheduled · {message.task.name}
+          </button>
+        )}
         <div className="fd-markdown text-sm text-zinc-300">
           <MarkdownMessage content={processImagePaths(cleanContent, agentConn?.host, agentConn?.port, agentConn?.auth)} />
         </div>

@@ -792,6 +792,29 @@ When a chat user asks for a spoken reply and the agent made none, the chat bridg
 
 **The hotkey and the web mic** use Soniox realtime streaming (or OpenAI Whisper / Gemini as a fallback; `tools.screen_capture.stt_provider` picks one). Under Flight Deck they get a short-lived Soniox key for each session.
 
+### telegram_inbox
+
+Read the owner's Telegram, the way the mail tools read email. **Read-only**: there is no way to send, reply or mark anything read. The tool appears only while the owner keeps a Telegram inbox in Flight Deck, and only for the owner (never during a shared-agent member's turn).
+
+Flight Deck keeps the inbox through the deck's team Telegram bot:
+
+- **Private chats.** The user connects the team bot in Telegram → **Settings → Chat Automation** (Telegram 12.7 or newer; with Premium, **Settings → Telegram Business → Chatbots** works too) and picks which chats it may see. Telegram then hands the bot both sides of those chats, their edits and their deletions. Older history isn't available: the inbox starts when the connection does.
+- **Groups.** The user adds the team bot to a group, or sends `/inbox` in a group it's already in (`/inbox off` stops). The bot tells the members once that it reads along, and never posts again. Anyone else who adds the bot sees it leave.
+
+The user turns it on in **Connections → Telegram → Inbox** with explicit consent, after linking Telegram to the team bot. Turning it off, or disconnecting Telegram, deletes everything kept. Text and names are encrypted at rest with a key file kept apart from the database (`<FD home>/data_key`, or `FD_DATA_KEY_FILE`; needs the `cryptography` package). Messages are kept for 30 days by default (7, 30, 90 or 365). An admin can switch the inbox off for the deck in **Admin → Integrations**. For groups, the bot needs group privacy off in @BotFather or admin rights in the group; for private chats it needs **Secretary Mode** on in @BotFather (Admin → Integrations shows both).
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `action` | string | yes | `chats` (list them), `read` (one chat, oldest first), `recent` (newest across all chats), `search` (every word of `query`) |
+| `chat` | string | read | A chat's id or (part of) its name; optional for `search` |
+| `query` | string | search | Words that must all appear (text, sender, chat or attachment) |
+| `since` / `until` | string | no | `24h`, `7d`, `90m`, a date or an ISO time |
+| `limit` | integer | no | Default 50, max 200 |
+
+Attachments show as a short description (`[photo]`, `[voice message (12s)]`, `[file: offer.pdf]`), not as files. The output reminds the model that the text was written by other people and is information, not instructions.
+
+**What's new, every turn.** On the owner's own live turns the agent also gets one line in its turn context, e.g. *Telegram since your last turn: 3 new from "Ana Kovač", 12 new in "Obitelj" (group)*. The line has counts and chat names only, never message text. It is fetched once at the start of the turn. Each agent keeps its own place: the line moves it forward, and so does reading a chat (or `recent`) with the tool; a search doesn't. The first line an agent gets covers the last day. Messages the owner sent and deleted messages don't count. Scheduled, autonomous, peer and worker turns don't get the line and don't move the place, so a cron job never uses up "new" before the user has seen it. Neither do shared-agent members, public sessions or BotPort tasks.
+
 ### send_mail
 
 Send email via SMTP, Mailgun, or SendGrid.

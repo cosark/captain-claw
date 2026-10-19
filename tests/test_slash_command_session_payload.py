@@ -99,7 +99,7 @@ async def test_new_names_the_session_it_switched_to(ws):
     await handle_command(s, ws, "/new")
 
     r = _result(s)
-    assert r["session"] == {"id": "fresh", "name": "web-session", "message_count": 0}
+    assert r["session"] == {"id": "fresh", "name": "web-session", "title": "", "message_count": 0}
     assert sm.last_active == "fresh"
 
 
@@ -115,7 +115,7 @@ async def test_session_switch_names_the_resumed_session(ws):
 
     r = _result(s)
     assert "Switched" in r["content"]
-    assert r["session"] == {"id": "old", "name": "trip", "message_count": 2}
+    assert r["session"] == {"id": "old", "name": "trip", "title": "", "message_count": 2}
 
 
 async def test_clear_keeps_the_same_session(ws):

@@ -252,6 +252,14 @@ def _build_replay_batch(session) -> list[dict]:
                 "timestamp": timestamp,
                 "model": model,
             }
+            if isinstance(msg.get("task"), dict):
+                # A scheduled task's result mirrored here: the client shows
+                # (and matches) the result itself, with the task's label —
+                # the bracketed note line is for the model.
+                payload["task"] = msg["task"]
+                head, sep, rest = content.partition("\n")
+                if sep and head.startswith("[") and head.endswith("]"):
+                    payload["content"] = rest
             if msg.get("feedback"):
                 payload["feedback"] = msg["feedback"]
             # Where the message came from (human, corrective, fleet notice…),
@@ -424,6 +432,10 @@ async def handle_ws_message(
         # shown there but not relayed again by the chat bridges.
         fd_delivers = bool(isinstance(data.get("automation"), dict)
                            and data["automation"].get("fd_delivers") is True)
+        # A Flight Deck scheduled task: its turn runs in the task's own session.
+        from captain_claw.web.chat_handler import task_marker
+        task = (task_marker(data["automation"].get("task"))
+                if automation is not None and isinstance(data.get("automation"), dict) else None)
 
         if not content and not has_attachments:
             return
@@ -497,6 +509,7 @@ async def handle_ws_message(
                 no_rephrase=bool(data.get("no_rephrase", False)),
                 automation=automation,
                 fd_delivers=fd_delivers,
+                task=task,
                 # A scheduled job delivering to WhatsApp: where its files go.
                 whatsapp_media_to=str(data.get("whatsapp_media_to", "") or "").strip() or None,
             )
@@ -535,6 +548,11 @@ async def handle_ws_message(
             try:
                 from captain_claw import soniox_client
                 await soniox_client.available()
+            except Exception:
+                pass
+            try:
+                from captain_claw import telegram_inbox_client
+                await telegram_inbox_client.refresh_connected()
             except Exception:
                 pass
             # The action catalog is the authority for a deterministic invocation,

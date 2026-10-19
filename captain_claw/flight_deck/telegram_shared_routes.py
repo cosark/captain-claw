@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
+from captain_claw.flight_deck import telegram_inbox
 from captain_claw.flight_deck import telegram_shared as ts
 from captain_claw.flight_deck.admin_routes import require_admin
 from captain_claw.flight_deck.agent_identity import require_agent_caller
@@ -188,12 +189,23 @@ async def disconnect(user: dict = Depends(get_current_user)) -> dict[str, Any]:
     if link:
         await db.delete_telegram_link(user["id"])
         await ts.reload_links(db)
+        # The Telegram inbox rides on this link: it goes with it.
+        await _forget_inbox(db, user["id"])
         if link.get("tg_user_id"):
             await ts.send_text(link["tg_user_id"], (
                 "Disconnected — this bot no longer forwards your messages. "
                 "Reconnect any time in Flight Deck → Connections → Telegram."
             ))
     return await _me(user)
+
+
+async def _forget_inbox(db, user_id: str) -> None:
+    """Delete the user's Telegram inbox (nothing to do if they never had one)."""
+    try:
+        if await db.get_tg_inbox_settings(user_id):
+            await telegram_inbox.forget(db, user_id)
+    except Exception as exc:
+        log.warning("Telegram inbox not cleared: %s", type(exc).__name__)
 
 
 # ── admin routes ────────────────────────────────────────────────────
@@ -218,6 +230,7 @@ async def _admin_view() -> dict[str, Any]:
             "configured": bool(cfg["token"]),
             "enabled": cfg["enabled"],
             "auto_approve": cfg["auto_approve"],
+            "inbox": cfg["inbox"],
             "bot_username": cfg["bot_username"],
             "bot_name": cfg["bot_name"],
             "token_hint": ts.token_hint(cfg["token"]),
@@ -229,6 +242,7 @@ async def _admin_view() -> dict[str, Any]:
 
 @router.get("/fd/admin/telegram-shared")
 async def admin_get(_admin: dict = Depends(require_admin)) -> dict[str, Any]:
+    await ts.refresh_flags()
     return await _admin_view()
 
 
@@ -260,6 +274,8 @@ async def admin_put(request: Request, _admin: dict = Depends(require_admin)) -> 
     newly_auto = data.get("auto_approve") is True and not cfg["auto_approve"]
     if isinstance(data.get("auto_approve"), bool):
         cfg["auto_approve"] = data["auto_approve"]
+    if isinstance(data.get("inbox"), bool):
+        cfg["inbox"] = data["inbox"]
     await ts.save_config(db, cfg)
     await ts.start(db)
     if newly_auto:
@@ -276,7 +292,8 @@ async def admin_clear(_admin: dict = Depends(require_admin)) -> dict[str, Any]:
     token picks them up again."""
     db = get_db()
     cfg = await ts.load_config(db)
-    await ts.save_config(db, {"enabled": True, "auto_approve": cfg["auto_approve"]})
+    await ts.save_config(db, {"enabled": True, "auto_approve": cfg["auto_approve"],
+                              "inbox": cfg["inbox"]})
     await ts.start(db)
     return await _admin_view()
 
@@ -325,6 +342,7 @@ async def admin_approve(user_id: str, admin: dict = Depends(require_admin)) -> d
 @router.post("/fd/admin/telegram-shared/links/{user_id}/reject")
 async def admin_reject(user_id: str, admin: dict = Depends(require_admin)) -> dict[str, Any]:
     link = await _decide(user_id, "rejected", admin)
+    await _forget_inbox(get_db(), user_id)
     if link.get("tg_user_id"):
         await ts.send_text(link["tg_user_id"], "Your access to this bot was turned off by an admin.")
     await get_db().add_notification(
@@ -342,6 +360,7 @@ async def admin_remove(user_id: str, _admin: dict = Depends(require_admin)) -> d
     if link:
         await db.delete_telegram_link(user_id)
         await ts.reload_links(db)
+        await _forget_inbox(db, user_id)
         if link.get("tg_user_id"):
             await ts.send_text(link["tg_user_id"], "Your access to this bot was removed by an admin.")
     return await _admin_view()

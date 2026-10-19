@@ -102,6 +102,7 @@ _TOOL_PROMPT_DESCRIPTIONS: dict[str, str] = {
     "pptx_extract": "Extract a single .pptx file into markdown. ONLY for .pptx files — never use on .pdf/.docx/.xlsx. For multiple files in a folder use summarize_files instead.",
     "pocket_tts": "Convert text to local speech audio and save as MP3",
     "audio": "Speech-to-text and text-to-speech (Soniox): transcribe an audio/video file (voice note, recording, meeting) to text, optionally with timestamps; speak text as an MP3 voice recording the chat sends to the user automatically; list voices.",
+    "telegram_inbox": "Read the user's Telegram (read-only): their connected private chats and groups with the team bot — list chats, read one chat, recent messages, search. Never sends or replies.",
     "send_mail": "Send emails via SMTP — only when the user asked for that email. Supports to, cc, bcc, subject, body, and file attachments.",
     "clipboard": "Read or write the system clipboard. Supports text, images, and files.",
     "google_drive": "Google Drive/Docs/Sheets/Slides — list (folder_id), search, read (returns content inline: Docs/Sheets/Slides exported, PDF/DOCX/XLSX/PPTX extracted), info (metadata), download (saves a local copy and returns its path — for scripts/extract tools), upload (local file → Drive), create, update. Takes a file/folder ID or a full Drive/Docs URL — never web_fetch/browser/curl a Google URL. Edit an existing Google Sheet/Doc IN PLACE — sheet_read/sheet_update/sheet_append/sheet_clear, doc_read/doc_replace_text/doc_append_text/doc_insert_text — never upload a modified copy.",
@@ -160,6 +161,7 @@ _TOOL_PROMPT_DESCRIPTIONS_MICRO: dict[str, str] = {
     "pptx_extract": "single .pptx → markdown (ONLY .pptx, never .pdf; for multiple files use summarize_files)",
     "pocket_tts": "text-to-speech MP3",
     "audio": "Soniox: transcribe an audio/video file to text (timestamps optional); speak text as an MP3 sent to the user; list voices",
+    "telegram_inbox": "read-only Telegram: chats / read one chat / recent / search; never sends",
     "send_mail": "send emails via SMTP (only when asked)",
     "whatsapp_send_file": "send a saved file or picture to a WhatsApp chat (defaults to current chat; photos as images)",
     "intentions": "record future actions: user notes-to-self + your own proactive intentions",
@@ -2403,6 +2405,7 @@ class AgentContextMixin:
             ImageGenTool,
             JevTool,
             AudioTool,
+            TelegramInboxTool,
             MicrosoftCalendarTool,
             MicrosoftMailTool,
             MicrosoftOneDriveTool,
@@ -2437,6 +2440,7 @@ class AgentContextMixin:
             IntentionsTool,
             VideoVisionTool,
             TopicsTool,
+            SessionsTool,
             SessionHistoryTool,
             VfsTool,
             CvTool,
@@ -2524,12 +2528,17 @@ class AgentContextMixin:
                 # Hidden until a Soniox key is usable (the owner's in Flight
                 # Deck, or SONIOX_API_KEY standalone) — see the registry.
                 self.tools.register(AudioTool(), metadata={"requires_soniox": True})
+            elif tool_name == "telegram_inbox":
+                # Hidden until the owner keeps a Telegram inbox in Flight Deck.
+                self.tools.register(TelegramInboxTool(), metadata={"requires_telegram_inbox": True})
             elif tool_name == "whatsapp_send_file":
                 self.tools.register(WhatsAppSendFileTool())
             elif tool_name == "intentions":
                 self.tools.register(IntentionsTool())
             elif tool_name == "topics":
                 self.tools.register(TopicsTool())
+            elif tool_name == "sessions":
+                self.tools.register(SessionsTool())
             elif tool_name == "vfs":
                 self.tools.register(VfsTool())
             elif tool_name == "history":
@@ -4406,6 +4415,22 @@ class AgentContextMixin:
             )
         return "Your reply goes to a WhatsApp chat. To send a file or picture there, use whatsapp_send_file."
 
+    def _telegram_news_note(self) -> str:
+        """One line of what others wrote on the owner's Telegram since this
+        agent's last look — only when the turn fetched it (owner's live turns)."""
+        news = getattr(self, "_turn_telegram_news", None)
+        if not news:
+            return ""
+        from captain_claw.telegram_inbox_client import news_line
+
+        if self.instructions.use_nano:
+            detail = "nano"
+        elif self.instructions.use_micro:
+            detail = "micro"
+        else:
+            detail = "normal"
+        return news_line(news, detail=detail)
+
     def _surface_rules_for_turn(self) -> str:
         """The chat surface's rules when this turn came from one (glasses,
         WhatsApp, Messenger): stored when the surface's block first arrived,
@@ -4898,6 +4923,10 @@ class AgentContextMixin:
             _delivery_text = self._whatsapp_delivery_note()
             if _delivery_text:
                 env_note = [("whatsapp_delivery", _delivery_text)] + env_note
+            # What's new on the owner's Telegram (fetched at turn start).
+            _telegram_text = self._telegram_news_note()
+            if _telegram_text:
+                env_note = [("telegram_news", _telegram_text)] + env_note
             self._turn_env_tokens = self._count_tokens(_env_text) if _env_text else 0
             reserved_tokens = 0
             if turn_anchor_pos is not None:

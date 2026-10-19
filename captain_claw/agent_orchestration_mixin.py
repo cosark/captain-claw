@@ -175,6 +175,9 @@ _ECO_CORE_TOOLS: frozenset[str] = frozenset({
     # Jev-first: judgments come up in any task and any language, so the schema
     # is always sent; the registry still hides jev until the owner has a key.
     "jev",
+    # The owner's Telegram: "what's new?" comes in any language. Hidden by the
+    # registry unless the owner keeps a Telegram inbox.
+    "telegram_inbox",
 })
 
 # ── Nano-mode: barebone tool allowlist for tiny local models. ──
@@ -999,6 +1002,21 @@ class AgentOrchestrationMixin:
         except Exception as exc:  # noqa: BLE001 — surface a clean message
             return f"I couldn't start the Basna run: {exc}"
 
+
+    def _turn_wants_telegram_news(self) -> bool:
+        """The owner's own live turn on an owner instance (see the Telegram
+        news fetch in complete())."""
+        if getattr(self, "_speaker_scoped", False) is True:
+            return False
+        turn = getattr(self, "_turn_origin", None)
+        if not (isinstance(turn, tuple) and turn and turn[0] == "human"):
+            return False
+        try:
+            from captain_claw.shared_usage import usage_allowed
+
+            return usage_allowed(self)
+        except Exception:
+            return False
     async def complete(self, user_input: str) -> str:
         """Process user input and return response.
 
@@ -1163,6 +1181,19 @@ class AgentOrchestrationMixin:
         self._deferred_scale_attempts: int = 0
         planning_pipeline: dict[str, Any] | None = None
         recent_source_urls: list[str] = []
+        # What's new on the owner's Telegram since this agent's last look, for
+        # the turn's context block (one line, counts only). Fetched once, here,
+        # for the sync _build_messages path — and only on the owner's own live
+        # turns on an owner instance: the look moves the agent's cursor, so a
+        # cron / peer / worker turn would use up "new" before the user saw it,
+        # and a member, public or BotPort turn must never see the owner's chats.
+        self._turn_telegram_news = None
+        if self._turn_wants_telegram_news():
+            try:
+                from captain_claw import telegram_inbox_client
+                self._turn_telegram_news = await telegram_inbox_client.news()
+            except Exception:
+                self._turn_telegram_news = None
         # Pre-populate playbook context cache for the sync _build_messages path.
         if hasattr(self, "_build_playbook_context_note"):
             try:
@@ -2162,6 +2193,12 @@ class AgentOrchestrationMixin:
                 try:
                     from captain_claw import payments_client
                     await payments_client.refresh()
+                except Exception:
+                    pass
+                # Telegram inbox (owner-only): does the owner keep one?
+                try:
+                    from captain_claw import telegram_inbox_client
+                    await telegram_inbox_client.refresh_connected()
                 except Exception:
                     pass
 

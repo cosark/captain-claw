@@ -40,6 +40,7 @@ from captain_claw.tools.microsoft_calendar import MicrosoftCalendarTool
 from captain_claw.tools.microsoft_mail import MicrosoftMailTool
 from captain_claw.tools.microsoft_onedrive import MicrosoftOneDriveTool
 from captain_claw.tools.jev import JevTool
+from captain_claw.tools.telegram_inbox import TelegramInboxTool
 from captain_claw.tools.personality import PersonalityTool
 from captain_claw.tools.todo import TodoTool
 from captain_claw.tools.contacts import ContactsTool
@@ -67,6 +68,7 @@ from captain_claw.tools.desktop_action import DesktopActionTool
 from captain_claw.tools.summarize_files import SummarizeFilesTool
 from captain_claw.tools.insights import InsightsTool
 from captain_claw.tools.conversation_topics import TopicsTool
+from captain_claw.tools.sessions import SessionsTool
 from captain_claw.tools.session_history import SessionHistoryTool
 from captain_claw.tools.cron_tool import CronTool
 from captain_claw.tools.twitter import TwitterTool
@@ -118,6 +120,7 @@ __all__ = [
     "MicrosoftOneDriveTool",
     "JevTool",
     "AudioTool",
+    "TelegramInboxTool",
     "TodoTool",
     "ContactsTool",
     "ScriptsTool",
@@ -144,6 +147,7 @@ __all__ = [
     "SummarizeFilesTool",
     "InsightsTool",
     "TopicsTool",
+    "SessionsTool",
     "SessionHistoryTool",
     "CronTool",
     "TwitterTool",

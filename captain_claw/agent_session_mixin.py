@@ -556,6 +556,102 @@ class AgentSessionMixin:
 
         return self._fallback_session_description(session)
 
+    # ── Topic titles ─────────────────────────────────────────────────
+
+    @staticmethod
+    def fallback_session_title(target_session: Session | None) -> str:
+        """The first user turn, trimmed — what a Topics list would show anyway.
+        Typed slash commands are control lines, not turns."""
+        for msg in (getattr(target_session, "messages", None) or []):
+            if msg.get("role") != "user":
+                continue
+            text = " ".join(str(msg.get("content") or "").split())
+            if not text or text.startswith("/"):
+                continue
+            if len(text) <= 48:
+                return text
+            cut = text[:47]
+            if " " in cut:
+                cut = cut.rsplit(" ", 1)[0]   # whole words only
+            return cut.rstrip(" ,;:") + "…"
+        return ""
+
+    @staticmethod
+    def sanitize_session_title(text: str) -> str:
+        """The title in a model reply, or "" when there is none to trust.
+
+        Trusted: what is between ``<title>`` tags (the prompt asks for them),
+        else a reply that is a single short line once ``<think>`` blocks are
+        gone. Anything longer — a reasoning model that spent its budget
+        thinking out loud, a paraphrase of the prompt — yields "" so the
+        caller falls back to the first user message rather than labelling a
+        topic with leaked reasoning. Quotes and a "Title:" prefix stripped,
+        no trailing punctuation, at most 8 words and 60 characters."""
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        tagged = re.search(r"<title>(.*?)</title>", raw, flags=re.IGNORECASE | re.DOTALL)
+        if tagged:
+            line = " ".join(tagged.group(1).split())
+        else:
+            body = re.sub(
+                r"<\s*(think|thinking|reasoning)\s*>.*?(?:<\s*/\s*\1\s*>|$)", " ", raw,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+            if len(lines) != 1 or len(lines[0].split()) > 8:
+                return ""
+            line = lines[0]
+        line = line.strip("\"'`“”«»*_ ").strip()
+        line = re.sub(r"^(?:title|topic|naslov|tema)\s*:\s*", "", line, flags=re.IGNORECASE)
+        line = line.strip("\"'`“”«»*_ ").rstrip(".!?:;,").strip()
+        words = line.split()
+        if len(words) > 8:
+            line = " ".join(words[:8])
+        return line[:60].strip()
+
+    async def generate_session_title(self, target_session: Session | None = None) -> str:
+        """A short title (≤ 6 words) for *target_session* from its opening
+        turns — one small LLM call; the first user message when that fails.
+        Empty for a session with no messages."""
+        session = target_session or self.session
+        if not session or not session.messages:
+            return ""
+        fallback = self.fallback_session_title(session)
+        formatted = self._format_compaction_messages(
+            session.messages[:8],
+            max_total_chars=4000,
+            max_item_chars=400,
+        )
+        if not formatted.strip():
+            return fallback
+        messages = [
+            Message(
+                role="system",
+                content=self.instructions.load("session_title_system_prompt.md"),
+            ),
+            Message(
+                role="user",
+                content=self.instructions.render(
+                    "session_title_user_prompt.md",
+                    conversation_excerpt=formatted,
+                ),
+            ),
+        ]
+        try:
+            response = await self._complete_with_guards(
+                messages=messages,
+                tools=None,
+                interaction_label="session_title",
+                max_tokens=120,
+            )
+            title = self.sanitize_session_title(response.content or "")
+            if title:
+                return title
+        except Exception as e:
+            log.warning("Session title generation failed, using fallback", error=str(e))
+        return fallback
+
     def archive_current_session_to_history(self) -> int:
         """Freeze the active session's raw messages into append-only history
         memory — the same verbatim preservation compaction does before dropping

@@ -26,8 +26,10 @@ interface Job {
   agent_auth: string
   prompt: string
   flow_id?: string
-  delivery_kind: 'whatsapp' | 'channel'
+  delivery_kind: 'whatsapp' | 'channel' | 'agent'
   delivery_target: string
+  /** A kiosk Scheduled task (delivery_kind 'agent'): where it delivers. */
+  delivery?: { chat: boolean; email: boolean; telegram: boolean; email_to: string } | null
   enabled: number
   ignore_quiet_hours: number
   created_at: string
@@ -178,7 +180,7 @@ export function SchedulerPage() {
       agent_auth: job.agent_auth,
       prompt: job.prompt,
       flow_id: job.flow_id || '',
-      delivery_kind: job.delivery_kind,
+      delivery_kind: job.delivery_kind === 'agent' ? 'whatsapp' : job.delivery_kind,
       delivery_target: job.delivery_target,
       ignore_quiet_hours: job.ignore_quiet_hours === 1,
     })
@@ -430,7 +432,9 @@ export function SchedulerPage() {
                       <span className="font-semibold truncate">{job.name || '(unnamed)'}</span>
                       <span className="rounded bg-zinc-800 px-1.5 py-0.5 font-mono text-xs text-cyan-400/80">{job.schedule}</span>
                       <span className="flex items-center gap-1 rounded bg-zinc-800 px-1.5 py-0.5 text-xs text-zinc-400">
-                        {job.delivery_kind === 'whatsapp'
+                        {job.delivery_kind === 'agent'
+                          ? <><MessageSquare className="h-3 w-3" /> {[job.delivery?.chat && 'chat', job.delivery?.email && 'email', job.delivery?.telegram && 'telegram'].filter(Boolean).join(' + ')}</>
+                          : job.delivery_kind === 'whatsapp'
                           ? <><MessageSquare className="h-3 w-3" /> {job.delivery_target}</>
                           : <><Radio className="h-3 w-3" /> {job.delivery_target}</>}
                       </span>

@@ -26,6 +26,8 @@ static uint32_t holdUntilMs = 0;
 static uint32_t soundStartMs = 0;         // when the speaker last started from silence…
 static size_t soundStartPos = 0;          // …and from which sample
 static int carry = -1;                    // odd byte waiting for its pair
+static bool replaying = false;            // the clip is playing again (replay())
+static bool finished = false;             // it played to its end by itself (takeFinished())
 
 // ── a line spoken aside: its own small buffer and speaker channel ──
 static constexpr size_t kAsideCap = 6 * 24000;  // samples (6 s at 24 kHz)
@@ -73,6 +75,13 @@ void cue() {
   if (!M5.Speaker.isEnabled()) M5.Speaker.begin();
   M5.Speaker.tone(1046, 110, 1, true);   // C6
   M5.Speaker.tone(1568, 160, 1, false);  // then G6
+}
+
+void cueEnd() {
+  if (micOn || streamOpen) return;
+  if (!M5.Speaker.isEnabled()) M5.Speaker.begin();
+  M5.Speaker.tone(1568, 110, 1, true);   // G6
+  M5.Speaker.tone(1046, 160, 1, false);  // then C6
 }
 
 void click() {
@@ -162,6 +171,7 @@ bool playBegin(uint32_t rate, uint32_t holdMs) {
   playRate = rate;
   playPos = writePos;
   carry = -1;
+  replaying = false;
   streamOpen = true;
   streamEnded = false;
   started = false;
@@ -224,12 +234,19 @@ void playPoll() {
   }
   if (streamEnded && playPos == writePos && M5.Speaker.isPlaying(0) == 0) {
     streamOpen = false;  // stream finished and fully played
+    finished = !replaying;
   }
 }
 
 bool playing() { return streamOpen; }
 
 bool sounding() { return streamOpen && started; }
+
+bool takeFinished() {
+  bool f = finished;
+  finished = false;
+  return f;
+}
 
 int outputLevel() {
   // Where the speaker is now, assuming it has played without gaps since it
@@ -290,6 +307,7 @@ void replay() {
   if (M5.Speaker.isEnabled()) M5.Speaker.stop(0);
   speakerOn();
   playPos = 0;
+  replaying = true;
   if (!arriving) carry = -1;
   streamOpen = true;
   streamEnded = !arriving;

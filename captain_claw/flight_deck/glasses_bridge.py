@@ -334,6 +334,13 @@ async def _forward_agent_msg(ch: "_ChannelState", data: dict) -> None:
                 event["fd_delivers"] = True
             if data.get("proactive"):
                 event["proactive"] = True  # e.g. an agent cron result
+            # A scheduled task's reply names the session it ran in (the
+            # scheduler keeps it, so the next run lands in the same one).
+            if isinstance(data.get("task_session"), dict):
+                event["task_session"] = {
+                    "id": str(data["task_session"].get("id") or ""),
+                    "name": str(data["task_session"].get("name") or ""),
+                }
             await _broadcast(ch, event)
         # We don't echo "user" chat_messages back — mobile already injected its
         # own "user" event for instant local display.

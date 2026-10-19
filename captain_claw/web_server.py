@@ -1307,6 +1307,9 @@ class WebServer:
             "model": model_details.get("model", ""),
             "provider": model_details.get("provider", ""),
             "description": (s.metadata or {}).get("description", ""),
+            # The short topic title a session gets when it is left behind
+            # (see slash_commands._title_session_in_background).
+            "title": str((s.metadata or {}).get("title") or ""),
             "message_count": len(s.messages),
             "tools": self._session_tools(agent),
             "skills": [] if _is_speaker_agent(agent) else [

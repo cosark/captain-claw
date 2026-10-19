@@ -276,8 +276,119 @@ def _sync_automation_agent(server: Any, agent: Any) -> None:
             agent.provider = base
 
 
+# ── Scheduled tasks: one agent session per task ──────────────────────
+#
+# A Flight Deck scheduled task (``automation.task`` on its frame) runs on the
+# automation lane's agent, but in the task's OWN session — found by the id
+# Flight Deck learned from its last run, else by name, else created — and the
+# lane goes back to its own session when the turn ends. So each task's runs
+# read as one conversation (searchable like any session, resumable in chat)
+# and the agent sees what it said last time.
+
+_TASK_ID_MAX = 64
+
+
+def task_marker(raw: Any) -> dict | None:
+    """``automation.task`` from a frame, cleaned: ``{id, name, session_id,
+    mirror}``, or None when it names no task."""
+    if not isinstance(raw, dict):
+        return None
+    tid = re.sub(r"[^A-Za-z0-9_-]", "", str(raw.get("id") or ""))[:_TASK_ID_MAX]
+    if not tid:
+        return None
+    name = " ".join(str(raw.get("name") or "").split())[:80] or "Scheduled task"
+    return {
+        "id": tid, "name": name,
+        "session_id": str(raw.get("session_id") or "").strip()[:128],
+        "mirror": raw.get("mirror") is not False,
+    }
+
+
+def task_session_name(task: dict) -> str:
+    return f"⏰ {task['name']}"
+
+
+def _live_session(server: Any, session_id: str) -> Any:
+    """The Session object a live agent of this process has open with
+    *session_id* (main, a lane, a public or member instance), or None."""
+    holders = [getattr(server, "agent", None)]
+    for pool in ("_lane_agents", "_public_agents", "_speaker_agents"):
+        holders.extend((getattr(server, pool, None) or {}).values())
+    for holder in holders:
+        session = getattr(holder, "session", None)
+        if session is not None and getattr(session, "id", None) == session_id:
+            return session
+    return None
+
+
+async def _task_session(server: Any, agent: Any, task: dict) -> Any:
+    """The task's session: its known one, else the newest of its name, else a
+    new one. Only a session marked as this task's is adopted (never someone
+    else's session that happens to share the id or name, never a member's)."""
+    from captain_claw.speaker import is_member_session
+
+    sm = agent.session_manager
+
+    def _ours(session: Any) -> bool:
+        meta = getattr(session, "metadata", None) or {}
+        return (session is not None and meta.get("scheduled_task") == task["id"]
+                and not is_member_session(session))
+
+    session = None
+    if task["session_id"]:
+        # Open elsewhere right now (the user reading it in chat): share that
+        # very object, so neither agent's save clobbers the other's turns.
+        session = _live_session(server, task["session_id"]) or await sm.load_session(task["session_id"])
+        if not _ours(session):
+            session = None
+    name = task_session_name(task)
+    if session is None:
+        by_name = await sm.load_session_by_name(name)
+        if _ours(by_name):
+            session = _live_session(server, by_name.id) or by_name
+    if session is None:
+        return await sm.create_session(name=name, metadata={
+            "scheduled_task": task["id"], "title": name,
+        })
+    if session.name != name:  # the task was renamed
+        session.name = name
+        session.metadata["title"] = name
+    return session
+
+
+async def enter_task_session(server: Any, agent: Any, task: dict) -> Any:
+    """Put *agent* on the task's session for this turn. Returns the session to
+    go back to afterwards, or None when there is nothing to undo."""
+    try:
+        session = await _task_session(server, agent, task)
+    except Exception as exc:
+        log.warning("Scheduled task session unavailable — running on the lane's own",
+                    task=task.get("id"), error=str(exc))
+        return None
+    previous = getattr(agent, "session", None)
+    if session is previous:
+        return None
+    agent.session = session
+    agent.refresh_session_runtime_flags()
+    return previous if previous is not None else False
+
+
+async def leave_task_session(agent: Any, previous: Any) -> None:
+    """Save the task's session and put *agent* back on *previous*."""
+    if previous is None:
+        return
+    try:
+        await agent.session_manager.save_session(agent.session)
+    except Exception as exc:
+        log.warning("Could not save a scheduled task's session", error=str(exc))
+    if previous is not False:
+        agent.session = previous
+        agent.refresh_session_runtime_flags()
+
+
 async def _mirror_automation_result(
     server: Any, ws: Any, automation: Any, reply: str, lane: str, *, fd_delivers: bool = False,
+    task: dict | None = None,
 ) -> None:
     """Bring an automated turn's result into the main chat (and the channels
     bound to it) once lane A is idle: shown live, and kept in the main
@@ -292,10 +403,13 @@ async def _mirror_automation_result(
         return
     label = mail_authority.KIND_LABELS.get(getattr(automation, "kind", ""), "automated turn")
     label = label[:1].upper() + label[1:]
+    if task:
+        label = f'Scheduled task "{task["name"]}"'
     pending = session.metadata.setdefault(PENDING_RESULTS_KEY, [])
     pending.append({"label": label, "lane": lane, "text": text,
                     "at": datetime.now(UTC).isoformat(),
-                    **({"fd_delivers": True} if fd_delivers else {})})
+                    **({"fd_delivers": True} if fd_delivers else {}),
+                    **({"task": {k: task[k] for k in ("id", "name", "session_id")}} if task else {})})
     del pending[: max(0, len(pending) - _PENDING_RESULTS_KEPT)]
     for _ in range(_MIRROR_WAIT_TICKS):
         if not server._busy:
@@ -314,17 +428,24 @@ async def flush_automation_results(server: Any, exclude: Any = None) -> int:
     pending = session.metadata.pop(PENDING_RESULTS_KEY, None) or []
     for item in pending:
         text = str(item.get("text") or "")
+        task = item.get("task") if isinstance(item.get("task"), dict) else None
         server._broadcast({
             "type": "chat_message", "role": "assistant", "content": text,
             "timestamp": item.get("at") or datetime.now(UTC).isoformat(),
             "automation_lane": item.get("lane") or "",
             **({"fd_delivers": True} if item.get("fd_delivers") else {}),
+            # A scheduled task's result: the chat labels it and links the task.
+            **({"task": task} if task else {}),
         }, exclude=exclude)
+        where = (f"ran in its own session \"{task_session_name(task)}\"" if task
+                 else f"from the {item.get('lane') or 'automation'} lane")
         session.add_message(
-            "assistant", f"[{item.get('label') or 'Automated turn'} — from the "
-                         f"{item.get('lane') or 'automation'} lane]\n{text}",
+            "assistant", f"[{item.get('label') or 'Automated turn'} — {where}]\n{text}",
             origin="system_note", origin_detail="automation_result",
         )
+        if task:
+            # A replay shows it as the live frame did: the result, labelled.
+            session.messages[-1]["task"] = task
     if pending:
         try:
             await main.session_manager.save_session(session)
@@ -533,6 +654,32 @@ def accepted_fields(client_msg_id: str = "") -> dict[str, Any]:
     return {"client_msg_id": client_msg_id} if client_msg_id else {}
 
 
+def turn_via(surface: str | None, ws: Any, whatsapp_waid: str = "", origin: Any = None) -> str:
+    """Where a turn came from, as the clients on the lane see it: the frame's
+    surface ("device", "glasses" …), "whatsapp" for the WhatsApp bridge,
+    else "web"."""
+    via = str(surface or getattr(ws, "_claw_surface", None) or "").strip().lower()
+    if not via:
+        kind = str((origin or {}).get("kind", "") or "").strip().lower() if isinstance(origin, dict) else ""
+        if whatsapp_waid or kind == "whatsapp":
+            via = "whatsapp"
+    return via or "web"
+
+
+def user_turn_frame(content: str, via: str, client_msg_id: str = "") -> dict[str, Any]:
+    """The user turn as every client on the lane sees it. ``via`` names the
+    surface it came from and ``client_msg_id`` the frame, so a web tab can
+    tell its own echo (dropped) from another surface's turn (kept, labelled
+    "via WhatsApp", "via stick")."""
+    return {
+        "type": "chat_message", "role": "user",
+        "content": content,
+        "timestamp": datetime.now(UTC).isoformat(),
+        "via": via,
+        **accepted_fields(client_msg_id),
+    }
+
+
 async def handle_chat(
     server: WebServer,
     ws: web.WebSocketResponse,
@@ -560,6 +707,7 @@ async def handle_chat(
     whatsapp_media_to: str | None = None,
     client_msg_id: str = "",
     fd_delivers: bool = False,
+    task: dict | None = None,
 ) -> bool:
     """Process a chat message through the agent.
 
@@ -591,6 +739,9 @@ async def handle_chat(
     from (a handheld device's battery and sensor readings when it sent the
     turn). They open the turn as ``[Context: …]`` lines and, like the notes,
     never count as the user's words.
+
+    *task* (a Flight Deck scheduled task, :func:`task_marker`) runs the
+    rerouted turn in the task's own session (see :func:`enter_task_session`).
     """
     from captain_claw.card_scrub import scrub_user_text
     from captain_claw.speaker import speaker_error, speaker_key_of
@@ -676,6 +827,8 @@ async def handle_chat(
         # Claimed now, not when the turn task starts: a second frame arriving
         # in between must see the lane taken.
         agent._lane_busy = True  # type: ignore[attr-defined]
+        if rerouted and task:
+            task = {**task, "previous": await enter_task_session(server, agent, task)}
         if rerouted:
             _sync_automation_agent(server, agent)
     else:
@@ -773,20 +926,14 @@ async def handle_chat(
         else:
             _send_msg = server._lane_send(lane)
         _send_msg({"type": "status", "status": "thinking", **accepted_fields(client_msg_id)})
-        _send_msg({
-            "type": "chat_message", "role": "user",
-            "content": effective_content,
-            "timestamp": datetime.now(UTC).isoformat(),
-        })
+        _send_msg(user_turn_frame(
+            effective_content, turn_via(surface, ws, whatsapp_waid, origin), client_msg_id))
     else:
         server._busy = True
         server._broadcast({"type": "status", "status": "thinking", **accepted_fields(client_msg_id)})
         server._thinking_callback("Thinking\u2026", phase="reasoning")
-        server._broadcast({
-            "type": "chat_message", "role": "user",
-            "content": effective_content,
-            "timestamp": datetime.now(UTC).isoformat(),
-        })
+        server._broadcast(user_turn_frame(
+            effective_content, turn_via(surface, ws, whatsapp_waid, origin), client_msg_id))
 
     # ── Task naming (runs concurrently with the agent) ────────────
     if not hasattr(server, "_recent_prompts"):
@@ -826,6 +973,7 @@ async def handle_chat(
         automation=automation,
         fd_delivers=fd_delivers,
         rerouted=bool(rerouted),
+        task=task if rerouted else None,
         reply_waid=_reply_waid(whatsapp_waid, origin, whatsapp_media_to if automation is not None else None),
         flow_text=user_words,
         flow_attach={
@@ -1290,6 +1438,7 @@ async def _run_agent(
     speaker_grant: str = "",
     turn_channel: str | None = None,
     non_image_attached: bool = False,
+    task: dict | None = None,
 ) -> None:
     """Background coroutine that drives the agent and finalises the turn.
 
@@ -1533,10 +1682,17 @@ async def _run_agent(
                 # Flight Deck delivers this automated result itself: a chat
                 # bridge on this lane (automation lane off) must not relay it.
                 **({"fd_delivers": True} if _fd_delivers_now else {}),
+                # A scheduled task: the session it ran in, for Flight Deck.
+                **({"task_session": {"id": agent.session.id, "name": agent.session.name}}
+                   if task and getattr(agent, "session", None) is not None else {}),
             })
-            if rerouted and automation is not None and automation.kind in MIRRORED_AUTOMATION_KINDS:
+            if (rerouted and automation is not None and automation.kind in MIRRORED_AUTOMATION_KINDS
+                    and (task is None or task.get("mirror", True))):
+                _task_ref = ({**task, "session_id": agent.session.id}
+                             if task and getattr(agent, "session", None) is not None else task)
                 asyncio.create_task(_mirror_automation_result(
-                    server, ws, automation, response, lane, fd_delivers=_fd_delivers_now))
+                    server, ws, automation, response, lane, fd_delivers=_fd_delivers_now,
+                    task=_task_ref))
             if reply_waid:
                 asyncio.create_task(_wa_files.deliver_turn_media(
                     agent, reply_waid, _wa_turn_start, reply=str(response or ""),
@@ -1724,6 +1880,10 @@ async def _run_agent(
                 _spk_end.reset_grant(_grant_tok)
             if _counted:
                 _spk_end.turn_ended()
+        # A scheduled task's session is saved and the lane goes back to its
+        # own BEFORE the lane is freed (the next turn must find it there).
+        if task and task.get("previous") is not None:
+            await leave_task_session(agent, task["previous"])
         if is_public:
             agent._public_busy = False  # type: ignore[attr-defined]
         elif _is_side_lane:
@@ -1738,6 +1898,16 @@ async def _run_agent(
             "type": "status", "status": "ready",
             **({"turn_end": speaker_turn} if speaker_key else {}),
         })
+        # A `sessions` tool call asked to move the conversation: now that the
+        # turn is over and the reply delivered, switch or start the session
+        # (never for a public visitor's or a member's turn).
+        if not is_public and not speaker_key:
+            try:
+                from captain_claw.web.slash_commands import apply_pending_session_change
+                _change_view = server if lane == server.LANE_MAIN else server.lane_view(ws, agent)
+                await apply_pending_session_change(_change_view, agent)
+            except Exception as exc:
+                log.warning("Pending session change failed", error=str(exc))
         # The turn's WhatsApp chat ends with it (a later cron or channel turn
         # on this session must not inherit it).
         _wa_files.reset_turn(agent)

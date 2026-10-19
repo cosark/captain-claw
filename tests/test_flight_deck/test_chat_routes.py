@@ -128,6 +128,51 @@ class TestTopics:
         assert tail.status_code == 200 and tail.json() == []
 
 
+class TestTopicTitles:
+    async def test_patch_names_a_topic_and_topics_show_it(self, deck):
+        async with _client() as c:
+            ids = await _seed(c)
+            r = await c.patch(f"/fd/chat/sessions/proc-x/topics/{ids[2]}", headers=_hdr(BOB),
+                              json={"title": "  Trip   planning  "})
+            assert r.status_code == 200, r.text
+            assert r.json() == {"ok": True, "title": "Trip planning"}
+            topics = (await c.get("/fd/chat/sessions/proc-x/topics", headers=_hdr(BOB))).json()
+        assert topics[0]["title"] == "Trip planning"
+        assert topics[1]["title"] == ""
+
+    async def test_patch_refuses_a_turn_and_another_users_log(self, deck):
+        async with _client() as c:
+            ids = await _seed(c)
+            turn = await c.patch(f"/fd/chat/sessions/proc-x/topics/{ids[3]}", headers=_hdr(BOB),
+                                 json={"title": "x"})
+            foreign = await c.patch(f"/fd/chat/sessions/proc-x/topics/{ids[2]}", headers=_hdr(CAROL),
+                                    json={"title": "x"})
+            topics = (await c.get("/fd/chat/sessions/proc-x/topics", headers=_hdr(BOB))).json()
+        assert turn.status_code == 404
+        assert foreign.status_code == 404
+        assert topics[0]["title"] == ""
+
+
+class TestWithdraw:
+    async def test_a_users_own_row_can_be_withdrawn(self, deck):
+        async with _client() as c:
+            ids = await _seed(c)
+            r = await c.delete(f"/fd/chat/sessions/proc-x/messages/{ids[0]}", headers=_hdr(BOB))
+            assert r.status_code == 200 and r.json() == {"ok": True}
+            rows = (await c.get("/fd/chat/sessions/proc-x/messages?limit=50", headers=_hdr(BOB))).json()
+        assert [row["content"] for row in rows][:2] == ["hi", "New topic"]
+
+    async def test_replies_dividers_and_other_users_rows_stay(self, deck):
+        async with _client() as c:
+            ids = await _seed(c)
+            reply = await c.delete(f"/fd/chat/sessions/proc-x/messages/{ids[1]}", headers=_hdr(BOB))
+            divider = await c.delete(f"/fd/chat/sessions/proc-x/messages/{ids[2]}", headers=_hdr(BOB))
+            foreign = await c.delete(f"/fd/chat/sessions/proc-x/messages/{ids[0]}", headers=_hdr(CAROL))
+            rows = (await c.get("/fd/chat/sessions/proc-x/messages?limit=50", headers=_hdr(BOB))).json()
+        assert reply.status_code == 404 and divider.status_code == 404 and foreign.status_code == 404
+        assert len(rows) == len(ids)
+
+
 class TestPaging:
     async def test_since_id_returns_the_log_from_that_row_on(self, deck):
         async with _client() as c:

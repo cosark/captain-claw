@@ -15,6 +15,8 @@ This folder contains externalized LLM instruction templates consumed by
 - `tool_output_rewrite_user_prompt.md`: User payload template for tool-output rewrite.
 - `session_description_system_prompt.md`: System prompt for automatic session description generation.
 - `session_description_user_prompt.md`: User prompt template for session description generation from context.
+- `session_title_system_prompt.md`: System prompt for the short topic title a session gets when it is left behind (Flight Deck's Topics list).
+- `session_title_user_prompt.md`: User prompt template for that title, from the session's opening turns.
 - `guard_input_system_prompt.md`: Input guard system prompt for outbound-to-LLM safety checks.
 - `guard_input_user_prompt.md`: Input guard user payload template.
 - `guard_output_system_prompt.md`: Output guard system prompt for LLM response safety checks.

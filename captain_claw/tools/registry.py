@@ -478,6 +478,7 @@ class ToolRegistry:
                     and not self._tool_metadata.get(t.name, {}).get("requires_microsoft")
                     and not self._tool_metadata.get(t.name, {}).get("requires_jev")
                     and not self._tool_metadata.get(t.name, {}).get("requires_payments")
+                    and not self._tool_metadata.get(t.name, {}).get("requires_telegram_inbox")
                 ]
         except Exception:
             pass
@@ -554,6 +555,19 @@ class ToolRegistry:
                     tools = [t for t in tools if not self._tool_metadata.get(t.name, {}).get("requires_soniox")]
         except Exception:
             tools = [t for t in tools if not self._tool_metadata.get(t.name, {}).get("requires_soniox")]
+
+        # Telegram inbox: shown only while the owner keeps one in Flight Deck
+        # (refreshed per turn by ``telegram_inbox_client.refresh_connected()``).
+        # Owner-only; fails closed.
+        try:
+            if any(self._tool_metadata.get(t.name, {}).get("requires_telegram_inbox") for t in tools):
+                from captain_claw import telegram_inbox_client
+
+                if not telegram_inbox_client.inbox_usable():
+                    tools = [t for t in tools
+                             if not self._tool_metadata.get(t.name, {}).get("requires_telegram_inbox")]
+        except Exception:
+            tools = [t for t in tools if not self._tool_metadata.get(t.name, {}).get("requires_telegram_inbox")]
 
         # Same idea for deep memory. Under Flight Deck the tool always shows:
         # FD owns the Typesense connection and can gain one at any moment, and
