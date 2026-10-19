@@ -638,9 +638,8 @@ function onMonitor(d: Data): void {
 
 /** Own agent: a connection attempt ended before the agent's welcome. */
 function onFailedAttempt(sock: AgentChatWS): void {
-  // AgentChatWS restarts its backoff on every open, and Flight Deck's proxy
-  // opens even when the agent is down — it would retry every 500 ms forever.
-  // Back off here instead, and stop after a few tries (Reconnect chip).
+  // AgentChatWS would keep retrying an agent that is down for good. Back off
+  // here instead, and stop after a few tries (Reconnect chip).
   sock.disconnect()
   failedAttempts += 1
   if (failedAttempts >= MAX_FAILED_ATTEMPTS) {
@@ -663,8 +662,7 @@ function bind(sock: AgentChatWS): void {
   const on = (event: string, fn: (data: Data) => void) => {
     offs.push(sock.on(event, (data) => { if (ws === sock) fn(data) }))
   }
-  // Socket open (own agent) / agent welcome (shared). `connected` waits for
-  // the welcome either way.
+  // The agent's welcome arrived (own and shared agents alike).
   on('_connected', () => {
     connectedAt = Date.now()
     rulesNeeded = true
@@ -704,6 +702,8 @@ function bind(sock: AgentChatWS): void {
   on('response_stream', touch)
   on('tool_stream', touch)
   on('error', onError)
+  // Flight Deck's proxy is holding the socket until the agent answers.
+  on('fd_agent_waiting', () => { if (!welcomed) set({ error: 'Agent unreachable — retrying…' }) })
   on('command_result', onCommandResult)
   on('session_info', onSessionInfo)
   on('next_steps', onNextSteps)

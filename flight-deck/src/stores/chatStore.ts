@@ -809,6 +809,9 @@ interface ChatSession {
   closed?: { code: number; reason: string } | null
   /** Shared chats: who the agent knows it is talking to (from `welcome`). */
   speaker?: { id: string; name: string; owner_name: string; lane: string } | null
+  /** Why the agent can't be reached while the chat keeps reconnecting (it is
+   *  restarting, or gone). Shown on the chat in place of an error per retry. */
+  unreachable?: string | null
 }
 
 /** What the internal opener needs; `shared` marks an agent shared with you. */
@@ -900,9 +903,16 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const key = laneKey(containerId, lane)
     const existing = get().sessions.get(key)
     if (existing) {
-      // Already have a session, just activate it. A shared socket still in
-      // Flight Deck's handshake is left to finish rather than restarted.
-      if (!existing.connected && !(existing.shared && existing.ws.connecting)) {
+      // Already have a session, just activate it. A socket still waiting for
+      // the agent's welcome is left to finish rather than restarted — unless
+      // the agent is now somewhere else.
+      const moved = !existing.connected && !existing.shared && port > 0
+        && (port !== existing.port || host !== existing.host)
+      if (moved) {
+        existing.ws.retarget(host, port, auth)
+        updateSession(key, { host, port, auth: auth || existing.auth })
+      }
+      if (!existing.connected && (moved || !existing.ws.connecting)) {
         // Clear old replay messages — agent will resend them on reconnect
         const kept = existing.messages.filter((m) => !m.replay)
         if (kept.length !== existing.messages.length) {
@@ -994,7 +1004,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
     // Wire up event handlers
     ws.on('_connected', () => {
-      updateSession(key, shared ? { connected: true, closed: null } : { connected: true })
+      updateSession(key, shared ? { connected: true, closed: null } : { connected: true, unreachable: null })
       // If we hydrated a queue with pending items and auto-mode is on, kick
       // off the first dispatch now that the socket is live.
       const cur = useChatStore.getState().sessions.get(key)
@@ -1009,6 +1019,19 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       // any pending auto-mark — when the agent reconnects, replay or fresh
       // events will drive the queue forward again.
       cancelAutoCompleteWatch(key)
+    })
+
+    // Flight Deck's proxy is holding the socket until the agent answers (it is
+    // restarting). The chat says so once; it reconnects by itself.
+    ws.on('fd_agent_waiting', () => {
+      updateSession(key, { unreachable: 'The agent is not answering yet' })
+    })
+
+    // The agent came back on another port (it restarted and its old one was
+    // taken) — the socket already follows it; the session keeps up.
+    ws.on('fd_agent_endpoint', (data) => {
+      const p = Number(data.port)
+      if (p > 0) updateSession(key, { port: p })
     })
 
     // Shared chats: Flight Deck closed the member socket for good. Say why
@@ -1361,6 +1384,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     })
 
     ws.on('error', (data) => {
+      // Before the agent's welcome an error is about reaching it (Flight
+      // Deck's proxy could not connect), not about a turn. Every retry would
+      // add one: keep a single line on the chat instead.
+      if (!shared && !ws.connected) {
+        updateSession(key, { unreachable: String(data.message || 'Connection failed') })
+        return
+      }
       const msg: ChatMessage = {
         id: nextId(),
         role: 'system',
@@ -1836,7 +1866,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         state.openChat(containerId, anyLane.containerName, anyLane.host,
                        anyLane.port, anyLane.auth, target)
       }
-    } else if (!existing.connected && !(existing.shared && existing.ws.connecting)) {
+    } else if (!existing.connected && !existing.ws.connecting) {
       if (existing.closed) updateSession(key, { closed: null })
       existing.ws.connect()
     }

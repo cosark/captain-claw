@@ -47,6 +47,7 @@ from captain_claw.flight_deck.auth import (
 from captain_claw.flight_deck.db import FlightDeckDB
 from captain_claw.flight_deck.endpoints import same_endpoint as _same_endpoint
 from captain_claw.flight_deck import origin_guard
+from captain_claw.flight_deck import agent_ws_quiet
 from captain_claw.flight_deck import tenant_profile
 from captain_claw.flight_deck import agent_sharing
 from captain_claw.flight_deck import context_packs
@@ -184,6 +185,11 @@ def _configure_fd_logging() -> None:
         lg = logging.getLogger(name)
         if not any(type(f).__name__ == "_RedactQueryTokenFilter" for f in lg.filters):
             lg.addFilter(_RedactQueryTokenFilter())
+    # A chat socket retrying an agent that is down (FD just restarted it) logs
+    # once when it goes down and once when it is back — not on every attempt.
+    _uv_err = logging.getLogger("uvicorn.error")
+    if not any(isinstance(f, agent_ws_quiet.AgentWsLogFilter) for f in _uv_err.filters):
+        _uv_err.addFilter(agent_ws_quiet.AgentWsLogFilter())
 
 
 _configure_fd_logging()
@@ -4162,8 +4168,31 @@ def _agent_ws_url(host: str, port: int, auth: str = "", lane: str = "") -> str:
     return f"ws://{host}:{port}/ws" + (("?" + "&".join(query)) if query else "")
 
 
+# How long the chat proxy holds a client's socket open for an agent that isn't
+# answering yet (Flight Deck just restarted it) before reporting it unreachable.
+_AGENT_WS_WAIT_S = float(os.environ.get("FD_AGENT_WS_WAIT_S", "30"))
+
+
+def _process_chat_target(agent: str) -> dict | None:
+    """Registry entry of the process agent the SPA calls ``proc-<slug>``."""
+    if not agent.startswith("proc-"):
+        return None
+    return _load_process_registry().get(agent[len("proc-"):])
+
+
+def _agent_ws_retryable(exc: BaseException) -> bool:
+    """A connect failure that waiting can fix: nothing listening yet, a
+    handshake cut short, a 5xx while the agent boots. A 4xx is a real answer."""
+    from websockets.exceptions import InvalidHandshake, InvalidStatus
+
+    if isinstance(exc, InvalidStatus):
+        return exc.response.status_code >= 500
+    return isinstance(exc, (OSError, TimeoutError, InvalidHandshake))
+
+
 @app.websocket("/fd/agent-ws/{host}/{port}")
-async def agent_ws_proxy(ws: WebSocket, host: str, port: int, token: str = "", lane: str = "", fd_token: str = ""):
+async def agent_ws_proxy(ws: WebSocket, host: str, port: int, token: str = "", lane: str = "",
+                         fd_token: str = "", agent: str = ""):
     """Proxy WebSocket to a CC agent — avoids browser CORS restrictions.
 
     `lane` selects a parallel context on the agent (docs/queue-lanes-plan.md).
@@ -4175,8 +4204,24 @@ async def agent_ws_proxy(ws: WebSocket, host: str, port: int, token: str = "", l
     socket is refused unless the JWT is valid AND the caller owns the target
     agent (admins may reach any). HTTP middleware can't guard WebSockets, so
     the ownership check lives here.
+
+    `agent` is the SPA's chat id for the agent (``proc-<slug>``). Flight Deck
+    restarts its process agents when it restarts, and one whose port is still
+    taken comes back on another one and announces it. The proxy follows the
+    registry to the agent's current port; the port in the path is only the
+    fallback, for agents the registry doesn't know. While the agent isn't
+    answering, the proxy holds the socket for up to FD_AGENT_WS_WAIT_S seconds
+    and tells the client once (``fd_agent_waiting``). If the agent comes back
+    on a new port, the client hears it (``fd_agent_endpoint``).
     """
     import websockets
+
+    path_port = port
+    entry = _process_chat_target(agent)
+    if entry and entry.get("web_port"):
+        port = int(entry["web_port"])
+    else:
+        entry = None
 
     # Ownership guard (HTTP middleware does not run for WebSockets).
     if AUTH_ENABLED:
@@ -4190,54 +4235,117 @@ async def agent_ws_proxy(ws: WebSocket, host: str, port: int, token: str = "", l
             await ws.close(code=4001, reason="Missing or invalid token")
             return
         if payload.get("role", "user") != "admin":
-            owner = _resolve_agent_owner(port)
+            owner = str(entry.get("owner") or "") if entry else _resolve_agent_owner(port)
             if owner and owner != payload.get("sub", ""):
                 await ws.close(code=4403, reason="This agent belongs to another user")
                 return
 
     await ws.accept()
     # Auto-resolve auth token if the caller didn't provide one
-    auth = token or _resolve_agent_auth(port)
-    agent_url = _agent_ws_url(host, port, auth, lane)
+    auth = token or (str(entry.get("web_auth") or "") if entry else "") or _resolve_agent_auth(port)
 
-    try:
-        # ping_interval/ping_timeout keep the upstream link alive through any
-        # intermediaries and surface dead peers fast — without these the proxy
-        # silently drops after a few minutes of idle, forcing the user to
-        # re-click the chat button in FD.
-        async with websockets.connect(
-            agent_url,
-            max_size=4 * 1024 * 1024,
-            ping_interval=20,
-            ping_timeout=10,
-        ) as agent_ws:
-            async def client_to_agent():
+    key = agent_ws_quiet.target_key(host, path_port, agent)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _AGENT_WS_WAIT_S
+    # Read the client while waiting for the agent: to notice it leave, and to
+    # keep whatever it sends meanwhile for the agent.
+    from_client = asyncio.create_task(ws.receive())
+    held: list[str] = []
+    told_waiting = False
+    agent_ws = None
+    while agent_ws is None:
+        try:
+            # ping_interval/ping_timeout keep the upstream link alive through any
+            # intermediaries and surface dead peers fast — without these the proxy
+            # silently drops after a few minutes of idle, forcing the user to
+            # re-click the chat button in FD.
+            agent_ws = await websockets.connect(
+                _agent_ws_url(host, port, auth, lane),
+                max_size=4 * 1024 * 1024,
+                ping_interval=20,
+                ping_timeout=10,
+                open_timeout=5,
+            )
+            break
+        except Exception as exc:
+            if agent_ws_quiet.mark_down(key):
+                log.info("agent-ws: can't reach agent — further attempts aren't logged until it is back",
+                         agent=agent or f"{host}:{path_port}", port=port, error=str(exc)[:200])
+            stopped = bool(entry and entry.get("stopped"))
+            if stopped or not _agent_ws_retryable(exc) or loop.time() >= deadline:
+                from_client.cancel()
                 try:
-                    while True:
-                        data = await ws.receive_text()
-                        await agent_ws.send(data)
-                except WebSocketDisconnect:
-                    pass
-
-            async def agent_to_client():
-                try:
-                    async for msg in agent_ws:
-                        await ws.send_text(msg if isinstance(msg, str) else msg.decode())
+                    await ws.send_text(json.dumps({"type": "error", "code": "agent_unreachable",
+                                                   "message": f"Connection failed: {exc}"}))
+                    await ws.close()
                 except Exception:
                     pass
+                return
+            if not told_waiting:
+                told_waiting = True
+                try:
+                    await ws.send_text(json.dumps({"type": "fd_agent_waiting", "port": port}))
+                except Exception:
+                    from_client.cancel()
+                    return
+        done, _ = await asyncio.wait({from_client}, timeout=1.0)
+        if from_client in done:
+            try:
+                msg = from_client.result()
+            except Exception:
+                return
+            if msg.get("type") == "websocket.disconnect":
+                return
+            if msg.get("text") is not None:
+                held.append(msg["text"])
+            from_client = asyncio.create_task(ws.receive())
+        # The agent may have announced a new port meanwhile.
+        if entry is not None:
+            fresh = _process_chat_target(agent)
+            if fresh and fresh.get("web_port"):
+                entry, port = fresh, int(fresh["web_port"])
 
-            done, pending = await asyncio.wait(
-                [asyncio.create_task(client_to_agent()), asyncio.create_task(agent_to_client())],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            for t in pending:
-                t.cancel()
-    except Exception as exc:
-        try:
-            await ws.send_text(f'{{"type":"error","message":"Connection failed: {exc}"}}')
-            await ws.close()
-        except Exception:
-            pass
+    down_for = agent_ws_quiet.mark_up(key)
+    if down_for is not None:
+        log.info("agent-ws: agent is back", agent=agent or f"{host}:{path_port}", port=port,
+                 down_s=f"{down_for:.1f}")
+
+    async with agent_ws:
+        if port != path_port:
+            try:
+                await ws.send_text(json.dumps({"type": "fd_agent_endpoint", "port": port}))
+            except Exception:
+                pass
+
+        async def client_to_agent():
+            nonlocal from_client
+            try:
+                for data in held:
+                    await agent_ws.send(data)
+                while True:
+                    msg = await from_client
+                    if msg.get("type") == "websocket.disconnect":
+                        return
+                    if msg.get("text") is not None:
+                        await agent_ws.send(msg["text"])
+                    from_client = asyncio.create_task(ws.receive())
+            except Exception:
+                pass
+
+        async def agent_to_client():
+            try:
+                async for msg in agent_ws:
+                    await ws.send_text(msg if isinstance(msg, str) else msg.decode())
+            except Exception:
+                pass
+
+        done, pending = await asyncio.wait(
+            [asyncio.create_task(client_to_agent()), asyncio.create_task(agent_to_client())],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+        from_client.cancel()
 
 
 @app.get("/fd/probe")

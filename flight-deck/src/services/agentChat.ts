@@ -76,9 +76,11 @@ export class AgentChatWS {
   private _reconnectAttempt = 0
   private _reconnectTimer: ReturnType<typeof setTimeout> | null = null
   readonly agentId: string
-  readonly host: string
-  readonly port: number
-  readonly auth: string
+  // Where the agent is. Not fixed: an agent Flight Deck restarted can come
+  // back on another port (see retarget and the proxy's fd_agent_endpoint).
+  host: string
+  port: number
+  auth: string
   readonly lane: string
   /** Shared mode: an agent another deck user shared with us, reached only
    *  through Flight Deck's member route by its agent_ref — no host, port or
@@ -106,9 +108,17 @@ export class AgentChatWS {
 
   get connected() { return this._connected }
 
-  /** A socket is open (or opening) but not yet usable. Shared mode only
-   *  becomes usable on the agent's `welcome`, after Flight Deck's checks. */
+  /** A socket is open (or opening) but not yet usable: it becomes usable on
+   *  the agent's `welcome`. Flight Deck's proxy opens the socket first and
+   *  holds it while the agent is still starting. */
   get connecting() { return !!this.ws && !this._connected }
+
+  /** Point the next connect at a new address (the agent moved). */
+  retarget(host: string, port: number, auth?: string) {
+    this.host = host
+    this.port = port
+    if (auth) this.auth = auth
+  }
 
   connect() {
     if (this.ws) this._teardownSocket()
@@ -146,18 +156,17 @@ export class AgentChatWS {
     // Lane A is the agent's main context — send nothing, so the URL is
     // byte-identical to what every pre-lane client produced.
     if (this.lane && this.lane !== 'A') params.set('lane', this.lane)
+    // Which agent this is: Flight Deck follows a process agent (`proc-<slug>`)
+    // to its current port when it came back on a different one.
+    if (this.agentId) params.set('agent', this.agentId)
     const qs = params.toString() ? `?${params}` : ''
     const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
     const url = `${wsProto}//${window.location.host}/fd/agent-ws/${encodeURIComponent(this.host)}/${this.port}${qs}`
 
     this.ws = new WebSocket(url)
 
-    this.ws.onopen = () => {
-      this._connected = true
-      this._reconnectAttempt = 0
-      this.emit('_connected', {})
-    }
-
+    // Connected means the agent's welcome, not the socket's open: the proxy
+    // opens the socket first and holds it while the agent is still starting.
     this.ws.onclose = () => {
       const wasConnected = this._connected
       this._connected = false
@@ -174,6 +183,14 @@ export class AgentChatWS {
       try {
         const data = JSON.parse(ev.data)
         const type = data.type || 'unknown'
+        if (type === 'welcome' && !this._connected) {
+          this._connected = true
+          this._reconnectAttempt = 0
+          this.emit('_connected', {})
+        } else if (type === 'fd_agent_endpoint' && Number(data.port) > 0) {
+          // The agent came back on another port: reconnect there next time.
+          this.port = Number(data.port)
+        }
         this.emit(type, data)
         this.emit('_any', data)
       } catch {
@@ -245,10 +262,12 @@ export class AgentChatWS {
 
   private _scheduleReconnect() {
     if (this._reconnectTimer) return
-    // Exponential backoff capped at 15s. The first retry fires fast (~500ms)
-    // so quick blips feel instant; subsequent retries back off so we don't
-    // hammer a dead agent.
-    const delay = Math.min(15000, 500 * 2 ** this._reconnectAttempt)
+    // 0.5s, 1s, then every 2s for about a minute: a Flight Deck restart is
+    // over in seconds, and the chat should be back as soon as it is. Then
+    // every 10s for an agent that stays away. While Flight Deck is up, its
+    // proxy holds each attempt until the agent answers, so these are rare.
+    const n = this._reconnectAttempt
+    const delay = n < 2 ? 500 * 2 ** n : n < 30 ? 2000 : 10000
     this._reconnectAttempt++
     this.emit('_reconnecting', { attempt: this._reconnectAttempt, delayMs: delay })
     this._reconnectTimer = setTimeout(() => {

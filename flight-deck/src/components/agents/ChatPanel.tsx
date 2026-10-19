@@ -728,7 +728,7 @@ function ChatContent({
   onSend,
   onCancel,
 }: {
-  session: { containerId: string; containerName: string; messages: ChatMessage[]; connected: boolean; busy: boolean; statusText: string; nextStepOptions?: NextStepOption[]; liveTurnUsage?: TokenUsage | null; closed?: { code: number; reason: string } | null }
+  session: { containerId: string; containerName: string; messages: ChatMessage[]; connected: boolean; busy: boolean; statusText: string; nextStepOptions?: NextStepOption[]; liveTurnUsage?: TokenUsage | null; closed?: { code: number; reason: string } | null; unreachable?: string | null }
   /** This lane's store key — for anything that reads or writes session state.
    *  The agent id lives on `session.containerId`. */
   sessionKey: string
@@ -869,9 +869,11 @@ function ChatContent({
         )}
 
         {!session.connected && !closed && (
-          <div className="mt-12 text-center">
+          <div className="mt-12 text-center" title={session.unreachable || undefined}>
             <AlertCircle className="mx-auto h-8 w-8 text-zinc-700" />
-            <p className="mt-2 text-sm text-zinc-500">Connecting to agent...</p>
+            <p className="mt-2 text-sm text-zinc-500">
+              {session.unreachable ? 'Agent unreachable — reconnecting…' : 'Connecting to agent...'}
+            </p>
           </div>
         )}
 
