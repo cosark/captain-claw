@@ -86,13 +86,14 @@ def auth_token(lifetime: int = 3600) -> str:
     return jwt.encode(claims, _key(), algorithm="RS256", headers={"kid": app_id(), "typ": "JWT"})
 
 
-async def _request(method: str, path: str, *, json: Any = None, params: dict | None = None) -> Any:
+async def _request(method: str, path: str, *, json: Any = None, params: dict | None = None,
+                   headers: dict | None = None) -> Any:
     if not configured():
         raise BankLinkError(503, "Bank links aren't set up on this deck (FD_ENABLEBANKING_APP_ID / _KEY)")
     try:
         async with httpx.AsyncClient(timeout=30, transport=transport) as client:
             resp = await client.request(method, f"{API}{path}", json=json, params=params,
-                                        headers={"Authorization": f"Bearer {auth_token()}"})
+                                        headers={**(headers or {}), "Authorization": f"Bearer {auth_token()}"})
     except httpx.HTTPError as exc:
         raise BankLinkError(502, f"Couldn't reach Enable Banking ({type(exc).__name__})")
     if resp.status_code >= 400:

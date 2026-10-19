@@ -135,6 +135,60 @@ CREATE TABLE IF NOT EXISTS payment_prefs (
     updated_at REAL NOT NULL,
     PRIMARY KEY (owner_id, key)
 );
+-- Statements (Phase 4): a read-only bank connection — an Enable Banking AIS
+-- session or the owner's Revolut Business statement — and the outgoing
+-- payments read from it. Incoming payments and balances are never stored.
+CREATE TABLE IF NOT EXISTS bank_sessions (
+    owner_id        TEXT NOT NULL,
+    provider        TEXT NOT NULL,
+    session_id      TEXT NOT NULL,
+    aspsp_name      TEXT NOT NULL DEFAULT '',
+    aspsp_country   TEXT NOT NULL DEFAULT '',
+    psu_type        TEXT NOT NULL DEFAULT 'personal',
+    required_psu_headers TEXT NOT NULL DEFAULT '[]',
+    valid_until     REAL,
+    status          TEXT NOT NULL,
+    last_sync_at    REAL,
+    last_attempt_at REAL,
+    unattended_at   TEXT NOT NULL DEFAULT '[]',
+    last_error      TEXT NOT NULL DEFAULT '',
+    notified        TEXT NOT NULL DEFAULT '',
+    created_at      REAL NOT NULL,
+    updated_at      REAL NOT NULL,
+    PRIMARY KEY (owner_id, provider, session_id)
+);
+CREATE TABLE IF NOT EXISTS bank_accounts (
+    owner_id        TEXT NOT NULL,
+    provider        TEXT NOT NULL,
+    session_id      TEXT NOT NULL,
+    uid             TEXT NOT NULL,
+    account_key     TEXT NOT NULL,
+    label           TEXT NOT NULL,
+    currency        TEXT NOT NULL DEFAULT 'EUR',
+    watched         INTEGER NOT NULL DEFAULT 1,
+    synced_through  TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (owner_id, uid)
+);
+CREATE TABLE IF NOT EXISTS bank_transactions (
+    owner_id         TEXT NOT NULL,
+    account_key      TEXT NOT NULL,
+    fp               TEXT NOT NULL,
+    status           TEXT NOT NULL,
+    booking_date     TEXT NOT NULL DEFAULT '',
+    value_date       TEXT NOT NULL DEFAULT '',
+    amount_cents     INTEGER NOT NULL,
+    currency         TEXT NOT NULL,
+    creditor_name    TEXT NOT NULL DEFAULT '',
+    creditor_iban    TEXT NOT NULL DEFAULT '',
+    reference_digits TEXT NOT NULL DEFAULT '',
+    remittance       TEXT NOT NULL DEFAULT '',
+    intent_id        TEXT NOT NULL DEFAULT '',
+    match            TEXT NOT NULL DEFAULT '',
+    seen_at          REAL NOT NULL,
+    updated_at       REAL NOT NULL,
+    PRIMARY KEY (owner_id, fp)
+);
+CREATE INDEX IF NOT EXISTS idx_bank_transactions_date ON bank_transactions(owner_id, booking_date);
 """
 
 # Columns added after a table first shipped: (table, column, DDL).
@@ -142,6 +196,7 @@ _MIGRATIONS = (
     ("payment_intents", "handoff_rail", "TEXT NOT NULL DEFAULT ''"),
     ("payment_intents", "rails_state", "TEXT NOT NULL DEFAULT '{}'"),
     ("payment_intents", "rail_nonce", "TEXT"),
+    ("bank_sessions", "last_attempt_at", "REAL"),
 )
 # Indexes on migrated columns, created after the migrations ran.
 _POST_MIGRATION_DDL = (
@@ -326,6 +381,8 @@ class PaymentsStore:
         await db.execute("DELETE FROM payment_connections WHERE owner_id = ?", (owner_id,))
         await db.execute("DELETE FROM payment_prefs WHERE owner_id = ?", (owner_id,))
         await db.execute("DELETE FROM purchases WHERE owner_id = ?", (owner_id,))
+        for table in ("bank_sessions", "bank_accounts", "bank_transactions"):
+            await db.execute(f"DELETE FROM {table} WHERE owner_id = ?", (owner_id,))
         await db.commit()
 
     # ── purchases (Phase 3) ──────────────────────────────────────────
@@ -420,6 +477,147 @@ class PaymentsStore:
         await db.execute("DELETE FROM payment_connections WHERE owner_id = ? AND provider = ?",
                          (owner_id, provider))
         await db.commit()
+
+    # ── statements (Phase 4) ─────────────────────────────────────────
+
+    async def save_bank_session(self, owner_id: str, provider: str, session_id: str, **values: Any) -> dict:
+        db = await self._ensure_db()
+        now = time.time()
+        values = {k: (json.dumps(v) if k in ("required_psu_headers", "unattended_at") else v)
+                  for k, v in {**values, "updated_at": now}.items()}
+        key = (owner_id, provider, session_id)
+        if await self.get_bank_session(*key):
+            # A plain UPDATE: SQLite checks NOT NULL on an upsert's insert row first.
+            sets = ", ".join(f"{k} = ?" for k in values)
+            await db.execute(f"UPDATE bank_sessions SET {sets} WHERE owner_id = ? AND provider = ? AND session_id = ?",
+                             (*values.values(), *key))
+        else:
+            values.setdefault("status", "active")
+            cols = ["owner_id", "provider", "session_id", "created_at", *values]
+            await db.execute(f"INSERT INTO bank_sessions ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+                             (*key, now, *values.values()))
+        await db.commit()
+        return await self.get_bank_session(owner_id, provider, session_id)
+
+    @staticmethod
+    def _session_row(row: Any) -> dict | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["required_psu_headers"] = _loads(out.get("required_psu_headers"), [])
+        out["unattended_at"] = _loads(out.get("unattended_at"), [])
+        return out
+
+    async def get_bank_session(self, owner_id: str, provider: str, session_id: str) -> dict | None:
+        db = await self._ensure_db()
+        async with db.execute(
+            "SELECT * FROM bank_sessions WHERE owner_id = ? AND provider = ? AND session_id = ?",
+            (owner_id, provider, session_id),
+        ) as cur:
+            return self._session_row(await cur.fetchone())
+
+    async def list_bank_sessions(self, owner_id: str | None = None) -> list[dict]:
+        """One owner's sessions, or every owner's (the background loop)."""
+        db = await self._ensure_db()
+        q, args = "SELECT * FROM bank_sessions", ()
+        if owner_id is not None:
+            q, args = q + " WHERE owner_id = ?", (owner_id,)
+        async with db.execute(q + " ORDER BY created_at", args) as cur:
+            return [self._session_row(r) for r in await cur.fetchall()]
+
+    async def delete_bank_session(self, owner_id: str, provider: str, session_id: str, *,
+                                  keep_transactions: bool = False) -> None:
+        """The session, its accounts and (unless a renewal carries them on) every
+        transaction read from them."""
+        db = await self._ensure_db()
+        if not keep_transactions:
+            await db.execute(
+                "DELETE FROM bank_transactions WHERE owner_id = ? AND account_key IN"
+                " (SELECT account_key FROM bank_accounts WHERE owner_id = ? AND provider = ? AND session_id = ?)",
+                (owner_id, owner_id, provider, session_id))
+        await db.execute("DELETE FROM bank_accounts WHERE owner_id = ? AND provider = ? AND session_id = ?",
+                         (owner_id, provider, session_id))
+        await db.execute("DELETE FROM bank_sessions WHERE owner_id = ? AND provider = ? AND session_id = ?",
+                         (owner_id, provider, session_id))
+        await db.commit()
+
+    async def save_bank_accounts(self, owner_id: str, provider: str, session_id: str, accounts: list[dict]) -> None:
+        """Upsert the session's accounts; a re-read keeps each account's watch choice and sync point."""
+        db = await self._ensure_db()
+        for a in accounts:
+            await db.execute(
+                "INSERT INTO bank_accounts (owner_id, provider, session_id, uid, account_key, label, currency,"
+                " watched, synced_through) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(owner_id, uid) DO UPDATE SET"
+                " provider = excluded.provider, session_id = excluded.session_id, label = excluded.label,"
+                " currency = excluded.currency, account_key = excluded.account_key",
+                (owner_id, provider, session_id, a["uid"], a.get("account_key") or a["uid"], a["label"],
+                 a.get("currency") or "EUR", 1 if a.get("watched", True) else 0, a.get("synced_through", "")))
+        await db.commit()
+
+    async def bank_accounts(self, owner_id: str, provider: str = "", session_id: str = "") -> list[dict]:
+        db = await self._ensure_db()
+        q, args = "SELECT * FROM bank_accounts WHERE owner_id = ?", [owner_id]
+        if provider:
+            q, args = q + " AND provider = ? AND session_id = ?", [*args, provider, session_id]
+        async with db.execute(q + " ORDER BY label", args) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def update_bank_account(self, owner_id: str, uid: str, **values: Any) -> None:
+        db = await self._ensure_db()
+        sets = ", ".join(f"{k} = ?" for k in values)
+        await db.execute(f"UPDATE bank_accounts SET {sets} WHERE owner_id = ? AND uid = ?",
+                         (*values.values(), owner_id, uid))
+        await db.commit()
+
+    async def upsert_bank_transactions(self, owner_id: str, rows: list[dict]) -> tuple[int, int]:
+        """(new, changed). A re-read updates the bank status and dates; the
+        match (Phase 4b) is kept."""
+        db = await self._ensure_db()
+        now = time.time()
+        new = changed = 0
+        for r in rows:
+            async with db.execute("SELECT status, booking_date FROM bank_transactions WHERE owner_id = ? AND fp = ?",
+                                  (owner_id, r["fp"])) as cur:
+                old = await cur.fetchone()
+            if old is None:
+                await db.execute(
+                    "INSERT INTO bank_transactions (owner_id, account_key, fp, status, booking_date, value_date,"
+                    " amount_cents, currency, creditor_name, creditor_iban, reference_digits, remittance,"
+                    " seen_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (owner_id, r["account_key"], r["fp"], r["status"], r.get("booking_date", ""),
+                     r.get("value_date", ""), r["amount_cents"], r["currency"], r.get("creditor_name", ""),
+                     r.get("creditor_iban", ""), r.get("reference_digits", ""), r.get("remittance", ""), now, now))
+                new += 1
+            elif (old["status"], old["booking_date"]) != (r["status"], r.get("booking_date", "")):
+                await db.execute("UPDATE bank_transactions SET status = ?, booking_date = ?, value_date = ?,"
+                                 " updated_at = ? WHERE owner_id = ? AND fp = ?",
+                                 (r["status"], r.get("booking_date", ""), r.get("value_date", ""), now,
+                                  owner_id, r["fp"]))
+                changed += 1
+        await db.commit()
+        return new, changed
+
+    async def bank_transactions(self, owner_id: str, *, since: str = "", limit: int = 2000) -> list[dict]:
+        db = await self._ensure_db()
+        async with db.execute(
+            "SELECT * FROM bank_transactions WHERE owner_id = ? AND (booking_date >= ? OR booking_date = '')"
+            " ORDER BY booking_date DESC LIMIT ?", (owner_id, since, limit),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def count_bank_transactions(self, owner_id: str, account_key: str) -> int:
+        db = await self._ensure_db()
+        async with db.execute("SELECT COUNT(*) FROM bank_transactions WHERE owner_id = ? AND account_key = ?",
+                              (owner_id, account_key)) as cur:
+            return int((await cur.fetchone())[0])
+
+    async def purge_bank_transactions(self, before: str) -> int:
+        """Unmatched outgoing payments booked before *before* (YYYY-MM-DD) go."""
+        db = await self._ensure_db()
+        cur = await db.execute("DELETE FROM bank_transactions WHERE intent_id = '' AND booking_date != ''"
+                               " AND booking_date < ?", (before,))
+        await db.commit()
+        return cur.rowcount or 0
 
     # ── audit trail ──────────────────────────────────────────────────
 

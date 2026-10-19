@@ -6,6 +6,7 @@ import { Loader2, Receipt } from 'lucide-react'
 import { PaymentCard } from '../components/payments/PaymentCard'
 import { RevolutPanel } from '../components/payments/RevolutPanel'
 import { BankLinkPanel } from '../components/payments/BankLinkPanel'
+import { StatementsPanel } from '../components/payments/StatementsPanel'
 import { LinkPanel } from '../components/payments/LinkPanel'
 import { ProtocolsPanel } from '../components/payments/ProtocolsPanel'
 import { PurchaseCard } from '../components/payments/PurchaseCard'
@@ -138,6 +139,7 @@ export function PaymentsPage() {
         )}
         {config && <div className="mb-4"><CapEditor config={config} onSaved={setConfig} /></div>}
         <BankLinkPanel />
+        <StatementsPanel />
         <RevolutPanel />
         <LinkPanel />
         <ProtocolsPanel />

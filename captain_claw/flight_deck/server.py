@@ -908,6 +908,12 @@ async def lifespan(app: FastAPI):
         app.state.scheduler_stop = _sched_stop
         app.state.scheduler_task = asyncio.create_task(_sched_loop(_sched_stop))
         print("Flight Deck: scheduler started")
+    # ── Payments loop (FD_PAYMENTS): expiry, bank statement syncs (Phase 4). ──
+    if payments_routes.enabled():
+        from captain_claw.flight_deck.payments_jobs import payments_loop as _pay_loop
+        _pay_stop = asyncio.Event()
+        app.state.payments_stop = _pay_stop
+        app.state.payments_task = asyncio.create_task(_pay_loop(_pay_stop))
     # ── Consciousness heartbeat (free-running, per-user inner life that quietly
     # observes each user's agents). Disable with FD_CONSCIOUSNESS_DISABLED=true. ──
     if os.environ.get("FD_CONSCIOUSNESS_DISABLED", "").lower() not in ("true", "1", "yes"):
@@ -1117,6 +1123,12 @@ async def lifespan(app: FastAPI):
                 await asyncio.wait_for(app.state.scheduler_task, timeout=5.0)
             except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
                 pass
+    if hasattr(app.state, "payments_stop"):
+        app.state.payments_stop.set()
+        try:
+            await asyncio.wait_for(app.state.payments_task, timeout=5.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            pass
     # Stop the consciousness heartbeat.
     if hasattr(app.state, "consciousness_stop"):
         app.state.consciousness_stop.set()
@@ -1520,7 +1532,10 @@ payments_routes.configure(data_dir=DATA_DIR)
 # Purchases first: its /fd/payments/purchases… paths must win over
 # /fd/payments/{payment_id}.
 from captain_claw.flight_deck import purchases_routes  # noqa: E402 — Phase 3 purchases
+from captain_claw.flight_deck import statements_routes  # noqa: E402 — Phase 4 bank statements
 app.include_router(purchases_routes.router)
+app.include_router(statements_routes.router)
+app.include_router(statements_routes.public_router)
 app.include_router(payments_routes.router)
 app.include_router(payments_routes.public_router)
 app.include_router(agent_sharing_router)

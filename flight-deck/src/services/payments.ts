@@ -231,6 +231,60 @@ export function statusLabel(s: PaymentStatus): string {
   }[s] ?? s
 }
 
+// ── Bank statements (Phase 4): read-only, outgoing payments only ──
+
+export interface StatementAccount {
+  uid: string
+  label: string
+  currency: string
+  watched: boolean
+  synced_through: string
+  outgoing: number
+}
+export interface StatementSession {
+  provider: 'enablebanking' | 'revolut'
+  session_id: string
+  bank: string
+  country: string
+  status: 'active' | 'needs_renewal' | 'revoked'
+  valid_until: number | null
+  last_sync_at: number | null
+  next_sync_at: number | null
+  last_error: string
+  unattended_left: number | null
+  accounts: StatementAccount[]
+}
+export interface StatementsStatus {
+  enabled: boolean
+  configured: boolean
+  revolut_connected: boolean
+  sync_times: string[]
+  redirect_url: string
+  sessions: StatementSession[]
+}
+export interface StatementBank { name: string; country: string; logo: string; beta: boolean; consent_days: number }
+
+export const getStatements = () => fdJson<StatementsStatus>('/payments/statements')
+export const statementBanks = (country: string, psu_type: string) =>
+  fdJson<{ banks: StatementBank[] }>(`/payments/statements/aspsps?country=${encodeURIComponent(country)}&psu_type=${psu_type}`)
+export const connectStatements = (name: string, country: string, psu_type: string) =>
+  fdJson<{ url: string }>('/payments/statements/connect', {
+    method: 'POST', body: JSON.stringify({ name, country, psu_type }),
+  })
+export const syncStatements = () =>
+  fdJson<{ results: { provider: string; new: number; error: string }[]; sessions: StatementSession[] }>(
+    '/payments/statements/sync', { method: 'POST' })
+export const watchStatementAccount = (uid: string, watched: boolean) =>
+  fdJson<{ ok: true }>(`/payments/statements/accounts/${encodeURIComponent(uid)}`, {
+    method: 'PUT', body: JSON.stringify({ watched }),
+  })
+export const disconnectStatements = (provider: string, sessionId: string) =>
+  fdJson<{ ok: true }>(`/payments/statements/${provider}/${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
+export const setRevolutStatement = (enabled: boolean) =>
+  fdJson<{ enabled: boolean; message?: string }>('/payments/statements/revolut', {
+    method: 'PUT', body: JSON.stringify({ enabled }),
+  })
+
 // ── Purchases (Phase 3): Captain buys from a shop with a one-time card ──
 
 export type PurchaseStatus =
