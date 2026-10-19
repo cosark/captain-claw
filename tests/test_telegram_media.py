@@ -242,3 +242,14 @@ async def test_telegrams_refusal_reason_survives_the_download(tmp_path):
         lambda r: httpx.Response(502, text="bad gateway")))
     with pytest.raises(RuntimeError, match="HTTP 502"):
         await bridge.download_file("x", tmp_path / "x.mp4")
+
+
+async def test_a_card_number_spoken_in_a_voice_note_is_scrubbed(env):
+    async def transcribe(path, mime):
+        return "pay with card 4111 1111 1111 1111 please", ""
+
+    env.monkeypatch.setattr(tg, "_tg_transcribe", transcribe)
+    await tg._handle_telegram_message(env.server, _msg(media_kind="voice", media_file_id="v1"))
+    (turn,) = env.turns
+    assert "4111 1111 1111 1111" not in turn["text"]
+    assert all("4111 1111 1111 1111" not in s for s in env.sent)

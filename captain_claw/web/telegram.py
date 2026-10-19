@@ -502,8 +502,13 @@ async def _handle_telegram_message(server: WebServer, message: TelegramMessage) 
                     reply_to_message_id=message.message_id,
                 )
                 return
-            await _tg_send(server, message.chat_id, f"🎙 Transcription:\n\n\"{transcript}\"",
+            # A spoken card number is scrubbed like a typed one (card_scrub).
+            from captain_claw.card_scrub import scrub, scrub_user_text
+
+            await _tg_send(server, message.chat_id,
+                           f"🎙 Transcription:\n\n\"{scrub(transcript)[0]}\"",
                            reply_to_message_id=message.message_id)
+            transcript = scrub_user_text(transcript)
             text = f"{text}\n\n{transcript}" if text else transcript
             attachment_notes.append(
                 "This message is the transcript of the user's Telegram voice note; "
