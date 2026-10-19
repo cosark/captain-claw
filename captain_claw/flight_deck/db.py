@@ -897,6 +897,57 @@ class FlightDeckDB:
                 ON telegram_links(tg_user_id) WHERE tg_user_id != '';
             CREATE UNIQUE INDEX IF NOT EXISTS idx_telegram_links_code
                 ON telegram_links(link_code) WHERE link_code != '';
+            -- Telegram inbox (telegram_inbox.py): a read-only copy of a user's
+            -- Telegram chats that their agents read — private chats through a
+            -- Chat Automation (business) connection to the shared bot, groups
+            -- the bot was added to. Text and names are sealed (fd_crypto);
+            -- only ids and times are plain.
+            CREATE TABLE IF NOT EXISTS telegram_inbox_settings (
+                user_id        TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                enabled        INTEGER NOT NULL DEFAULT 0,
+                consented_at   TEXT,
+                retention_days INTEGER NOT NULL DEFAULT 30,
+                updated_at     TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS telegram_inbox_connections (
+                connection_id TEXT PRIMARY KEY,
+                user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                tg_user_id    TEXT NOT NULL,
+                enabled       INTEGER NOT NULL DEFAULT 1,
+                rights        TEXT NOT NULL DEFAULT '{}',
+                connected_at  TEXT NOT NULL,
+                updated_at    TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS telegram_inbox_chats (
+                user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                chat_id    TEXT NOT NULL,
+                kind       TEXT NOT NULL,
+                title      TEXT NOT NULL DEFAULT '',
+                active     INTEGER NOT NULL DEFAULT 1,
+                last_at    INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, chat_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tg_inbox_chats_chat
+                ON telegram_inbox_chats(chat_id);
+            CREATE TABLE IF NOT EXISTS telegram_inbox_messages (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                chat_id    TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                sender_id  TEXT NOT NULL DEFAULT '',
+                outgoing   INTEGER NOT NULL DEFAULT 0,
+                sent_at    INTEGER NOT NULL,
+                body       TEXT NOT NULL DEFAULT '',
+                reply_to   INTEGER,
+                edited_at  INTEGER,
+                deleted    INTEGER NOT NULL DEFAULT 0,
+                UNIQUE (user_id, chat_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_tg_inbox_msgs_time
+                ON telegram_inbox_messages(user_id, sent_at);
+            CREATE INDEX IF NOT EXISTS idx_tg_inbox_msgs_chat
+                ON telegram_inbox_messages(user_id, chat_id, sent_at);
         """)
         # Lightweight migrations: add columns introduced after a table first shipped.
         for table, col, ddl in [
@@ -3445,6 +3496,266 @@ class FlightDeckDB:
         assert self._db is not None
         rows = await self._db.execute_fetchall("SELECT id FROM users WHERE role = 'admin'")
         return [str(r["id"]) for r in rows]
+
+    # ── Telegram inbox (telegram_inbox.py) ─────────────────────────────
+    # `title` and `body` arrive sealed (fd_crypto); this layer never sees text.
+
+    async def get_tg_inbox_settings(self, user_id: str) -> dict | None:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT * FROM telegram_inbox_settings WHERE user_id = ?", (user_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def set_tg_inbox_settings(
+        self, user_id: str, *, enabled: bool, consented_at: str | None, retention_days: int,
+    ) -> dict:
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT INTO telegram_inbox_settings (user_id, enabled, consented_at, retention_days,"
+            " updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET"
+            " enabled = excluded.enabled, consented_at = excluded.consented_at,"
+            " retention_days = excluded.retention_days, updated_at = excluded.updated_at",
+            (user_id, 1 if enabled else 0, consented_at, int(retention_days), _utcnow()),
+        )
+        await self._db.commit()
+        return await self.get_tg_inbox_settings(user_id) or {}
+
+    async def get_tg_inbox_connection(self, connection_id: str) -> dict | None:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT * FROM telegram_inbox_connections WHERE connection_id = ?", (connection_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def list_tg_inbox_connections(self, user_id: str) -> list[dict]:
+        assert self._db is not None
+        rows = await self._db.execute_fetchall(
+            "SELECT * FROM telegram_inbox_connections WHERE user_id = ? ORDER BY connected_at DESC",
+            (user_id,),
+        )
+        return [dict(r) for r in rows]
+
+    async def upsert_tg_inbox_connection(
+        self, connection_id: str, user_id: str, tg_user_id: str, *, enabled: bool, rights: str,
+    ) -> None:
+        assert self._db is not None
+        now = _utcnow()
+        await self._db.execute(
+            "INSERT INTO telegram_inbox_connections (connection_id, user_id, tg_user_id, enabled,"
+            " rights, connected_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(connection_id) DO UPDATE SET user_id = excluded.user_id,"
+            " tg_user_id = excluded.tg_user_id, enabled = excluded.enabled,"
+            " rights = excluded.rights, updated_at = excluded.updated_at",
+            (connection_id, user_id, tg_user_id, 1 if enabled else 0, rights, now, now),
+        )
+        await self._db.commit()
+
+    async def upsert_tg_inbox_chat(
+        self, user_id: str, chat_id: str, kind: str, title: str, *,
+        last_at: int | None = None, active: bool | None = None,
+    ) -> None:
+        """Create or refresh a chat: a new title always, ``last_at`` only
+        forward, ``active`` only when given."""
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT INTO telegram_inbox_chats (user_id, chat_id, kind, title, active, last_at,"
+            " created_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(user_id, chat_id) DO UPDATE SET"
+            " kind = excluded.kind, title = CASE WHEN excluded.title != '' THEN excluded.title"
+            " ELSE telegram_inbox_chats.title END,"
+            " last_at = MAX(telegram_inbox_chats.last_at, excluded.last_at),"
+            " active = CASE WHEN ? THEN excluded.active ELSE telegram_inbox_chats.active END",
+            (user_id, chat_id, kind, title, 1 if (active is None or active) else 0,
+             int(last_at or 0), _utcnow(), 1 if active is not None else 0),
+        )
+        await self._db.commit()
+
+    async def get_tg_inbox_chat(self, user_id: str, chat_id: str) -> dict | None:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT * FROM telegram_inbox_chats WHERE user_id = ? AND chat_id = ?",
+            (user_id, chat_id),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def list_tg_inbox_chats(self, user_id: str) -> list[dict]:
+        """The user's chats, newest activity first, with how many messages
+        each holds."""
+        assert self._db is not None
+        rows = await self._db.execute_fetchall(
+            "SELECT c.*, (SELECT COUNT(*) FROM telegram_inbox_messages m"
+            "  WHERE m.user_id = c.user_id AND m.chat_id = c.chat_id) AS messages"
+            " FROM telegram_inbox_chats c WHERE c.user_id = ? ORDER BY c.last_at DESC",
+            (user_id,),
+        )
+        return [dict(r) for r in rows]
+
+    async def tg_inbox_group_subscribers(self, chat_id: str) -> list[str]:
+        """Users collecting this group now (their inbox on, the group active)."""
+        assert self._db is not None
+        rows = await self._db.execute_fetchall(
+            "SELECT c.user_id FROM telegram_inbox_chats c JOIN telegram_inbox_settings s"
+            " ON s.user_id = c.user_id WHERE c.chat_id = ? AND c.kind = 'group'"
+            " AND c.active = 1 AND s.enabled = 1",
+            (chat_id,),
+        )
+        return [str(r["user_id"]) for r in rows]
+
+    async def set_tg_inbox_group_active(self, chat_id: str, active: bool, user_id: str | None = None) -> None:
+        assert self._db is not None
+        if user_id is None:
+            await self._db.execute(
+                "UPDATE telegram_inbox_chats SET active = ? WHERE chat_id = ? AND kind = 'group'",
+                (1 if active else 0, chat_id),
+            )
+        else:
+            await self._db.execute(
+                "UPDATE telegram_inbox_chats SET active = ? WHERE chat_id = ? AND user_id = ?"
+                " AND kind = 'group'",
+                (1 if active else 0, chat_id, user_id),
+            )
+        await self._db.commit()
+
+    async def move_tg_inbox_chat(self, old_chat_id: str, new_chat_id: str) -> None:
+        """A group became a supergroup: a new id whose message ids start over,
+        so whoever kept the old one keeps the new one; the old messages stay
+        under the old (now inactive) id."""
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT OR IGNORE INTO telegram_inbox_chats (user_id, chat_id, kind, title, active,"
+            " last_at, created_at) SELECT user_id, ?, kind, title, active, 0, ?"
+            " FROM telegram_inbox_chats WHERE chat_id = ?",
+            (new_chat_id, _utcnow(), old_chat_id),
+        )
+        await self._db.execute(
+            "UPDATE telegram_inbox_chats SET active = 0 WHERE chat_id = ?", (old_chat_id,))
+        await self._db.commit()
+
+    async def add_tg_inbox_message(
+        self, user_id: str, chat_id: str, message_id: int, *, sender_id: str, outgoing: bool,
+        sent_at: int, body: str, reply_to: int | None,
+    ) -> bool:
+        """Store one message (a repeat of a stored one is ignored)."""
+        assert self._db is not None
+        cur = await self._db.execute(
+            "INSERT OR IGNORE INTO telegram_inbox_messages (user_id, chat_id, message_id,"
+            " sender_id, outgoing, sent_at, body, reply_to) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, chat_id, int(message_id), sender_id, 1 if outgoing else 0, int(sent_at),
+             body, reply_to),
+        )
+        await self._db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def edit_tg_inbox_message(
+        self, user_id: str, chat_id: str, message_id: int, *, body: str, edited_at: int,
+    ) -> bool:
+        assert self._db is not None
+        cur = await self._db.execute(
+            "UPDATE telegram_inbox_messages SET body = ?, edited_at = ? WHERE user_id = ?"
+            " AND chat_id = ? AND message_id = ? AND deleted = 0",
+            (body, int(edited_at), user_id, chat_id, int(message_id)),
+        )
+        await self._db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def get_tg_inbox_message(self, user_id: str, chat_id: str, message_id: int) -> dict | None:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT * FROM telegram_inbox_messages WHERE user_id = ? AND chat_id = ?"
+            " AND message_id = ?", (user_id, chat_id, int(message_id)),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def mark_tg_inbox_deleted(self, user_id: str, chat_id: str, message_id: int, *, body: str) -> None:
+        """Someone deleted it in Telegram: ``body`` is what's left (no text)."""
+        assert self._db is not None
+        await self._db.execute(
+            "UPDATE telegram_inbox_messages SET body = ?, deleted = 1 WHERE user_id = ?"
+            " AND chat_id = ? AND message_id = ?",
+            (body, user_id, chat_id, int(message_id)),
+        )
+        await self._db.commit()
+
+    async def list_tg_inbox_messages(
+        self, user_id: str, *, chat_id: str | None = None, since: int | None = None,
+        until: int | None = None, limit: int = 50,
+    ) -> list[dict]:
+        """Newest first."""
+        assert self._db is not None
+        where = ["user_id = ?"]
+        args: list[Any] = [user_id]
+        if chat_id is not None:
+            where.append("chat_id = ?")
+            args.append(chat_id)
+        if since is not None:
+            where.append("sent_at >= ?")
+            args.append(int(since))
+        if until is not None:
+            where.append("sent_at < ?")
+            args.append(int(until))
+        rows = await self._db.execute_fetchall(
+            f"SELECT * FROM telegram_inbox_messages WHERE {' AND '.join(where)}"
+            " ORDER BY sent_at DESC, id DESC LIMIT ?",
+            (*args, max(1, int(limit))),
+        )
+        return [dict(r) for r in rows]
+
+    async def tg_inbox_stats(self, user_id: str) -> dict:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT COUNT(*) AS messages, MIN(sent_at) AS oldest, MAX(sent_at) AS newest,"
+            " COUNT(DISTINCT chat_id) AS chats FROM telegram_inbox_messages WHERE user_id = ?",
+            (user_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else {"messages": 0, "oldest": None, "newest": None, "chats": 0}
+
+    async def delete_tg_inbox_data(self, user_id: str, *, chat_id: str | None = None,
+                                   connections: bool = False, keep_groups: bool = False) -> int:
+        """Delete a user's stored messages and chats (one chat's, or all);
+        ``keep_groups`` keeps the groups they collect (emptied); with
+        ``connections`` also their Chat Automation connections."""
+        assert self._db is not None
+        if chat_id is None:
+            cur = await self._db.execute(
+                "DELETE FROM telegram_inbox_messages WHERE user_id = ?", (user_id,))
+            await self._db.execute(
+                "DELETE FROM telegram_inbox_chats WHERE user_id = ?"
+                + (" AND kind != 'group'" if keep_groups else ""), (user_id,))
+        else:
+            cur = await self._db.execute(
+                "DELETE FROM telegram_inbox_messages WHERE user_id = ? AND chat_id = ?",
+                (user_id, chat_id))
+            await self._db.execute(
+                "DELETE FROM telegram_inbox_chats WHERE user_id = ? AND chat_id = ?",
+                (user_id, chat_id))
+        if connections:
+            await self._db.execute(
+                "DELETE FROM telegram_inbox_connections WHERE user_id = ?", (user_id,))
+        await self._db.commit()
+        return cur.rowcount or 0
+
+    async def purge_tg_inbox_expired(self, now: int) -> int:
+        """Drop messages past their owner's retention (and everything of a user
+        whose inbox is off), then private chats left with no messages."""
+        assert self._db is not None
+        cur = await self._db.execute(
+            "DELETE FROM telegram_inbox_messages WHERE sent_at < ? - 86400 * COALESCE("
+            " (SELECT s.retention_days FROM telegram_inbox_settings s"
+            "  WHERE s.user_id = telegram_inbox_messages.user_id AND s.enabled = 1), 0)",
+            (int(now),),
+        )
+        await self._db.execute(
+            "DELETE FROM telegram_inbox_chats WHERE kind = 'private' AND NOT EXISTS ("
+            " SELECT 1 FROM telegram_inbox_messages m WHERE m.user_id = telegram_inbox_chats.user_id"
+            " AND m.chat_id = telegram_inbox_chats.chat_id)",
+        )
+        await self._db.commit()
+        return cur.rowcount or 0
 
     # ── Notifications (persistent in-app bell) ─────────────────────────
 
