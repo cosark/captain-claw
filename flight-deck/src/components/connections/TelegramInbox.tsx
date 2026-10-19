@@ -12,7 +12,8 @@ import {
 
 // The Telegram inbox (captain_claw/flight_deck/telegram_inbox.py): a read-only
 // copy of the user's Telegram that their agents read, like mail — the private
-// chats they connect to the team bot in Telegram → Settings → Chat Automation,
+// chats they connect to the team bot in Telegram → Settings → Chat Automation
+// (Telegram 12.7+; with Premium also Settings → Telegram Business → Chatbots),
 // and groups they add the bot to. Off until the user consents here; turning it
 // off deletes everything kept. Nothing is ever sent in the user's name.
 
@@ -159,7 +160,8 @@ export default function TelegramInbox({ linkKey }: { linkKey: string }) {
               <>
                 <div>
                   Connected{view.connection.connected_at ? ` since ${day(view.connection.connected_at)}` : ''}.
-                  Change which chats it sees in Telegram → Settings → Chat Automation.
+                  Change which chats it sees where you connected it in Telegram (Settings → Chat
+                  Automation, or Settings → Telegram Business → Chatbots).
                 </div>
                 {view.connection.rights.length > 0 && (
                   <div className="text-zinc-500">
@@ -170,7 +172,12 @@ export default function TelegramInbox({ linkKey }: { linkKey: string }) {
               </>
             ) : (
               <ol className="list-decimal pl-4 space-y-0.5 text-zinc-400">
-                <li>In Telegram open <span className="text-zinc-200">Settings → Chat Automation</span>.</li>
+                <li>
+                  In Telegram open <span className="text-zinc-200">Settings → Chat Automation</span>. It
+                  needs Telegram 12.7 or newer — if it isn't there, update the app (or try the phone
+                  app). With Telegram Premium you can use{' '}
+                  <span className="text-zinc-200">Settings → Telegram Business → Chatbots</span> instead.
+                </li>
                 <li>Choose <span className="text-zinc-200">{bot}</span> and pick which chats it may see
                   (all, only new ones, everyone but your contacts …).</li>
                 <li>Leave every permission off — it only reads. Messages from then on reach the inbox;
@@ -180,8 +187,8 @@ export default function TelegramInbox({ linkKey }: { linkKey: string }) {
             {view.bot.business === false && (
               <div className="flex items-start gap-1.5 text-amber-600 dark:text-amber-400">
                 <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-px" />
-                The team bot can't be connected to accounts yet — an admin has to turn on Business Mode
-                for it in @BotFather.
+                The team bot can't be connected to accounts yet — an admin has to turn on Secretary
+                Mode for it in @BotFather.
               </div>
             )}
           </div>
@@ -279,7 +286,7 @@ export default function TelegramInbox({ linkKey }: { linkKey: string }) {
             </button>
             <button
               onClick={() => {
-                if (confirm('Turn the inbox off? Everything kept is deleted, the bot leaves your groups, and your agents can no longer read your Telegram. Also remove the bot in Telegram → Settings → Chat Automation.')) {
+                if (confirm('Turn the inbox off? Everything kept is deleted, the bot leaves your groups, and your agents can no longer read your Telegram. Also remove the bot where you connected it in Telegram (Settings → Chat Automation, or Telegram Business → Chatbots).')) {
                   run(() => setTelegramInbox({ enabled: false }))
                 }
               }}

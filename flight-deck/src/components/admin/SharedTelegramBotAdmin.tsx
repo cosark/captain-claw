@@ -205,9 +205,9 @@ export function SharedTelegramBotAdmin({ refreshTick = 0 }: { refreshTick?: numb
             {cfg.inbox && data?.status.bot_flags && (
               <div className="text-xs mt-1.5 space-y-0.5">
                 <div className={data.status.bot_flags.business ? 'text-emerald-500' : 'text-amber-500'}>
-                  {data.status.bot_flags.business === null ? 'Business Mode: not checked yet'
-                    : data.status.bot_flags.business ? 'Business Mode on — private chats can be connected'
-                    : 'Business Mode off — turn it on in @BotFather → Bot Settings → Business Mode, or private chats can\'t be connected'}
+                  {data.status.bot_flags.business === null ? 'Secretary Mode: not checked yet'
+                    : data.status.bot_flags.business ? 'Secretary Mode on — private chats can be connected'
+                    : 'Secretary Mode off — turn it on in @BotFather (the bot\'s settings → Secretary Mode), or private chats can\'t be connected'}
                 </div>
                 <div className={data.status.bot_flags.groups ? 'text-emerald-500' : 'text-amber-500'}>
                   {data.status.bot_flags.groups === null ? 'Group privacy: not checked yet'
