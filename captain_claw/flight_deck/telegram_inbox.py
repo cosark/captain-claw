@@ -5,8 +5,10 @@ Both ways in go through the deck's shared bot, which only Flight Deck polls
 (telegram_shared.route_update hands every update here first):
 
 * **Private chats** — the user connects the bot to their own account in
-  Telegram → Settings → Chat Automation (a Bot API "business connection"; no
-  Premium needed since Bot API 10.0) and picks which chats it covers. Telegram
+  Telegram → Settings → Chat Automation (Telegram 12.7+; with Premium also
+  Settings → Telegram Business → Chatbots) — a Bot API "business connection",
+  no Premium needed since Bot API 10.0 — and picks which chats it covers. The
+  bot needs Secretary Mode on in BotFather (getMe ``can_connect_to_business``). Telegram
   then hands the bot both sides of those chats, their edits and deletions.
   It never gets older history: the inbox starts when the connection does.
 * **Groups** — the user adds the bot to a group. It sees every message once
@@ -65,11 +67,12 @@ _unknown: dict[str, float] = {}
 _NOT_LINKED = (
     "This bot only reads chats for Flight Deck users who connected Telegram "
     "(Flight Deck → Connections → Telegram). Nothing is kept — you can remove it "
-    "in Settings → Chat Automation."
+    "in Settings → Chat Automation (or Settings → Telegram Business → Chatbots)."
 )
 _NOT_AVAILABLE = (
     "The Telegram inbox isn't available on this Flight Deck, so nothing is kept. "
-    "You can remove the bot in Settings → Chat Automation."
+    "You can remove the bot in Settings → Chat Automation (or Settings → Telegram "
+    "Business → Chatbots)."
 )
 _INBOX_OFF = (
     "Connected, but your Telegram inbox is off, so nothing is kept yet. Turn it on in "
@@ -81,8 +84,8 @@ _CONNECTED = (
     "never marks anything read."
 )
 _RIGHTS_TIP = (
-    "\n\nIt needs no permissions — you can switch them all off in Settings → Chat "
-    "Automation."
+    "\n\nIt needs no permissions — you can switch them all off where you connected it "
+    "(Settings → Chat Automation, or Telegram Business → Chatbots)."
 )
 _DISCONNECTED = "📭 Disconnected — nothing new from your private chats is kept."
 _JOINED = (

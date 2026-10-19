@@ -798,10 +798,10 @@ Read the owner's Telegram, the way the mail tools read email. **Read-only**: the
 
 Flight Deck keeps the inbox through the deck's team Telegram bot:
 
-- **Private chats.** The user connects the team bot in Telegram → **Settings → Chat Automation** and picks which chats it may see. Telegram then hands the bot both sides of those chats, their edits and their deletions. Older history isn't available: the inbox starts when the connection does.
+- **Private chats.** The user connects the team bot in Telegram → **Settings → Chat Automation** (Telegram 12.7 or newer; with Premium, **Settings → Telegram Business → Chatbots** works too) and picks which chats it may see. Telegram then hands the bot both sides of those chats, their edits and their deletions. Older history isn't available: the inbox starts when the connection does.
 - **Groups.** The user adds the team bot to a group, or sends `/inbox` in a group it's already in (`/inbox off` stops). The bot tells the members once that it reads along, and never posts again. Anyone else who adds the bot sees it leave.
 
-The user turns it on in **Connections → Telegram → Inbox** with explicit consent, after linking Telegram to the team bot. Turning it off, or disconnecting Telegram, deletes everything kept. Text and names are encrypted at rest with a key file kept apart from the database (`<FD home>/data_key`, or `FD_DATA_KEY_FILE`; needs the `cryptography` package). Messages are kept for 30 days by default (7, 30, 90 or 365). An admin can switch the inbox off for the deck in **Admin → Integrations**. For groups, the bot needs group privacy off in @BotFather or admin rights in the group; for private chats it needs Business Mode on.
+The user turns it on in **Connections → Telegram → Inbox** with explicit consent, after linking Telegram to the team bot. Turning it off, or disconnecting Telegram, deletes everything kept. Text and names are encrypted at rest with a key file kept apart from the database (`<FD home>/data_key`, or `FD_DATA_KEY_FILE`; needs the `cryptography` package). Messages are kept for 30 days by default (7, 30, 90 or 365). An admin can switch the inbox off for the deck in **Admin → Integrations**. For groups, the bot needs group privacy off in @BotFather or admin rights in the group; for private chats it needs **Secretary Mode** on in @BotFather (Admin → Integrations shows both).
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
