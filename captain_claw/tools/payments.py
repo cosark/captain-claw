@@ -515,6 +515,11 @@ def _turn_kind() -> dict:
         return {"automated": False, "job_kind": ""}
 
 
+def _hr_date(iso: str) -> str:
+    parts = str(iso or "").split("-")
+    return f"{parts[2]}.{parts[1]}.{parts[0]}." if len(parts) == 3 else str(iso or "")
+
+
 def _status_line(intent: dict) -> str:
     return f"payment_intent: {intent.get('id', '')} status: {intent.get('status', '')}"
 
@@ -556,8 +561,19 @@ def _describe(intent: dict, *, head: str = "", next_step: bool, rails: list[str]
         lines.append(f"Bank ({bank_link.get('bank_name') or 'the user’s bank'}): {bank_link.get('label')}"
                      + (f" ({bank_link['reason']})" if bank_link.get("reason") else "")
                      + (f" — link: {bank_link['url']}" if bank_link.get("url") else ""))
+    statement = intent.get("statement") or {}
     if intent.get("status") == "settled":
-        lines.append("Paid — confirmed by the bank.")
+        if statement.get("booked_on"):
+            lines.append(f"BANK CONFIRMED — on the user's statement, booked {_hr_date(statement['booked_on'])}"
+                         + (f" on {statement['account_label']}" if statement.get("account_label") else "") + ".")
+        else:
+            lines.append("Paid — confirmed by the bank.")
+    else:
+        if statement.get("pending_since"):
+            lines.append(f"The user's bank shows a payment for it pending since {_hr_date(statement['pending_since'])}.")
+        if statement.get("suggestions"):
+            lines.append("A payment on the user's bank statement may be this bill — they confirm or reject it in "
+                         f"Flight Deck → Payments ({intent.get('review_path')}). Don't call it paid until then.")
     lines.extend(_warning_lines(intent))
     if not next_step:
         return "\n".join(lines)

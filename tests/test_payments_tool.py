@@ -254,3 +254,17 @@ def test_protocol_purchases_send_shipping_and_never_ask_for_the_code(fd):
     r = _run(action="get", id="pur_0123456789ab")
     assert "Enter the code" in r.content and "Don't ask them to tell you the code" in r.content
     assert "checkout_pay" not in r.content
+
+
+def test_statement_wording_and_no_transaction_details(fd):
+    _, replies = fd
+    base = {**INTENT, "review_path": "/payments/pay_0123456789ab"}
+    replies["/pay_0123456789ab"] = {"intent": {**base, "status": "settled", "statement": {
+        "booked_on": "2026-10-24", "account_label": "Erste ••4565", "match": "auto", "pending_since": "",
+        "suggestions": 0}}}
+    r = _run(action="get", id="pay_0123456789ab")
+    assert "BANK CONFIRMED — on the user's statement, booked 24.10.2026. on Erste ••4565." in r.content
+    replies["/pay_0123456789ab"] = {"intent": {**base, "status": "handed_off", "statement": {
+        "booked_on": "", "pending_since": "2026-10-24", "suggestions": 1}}}
+    r = _run(action="get", id="pay_0123456789ab")
+    assert "pending since 24.10.2026." in r.content and "confirm or reject it in Flight Deck" in r.content

@@ -5,11 +5,11 @@
 // Captain never moves money: the user scans the barcode in their bank app and
 // approves it there. A blocking warning hides the barcode until the owner
 // checks it here — the agent can't clear one.
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { AlertTriangle, Check, CheckCircle2, Copy, ExternalLink, Info, Landmark, Loader2, Receipt, X } from 'lucide-react'
 import {
-  ackWarnings, CLOSED, getPayment, markPayment, PAID, payByBank, sendToRevolut, statusLabel, useBarcode,
-  type Payment, type PaymentWarning,
+  ackWarnings, answerStatementMatch, CLOSED, getPayment, markPayment, PAID, payByBank, sendToRevolut, statusLabel, useBarcode,
+  type Payment, type PaymentWarning, type StatementSuggestion,
 } from '../../services/payments'
 
 const REVOLUT_STATE: Record<string, string> = {
@@ -119,16 +119,45 @@ function Barcode({ p }: { p: Payment }) {
   )
 }
 
-export function PaymentCard({ id, compact = false }: { id: string; compact?: boolean }) {
+const STATEMENT_WARNINGS = ['paid_twice', 'bank_reversed', 'not_on_statement']
+const SUGGESTION_REASON: Record<string, string> = {
+  no_iban_on_statement: "your bank didn't show the payee's IBAN",
+  no_reference_on_statement: "your bank didn't show the reference",
+  name_only: 'same amount and payee name',
+  ambiguous: 'it fits more than one of your bills',
+  before_prepared: 'paid before Captain prepared this bill',
+}
+const isoDay = (iso: string) => {
+  const d = new Date(`${iso}T12:00:00`)
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleDateString()
+}
+
+export function PaymentCard({ id, compact = false, onChange }: {
+  id: string; compact?: boolean; onChange?: (p: Payment) => void
+}) {
   const [p, setP] = useState<Payment | null>(null)
   const [rails, setRails] = useState<string[]>([])
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [suggestions, setSuggestions] = useState<StatementSuggestion[]>([])
 
   const load = useCallback(() => {
-    getPayment(id).then((r) => { setP(r.intent); setRails(r.rails || []); setError('') })
-      .catch((e) => setError(String(e.message || e)))
+    getPayment(id).then((r) => {
+      setP(r.intent); setRails(r.rails || []); setSuggestions(r.statement_suggestions || []); setError('')
+    }).catch((e) => setError(String(e.message || e)))
   }, [id])
+  // Let a list showing this payment keep its row in step with the card.
+  const changed = useRef(onChange)
+  changed.current = onChange
+  useEffect(() => { if (p) changed.current?.(p) }, [p])
+  const answer = async (fp: string, accept: boolean) => {
+    if (!p) return
+    setBusy(true)
+    try {
+      const r = await answerStatementMatch(p.id, fp, accept)
+      setP(r.intent); setSuggestions(r.statement_suggestions || []); setError('')
+    } catch (e) { setError(String((e as Error).message || e)); load() } finally { setBusy(false) }
+  }
   useEffect(() => { load() }, [load])
 
   const act = async (fn: () => Promise<{ intent: Payment }>) => {
@@ -165,6 +194,9 @@ export function PaymentCard({ id, compact = false }: { id: string; compact?: boo
   const payable = p.status === 'ready' || p.status === 'handed_off'
   const openBlocking = p.warnings.filter((w) => w.severity === 'blocking' && !w.acked)
   const ref = [p.model, p.reference].filter(Boolean).join(' ')
+  const st = p.statement
+  // A paid bill still shows what its statement says (paid twice, reversed, not seen yet).
+  const shownWarnings = closed ? p.warnings.filter((w) => STATEMENT_WARNINGS.includes(w.code)) : p.warnings
   const euros = `${Math.floor(p.amount_cents / 100)},${String(p.amount_cents % 100).padStart(2, '0')}`
 
   return (
@@ -184,10 +216,41 @@ export function PaymentCard({ id, compact = false }: { id: string; compact?: boo
       </div>
 
       {paid && (
-        <div className="mt-2 flex items-center gap-1.5 text-xs text-emerald-400">
+        <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-emerald-400">
           <CheckCircle2 size={14} />
-          {p.status === 'settled' ? 'Paid — confirmed by the bank' : 'Marked as paid'}
-          {p.paid_at ? ` on ${new Date(p.paid_at * 1000).toLocaleDateString()}` : ''}
+          {st?.booked_on
+            ? `Bank confirmed · booked ${isoDay(st.booked_on)}${st.account_label ? ` · ${st.account_label}` : ''}`
+            : <>{p.status === 'settled' ? 'Paid — confirmed by the bank' : 'Marked as paid'}
+              {p.paid_at ? ` on ${new Date(p.paid_at * 1000).toLocaleDateString()}` : ''}</>}
+        </div>
+      )}
+      {st?.pending_since && !st.booked_on && (
+        <div className="mt-2 flex items-center gap-1.5 text-xs text-sky-300">
+          <Landmark size={14} /> Pending at your bank since {isoDay(st.pending_since)}
+          {st.pending_account ? ` · ${st.pending_account}` : ''}
+        </div>
+      )}
+      {p.status !== 'settled' && suggestions.length > 0 && (
+        <div className="mt-2 space-y-1.5">
+          {suggestions.map((s) => (
+            <div key={s.fp} className="rounded-md border border-sky-500/40 bg-sky-500/5 px-2 py-1.5 text-xs text-sky-100">
+              <div>
+                Is this your payment? <b>{(s.amount_cents / 100).toFixed(2)} EUR</b> to {s.creditor_name || 'a payee'},
+                booked {isoDay(s.day)}{s.account_label ? ` · ${s.account_label}` : ''}
+                <span className="text-sky-300/80"> — {SUGGESTION_REASON[s.reason] ?? s.reason}</span>
+              </div>
+              <div className="mt-1 flex gap-2">
+                <button disabled={busy} onClick={() => answer(s.fp, true)}
+                  className="rounded bg-emerald-600 px-2 py-0.5 font-medium text-white hover:bg-emerald-500 disabled:opacity-50">
+                  Yes, that's it
+                </button>
+                <button disabled={busy} onClick={() => answer(s.fp, false)}
+                  className="rounded bg-zinc-700 px-2 py-0.5 font-medium text-zinc-100 hover:bg-zinc-600 disabled:opacity-50">
+                  No
+                </button>
+              </div>
+            </div>
+          ))}
         </div>
       )}
 
@@ -213,9 +276,9 @@ export function PaymentCard({ id, compact = false }: { id: string; compact?: boo
         </div>
       )}
 
-      {!closed && p.warnings.length > 0 && (
+      {shownWarnings.length > 0 && (
         <div className="mt-2 space-y-1.5">
-          {p.warnings.map((w) => (
+          {shownWarnings.map((w) => (
             <WarningRow key={w.code} w={w} busy={busy} onAck={() => act(() => ackWarnings(p.id, [w.code]))} />
           ))}
         </div>

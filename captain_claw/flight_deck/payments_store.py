@@ -189,6 +189,18 @@ CREATE TABLE IF NOT EXISTS bank_transactions (
     PRIMARY KEY (owner_id, fp)
 );
 CREATE INDEX IF NOT EXISTS idx_bank_transactions_date ON bank_transactions(owner_id, booking_date);
+-- Phase 4b: which bank transaction belongs to which bill, and how sure we are.
+-- state: auto | confirmed (it settled the bill) | pending | suggested | rejected | duplicate.
+CREATE TABLE IF NOT EXISTS statement_links (
+    owner_id   TEXT NOT NULL,
+    fp         TEXT NOT NULL,
+    intent_id  TEXT NOT NULL,
+    state      TEXT NOT NULL,
+    reason     TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (owner_id, fp, intent_id)
+);
 """
 
 # Columns added after a table first shipped: (table, column, DDL).
@@ -197,6 +209,7 @@ _MIGRATIONS = (
     ("payment_intents", "rails_state", "TEXT NOT NULL DEFAULT '{}'"),
     ("payment_intents", "rail_nonce", "TEXT"),
     ("bank_sessions", "last_attempt_at", "REAL"),
+    ("payment_intents", "statement", "TEXT NOT NULL DEFAULT '{}'"),
 )
 # Indexes on migrated columns, created after the migrations ran.
 _POST_MIGRATION_DDL = (
@@ -204,7 +217,8 @@ _POST_MIGRATION_DDL = (
     " ON payment_intents(rail_nonce) WHERE rail_nonce IS NOT NULL"
 )
 
-_JSON_COLS = {"fields": {}, "provenance": {}, "warnings": [], "acks": {}, "barcodes": [], "rails_state": {}}
+_JSON_COLS = {"fields": {}, "provenance": {}, "warnings": [], "acks": {}, "barcodes": [], "rails_state": {},
+              "statement": {}}
 
 
 def _loads(raw: Any, default: Any) -> Any:
@@ -381,7 +395,7 @@ class PaymentsStore:
         await db.execute("DELETE FROM payment_connections WHERE owner_id = ?", (owner_id,))
         await db.execute("DELETE FROM payment_prefs WHERE owner_id = ?", (owner_id,))
         await db.execute("DELETE FROM purchases WHERE owner_id = ?", (owner_id,))
-        for table in ("bank_sessions", "bank_accounts", "bank_transactions"):
+        for table in ("bank_sessions", "bank_accounts", "bank_transactions", "statement_links"):
             await db.execute(f"DELETE FROM {table} WHERE owner_id = ?", (owner_id,))
         await db.commit()
 
@@ -610,6 +624,29 @@ class PaymentsStore:
         async with db.execute("SELECT COUNT(*) FROM bank_transactions WHERE owner_id = ? AND account_key = ?",
                               (owner_id, account_key)) as cur:
             return int((await cur.fetchone())[0])
+
+    async def statement_links(self, owner_id: str) -> list[dict]:
+        db = await self._ensure_db()
+        async with db.execute("SELECT * FROM statement_links WHERE owner_id = ?", (owner_id,)) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def set_statement_link(self, owner_id: str, fp: str, intent_id: str, state: str, reason: str = "") -> None:
+        db = await self._ensure_db()
+        now = time.time()
+        await db.execute(
+            "INSERT INTO statement_links (owner_id, fp, intent_id, state, reason, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(owner_id, fp, intent_id) DO UPDATE SET"
+            " state = excluded.state, reason = CASE WHEN excluded.reason = '' THEN reason ELSE excluded.reason END,"
+            " updated_at = excluded.updated_at",
+            (owner_id, fp, intent_id, state, reason, now, now))
+        await db.commit()
+
+    async def assign_transaction(self, owner_id: str, fp: str, intent_id: str, match: str) -> None:
+        """Record the bill a transaction paid (kept past the retention purge)."""
+        db = await self._ensure_db()
+        await db.execute("UPDATE bank_transactions SET intent_id = ?, match = ?, updated_at = ?"
+                         " WHERE owner_id = ? AND fp = ?", (intent_id, match, time.time(), owner_id, fp))
+        await db.commit()
 
     async def purge_bank_transactions(self, before: str) -> int:
         """Unmatched outgoing payments booked before *before* (YYYY-MM-DD) go."""

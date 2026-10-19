@@ -1,7 +1,8 @@
 # Payments, Phase 4: the bank statement closes the loop
 
 Status: **plan agreed** (2026-10-19): all six decisions at the end were taken
-as recommended. **4a is built** (see "As built: 4a" below); 4b–4d are next.
+as recommended. **4a and 4b are built** (see "As built" below); 4c and 4d
+are next.
 It builds on Phases 0–2: the same ledger, the same Enable Banking application
 as pay-by-bank links, and the same Revolut Business connection.
 
@@ -52,6 +53,65 @@ the error shows cleanly on the panel.
     account), looked up once per sync.
   - **`FD_ENABLEBANKING_STATEMENTS_REDIRECT_URL`** overrides the callback URL
     the deck works out, like Phase 2's override.
+
+## As built: 4b (2026-10-19)
+
+Tested with table tests of the pure matcher, end-to-end tests against a fake
+Enable Banking, and on a spare deck with seeded statement rows (settle, paid
+twice, a name-only suggestion rejected, a paid-before-prepared suggestion
+confirmed).
+
+- **Files:**
+  - `payments/matching.py` (`grade`, `match`, `not_seen`), pure.
+  - `flight_deck/statement_matching.py`: carries decisions out; the owner's
+    answer.
+  - Card UI in `PaymentCard.tsx`.
+- **Store:**
+  - A `statement_links` table: transaction ↔ bill, with state `auto`,
+    `confirmed`, `pending`, `suggested`, `rejected` or `duplicate`, and a
+    reason.
+  - A `statement` JSON column on bills: `settled_by`, `pending` and
+    `suggestions`, so list views need no extra queries.
+  - `bank_transactions.intent_id` / `match` are set for settling and duplicate
+    links, which keeps those rows past the retention purge.
+- **When matching runs:**
+  - after every statement sync;
+  - when a bill is prepared (it may be paid already);
+  - after "I paid" on the card: a read with the user present, skipped if the
+    statement was read in the last 10 minutes or the bank needs PSU headers
+    Flight Deck can't give;
+  - hourly from the loop, so "not on the statement" ages.
+- **Routes:**
+  - `POST /fd/payments/{id}/statement-match {fp, accept}` (owner).
+  - `PUT /fd/payments/statements/settings {not_on_statement}`.
+  - `GET /fd/payments/{id}` adds `statement_suggestions`.
+- **The agent** gets `statement`: booked on, account label, match, pending
+  since, and a suggestion count. No creditor names, amounts or fingerprints.
+  The tool says "BANK CONFIRMED — on the user's statement, booked …".
+- **Where it differs from the plan above:**
+  - **References are matched on their digits alone** (at least 4), so a bank
+    that drops the model still matches. HR99 means no reference.
+  - **A bill without a reference** settles automatically only when it is the
+    only open bill with that IBAN and amount, and only with a payment booked
+    no earlier than a day before the bill was prepared. An older one belongs
+    to the last period.
+  - **An open bill wins a transaction over a paid one.** A paid bill only
+    claims a transaction from 3 days before to 20 days after its first
+    payment, as evidence or as "paid twice". So next month's rent isn't
+    "paid twice".
+  - **`paid_before_prepared` is blocking**, not info. The bill moves to
+    `needs_review`, so it can't be handed over until the owner confirms or
+    rejects that payment, or acks the warning.
+  - **A bill the user marked paid keeps its paid time and method** when the
+    statement settles it.
+  - **`not_on_statement`** needs every watched account of an active connection
+    read past the payment day plus 4 business days. It has an on/off switch in
+    the Bank statements panel.
+  - **Paid-bill warnings stay visible:** `paid_twice`, `bank_reversed` and
+    `not_on_statement` still show on a closed bill's card.
+- **Risk:** if a bank changes a booked transaction's `entry_reference`, the
+  same payment could look like "paid twice". The warning says to check the
+  statement, and nothing is ever unsettled.
 
 ## Goal
 

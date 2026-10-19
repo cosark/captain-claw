@@ -4,7 +4,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ChevronDown, ChevronRight, FileSearch, Loader2, RefreshCw } from 'lucide-react'
 import {
-  connectStatements, disconnectStatements, getBankLink, getStatements, setRevolutStatement, statementBanks,
+  connectStatements, disconnectStatements, getBankLink, getStatements, setRevolutStatement, setStatementWarnings,
+  statementBanks,
   syncStatements, watchStatementAccount, type StatementBank, type StatementSession, type StatementsStatus,
 } from '../../services/payments'
 
@@ -116,6 +117,13 @@ export function StatementsPanel() {
                   </button>
                   <span className="text-[11px] text-zinc-500">Captain also checks at {s.sync_times.join(' and ')}.</span>
                 </div>
+              )}
+              {s.sessions.length > 0 && (
+                <label className="flex items-center gap-2 text-zinc-300">
+                  <input type="checkbox" disabled={busy} checked={s.not_on_statement}
+                    onChange={(e) => run(() => setStatementWarnings(e.target.checked))} />
+                  Tell me when a bill I marked paid doesn't show up on my statement after 4 working days
+                </label>
               )}
               {!s.configured ? (
                 <p className="text-zinc-300">Connecting a bank needs the deck's Enable Banking application

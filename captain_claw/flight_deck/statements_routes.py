@@ -180,7 +180,10 @@ async def sync_session(sess: dict, *, psu: dict | None = None, now: float | None
         await store().save_bank_session(owner, provider, sid, **changes)
         log.info("Statement sync", provider=provider, new=summary["new"], changed=summary["changed"],
                  error=bool(summary["error"]))
-        return summary
+    from captain_claw.flight_deck import statement_matching
+
+    summary["matched"] = await statement_matching.safe_match(owner)
+    return summary
 
 
 async def _store_rows(owner: str, account: dict, rows: list[dict], summary: dict) -> None:
@@ -207,6 +210,20 @@ async def _first_read(sess: dict, psu: dict | None, wait: float = 20.0) -> str:
     if result.get("error"):
         return f"The first read didn't work ({html.escape(result['error'])}); Captain tries again at the next sync"
     return f"Captain read {result['new']} outgoing payments from the last months"
+
+
+async def after_user_paid(owner: str, request: Request) -> None:
+    """ "I paid" on the card: the user is here, so read the statement now (in the
+    background, with their PSU headers) unless it was read in the last 10 minutes."""
+    if not bs.enabled():
+        return
+    for sess in await store().list_bank_sessions(owner):
+        if sess["status"] != "active" or time.time() - float(sess.get("last_sync_at") or 0) < 600:
+            continue
+        psu = psu_headers(request, sess.get("required_psu_headers") or []) if sess["provider"] == EB else None
+        if sess["provider"] == EB and psu is None:
+            continue                     # not without the user's presence: keep the unattended budget
+        _spawn(sync_session(sess, psu=psu))
 
 
 async def _has_work(owner: str) -> bool:
@@ -294,8 +311,11 @@ async def statements_status(request: Request, user: dict = Depends(get_current_u
     from captain_claw.flight_deck import bank_link
 
     _pr()._require_on()
+    from captain_claw.flight_deck import statement_matching
+
     out = {"enabled": bs.enabled(), "configured": bank_link.configured(),
            "revolut_connected": bool(await _pr()._revolut_conn(user["id"])),
+           "not_on_statement": await store().get_pref(user["id"], statement_matching.WARNINGS_PREF) is not False,
            "sync_times": [f"{h:02d}:{m:02d}" for h, m in sync_times()], "redirect_url": "", "sessions": []}
     if not out["enabled"]:
         return out
@@ -497,3 +517,34 @@ async def statements_revolut(req: RevolutStatementRequest, user: dict = Depends(
         for a in accounts if a.get("id") and str(a.get("state") or "active") == "active"])
     read = await _first_read(sess, None)
     return {"enabled": True, "message": read}
+
+
+class SettingsRequest(BaseModel):
+    not_on_statement: bool
+
+
+@router.put("/fd/payments/statements/settings")
+async def statements_settings(req: SettingsRequest, user: dict = Depends(get_current_user)):
+    """Whether "I paid" bills missing from the statement get a warning."""
+    from captain_claw.flight_deck import statement_matching
+
+    _require_statements()
+    await store().set_pref(user["id"], statement_matching.WARNINGS_PREF, req.not_on_statement)
+    await statement_matching.safe_match(user["id"])
+    return {"not_on_statement": req.not_on_statement}
+
+
+class AnswerRequest(BaseModel):
+    fp: str
+    accept: bool
+
+
+@router.post("/fd/payments/{intent_id}/statement-match")
+async def statement_answer(intent_id: str, req: AnswerRequest, user: dict = Depends(get_current_user)):
+    """The owner says whether a payment on their statement is this bill."""
+    from captain_claw.flight_deck import statement_matching
+
+    _require_statements()
+    row = await _pr()._owned(intent_id, user["id"])
+    row = await statement_matching.answer(row, req.fp, req.accept, f"user:{user['id']}")
+    return {"intent": _pr().view(row), "statement_suggestions": (row.get("statement") or {}).get("suggestions") or []}

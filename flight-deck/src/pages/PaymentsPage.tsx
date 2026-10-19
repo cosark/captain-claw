@@ -159,7 +159,8 @@ export function PaymentsPage() {
 
         {selected && (
           <div className="mb-4">
-            <PaymentCard key={selected} id={selected} />
+            <PaymentCard key={selected} id={selected}
+              onChange={(np) => setRows((rs) => rs && rs.map((r) => (r.id === np.id ? np : r)))} />
           </div>
         )}
 

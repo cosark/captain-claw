@@ -316,8 +316,8 @@ def test_off_without_the_flag_and_never_shown_to_the_agent(env, monkeypatch):
         assert "HEP ELEKTRA" not in text and "Erste" not in text
     monkeypatch.delenv("FD_PAYMENTS_STATEMENTS")
     assert client.get("/fd/payments/statements").json() == {
-        "enabled": False, "configured": True, "revolut_connected": False, "sync_times": ["07:30", "16:30"],
-        "redirect_url": "", "sessions": []}
+        "enabled": False, "configured": True, "revolut_connected": False, "not_on_statement": True,
+        "sync_times": ["07:30", "16:30"], "redirect_url": "", "sessions": []}
     assert client.post("/fd/payments/statements/connect", json={"name": BANK}).status_code == 404
     assert client.get("/fd/payments/statements/callback?code=x&state=y").status_code == 404
     assert asyncio.run(payments_jobs.tick())["synced"] == 0

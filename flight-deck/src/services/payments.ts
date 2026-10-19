@@ -55,6 +55,16 @@ export interface Payment {
   revolut: { draft_id?: string; state?: string; reason?: string; vop?: { result_code: string; name: string } }
   /** Pay-by-bank link (Phase 2): the bank, its status in words, and the link while it's fresh. */
   bank_link: { bank_name?: string; status?: string; label?: string; reason?: string; url?: string }
+  /** What the bank statement says (Phase 4b): booked on which account, pending, or payments to confirm. */
+  statement?: {
+    booked_on: string; account_label: string; match: string
+    pending_since: string; pending_account: string; suggestions: number
+  }
+}
+
+/** A payment on the statement that may be this bill — the owner says yes or no. */
+export interface StatementSuggestion {
+  fp: string; day: string; amount_cents: number; creditor_name: string; account_label: string; reason: string
 }
 
 export interface BankLinkStatus {
@@ -129,7 +139,10 @@ export const listPayments = (status = '') =>
   fdJson<{ payments: Payment[] } & PaymentsConfig>(`/payments${status ? `?status=${encodeURIComponent(status)}` : ''}`)
 
 export const getPayment = (id: string) =>
-  fdJson<{ intent: Payment; rails: string[] }>(`/payments/${encodeURIComponent(id)}`)
+  fdJson<{ intent: Payment; rails: string[]; statement_suggestions?: StatementSuggestion[] }>(`/payments/${encodeURIComponent(id)}`)
+export const answerStatementMatch = (id: string, fp: string, accept: boolean) =>
+  fdJson<{ intent: Payment; statement_suggestions: StatementSuggestion[] }>(
+    `/payments/${encodeURIComponent(id)}/statement-match`, { method: 'POST', body: JSON.stringify({ fp, accept }) })
 
 export const sendToRevolut = (id: string) =>
   fdJson<{ intent: Payment }>(`/payments/${encodeURIComponent(id)}/revolut`, { method: 'POST' })
@@ -258,6 +271,7 @@ export interface StatementsStatus {
   enabled: boolean
   configured: boolean
   revolut_connected: boolean
+  not_on_statement: boolean
   sync_times: string[]
   redirect_url: string
   sessions: StatementSession[]
@@ -280,6 +294,10 @@ export const watchStatementAccount = (uid: string, watched: boolean) =>
   })
 export const disconnectStatements = (provider: string, sessionId: string) =>
   fdJson<{ ok: true }>(`/payments/statements/${provider}/${encodeURIComponent(sessionId)}`, { method: 'DELETE' })
+export const setStatementWarnings = (not_on_statement: boolean) =>
+  fdJson<{ not_on_statement: boolean }>('/payments/statements/settings', {
+    method: 'PUT', body: JSON.stringify({ not_on_statement }),
+  })
 export const setRevolutStatement = (enabled: boolean) =>
   fdJson<{ enabled: boolean; message?: string }>('/payments/statements/revolut', {
     method: 'PUT', body: JSON.stringify({ enabled }),

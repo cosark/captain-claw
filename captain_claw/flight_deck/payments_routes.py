@@ -231,7 +231,17 @@ def view(row: dict) -> dict:
         "handoff_rail": row.get("handoff_rail", ""),
         "revolut": _revolut_public((row.get("rails_state") or {}).get("revolut") or {}),
         "bank_link": _bank_public(row),
+        "statement": _statement_public(row),
     }
+
+
+def _statement_public(row: dict) -> dict:
+    """What the bank statement says about this bill — no transaction details (the agent sees this)."""
+    st = row.get("statement") or {}
+    settled, pending = st.get("settled_by") or {}, st.get("pending") or {}
+    return {"booked_on": settled.get("booked_on", ""), "account_label": settled.get("account_label", ""),
+            "match": settled.get("match", ""), "pending_since": pending.get("since", ""),
+            "pending_account": pending.get("account_label", ""), "suggestions": len(st.get("suggestions") or [])}
 
 
 def _bank_public(row: dict) -> dict:
@@ -431,8 +441,19 @@ async def agent_prepare(req: PrepareRequest, request: Request):
             await _set_status(old, "cancelled", f"agent:{slug}", detail={"replaced_by": intent_id})
     if req.automated:
         await _notify(owner, row)
+    row = await _statement_check(owner, row)
     log.info("Payment prepared", id=intent_id, owner=owner, status=status, source=source_kind)
     return {"intent": view(row), "existing": False, "rails": await _rails(owner)}
+
+
+async def _statement_check(owner: str, row: dict) -> dict:
+    """Phase 4b: match a new bill against the stored statement (it may be paid already)."""
+    from captain_claw.flight_deck import bank_statements, statement_matching
+
+    if not bank_statements.enabled():
+        return row
+    await statement_matching.safe_match(owner)
+    return await store().get(row["id"]) or row
 
 
 async def _notify(owner: str, row: dict) -> None:
@@ -594,7 +615,8 @@ async def owner_list(status: str = "", user: dict = Depends(get_current_user)):
 async def owner_get(intent_id: str, user: dict = Depends(get_current_user)):
     _require_on()
     row = await _sync_rail(await _owned(intent_id, user["id"]))
-    return {"intent": view(row), "events": await store().events(intent_id), "rails": await _rails(user["id"])}
+    return {"intent": view(row), "events": await store().events(intent_id), "rails": await _rails(user["id"]),
+            "statement_suggestions": (row.get("statement") or {}).get("suggestions") or []}
 
 
 @router.get("/fd/payments/{intent_id}/barcode/{kind}.png")
@@ -635,7 +657,7 @@ async def owner_ack(intent_id: str, req: AckRequest, user: dict = Depends(get_cu
 
 
 @router.post("/fd/payments/{intent_id}/mark")
-async def owner_mark(intent_id: str, req: OwnerMarkRequest, user: dict = Depends(get_current_user)):
+async def owner_mark(intent_id: str, req: OwnerMarkRequest, request: Request, user: dict = Depends(get_current_user)):
     _require_on()
     if req.status not in ("user_paid", "skipped", "cancelled"):
         raise HTTPException(422, "status is one of user_paid, skipped, cancelled")
@@ -643,6 +665,10 @@ async def owner_mark(intent_id: str, req: OwnerMarkRequest, user: dict = Depends
     if row["status"] in TERMINAL_STATES:
         raise HTTPException(409, f"This payment is already {row['status'].replace('_', ' ')}")
     row = await _set_status(row, req.status, f"user:{user['id']}", via="card")
+    if req.status == "user_paid":
+        from captain_claw.flight_deck import statements_routes
+
+        await statements_routes.after_user_paid(user["id"], request)
     return {"intent": view(row)}
 
 
