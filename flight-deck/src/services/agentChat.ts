@@ -92,6 +92,10 @@ export class AgentChatWS {
   // Shared mode: a 4001 (FD token expired) gets ONE refresh-and-reopen per
   // welcome; a second one is final.
   private _authRetried = false
+  // Own agents: when Flight Deck last refused our FD token (4001) and we
+  // refreshed it. One refresh-and-reopen per 30s, however long the socket
+  // has been away.
+  private _lastAuthRefresh = 0
   private _unsubAuth: (() => void) | null = null
 
   constructor(agentId: string, host: string, port: number, auth: string, lane: string = '', opts?: { sharedRef?: string }) {
@@ -167,12 +171,25 @@ export class AgentChatWS {
 
     // Connected means the agent's welcome, not the socket's open: the proxy
     // opens the socket first and holds it while the agent is still starting.
-    this.ws.onclose = () => {
+    this.ws.onclose = (ev) => {
       const wasConnected = this._connected
       this._connected = false
       this.ws = null
-      this.emit('_disconnected', { wasConnected })
-      if (this._shouldReconnect) this._scheduleReconnect()
+      this.emit('_disconnected', { wasConnected, code: ev.code })
+      if (!this._shouldReconnect) return
+      // Flight Deck refused our FD token: it expired, or Flight Deck restarted
+      // and no longer accepts tokens it signed before. Retrying it would be
+      // refused forever — get a fresh one and reopen right away.
+      if (ev.code === 4001 && Date.now() - this._lastAuthRefresh > 30_000) {
+        this._lastAuthRefresh = Date.now()
+        void refreshAccessToken().then((ok) => {
+          if (!this._shouldReconnect || this.ws || this._reconnectTimer) return
+          if (ok) this._openSocket()
+          else this._scheduleReconnect()
+        })
+        return
+      }
+      this._scheduleReconnect()
     }
 
     this.ws.onerror = () => {
