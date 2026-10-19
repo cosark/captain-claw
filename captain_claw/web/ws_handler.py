@@ -401,6 +401,10 @@ async def handle_ws_message(
         # a file it couldn't fetch, …). They reach the model beside the
         # attachments — never as the user's words.
         attachment_notes = _attachment_notes(data.get("attachment_notes"))
+        # Lines about where the message came from (a handheld device's
+        # battery and sensors as it sent it). Context, never the user's
+        # words — and unlike notes they don't make the frame an attachment.
+        context_notes = _attachment_notes(data.get("context_notes"))
         # A bridge's id for this frame, echoed in a busy refusal (retry exactly it).
         client_msg_id = str(data.get("client_msg_id") or "").strip()[:64]
         # A frame carrying attachments is always a chat turn: a caption that
@@ -478,6 +482,7 @@ async def handle_ws_message(
                 image_paths=image_paths if len(image_paths) > 1 else None,
                 file_paths=file_paths if len(file_paths) > 1 else None,
                 attachment_notes=attachment_notes or None,
+                context_notes=context_notes or None,
                 client_msg_id=client_msg_id,
                 rewind_to=rewind_to,
                 whatsapp_waid=whatsapp_waid,

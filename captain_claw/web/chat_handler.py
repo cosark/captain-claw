@@ -380,6 +380,16 @@ def sanitize_attachment_note(note: Any) -> str:
     return text
 
 
+_MAX_CONTEXT_NOTES = 4
+
+
+def context_note_lines(notes: list[str] | None) -> list[str]:
+    """``[Context: …]`` lines for a turn's context notes (a device's
+    readings), sanitised like attachment notes; at most a few."""
+    lines = [f"[Context: {n}]" for n in map(sanitize_attachment_note, notes or ()) if n]
+    return lines[:_MAX_CONTEXT_NOTES]
+
+
 def attachment_reader_hint(path: str) -> str | None:
     """``(<name>: <kind> — open it with <tool>.)`` for an attached data file;
     None for a video (analyzed automatically). A weak model otherwise gets a
@@ -533,6 +543,7 @@ async def handle_chat(
     image_paths: list[str] | None = None,
     file_paths: list[str] | None = None,
     attachment_notes: list[str] | None = None,
+    context_notes: list[str] | None = None,
     rewind_to: str | None = None,
     whatsapp_waid: str | None = None,
     origin: dict | None = None,
@@ -575,6 +586,11 @@ async def handle_chat(
     voice note's length, a file it couldn't fetch, …). Each is sanitised to
     one line and shown after the ``[Attached …]`` lines; they never count as
     the user's words (task naming, flows and the mail guard don't see them).
+
+    *context_notes* are lines a bridge wrote about where the message came
+    from (a handheld device's battery and sensor readings when it sent the
+    turn). They open the turn as ``[Context: …]`` lines and, like the notes,
+    never count as the user's words.
     """
     from captain_claw.speaker import speaker_error, speaker_key_of
 
@@ -729,6 +745,9 @@ async def handle_chat(
         effective_content = "\n".join(_prefix.lines) + "\n" + (content or default_msg)
         if not content:
             user_words = "\n".join(_prefix.base_lines + [default_msg])
+    _context = context_note_lines(context_notes)
+    if _context:
+        effective_content = "\n".join(_context) + "\n" + effective_content
 
     # A rerouted turn's caller (a lane-A socket) moves to the automation lane
     # for this turn: it gets every frame that lane sends (Flight Deck's

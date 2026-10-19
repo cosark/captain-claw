@@ -1,6 +1,6 @@
 """Firmware for over-the-air device updates (docs/device-ota-plan.md).
 
-An admin publishes a signed build per device kind (``sticks3``,
+An admin publishes a signed build per device kind (``sticks3``, ``papercolor``,
 ``stopwatch`` — the PlatformIO env) with ``firmware/device/tools/publish.py``;
 it lands in ``<fd_home>/device_firmware/<hw>/<version>.bin`` beside a
 ``manifest.json``. A device reports ``hw`` and ``fw`` on ``/device/ws`` and is
