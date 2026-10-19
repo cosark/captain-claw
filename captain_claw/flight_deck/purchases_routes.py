@@ -120,15 +120,25 @@ async def sources_for(owner: str) -> list[str]:
         out.append("link")
     if await revolut_cards_conn(owner):
         out.append("revolut_card")
-    from captain_claw.flight_deck import protocol_checkout
+    from captain_claw.flight_deck import ap2_client, protocol_checkout
 
-    out += [s for s in ("acp", "ap2") if protocol_checkout.enabled(s)]
+    # Ready for this user, not just on for the deck: ACP pays through their Link
+    # and needs a shop key; AP2 needs their credentials provider.
+    if "link" in out and protocol_checkout.enabled("acp") and await protocol_checkout.merchants(owner):
+        out.append("acp")
+    if protocol_checkout.enabled("ap2") and ((await store().get_pref(owner, ap2_client.PREF)) or {}).get(
+            "credentials_provider_url"):
+        out.append("ap2")
     return out
 
 
 async def sync(row: dict) -> dict:
     """Move a purchase on from what its provider says."""
     try:
+        if row["source"] in ("acp", "ap2"):
+            from captain_claw.flight_deck import protocol_checkout
+
+            return await protocol_checkout.sync(row)
         if row["source"] == LINK and row["status"] not in PURCHASE_TERMINAL[2:] and row["status"] != "completed":
             return await _sync_link(row)
         if row["source"] == "revolut_card" and row["status"] in ("paying", "ordered", "needs_action"):
@@ -203,6 +213,7 @@ class PurchaseItem(BaseModel):
     quantity: int = 1
     unit_amount: str = ""
     url: str = ""
+    id: str = ""                           # the shop's own item id (ACP / AP2)
 
 
 class PurchaseRequest(BaseModel):
@@ -216,6 +227,7 @@ class PurchaseRequest(BaseModel):
     credential_type: str = "card"          # link: card | link_pay_token
     merchant_account_id: str = ""          # link_pay_token: the acct_… on the checkout page
     protocol_endpoint: str = ""            # acp / ap2: the merchant's endpoint
+    shipping: dict = {}                    # acp / ap2: {name, line_one, line_two, city, state, country, postal_code, email, phone_number}
     session_id: str = ""
     automated: bool = False
 
@@ -297,6 +309,10 @@ async def agent_create(req: PurchaseRequest, request: Request):
     else:
         from captain_claw.flight_deck import protocol_checkout
 
+        shipping = {k: str(v)[:200] for k, v in (req.shipping or {}).items()
+                    if k in ("name", "line_one", "line_two", "city", "state", "country", "postal_code",
+                             "email", "phone_number") and v}
+        row["provider_state"] = {"shipping": shipping}
         row = await protocol_checkout.start(row, req.protocol_endpoint)
     created = await store().create_purchase(row)
     await _event(created, f"agent:{slug}", "purchase_created", {"source": req.source, "amount_cents": cents})
@@ -451,7 +467,11 @@ async def _wind_down(row: dict) -> None:
     """A purchase that won't happen: its card or spend request goes too."""
     ps = row.get("provider_state") or {}
     try:
-        if row["source"] == LINK and ps.get("spend_request_id"):
+        if row["source"] in ("acp", "ap2"):
+            from captain_claw.flight_deck import protocol_checkout
+
+            await protocol_checkout.cancel(row)
+        if row["source"] in (LINK, "acp") and ps.get("spend_request_id"):
             conn = await link_conn(row["owner_id"])
             if conn:
                 await link_client(conn).cancel_spend_request(ps["spend_request_id"])
@@ -607,6 +627,53 @@ async def revolut_cards(req: RevolutCardsRequest, user: dict = Depends(get_curre
     return {"enabled": True, "url": rb.consent_url(conn, state, cards=True)}
 
 
+class AcpMerchantRequest(BaseModel):
+    domain: str
+    api_key: str
+    name: str = ""
+
+
+@router.get("/fd/payments/acp/merchants")
+async def acp_merchants(user: dict = Depends(get_current_user)):
+    from captain_claw.flight_deck import protocol_checkout
+
+    _pr()._require_on()
+    rows = await protocol_checkout.merchants(user["id"])
+    return {"merchants": [{"domain": d, "name": m.get("name", ""), "added_at": m.get("added_at")}
+                          for d, m in sorted(rows.items())]}
+
+
+@router.put("/fd/payments/acp/merchants")
+async def acp_merchant_add(req: AcpMerchantRequest, user: dict = Depends(get_current_user)):
+    """The shop's ACP key for this user (ACP agents are onboarded per shop)."""
+    from captain_claw.flight_deck import protocol_checkout
+
+    _pr()._require_on()
+    domain = protocol_checkout.domain_of(req.domain)
+    key = req.api_key.strip()
+    if not domain or "." not in domain or not key or len(key) > 500:
+        raise HTTPException(422, "Give the shop's domain and its ACP key")
+    try:
+        await protocol_checkout.discover(domain)
+    except protocol_checkout.ProtocolError as exc:
+        raise HTTPException(422, exc.message)
+    rows = await protocol_checkout.merchants(user["id"])
+    rows[domain] = {"api_key": key, "name": req.name.strip()[:120], "added_at": time.time()}
+    await store().set_pref(user["id"], protocol_checkout.ACP_PREF, rows)
+    return await acp_merchants(user)
+
+
+@router.delete("/fd/payments/acp/merchants/{domain}")
+async def acp_merchant_remove(domain: str, user: dict = Depends(get_current_user)):
+    from captain_claw.flight_deck import protocol_checkout
+
+    _pr()._require_on()
+    rows = await protocol_checkout.merchants(user["id"])
+    rows.pop(protocol_checkout.domain_of(domain), None)
+    await store().set_pref(user["id"], protocol_checkout.ACP_PREF, rows)
+    return await acp_merchants(user)
+
+
 # ── owner routes ──────────────────────────────────────────────────────
 
 @router.get("/fd/payments/purchases")
@@ -671,6 +738,55 @@ async def _make_revolut_card(row: dict) -> dict:
     ps = {**(row.get("provider_state") or {}), "card_id": card.get("id"), "card_state": card.get("state")}
     return await store().update_purchase(row["id"], status="approved", provider_state=ps,
                                          card_last4=str(card.get("last_digits") or ""))
+
+
+class ChallengeRequest(BaseModel):
+    response: str
+
+
+@router.post("/fd/payments/purchases/{purchase_id}/challenge")
+async def owner_challenge(purchase_id: str, req: ChallengeRequest, user: dict = Depends(get_current_user)):
+    """The owner answers the payment's challenge (AP2: e.g. an OTP)."""
+    from captain_claw.flight_deck import ap2_client
+
+    _pr()._require_on()
+    row = await _owned(purchase_id, user["id"])
+    if row["source"] != "ap2" or row["status"] != "needs_action":
+        raise HTTPException(409, "This purchase isn't waiting for a challenge answer")
+    row = await ap2_client.answer_challenge(row, req.response.strip()[:64])
+    await _event(row, f"user:{user['id']}", "challenge_answered", {})
+    return {"purchase": view(row)}
+
+
+class Ap2SettingsRequest(BaseModel):
+    credentials_provider_url: str
+    user_email: str
+
+
+@router.get("/fd/payments/ap2/settings")
+async def ap2_settings(user: dict = Depends(get_current_user)):
+    from captain_claw.flight_deck import ap2_client
+
+    _pr()._require_on()
+    settings = await store().get_pref(user["id"], ap2_client.PREF) or {}
+    conn = await store().get_connection(user["id"], ap2_client.PROVIDER)
+    return {"enabled": ap2_client.enabled(), "credentials_provider_url": settings.get("credentials_provider_url", ""),
+            "user_email": settings.get("user_email", ""), "public_key": (conn or {}).get("certificate", ""),
+            "kid": (conn or {}).get("client_id", ""), "shopping_agent_id": ap2_client.shopping_agent_id()}
+
+
+@router.put("/fd/payments/ap2/settings")
+async def ap2_settings_set(req: Ap2SettingsRequest, user: dict = Depends(get_current_user)):
+    from captain_claw.flight_deck import ap2_client
+
+    _pr()._require_on()
+    url = req.credentials_provider_url.strip()
+    if not url.startswith(("https://", "http://localhost", "http://127.0.0.1")) or "@" not in req.user_email:
+        raise HTTPException(422, "Give the credentials provider's A2A URL and your wallet email")
+    await store().set_pref(user["id"], ap2_client.PREF, {"credentials_provider_url": url,
+                                                         "user_email": req.user_email.strip()[:200]})
+    await ap2_client.user_key(user["id"])          # make the signing key now, so its public key can be shared
+    return await ap2_settings(user)
 
 
 @router.post("/fd/payments/purchases/{purchase_id}/deny")

@@ -7,6 +7,7 @@ import { PaymentCard } from '../components/payments/PaymentCard'
 import { RevolutPanel } from '../components/payments/RevolutPanel'
 import { BankLinkPanel } from '../components/payments/BankLinkPanel'
 import { LinkPanel } from '../components/payments/LinkPanel'
+import { ProtocolsPanel } from '../components/payments/ProtocolsPanel'
 import { PurchaseCard } from '../components/payments/PurchaseCard'
 import {
   CLOSED, listPayments, listPurchases, PURCHASE_LABEL, setPaymentsCap, statusLabel,
@@ -39,7 +40,8 @@ function Purchases() {
   return (
     <div className="mb-6">
       <h2 className="mb-2 text-sm font-semibold text-zinc-200">Purchases</h2>
-      {selected && <PurchaseCard key={selected} id={selected} />}
+      {selected && <PurchaseCard key={selected} id={selected}
+        onChange={(np) => setRows((rs) => rs && rs.map((r) => (r.id === np.id ? np : r)))} />}
       <div className="divide-y divide-zinc-800 rounded-lg border border-zinc-800">
         {rows.map((p) => (
           <button key={p.id} onClick={() => setSelected(p.id === selected ? '' : p.id)}
@@ -138,6 +140,7 @@ export function PaymentsPage() {
         <BankLinkPanel />
         <RevolutPanel />
         <LinkPanel />
+        <ProtocolsPanel />
         <Purchases />
 
         <div className="mb-3 flex gap-1">

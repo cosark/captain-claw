@@ -89,9 +89,12 @@ def auth_token(lifetime: int = 3600) -> str:
 async def _request(method: str, path: str, *, json: Any = None, params: dict | None = None) -> Any:
     if not configured():
         raise BankLinkError(503, "Bank links aren't set up on this deck (FD_ENABLEBANKING_APP_ID / _KEY)")
-    async with httpx.AsyncClient(timeout=30, transport=transport) as client:
-        resp = await client.request(method, f"{API}{path}", json=json, params=params,
-                                    headers={"Authorization": f"Bearer {auth_token()}"})
+    try:
+        async with httpx.AsyncClient(timeout=30, transport=transport) as client:
+            resp = await client.request(method, f"{API}{path}", json=json, params=params,
+                                        headers={"Authorization": f"Bearer {auth_token()}"})
+    except httpx.HTTPError as exc:
+        raise BankLinkError(502, f"Couldn't reach Enable Banking ({type(exc).__name__})")
     if resp.status_code >= 400:
         try:
             body = resp.json()
@@ -99,7 +102,10 @@ async def _request(method: str, path: str, *, json: Any = None, params: dict | N
             body = {}
         message = str((body or {}).get("message") or (body or {}).get("detail") or resp.text[:200])
         raise BankLinkError(resp.status_code, message[:300], str((body or {}).get("error") or ""))
-    return resp.json() if resp.content else None
+    try:
+        return resp.json() if resp.content else None
+    except ValueError:
+        raise BankLinkError(502, "Enable Banking's answer isn't JSON")
 
 
 async def application() -> dict:

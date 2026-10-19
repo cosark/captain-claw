@@ -68,6 +68,12 @@ class PaymentsTool(Tool):
         "it types the one-time card into the form and clicks pay in one step — you never see the card. "
         "Don't screenshot or read the page between checkout_pay's fill and its result. If the bank asks the "
         "user to confirm (3-D Secure), ask them, then action='checkout_check' (id).\n"
+        "Shops that speak a checkout protocol need no browser: source='acp' (protocol_endpoint = the shop's "
+        "domain, items with the shop's item `id`, shipping {name, line_one, city, state, country, "
+        "postal_code, email}) — the user approves in Link and Flight Deck completes the order; "
+        "source='ap2' (protocol_endpoint = the merchant agent's A2A URL, description = what to look for) — "
+        "the user approves in Flight Deck → Payments and answers any one-time code there. For both: no "
+        "checkout_pay, just check with get.\n"
         "Rules: never ask for or accept card numbers, CVVs or bank logins. Never say anything was "
         "paid unless the user marked it paid — you can't pay. Tell the user every warning; you "
         "can't clear one, the user does that in Flight Deck → Payments."
@@ -79,8 +85,9 @@ class PaymentsTool(Tool):
         "properties": {
             "action": {"type": "string", "enum": ["prepare", "handoff", "mark", "list", "get",
                                                   "purchase", "checkout_pay", "checkout_check"]},
-            "source": {"type": "string", "enum": ["link", "revolut_card", "acp", "ap2"],
-                       "description": "purchase: how it's paid (see the description)."},
+            "source": {"type": "string",
+                       "description": "prepare: the invoice file — path or file name (PDF, PNG, JPG). "
+                                      "purchase: how it's paid — link, revolut_card, acp or ap2."},
             "merchant_name": {"type": "string", "description": "purchase: the shop's name."},
             "merchant_url": {"type": "string", "description": "purchase: the shop's https:// page for this order."},
             "items": {"type": "array", "description": "purchase: what is bought.",
@@ -94,15 +101,17 @@ class PaymentsTool(Tool):
             "merchant_account_id": {"type": "string",
                                     "description": "purchase with link_pay_token: the acct_… on the checkout page."},
             "protocol_endpoint": {"type": "string",
-                                  "description": "purchase with source acp / ap2: the merchant's endpoint."},
+                                  "description": "purchase with source acp: the shop's domain; ap2: the "
+                                                 "merchant agent's A2A URL."},
+            "shipping": {"type": "object",
+                         "description": "purchase with source acp / ap2: where it's delivered — {name, line_one, "
+                                        "line_two, city, state, country, postal_code, email, phone_number}."},
             "pay_button": {"type": "string",
                            "description": "checkout_pay: the exact visible text of the shop's pay button "
                                           "(or a CSS selector)."},
             "fields": {"type": "object",
                        "description": "checkout_pay, only if the card fields aren't found: CSS selectors "
                                       "{number, exp, exp_month, exp_year, cvc}."},
-            "source": {"type": "string",
-                       "description": "prepare: the invoice file — path or file name (PDF, PNG, JPG)."},
             "payee_name": {"type": "string", "description": "prepare: who is paid."},
             "payee_street": {"type": "string", "description": "prepare: payee street and number."},
             "payee_city": {"type": "string", "description": "prepare: payee postcode and city."},
@@ -311,7 +320,11 @@ class PaymentsTool(Tool):
         body["items"] = [{k: (str(v) if k != "quantity" else int(v or 1)) for k, v in dict(i).items()
                           if k in ("name", "quantity", "unit_amount", "url", "id") and v not in (None, "")}
                          for i in items if isinstance(i, dict) and i.get("name")]
-        for value in [*body.values(), *(i.get("name", "") for i in body["items"])]:
+        shipping = kwargs.get("shipping")
+        if isinstance(shipping, dict) and shipping:
+            body["shipping"] = {str(k): str(v).strip() for k, v in shipping.items() if v not in (None, "")}
+        for value in [*body.values(), *(i.get("name", "") for i in body["items"]),
+                      *body.get("shipping", {}).values()]:
             if card_scrub.looks_like_card_data(str(value)):
                 return ToolResult(success=False, error="Refused: that looks like payment-card data. Captain "
                                                        "never takes card numbers — the user approves the purchase.")
@@ -437,12 +450,18 @@ def _describe_purchase(p: dict) -> str:
         lines.append(f"- note: {w.get('message')}")
     status = p.get("status")
     if status == "awaiting_approval":
-        if p.get("source") == "link":
+        if p.get("source") in ("link", "acp"):
             lines.append(f"WAITING FOR THE USER — give them this link to approve it in Link: {p.get('approval_url')} "
                          "(it works for 30 minutes). Then check with get.")
         else:
             lines.append("WAITING FOR THE USER — they approve it in Flight Deck → Payments "
                          f"({p.get('review_path')}). You can't approve it. Then check with get.")
+    elif status in ("approved", "paying") and p.get("source") in ("acp", "ap2"):
+        lines.append("APPROVED — Flight Deck is completing the order with the shop. Check again with get.")
+    elif status == "needs_action" and p.get("source") == "ap2":
+        lines.append("THE SHOP WANTS A ONE-TIME CODE — ask the user to enter it in Flight Deck → Payments "
+                     f"({p.get('review_path')}): " + str((p.get("next_action") or {}).get("display_message") or "")
+                     + ". Don't ask them to tell you the code. Then check with get.")
     elif status == "approved":
         lines.append("APPROVED — open the checkout in the browser (cart, shipping, contact filled; stop at the card "
                      f"form), then payments checkout_pay id={p.get('id')} pay_button='<the pay button text>'.")
@@ -450,7 +469,7 @@ def _describe_purchase(p: dict) -> str:
         action = p.get("next_action") or {}
         lines.append("THE BANK WANTS THE USER TO CONFIRM (3-D Secure) — ask them to approve it in their bank or Link "
                      "app" + (f" ({action.get('action_url')})" if action.get("action_url") else "")
-                     + ", then call checkout_check.")
+                     + (", then check with get." if p.get("source") == "acp" else ", then call checkout_check."))
     elif status in ("ordered", "completed"):
         lines.append(f"ORDERED{' and paid' if status == 'completed' else ''}"
                      + (f" — order {p.get('order_ref')}" if p.get("order_ref") else "") + ".")

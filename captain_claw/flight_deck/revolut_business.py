@@ -115,13 +115,23 @@ def _message(resp: httpx.Response) -> str:
     return str(body)[:300]
 
 
+def _json(resp: httpx.Response) -> Any:
+    try:
+        return resp.json()
+    except ValueError:
+        raise RevolutError(502, "Revolut's answer isn't JSON")
+
+
 async def _token_request(conn: dict, form: dict) -> dict:
     form = {**form, "client_assertion_type": ASSERTION_TYPE, "client_assertion": client_assertion(conn)}
-    async with httpx.AsyncClient(timeout=30, transport=transport) as client:
-        resp = await client.post(f"{_api(conn)}/auth/token", data=form)
+    try:
+        async with httpx.AsyncClient(timeout=30, transport=transport) as client:
+            resp = await client.post(f"{_api(conn)}/auth/token", data=form)
+    except httpx.HTTPError as exc:
+        raise RevolutError(502, f"Couldn't reach Revolut ({type(exc).__name__})")
     if resp.status_code != 200:
         raise RevolutError(resp.status_code, _message(resp))
-    data = resp.json()
+    data = _json(resp)
     out = {"access_token": data["access_token"],
            "access_expires_at": time.time() + float(data.get("expires_in") or 2399)}
     if data.get("refresh_token"):
@@ -158,16 +168,19 @@ class RevolutClient:
     async def request(self, method: str, path: str, *, json: Any = None, params: dict | None = None) -> Any:
         for attempt in (0, 1):
             token = await self._token(force=attempt == 1)
-            async with httpx.AsyncClient(timeout=30, transport=transport) as client:
-                resp = await client.request(method, f"{_api(self.conn)}{path}", json=json, params=params,
-                                            headers={"Authorization": f"Bearer {token}"})
+            try:
+                async with httpx.AsyncClient(timeout=30, transport=transport) as client:
+                    resp = await client.request(method, f"{_api(self.conn)}{path}", json=json, params=params,
+                                                headers={"Authorization": f"Bearer {token}"})
+            except httpx.HTTPError as exc:
+                raise RevolutError(502, f"Couldn't reach Revolut ({type(exc).__name__})")
             if resp.status_code == 401 and attempt == 0:
                 continue
             if resp.status_code >= 400:
                 raise RevolutError(resp.status_code, _message(resp))
             if resp.status_code == 204 or not resp.content:
                 return None
-            return resp.json()
+            return _json(resp)
         raise RevolutError(401, "Revolut refused the token")
 
     async def accounts(self) -> list[dict]:

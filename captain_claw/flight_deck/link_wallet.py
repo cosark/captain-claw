@@ -101,15 +101,25 @@ def _message(resp: httpx.Response) -> tuple[str, str]:
     return str((body or {}).get("message") or body)[:300], ""
 
 
+def _json(resp: httpx.Response) -> Any:
+    try:
+        return resp.json()
+    except ValueError:
+        raise LinkError(502, "Link's answer isn't JSON")
+
+
 async def _token_call(form: dict) -> dict:
     form = {**form, "client_id": _env("FD_LINK_CLIENT_ID"), "client_secret": _env("FD_LINK_CLIENT_SECRET")}
-    async with httpx.AsyncClient(timeout=30, transport=transport) as client:
-        resp = await client.post(f"{AUTH}/auth/token", data=form,
-                                 headers={"Authorization": f"Bearer {_env('FD_LINK_PUBLISHABLE_KEY')}"})
+    try:
+        async with httpx.AsyncClient(timeout=30, transport=transport) as client:
+            resp = await client.post(f"{AUTH}/auth/token", data=form,
+                                     headers={"Authorization": f"Bearer {_env('FD_LINK_PUBLISHABLE_KEY')}"})
+    except httpx.HTTPError as exc:
+        raise LinkError(502, f"Couldn't reach Link ({type(exc).__name__})")
     if resp.status_code != 200:
         message, code = _message(resp)
         raise LinkError(resp.status_code, message, code)
-    data = resp.json()
+    data = _json(resp)
     return {"access_token": data["access_token"], "refresh_token": data.get("refresh_token", ""),
             "access_expires_at": time.time() + float(data.get("expires_in") or 3600),
             "scope": data.get("scope", "")}
@@ -155,16 +165,19 @@ class LinkClient:
     async def request(self, method: str, path: str, *, json: Any = None, params: dict | None = None) -> Any:
         for attempt in (0, 1):
             token = await self._token(force=attempt == 1)
-            async with httpx.AsyncClient(timeout=30, transport=transport) as client:
-                resp = await client.request(method, f"{API}{path}", json=json, params=params,
-                                            headers={"Authorization": f"Bearer {token}",
-                                                     "User-Agent": "captain-claw-payments"})
+            try:
+                async with httpx.AsyncClient(timeout=30, transport=transport) as client:
+                    resp = await client.request(method, f"{API}{path}", json=json, params=params,
+                                                headers={"Authorization": f"Bearer {token}",
+                                                         "User-Agent": "captain-claw-payments"})
+            except httpx.HTTPError as exc:
+                raise LinkError(502, f"Couldn't reach Link ({type(exc).__name__})")
             if resp.status_code == 401 and attempt == 0:
                 continue
             if resp.status_code >= 400:
                 message, code = _message(resp)
                 raise LinkError(resp.status_code, message, code)
-            return resp.json() if resp.content else None
+            return _json(resp) if resp.content else None
         raise LinkError(401, "Link refused the token")
 
     async def user_info(self) -> dict:
@@ -172,7 +185,8 @@ class LinkClient:
 
     async def create_spend_request(self, *, amount_cents: int, currency: str, merchant_name: str, merchant_url: str,
                                    context: str, line_items: list[dict], idempotency_key: str,
-                                   credential_type: str = "card", merchant_account_id: str = "") -> dict:
+                                   credential_type: str = "card", merchant_account_id: str = "",
+                                   network_id: str = "") -> dict:
         body: dict[str, Any] = {
             "amount": int(amount_cents), "currency": currency.lower(), "context": context,
             "credential_type": credential_type, "request_approval": True, "idempotency_key": idempotency_key,
@@ -181,6 +195,8 @@ class LinkClient:
         }
         if credential_type == "link_pay_token":
             body["merchant_account_id"] = merchant_account_id
+        elif credential_type == "shared_payment_token":
+            body["network_id"] = network_id        # Link resolves the seller itself
         else:
             body.update(merchant_name=merchant_name, merchant_url=merchant_url)
         if test_mode() and credential_type != "link_pay_token":

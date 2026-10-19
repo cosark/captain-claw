@@ -257,3 +257,16 @@ def test_not_connected_and_listing(env):
     assert r.status_code == 409 and "Link isn't connected" in r.json()["detail"]
     listing = client.get("/fd/payments/purchases").json()
     assert listing["purchases"] == [] and listing["sources"] == []
+
+
+def test_link_unreachable_is_an_answer_not_a_crash(env, monkeypatch):
+    client, *_ = env
+    _connect_link(client)
+
+    def down(request):
+        raise httpx.ConnectError("no route", request=request)
+
+    monkeypatch.setattr(link_wallet, "transport", httpx.MockTransport(down))
+    r = client.post("/fd/payments/agent/purchases", json=SHOP, headers=AGENT)
+    assert r.status_code == 502 and "Couldn't reach Link" in r.json()["detail"]
+    assert client.get("/fd/payments/purchases").status_code == 200

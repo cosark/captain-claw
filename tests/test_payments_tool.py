@@ -233,3 +233,24 @@ def test_checkout_pay_never_shows_the_card(fd, monkeypatch):
 def test_checkout_pay_needs_an_open_page(fd):
     r = _run(action="checkout_pay", id="pur_0123456789ab", pay_button="Pay", _session_id="nobody")
     assert not r.success and "No checkout page is open" in r.error
+
+
+def test_protocol_purchases_send_shipping_and_never_ask_for_the_code(fd):
+    calls, replies = fd
+    assert "acp" in PaymentsTool.parameters["properties"]["source"]["description"]
+    replies["/purchases"] = {"purchase": {"id": "pur_0123456789ab", "status": "awaiting_approval", "source": "acp",
+                                          "merchant_name": "Shop", "merchant_domain": "shop.example",
+                                          "amount_text": "3.00 USD", "approval_url": "https://app.link.com/a/2"}}
+    r = _run(action="purchase", source="acp", merchant_name="Shop", merchant_url="https://shop.example",
+             protocol_endpoint="shop.example", amount="3", items=[{"name": "Socks", "id": "item_123"}],
+             shipping={"name": "Ana", "city": "Zagreb", "country": "HR", "phone_number": None})
+    assert r.success and "https://app.link.com/a/2" in r.content
+    assert calls[0][2]["shipping"] == {"name": "Ana", "city": "Zagreb", "country": "HR"}
+    assert calls[0][2]["items"] == [{"name": "Socks", "id": "item_123"}]
+    replies.clear()
+    replies["/pur_0123456789ab"] = {"purchase": {"id": "pur_0123456789ab", "status": "needs_action", "source": "ap2",
+                                                 "review_path": "/payments/purchases/pur_0123456789ab",
+                                                 "next_action": {"display_message": "Enter the code"}}}
+    r = _run(action="get", id="pur_0123456789ab")
+    assert "Enter the code" in r.content and "Don't ask them to tell you the code" in r.content
+    assert "checkout_pay" not in r.content

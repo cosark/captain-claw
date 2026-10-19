@@ -12,7 +12,7 @@ import {
   setRevolutAccount, setRevolutCards, setRevolutClient, type RevolutAccount, type RevolutConnection,
 } from '../../services/payments'
 
-function CopyBlock({ label, value, mono = true }: { label: string; value: string; mono?: boolean }) {
+export function CopyBlock({ label, value, mono = true }: { label: string; value: string; mono?: boolean }) {
   const [done, setDone] = useState(false)
   return (
     <div>

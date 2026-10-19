@@ -255,7 +255,7 @@ export interface Purchase {
   result: { outcome?: string; title?: string; url?: string; excerpt?: string }
   warnings: { code: string; severity: string; message: string }[]
   automated: boolean
-  next_action: { display_message?: string; action_url?: string | null }
+  next_action: { display_message?: string; action_url?: string | null; type?: string }
   test: boolean
   created_at: number
   completed_at: number | null
@@ -281,6 +281,33 @@ export const linkConnectUrl = () => fdJson<{ url: string }>('/payments/link/conn
 export const disconnectLink = () => fdJson<{ connected: false }>('/payments/link/connection', { method: 'DELETE' })
 export const setRevolutCards = (enabled: boolean) =>
   fdJson<{ enabled: boolean; url?: string }>('/payments/revolut/cards', { method: 'POST', body: JSON.stringify({ enabled }) })
+export const answerChallenge = (id: string, response: string) =>
+  fdJson<{ purchase: Purchase }>(`/payments/purchases/${encodeURIComponent(id)}/challenge`, {
+    method: 'POST', body: JSON.stringify({ response }),
+  })
+
+// Checkout protocols: ACP shops (their key per user) and AP2 (your credentials provider + signing key).
+export interface AcpMerchant { domain: string; name: string; added_at: number | null }
+export interface Ap2Settings {
+  enabled: boolean
+  credentials_provider_url: string
+  user_email: string
+  public_key: string
+  kid: string
+  shopping_agent_id: string
+}
+export const listAcpMerchants = () => fdJson<{ merchants: AcpMerchant[] }>('/payments/acp/merchants')
+export const addAcpMerchant = (domain: string, api_key: string, name: string) =>
+  fdJson<{ merchants: AcpMerchant[] }>('/payments/acp/merchants', {
+    method: 'PUT', body: JSON.stringify({ domain, api_key, name }),
+  })
+export const removeAcpMerchant = (domain: string) =>
+  fdJson<{ merchants: AcpMerchant[] }>(`/payments/acp/merchants/${encodeURIComponent(domain)}`, { method: 'DELETE' })
+export const getAp2Settings = () => fdJson<Ap2Settings>('/payments/ap2/settings')
+export const setAp2Settings = (credentials_provider_url: string, user_email: string) =>
+  fdJson<Ap2Settings>('/payments/ap2/settings', {
+    method: 'PUT', body: JSON.stringify({ credentials_provider_url, user_email }),
+  })
 
 /** A purchase id a `payments` tool row carries ("purchase_intent: pur_… status: …"). */
 const _PURCHASE_RE = /purchase_intent: (pur_[0-9a-f]{12}) status: (\w+)/

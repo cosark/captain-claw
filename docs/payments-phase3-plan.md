@@ -1,10 +1,11 @@
 # Payments, Phase 3: Captain buys from online shops
 
-Status: **3a built** on branch `feat/payments-phase0` (2026-10-19): the purchase
-core, the Link wallet, Revolut cards per purchase, and the safe checkout.
-**3b (ACP) and 3c (AP2) are next.** Everything is tested against fakes, and the
-checkout fill also against real headless Chromium pages. Nothing has run
-against a live Link, Revolut, ACP or AP2 service yet.
+Status: **3a, 3b and 3c built** on branch `feat/payments-phase0` (2026-10-19):
+the purchase core, the Link wallet, Revolut cards per purchase, the safe
+checkout, ACP checkout, and AP2 checkout. Everything is tested against fakes.
+The checkout fill was also tested against real headless Chromium pages, ACP
+requests against the official JSON Schema, and AP2 mandates with Google's own
+AP2 SDK. Nothing has run against a live Link, Revolut, ACP or AP2 service yet.
 
 ## What changed from the original Phase 3 idea
 
@@ -118,7 +119,21 @@ FD sync on every read: Link status / Revolut card transactions → completed
 - "Make a Revolut card for each purchase" in the Revolut panel.
 - Deep links at `/payments/purchases/<id>`.
 
-## 3b: ACP (next)
+## 3b: ACP (built)
+
+`flight_deck/protocol_checkout.py`. The agent calls `purchase` with
+`source=acp`, `protocol_endpoint` = the shop's domain, `items[].id` = the shop's
+item ids, and `shipping`. Flight Deck then:
+
+1. Discovers the shop, opens the checkout session, and picks the cheapest
+   fulfillment option.
+2. Asks Link for a shared payment token for the shop's total (a
+   `merchant_total` note when it differs from what the agent said).
+3. Once the user approves in Link, completes the checkout server-side. 3-D
+   Secure becomes `needs_action`; a decline becomes `failed`.
+
+The owner can't approve an ACP purchase in Flight Deck; only Link can. Shop
+keys go in Payments → Checkout protocols, and are never returned once saved.
 
 - Buyer side of spec 2026-04-17: `POST /checkout_sessions` (create, update,
   retrieve, complete, cancel).
@@ -131,17 +146,42 @@ FD sync on every read: Link status / Revolut card transactions → completed
 - Tested against a stub merchant built from the repo's examples, **with every
   request validated against the official JSON Schema**.
 
-## 3c: AP2 (next)
+## 3c: AP2 (built)
+
+`flight_deck/ap2_client.py`, off unless `FD_AP2=1`. Captain is the shopping
+agent; `FD_AP2_SHOPPING_AGENT_ID` sets the id it presents (default
+`captain-claw`; Google's samples allowlist `trusted_shopping_agent`). The owner
+sets the credentials provider's A2A URL and wallet email in Payments → Checkout
+protocols. Saving them makes the user's P-256 signing key, whose public key the
+panel shows.
 
 - Shopping-agent side of v0.2: A2A `message/send` (JSON-RPC) to the merchant
   agent, with the `X-A2A-Extensions` header.
-- The sample's message sequence: find cart → shipping address and payment
-  methods from the credentials provider → create checkout → the user approves
-  in Flight Deck → sign the SD-JWT CheckoutMandate and PaymentMandate with the
-  user's P-256 key held by Flight Deck → initiate payment → OTP challenge →
-  receipt.
-- Mandates are made, and checked, with Google's own AP2 SDK. A live run needs
-  the AP2 samples running, which need a Gemini API key.
+- `purchase` (`source=ap2`, `protocol_endpoint` = the merchant agent's URL,
+  `description` = what to look for) runs these steps:
+  1. Find carts, and pick the one closest to the amount.
+  2. Create the checkout in the same `contextId`.
+  3. Wait for the owner's approval in Flight Deck.
+- **Approve** (owner only) runs these steps:
+  1. Get the shipping address, payment methods, and a credential token from
+     the credentials provider.
+  2. Sign the SD-JWT CheckoutMandate (`checkout_jwt` selectively disclosed) and
+     the PaymentMandate (`transaction_id` = `checkout_hash`), ES256, valid for
+     an hour.
+  3. Send the signed mandate to the credentials provider.
+  4. Initiate payment with the merchant.
+
+  An OTP challenge becomes `needs_action` with the shop's text. The owner types
+  the code on the purchase card (`POST /fd/payments/purchases/{id}/challenge`),
+  never the agent. A receipt makes the purchase `completed`.
+- The mandates are made by our own SD-JWT code (PyJWT). Google's AP2 SDK
+  (`MandateClient().verify`) accepts the mandates from the approve flow. That
+  check runs only when `AP2_VERIFY_PYTHON` points at a Python with the SDK,
+  because the SDK's exact pins clash with Captain's:
+  `AP2_VERIFY_PYTHON=<venv>/bin/python pytest tests/test_flight_deck/test_payments_ap2.py`.
+- A live run needs the AP2 samples running, which need a Gemini API key. The
+  samples' agents are LLM-driven, so the request texts follow the samples'
+  wording; other merchant agents may word things differently.
 
 ## Not verified
 
@@ -149,5 +189,8 @@ FD sync on every read: Link status / Revolut card transactions → completed
   client, a Revolut Business account with cards and the IP whitelist, and real
   shop checkouts. Hosted fields from real payment providers may need selector
   overrides (`fields`).
+- **ACP and AP2:** no public merchants or sandboxes exist. ACP was checked
+  against the schema and examples only; AP2 against stub agents that follow the
+  samples' sequence.
 - **3-D Secure:** a challenge shown *inside* the agent's headless browser can't
   be completed by the user; only out-of-band confirmation in an app works.
