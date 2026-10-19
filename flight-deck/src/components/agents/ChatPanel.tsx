@@ -35,7 +35,13 @@ import {
   Users,
   RefreshCw,
   Layers,
+  History,
+  Undo2,
+  Sparkles,
+  Eraser,
 } from 'lucide-react'
+import { createPortal } from 'react-dom'
+import { fetchTopics, type TopicInfo } from '../../stores/chatStore'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
@@ -728,7 +734,7 @@ function ChatContent({
   onSend,
   onCancel,
 }: {
-  session: { containerId: string; containerName: string; messages: ChatMessage[]; connected: boolean; busy: boolean; statusText: string; nextStepOptions?: NextStepOption[]; liveTurnUsage?: TokenUsage | null; closed?: { code: number; reason: string } | null; unreachable?: string | null }
+  session: { containerId: string; containerName: string; messages: ChatMessage[]; connected: boolean; busy: boolean; statusText: string; nextStepOptions?: NextStepOption[]; liveTurnUsage?: TokenUsage | null; closed?: { code: number; reason: string } | null; unreachable?: string | null; hasOlder?: boolean; holdScrollUntil?: number }
   /** This lane's store key — for anything that reads or writes session state.
    *  The agent id lives on `session.containerId`. */
   sessionKey: string
@@ -746,13 +752,18 @@ function ChatContent({
   const fileInputRef = useRef<HTMLInputElement>(null)
   const conn = useAgentConnection(session.containerId)
   const { attachments, addFiles, removeAttachment, clearAttachments, handlePasteEvent, pasteFromClipboard } = useFileAttachments(conn)
+  const loadOlder = useChatStore((s) => s.loadOlder)
 
   // Auto-scroll to bottom when new messages arrive. Deliberately keyed only on
   // message COUNT — not statusText, which changes many times per turn and would
   // fire a fresh smooth-scroll animation on every phase blip ("Working…",
   // "Using X"), a real source of jank during heavy turns.
+  // Not while older rows were just prepended or the view jumped to a topic:
+  // the count changed, but the reader is looking at the past on purpose.
   useEffect(() => {
+    if (Date.now() < (session.holdScrollUntil ?? 0)) return
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.messages.length])
 
   // Focus input when panel opens
@@ -858,6 +869,17 @@ function ChatContent({
       {/* Messages */}
       <div className="flex-1 overflow-y-auto py-3">
         <div className="px-4">
+        {/* The loaded window is the newest page of the lane's log. */}
+        {session.hasOlder && (
+          <div className="mb-3 flex justify-center">
+            <button
+              onClick={() => loadOlder(sessionKey)}
+              className="rounded-md px-2.5 py-1 text-xs text-zinc-500 transition-colors hover:bg-zinc-800/60 hover:text-zinc-300"
+            >
+              Earlier messages
+            </button>
+          </div>
+        )}
         {visibleMessages.length === 0 && session.connected && (
           <div className="mt-12 text-center">
             <MessageSquare className="mx-auto h-8 w-8 text-zinc-700" />
@@ -1145,18 +1167,175 @@ function LaneStrip({ agentId, activeLane, agentName, trailing }: {
           </button>
         )
       })}
-      {/* A fresh conversation on the lane you're looking at (the agent's /new). */}
+      {/* A fresh topic on the lane you're looking at (the agent's /new): its
+          context starts over, the transcript keeps going with a divider. */}
       {!shared && <button
         onClick={() => activeSession && newSession(activeSession.key)}
         disabled={!activeSession || activeSession.busy}
-        title="Start a new session on this lane"
+        title="Start a new topic — the agent begins with a fresh context; earlier messages stay"
         className="ml-auto shrink-0 whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-800/60 hover:text-zinc-300 disabled:opacity-40 disabled:hover:bg-transparent wide:px-2 wide:py-1 wide:text-[11px]"
       >
-        + New<span className="hidden wide:inline"> session</span>
+        + New<span className="hidden wide:inline"> topic</span>
       </button>}
+      {!shared && activeSession && <TopicsButton sessionKey={activeSession.key} />}
       {trailing}
     </div>
   )
+}
+
+/** Opens the lane's Topics list: one row per divider in its transcript,
+ *  newest first. A row jumps to its divider; Resume puts the agent's
+ *  context back on that topic's session. */
+function TopicsButton({ sessionKey }: { sessionKey: string }) {
+  const [open, setOpen] = useState(false)
+  // Where the button is when it was clicked: the popover hangs under it.
+  const [anchor, setAnchor] = useState<DOMRect | null>(null)
+  return (
+    <>
+      <button
+        onClick={(e) => {
+          setAnchor(e.currentTarget.getBoundingClientRect())
+          setOpen((v) => !v)
+        }}
+        title="Topics — jump back to or resume an earlier topic"
+        aria-label="Topics"
+        className={`shrink-0 rounded-md p-1.5 transition-colors hover:bg-zinc-800/60 hover:text-zinc-300 wide:p-1 ${open ? 'bg-zinc-800/60 text-zinc-300' : 'text-zinc-500'}`}
+      >
+        <History className="h-4 w-4" />
+      </button>
+      {open && <TopicsMenu sessionKey={sessionKey} anchor={anchor} onClose={() => setOpen(false)} />}
+    </>
+  )
+}
+
+function TopicsMenu({ sessionKey, anchor, onClose }: {
+  sessionKey: string
+  anchor: DOMRect | null
+  onClose: () => void
+}) {
+  const { isMobile } = useIsMobile()
+  const [topics, setTopics] = useState<TopicInfo[] | null>(null)
+  const agentSessionId = useChatStore((s) => s.sessions.get(sessionKey)?.agentSessionId ?? '')
+  const busy = useChatStore((s) => s.sessions.get(sessionKey)?.busy ?? false)
+  const jumpToTopic = useChatStore((s) => s.jumpToTopic)
+  const resumeTopic = useChatStore((s) => s.resumeTopic)
+
+  useEffect(() => {
+    let alive = true
+    fetchTopics(sessionKey).then((list) => { if (alive) setTopics(list) })
+    return () => { alive = false }
+  }, [sessionKey])
+
+  // Newest first; the current topic is the newest row on the agent's session.
+  const rows = useMemo(() => (topics ? [...topics].reverse() : null), [topics])
+  const currentIdx = rows ? rows.findIndex((t) => !!t.agentSessionId && t.agentSessionId === agentSessionId) : -1
+
+  const jump = async (t: TopicInfo) => {
+    let id: string | null = t.messageId ?? null
+    if (!id && t.rowId !== undefined) id = await jumpToTopic(sessionKey, t.rowId)
+    onClose()
+    if (id) scrollToMessage(id)
+  }
+  const resume = (t: TopicInfo) => {
+    resumeTopic(sessionKey, t.agentSessionId)
+    onClose()
+  }
+
+  const rect = anchor
+  const style: React.CSSProperties = isMobile
+    ? { left: 0, right: 0, bottom: 0, maxHeight: '70dvh' }
+    : {
+      top: (rect?.bottom ?? 48) + 6,
+      right: Math.max(8, window.innerWidth - (rect?.right ?? window.innerWidth)),
+      width: 340, maxHeight: '60vh',
+    }
+
+  return createPortal(
+    <div className="fixed inset-0 z-[70]" onClick={onClose}>
+      <div
+        className={`fixed flex flex-col overflow-hidden border border-zinc-700 bg-zinc-900 shadow-xl ${
+          isMobile ? 'rounded-t-2xl pb-[env(safe-area-inset-bottom)]' : 'rounded-lg'
+        }`}
+        style={style}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-zinc-800 px-3 py-2">
+          <span className="text-xs font-semibold uppercase tracking-wide text-zinc-400">Topics</span>
+          <button onClick={onClose} aria-label="Close" className="rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200">
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto py-1">
+          {rows === null && <p className="px-3 py-3 text-xs text-zinc-500">Loading…</p>}
+          {rows !== null && rows.length === 0 && (
+            <p className="px-3 py-3 text-xs text-zinc-500">
+              No topics yet. "+ New topic" starts one; what was said before stays above its divider.
+            </p>
+          )}
+          {rows?.map((t, i) => {
+            const current = i === currentIdx
+            const canResume = !!t.agentSessionId && t.agentSessionId !== agentSessionId
+            return (
+              <div key={t.rowId ?? t.messageId ?? i} className="flex items-center gap-1 px-2 py-0.5">
+                <button
+                  onClick={() => jump(t)}
+                  title="Jump to this topic"
+                  className="min-w-0 flex-1 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-zinc-800/60"
+                >
+                  <div className="truncate text-sm text-zinc-200">{topicTitle(t)}</div>
+                  <div className="truncate text-[11px] text-zinc-500">
+                    {fmtTopicWhen(t.startedAt)} · {t.messageCount} message{t.messageCount === 1 ? '' : 's'}
+                    {current && <span className="ml-1.5 rounded bg-violet-600/20 px-1 text-[10px] text-violet-700 dark:text-violet-300">current</span>}
+                  </div>
+                </button>
+                {canResume && (
+                  <button
+                    onClick={() => resume(t)}
+                    disabled={busy}
+                    title={busy ? 'Wait for the agent to finish, then resume' : 'Resume: the agent picks this topic\'s context back up'}
+                    aria-label="Resume topic"
+                    className="shrink-0 rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-zinc-800/60 hover:text-zinc-200 disabled:opacity-40 disabled:hover:bg-transparent"
+                  >
+                    <Undo2 className="h-4 w-4" />
+                  </button>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    </div>,
+    document.body,
+  )
+}
+
+function topicTitle(t: TopicInfo): string {
+  if (t.title) return t.title
+  const first = t.firstUserMessage.replace(/\s+/g, ' ').trim()
+  if (first) return first.length > 72 ? `${first.slice(0, 72)}…` : first
+  if (t.action === 'clear') return 'Context cleared'
+  if (t.action === 'resume') return 'Back on an earlier topic'
+  return 'New topic'
+}
+
+function fmtTopicWhen(ts: string): string {
+  if (!ts) return ''
+  try {
+    const d = new Date(ts)
+    const sameDay = d.toDateString() === new Date().toDateString()
+    return sameDay
+      ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      : d.toLocaleDateString([], { day: 'numeric', month: 'short' })
+  } catch {
+    return ''
+  }
+}
+
+function scrollToMessage(id: string) {
+  // After a jump the loaded window may have just been replaced: let it paint.
+  window.setTimeout(() => {
+    document.getElementById(`fd-msg-${id}`)?.scrollIntoView({ block: 'start', behavior: 'smooth' })
+  }, 60)
 }
 
 // `queueOnly` (simple layout): skip the files + datastore sections — the
@@ -1839,6 +2018,23 @@ const MessageBubble = memo(function MessageBubble({ message, sourceName, agentId
   }
 
   if (message.role === 'system') {
+    // A topic divider: the agent's context moved (new topic, back on an
+    // earlier one) or was reset; the transcript continues underneath.
+    if (message.topic) {
+      const action = message.topic.action
+      const Icon = action === 'resume' ? Undo2 : action === 'clear' ? Eraser : Sparkles
+      return (
+        <div id={`fd-msg-${message.id}`} data-topic={action} className="my-4 flex items-center gap-3 text-[11px] text-zinc-500">
+          <div className="h-px flex-1 bg-zinc-800" />
+          <span className="flex items-center gap-1.5 whitespace-nowrap font-medium">
+            <Icon className="h-3.5 w-3.5 text-zinc-600" />
+            {message.content || 'New topic'}
+            <span className="font-normal text-zinc-600">{formatTime(message.timestamp)}</span>
+          </span>
+          <div className="h-px flex-1 bg-zinc-800" />
+        </div>
+      )
+    }
     // Live between-step narration blurb — subtle, in the flow.
     if (message.narration) {
       return (

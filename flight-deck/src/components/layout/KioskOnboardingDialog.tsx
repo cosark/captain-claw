@@ -472,7 +472,8 @@ function buildSteps({ name, phone, authEnabled, sharingEnabled, info }: {
       phone
         ? <><B>Line up several tasks</B> in the queue: the list icon on the row above the chat switches to it. On <B>Auto</B>, the agent works through them one after another.</>
         : <><B>Line up several tasks</B> in the queue beside the chat (the list icon at the top shows or hides it). On <B>Auto</B>, the agent works through them one after another.</>,
-      <><B>Start fresh</B> with <B>{phone ? '+ New' : '+ New session'}</B> when you change topic. The agent keeps its memory and files.</>,
+      <><B>Change topic</B> with <B>{phone ? '+ New' : '+ New topic'}</B>: the agent starts with a fresh context, and everything said so far stays above the divider. It keeps its memory and files.</>,
+      <><B>Topics</B> (the history icon next to it) lists earlier topics: tap one to jump back to it, or resume it so the agent picks that context up again.</>,
       <><B>What it makes</B> lands in {phone ? 'files and data (the folder icon)' : 'Files and data on the right'}: open, preview or download it.</>,
     ],
     note: 'It keeps working while you chat with another agent: a blue dot tells you a reply is waiting.',
