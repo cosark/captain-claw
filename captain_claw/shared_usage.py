@@ -165,10 +165,11 @@ def _def_name(definition: Any) -> str:
 
 
 def drop_unusable(tool_defs: Any, agent: Any) -> list:
-    """*tool_defs* without the ``requires_shared_members`` tools unless
-    :func:`usage_instance_allowed` (J18: the registry is process-global, so a
-    public / BotPort / Iskra / VFS-scoped agent in this process would list
-    them). Never raises: an error drops those tools."""
+    """*tool_defs* without the ``requires_shared_members`` tools (and the
+    owner's ``requires_telegram_inbox`` one) unless :func:`usage_instance_allowed`
+    (J18: the registry is process-global, so a public / BotPort / Iskra /
+    VFS-scoped agent in this process would list them). Never raises: an error
+    drops those tools."""
     try:
         defs = list(tool_defs or [])
     except Exception:
@@ -183,7 +184,8 @@ def drop_unusable(tool_defs: Any, agent: Any) -> list:
             return True
         try:
             meta = registry.get_tool_metadata(name) if registry is not None else {}
-            return bool((meta or {}).get("requires_shared_members"))
+            return bool((meta or {}).get("requires_shared_members")
+                        or (meta or {}).get("requires_telegram_inbox"))
         except Exception:
             return False
 

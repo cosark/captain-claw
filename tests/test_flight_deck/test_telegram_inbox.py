@@ -113,7 +113,8 @@ def tg(monkeypatch):
 def agents(monkeypatch):
     import captain_claw.flight_deck.server as srv
 
-    registry = {"tok-bob": (BOB, "bob-bot"), "tok-carol": (CAROL, "carol-bot")}
+    registry = {"tok-bob": (BOB, "bob-bot"), "tok-bob2": (BOB, "bob-second"),
+                "tok-carol": (CAROL, "carol-bot")}
 
     def find(token):
         if token in registry:
@@ -457,6 +458,78 @@ class TestAgentRoutes:
         msgs = _client().get("/fd/telegram-inbox/recent", headers=_bearer(BOB)).json()["messages"]
         assert [m["text"] for m in msgs] == ["great news", "the contract is signed"]
         assert _client().get("/fd/telegram-inbox/recent", headers=_bearer(CAROL)).json() == {"messages": []}
+
+
+# ── what's new, per agent ───────────────────────────────────────────
+
+
+class TestNews:
+    async def _setup(self, db):
+        await _bot_on(db)
+        await _inbox_on(db, BOB, TG_BOB)
+        await ts.route_update(db, {"update_id": 1, "business_connection": _conn("c1", TG_BOB)})
+        await ts.route_update(db, _added(TG_BOB))
+
+    def _news(self, c, tok="tok-bob"):
+        r = c.post("/fd/telegram-inbox/agent/news", headers={"X-Agent-Auth": tok})
+        assert r.status_code == 200
+        return r.json()
+
+    @staticmethod
+    def _counts(news):
+        return {ch["title"]: ch["new"] for ch in news.get("chats", [])}
+
+    async def test_counts_what_others_wrote_once(self, db, tg, agents):
+        await self._setup(db)
+        old = int(time.time()) - 2 * 86400
+        await ts.route_update(db, _biz("c1", TG_ANA, TG_ANA, "two days ago", mid=1, date=old))
+        await ts.route_update(db, _biz("c1", TG_ANA, TG_ANA, "a", mid=2))
+        await ts.route_update(db, _biz("c1", TG_ANA, TG_ANA, "b", mid=3))
+        await ts.route_update(db, _biz("c1", TG_BOB, TG_ANA, "my own", mid=4))
+        await ts.route_update(db, _group_msg(TG_CAROL, "family news", mid=1))
+        c = _client()
+        first = self._news(c)
+        # The first look covers the last day; Bob's own message isn't news.
+        assert first["first_look"] and first["total"] == 3
+        assert self._counts(first) == {"Ana Kovač": 2, "Family": 1}
+        assert {ch["kind"] for ch in first["chats"]} == {"private", "group"}
+        assert self._news(c)["chats"] == []          # told once
+        await ts.route_update(db, _biz("c1", TG_ANA, TG_ANA, "c", mid=5))
+        later = self._news(c)
+        assert not later["first_look"] and self._counts(later) == {"Ana Kovač": 1}
+
+    async def test_each_agent_has_its_own_look(self, db, tg, agents):
+        await self._setup(db)
+        await ts.route_update(db, _biz("c1", TG_ANA, TG_ANA, "hi", mid=1))
+        c = _client()
+        assert self._counts(self._news(c, "tok-bob")) == {"Ana Kovač": 1}
+        assert self._counts(self._news(c, "tok-bob2")) == {"Ana Kovač": 1}
+        assert self._news(c, "tok-carol") == {"connected": False}
+
+    async def test_reading_a_chat_counts_as_seen_but_searching_doesnt(self, db, tg, agents):
+        await self._setup(db)
+        c = _client()
+        self._news(c)  # baseline
+        await ts.route_update(db, _biz("c1", TG_ANA, TG_ANA, "about the contract", mid=1))
+        await ts.route_update(db, _group_msg(TG_CAROL, "contract too", mid=1))
+        h = {"X-Agent-Auth": "tok-bob"}
+        c.post("/fd/telegram-inbox/agent/messages", headers=h, json={"query": "contract"})
+        c.post("/fd/telegram-inbox/agent/messages", headers=h, json={"chat": "ana"})
+        assert self._counts(self._news(c)) == {"Family": 1}
+        # Deleted messages aren't news either.
+        await ts.route_update(db, _biz("c1", TG_ANA, TG_ANA, "oops", mid=2))
+        await ts.route_update(db, {"update_id": 99, "deleted_business_messages": {
+            "business_connection_id": "c1", "chat": {"id": TG_ANA, "type": "private"},
+            "message_ids": [2]}})
+        assert self._news(c)["chats"] == []
+
+    async def test_off_means_no_news_and_no_cursor_left(self, db, tg, agents):
+        await self._setup(db)
+        c = _client()
+        self._news(c)
+        await ti.set_enabled(db, BOB, enabled=False)
+        assert self._news(c) == {"connected": False}
+        assert await db.tg_inbox_cursors(BOB, "bob-bot") == {}
 
 
 # ── the agent's chat is untouched ───────────────────────────────────

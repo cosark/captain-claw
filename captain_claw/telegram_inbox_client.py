@@ -134,6 +134,76 @@ async def _post(path: str, body: dict[str, Any]) -> dict[str, Any]:
     raise InboxError(resp.status_code, detail or f"Flight Deck refused (HTTP {resp.status_code})")
 
 
+# ── what's new, once per owner turn ─────────────────────────────────
+
+_NEWS_CHATS = 5
+_TITLE_MAX = 40
+
+
+def _clean_title(title: Any) -> str:
+    """A chat name for the context line: other people chose it, so one line,
+    no brackets or quotes, short."""
+    text = " ".join(str(title or "").split())
+    text = "".join(ch for ch in text if ch.isprintable() and ch not in "[]{}<>\"\u201c\u201d")
+    return (text[:_TITLE_MAX - 1] + "…") if len(text) > _TITLE_MAX else (text or "a chat")
+
+
+def news_line(data: dict[str, Any] | None, *, detail: str = "normal") -> str:
+    """One context line from Flight Deck's news ("" when nothing is new):
+    counts and chat names only, never message text."""
+    if not isinstance(data, dict) or not data.get("connected"):
+        return ""
+    chats = [c for c in (data.get("chats") or []) if isinstance(c, dict) and int(c.get("new") or 0) > 0]
+    if not chats or detail == "nano":
+        return ""
+    parts = []
+    for c in chats[:_NEWS_CHATS]:
+        n, name = int(c["new"]), _clean_title(c.get("title"))
+        if detail == "micro":
+            parts.append(f"\"{name}\" {n}")
+        elif c.get("kind") == "group":
+            parts.append(f"{n} new in \"{name}\" (group)")
+        else:
+            parts.append(f"{n} new from \"{name}\"")
+    more = len(chats) - _NEWS_CHATS
+    if more > 0:
+        parts.append(f"+{more} more chat{'' if more == 1 else 's'}")
+    when = "in the last day" if data.get("first_look") else "since your last turn"
+    if detail == "micro":
+        return f"Telegram new ({when}): {', '.join(parts)} — telegram_inbox reads them."
+    return (
+        f"Telegram {when}: {', '.join(parts)}. Read them with telegram_inbox if they bear on "
+        "what the user is doing or look urgent; otherwise don't bring them up."
+    )
+
+
+async def news() -> dict[str, Any] | None:
+    """What's new on the owner's Telegram since this agent's last look —
+    once per owner turn (the look moves the agent's cursor in Flight Deck).
+    Also refreshes the tool's "connected" flag. None when it can't be asked."""
+    if not _fd_base() or _member_call():
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(f"{_fd_base()}/fd/telegram-inbox/agent/news",
+                                     json={}, headers=_fd_headers())
+    except Exception as exc:
+        log.debug("Flight Deck Telegram news failed: %s", exc)
+        return None
+    if resp.status_code != 200:
+        if resp.status_code in (401, 403, 404):
+            _mark(False)
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    _mark(bool(data.get("connected")))
+    return data
+
+
 async def chats() -> dict[str, Any]:
     return await _post("/fd/telegram-inbox/agent/chats", {})
 

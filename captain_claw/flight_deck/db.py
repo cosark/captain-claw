@@ -948,6 +948,17 @@ class FlightDeckDB:
                 ON telegram_inbox_messages(user_id, sent_at);
             CREATE INDEX IF NOT EXISTS idx_tg_inbox_msgs_chat
                 ON telegram_inbox_messages(user_id, chat_id, sent_at);
+            -- How far each agent has looked (telegram_inbox.news): the newest
+            -- message id it was told about — chat_id '' for every chat, a chat's
+            -- own row when the agent read that chat further.
+            CREATE TABLE IF NOT EXISTS telegram_inbox_cursors (
+                user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                agent_slug TEXT NOT NULL,
+                chat_id    TEXT NOT NULL DEFAULT '',
+                last_id    INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, agent_slug, chat_id)
+            );
         """)
         # Lightweight migrations: add columns introduced after a table first shipped.
         for table, col, ddl in [
@@ -3736,8 +3747,74 @@ class FlightDeckDB:
         if connections:
             await self._db.execute(
                 "DELETE FROM telegram_inbox_connections WHERE user_id = ?", (user_id,))
+        if chat_id is None:
+            await self._db.execute(
+                "DELETE FROM telegram_inbox_cursors WHERE user_id = ?", (user_id,))
         await self._db.commit()
         return cur.rowcount or 0
+
+    async def tg_inbox_cursors(self, user_id: str, agent_slug: str) -> dict[str, int]:
+        """``{chat_id: last_id}`` for one agent ('' = every chat)."""
+        assert self._db is not None
+        rows = await self._db.execute_fetchall(
+            "SELECT chat_id, last_id FROM telegram_inbox_cursors WHERE user_id = ? AND agent_slug = ?",
+            (user_id, agent_slug),
+        )
+        return {str(r["chat_id"]): int(r["last_id"]) for r in rows}
+
+    async def advance_tg_inbox_cursor(
+        self, user_id: str, agent_slug: str, chat_id: str, last_id: int,
+    ) -> None:
+        """Move one chat's cursor forward (never back)."""
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT INTO telegram_inbox_cursors (user_id, agent_slug, chat_id, last_id, updated_at)"
+            " VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id, agent_slug, chat_id) DO UPDATE SET"
+            " last_id = MAX(telegram_inbox_cursors.last_id, excluded.last_id),"
+            " updated_at = excluded.updated_at",
+            (user_id, agent_slug, chat_id, int(last_id), _utcnow()),
+        )
+        await self._db.commit()
+
+    async def set_tg_inbox_seen_all(self, user_id: str, agent_slug: str, last_id: int) -> None:
+        """The agent was told about everything up to ``last_id``: one cursor
+        for every chat, the per-chat ones it covers dropped."""
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT INTO telegram_inbox_cursors (user_id, agent_slug, chat_id, last_id, updated_at)"
+            " VALUES (?, ?, '', ?, ?) ON CONFLICT(user_id, agent_slug, chat_id) DO UPDATE SET"
+            " last_id = MAX(telegram_inbox_cursors.last_id, excluded.last_id),"
+            " updated_at = excluded.updated_at",
+            (user_id, agent_slug, int(last_id), _utcnow()),
+        )
+        await self._db.execute(
+            "DELETE FROM telegram_inbox_cursors WHERE user_id = ? AND agent_slug = ?"
+            " AND chat_id != '' AND last_id <= ?",
+            (user_id, agent_slug, int(last_id)),
+        )
+        await self._db.commit()
+
+    async def tg_inbox_unseen(self, user_id: str, *, after_id: int, since: int | None = None) -> list[dict]:
+        """``(id, chat_id)`` of messages others sent after ``after_id`` (and
+        at or after ``since``), still there — ids and chats only, no text."""
+        assert self._db is not None
+        sql = ("SELECT id, chat_id FROM telegram_inbox_messages WHERE user_id = ? AND id > ?"
+               " AND outgoing = 0 AND deleted = 0")
+        args: list[Any] = [user_id, int(after_id)]
+        if since is not None:
+            sql += " AND sent_at >= ?"
+            args.append(int(since))
+        rows = await self._db.execute_fetchall(sql, args)
+        return [dict(r) for r in rows]
+
+    async def tg_inbox_max_id(self, user_id: str) -> int:
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT COALESCE(MAX(id), 0) AS top FROM telegram_inbox_messages WHERE user_id = ?",
+            (user_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return int(row["top"]) if row else 0
 
     async def purge_tg_inbox_expired(self, now: int) -> int:
         """Drop messages past their owner's retention (and everything of a user

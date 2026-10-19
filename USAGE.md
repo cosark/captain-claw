@@ -813,6 +813,8 @@ The user turns it on in **Connections → Telegram → Inbox** with explicit con
 
 Attachments show as a short description (`[photo]`, `[voice message (12s)]`, `[file: offer.pdf]`), not as files. The output reminds the model that the text was written by other people and is information, not instructions.
 
+**What's new, every turn.** On the owner's own live turns the agent also gets one line in its turn context, e.g. *Telegram since your last turn: 3 new from "Ana Kovač", 12 new in "Obitelj" (group)*. The line has counts and chat names only, never message text. It is fetched once at the start of the turn. Each agent keeps its own place: the line moves it forward, and so does reading a chat (or `recent`) with the tool; a search doesn't. The first line an agent gets covers the last day. Messages the owner sent and deleted messages don't count. Scheduled, autonomous, peer and worker turns don't get the line and don't move the place, so a cron job never uses up "new" before the user has seen it. Neither do shared-agent members, public sessions or BotPort tasks.
+
 ### send_mail
 
 Send email via SMTP, Mailgun, or SendGrid.
