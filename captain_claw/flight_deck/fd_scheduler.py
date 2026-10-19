@@ -30,8 +30,25 @@ traffic.
 
 Schedules
 ---------
-``every <N>{m|h|d}``  · ``daily HH:MM``  · ``weekly <day> HH:MM``
-``in <N>{m|h|d}`` (one-shot)  · ``once <ISO-8601>`` (one-shot)
+``every <N>{m|h|d}``  · ``daily HH:MM``  · ``weekdays HH:MM`` (Mon–Fri)
+``weekly <day>[,<day>…] HH:MM``  · ``in <N>{m|h|d}`` (one-shot)
+``once <ISO-8601>`` (one-shot)
+
+Wall-clock times are the job's own time zone (``tz``, an IANA name the
+browser reports when the job is made); a job without one uses the deck's
+local time, as before.
+
+Tasks (the kiosk's Scheduled tasks)
+-----------------------------------
+A job with ``delivery_kind="agent"`` delivers per its ``delivery`` JSON:
+``chat`` (the result lands in the agent's own chat — the kiosk timeline and
+the chat bridges bound to it), ``email`` (from the owner's connected Gmail or
+Outlook, to them or to ``email_to``) and ``telegram`` (the owner's chat with
+the deck's shared bot). Every prompt job runs in its own agent session (one
+per job, kept across runs — its runs read as one conversation, and the agent
+sees what it said last time), and every run is logged in ``scheduler_runs``
+with its result and how each delivery went — the history the kiosk shows and
+searches.
 
 Quiet hours
 -----------
@@ -52,10 +69,12 @@ import secrets
 import sqlite3
 import threading
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -78,8 +97,10 @@ _NO_CACHE = {
     "Expires": "0",
 }
 
-# How long to wait for the agent's reply to a scheduled prompt.
+# How long to wait for the agent's reply to a scheduled prompt — a task's
+# (delivery_kind "agent") may do real work first (mail, research, files).
 _REPLY_TIMEOUT_SECONDS = 150.0
+_TASK_REPLY_TIMEOUT_SECONDS = 1200.0
 
 _WEEKDAYS = {
     "mon": 0, "monday": 0,
@@ -106,26 +127,72 @@ def is_one_shot(schedule: str) -> bool:
     return s.startswith("in ") or s.startswith("once ")
 
 
-def validate_schedule(schedule: str) -> None:
-    """Raise ScheduleError if the schedule string is malformed.
+def validate_schedule(schedule: str, tz: str = "") -> None:
+    """Raise ScheduleError if the schedule string (or its time zone) is
+    malformed.
 
     Validates by attempting to compute a next run from a fixed base; any
     parse failure surfaces as ScheduleError with a human message.
     """
-    compute_next_run(schedule, base=datetime(2026, 1, 1, 12, 0, 0))
+    compute_next_run(schedule, base=datetime(2026, 1, 1, 12, 0, 0), tz=tz)
 
 
-def compute_next_run(schedule: str, base: datetime | None = None) -> float | None:
-    """Return the next run time as an epoch float (local), or None when the
+def _zone(tz: str) -> ZoneInfo | None:
+    """The IANA zone ``tz`` names, or None for "" (the deck's local time)."""
+    name = (tz or "").strip()
+    if not name:
+        return None
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ScheduleError(f"unknown time zone: {name}") from exc
+
+
+def _parse_days(text: str) -> list[int]:
+    """``mon,wed fri`` → [0, 2, 4] (order kept, duplicates dropped)."""
+    days: list[int] = []
+    for part in re.split(r"[,\s]+", text.strip()):
+        if not part:
+            continue
+        day = _WEEKDAYS.get(part)
+        if day is None:
+            raise ScheduleError(f"unknown weekday: {part}")
+        if day not in days:
+            days.append(day)
+    if not days:
+        raise ScheduleError("no weekday given")
+    return days
+
+
+def _next_on_days(now: datetime, days: list[int], hh: int, mm: int) -> float:
+    """The first HH:MM after ``now`` on one of ``days`` (Mon=0)."""
+    _check_hm(hh, mm)
+    today = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    for ahead in range(8):
+        target = today + timedelta(days=ahead)
+        if target.weekday() in days and target > now:
+            return target.timestamp()
+    raise ScheduleError("no next run")  # unreachable: 8 days cover every weekday
+
+
+def compute_next_run(schedule: str, base: datetime | None = None, tz: str = "") -> float | None:
+    """Return the next run time as an epoch float, or None when the
     schedule has no future occurrence (consumed one-shots).
 
     ``base`` defaults to now; pass an explicit value for deterministic
-    tests. All wall-clock math is in local time (``datetime`` naive).
+    tests. Wall-clock math is in ``tz`` (an IANA zone) when given, else in
+    local time (``datetime`` naive); a naive ``base`` is read in ``tz``.
     """
     s = (schedule or "").strip()
     if not s:
         raise ScheduleError("empty schedule")
-    now = base or datetime.now()
+    zone = _zone(tz)
+    if zone is None:
+        now = base or datetime.now()
+    elif base is None:
+        now = datetime.now(zone)
+    else:
+        now = base.astimezone(zone) if base.tzinfo else base.replace(tzinfo=zone)
     low = s.lower()
 
     # every <N><unit>
@@ -152,20 +219,15 @@ def compute_next_run(schedule: str, base: datetime | None = None) -> float | Non
             target += timedelta(days=1)
         return target.timestamp()
 
-    # weekly <day> HH:MM
-    m = re.fullmatch(r"weekly\s+([a-z]+)\s+(\d{1,2}):(\d{2})", low)
+    # weekdays HH:MM  (Monday to Friday)
+    m = re.fullmatch(r"weekdays\s+(\d{1,2}):(\d{2})", low)
     if m:
-        day = _WEEKDAYS.get(m.group(1))
-        if day is None:
-            raise ScheduleError(f"unknown weekday: {m.group(1)}")
-        hh, mm = int(m.group(2)), int(m.group(3))
-        _check_hm(hh, mm)
-        target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        days_ahead = (day - now.weekday()) % 7
-        target += timedelta(days=days_ahead)
-        if target <= now:
-            target += timedelta(days=7)
-        return target.timestamp()
+        return _next_on_days(now, [0, 1, 2, 3, 4], int(m.group(1)), int(m.group(2)))
+
+    # weekly <day>[,<day>…] HH:MM
+    m = re.fullmatch(r"weekly\s+([a-z][a-z,\s]*?)\s+(\d{1,2}):(\d{2})", low)
+    if m:
+        return _next_on_days(now, _parse_days(m.group(1)), int(m.group(2)), int(m.group(3)))
 
     # once <ISO-8601>  (one-shot)
     m = re.fullmatch(r"once\s+(.+)", s, re.I)
@@ -175,13 +237,15 @@ def compute_next_run(schedule: str, base: datetime | None = None) -> float | Non
             dt = datetime.fromisoformat(raw)
         except ValueError as exc:
             raise ScheduleError(f"bad ISO datetime: {raw}") from exc
-        # tz-aware → epoch directly; naive → assume local.
+        # tz-aware → epoch directly; naive → the job's zone, else local.
+        if dt.tzinfo is None and zone is not None:
+            dt = dt.replace(tzinfo=zone)
         return dt.timestamp()
 
     raise ScheduleError(
         f"unrecognized schedule: {schedule!r} "
-        "(use: every <N>m|h|d, daily HH:MM, weekly <day> HH:MM, "
-        "in <N>m|h|d, once <ISO>)"
+        "(use: every <N>m|h|d, daily HH:MM, weekdays HH:MM, "
+        "weekly <day>[,<day>] HH:MM, in <N>m|h|d, once <ISO>)"
     )
 
 
@@ -252,7 +316,54 @@ def _new_job_id() -> str:
     return "job_" + secrets.token_hex(5)
 
 
-_VALID_DELIVERY = {"whatsapp", "channel", "telegram"}
+_VALID_DELIVERY = {"whatsapp", "channel", "telegram", "agent"}
+
+# Runs kept per job (the oldest go first) and the result text kept per run.
+_RUNS_KEPT_PER_JOB = 200
+_RUN_RESULT_MAX = 60_000
+_EMAIL_TO_MAX = 10
+_EMAIL_RE = re.compile(r"[^@\s,;<>\"']+@[^@\s,;<>\"']+\.[^@\s,;<>\"']+")
+
+
+def _clean_addresses(raw: Any) -> list[str]:
+    """``"a@x.com, b@y.org"`` (or a list) → valid, de-duplicated addresses.
+    Raises ValueError for one that isn't an address or for too many."""
+    items = raw if isinstance(raw, (list, tuple)) else re.split(r"[,;\s]+", str(raw or ""))
+    out: list[str] = []
+    for item in items:
+        addr = str(item or "").strip()
+        if not addr:
+            continue
+        if not _EMAIL_RE.fullmatch(addr):
+            raise ValueError(f"not an email address: {addr}")
+        if addr.lower() not in {a.lower() for a in out}:
+            out.append(addr)
+    if len(out) > _EMAIL_TO_MAX:
+        raise ValueError(f"at most {_EMAIL_TO_MAX} email recipients")
+    return out
+
+
+def norm_delivery(raw: Any) -> dict[str, Any]:
+    """A task's delivery as stored: ``{chat, email, telegram, email_to}``.
+    ``email_to`` "" means the owner's own address."""
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw) if raw.strip() else {}
+        except ValueError:
+            raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        "chat": bool(raw.get("chat")),
+        "email": bool(raw.get("email")),
+        "telegram": bool(raw.get("telegram")),
+        "email_to": ", ".join(_clean_addresses(raw.get("email_to"))),
+    }
+
+
+def _check_agent_delivery(delivery: dict[str, Any]) -> None:
+    if not (delivery["chat"] or delivery["email"] or delivery["telegram"]):
+        raise ValueError("pick at least one delivery: chat, email or Telegram")
 
 
 class SchedulerStore:
@@ -322,18 +433,63 @@ class SchedulerStore:
                 )
             except Exception:
                 pass  # column already exists
+            # Tasks: where an "agent" job delivers (JSON, see norm_delivery),
+            # the IANA zone its wall-clock times are in ("" = deck local), and
+            # the agent session its runs live in (learned from the first run).
+            for ddl in (
+                "ALTER TABLE scheduler_jobs ADD COLUMN delivery TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE scheduler_jobs ADD COLUMN tz TEXT NOT NULL DEFAULT ''",
+                "ALTER TABLE scheduler_jobs ADD COLUMN agent_session_id TEXT NOT NULL DEFAULT ''",
+            ):
+                try:
+                    self._conn_or_open().execute(ddl)
+                except Exception:
+                    pass  # column already exists
+            # Every run: what it said and how each delivery went.
+            self._conn_or_open().executescript(
+                """
+                CREATE TABLE IF NOT EXISTS scheduler_runs (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id      TEXT NOT NULL,
+                    owner_id    TEXT NOT NULL DEFAULT '',
+                    job_name    TEXT NOT NULL DEFAULT '',
+                    agent_slug  TEXT NOT NULL DEFAULT '',
+                    trigger     TEXT NOT NULL DEFAULT 'scheduled',
+                    started_at  REAL NOT NULL,
+                    finished_at REAL,
+                    status      TEXT NOT NULL DEFAULT 'running',
+                    result      TEXT NOT NULL DEFAULT '',
+                    deliveries  TEXT NOT NULL DEFAULT '[]',
+                    session_id  TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX IF NOT EXISTS idx_runs_job ON scheduler_runs(job_id, id);
+                CREATE INDEX IF NOT EXISTS idx_runs_owner ON scheduler_runs(owner_id, id);
+                """
+            )
+            # A run this process didn't finish was cut off by a restart.
+            self._conn_or_open().execute(
+                "UPDATE scheduler_runs SET status = 'error:interrupted', finished_at = started_at "
+                "WHERE status = 'running'"
+            )
             self._conn_or_open().commit()
 
     def create(
         self, *, owner_id: str = "", prompt_author: str = "human", **fields: Any,
     ) -> dict[str, Any]:
         schedule = str(fields.get("schedule", "")).strip()
-        validate_schedule(schedule)  # raises ScheduleError
+        tz = str(fields.get("tz", "") or "").strip()
+        validate_schedule(schedule, tz)  # raises ScheduleError
         kind = str(fields.get("delivery_kind", "")).strip().lower()
         if kind not in _VALID_DELIVERY:
             raise ValueError(f"delivery_kind must be one of {sorted(_VALID_DELIVERY)}")
         target = str(fields.get("delivery_target", "")).strip()
-        if not target:
+        delivery = ""
+        if kind == "agent":
+            d = norm_delivery(fields.get("delivery"))
+            _check_agent_delivery(d)
+            delivery = json.dumps(d)
+            target = ""
+        elif not target:
             raise ValueError("delivery_target required")
         prompt = str(fields.get("prompt", "")).strip()
         flow_id = str(fields.get("flow_id", "")).strip()
@@ -343,7 +499,10 @@ class SchedulerStore:
         jid = _new_job_id()
         now_iso = _utcnow_iso()
         enabled = 1 if fields.get("enabled", True) else 0
-        next_run = compute_next_run(schedule) if enabled else None
+        next_run = compute_next_run(schedule, tz=tz) if enabled else None
+        if kind == "agent" and next_run is not None and is_one_shot(schedule) \
+                and next_run < time.time() - 60:
+            raise ScheduleError("that time has already passed")
         row = {
             "id": jid,
             "owner_id": str(owner_id or "").strip(),
@@ -356,6 +515,9 @@ class SchedulerStore:
             "flow_id": flow_id,
             "delivery_kind": kind,
             "delivery_target": target.lstrip("+") if kind == "whatsapp" else target,
+            "delivery": delivery,
+            "tz": tz,
+            "agent_session_id": "",
             "enabled": enabled,
             "ignore_quiet_hours": 1 if fields.get("ignore_quiet_hours", False) else 0,
             "created_at": now_iso,
@@ -371,13 +533,15 @@ class SchedulerStore:
                 """
                 INSERT INTO scheduler_jobs
                   (id, owner_id, name, schedule, agent_slug, agent_auth, prompt, prompt_author,
-                   flow_id, delivery_kind, delivery_target, enabled, ignore_quiet_hours,
+                   flow_id, delivery_kind, delivery_target, delivery, tz, agent_session_id,
+                   enabled, ignore_quiet_hours,
                    created_at, updated_at, next_run_at, last_run_at,
                    last_status, last_result)
                 VALUES
                   (:id, :owner_id, :name, :schedule, :agent_slug, :agent_auth, :prompt,
                    :prompt_author, :flow_id,
-                   :delivery_kind, :delivery_target, :enabled, :ignore_quiet_hours,
+                   :delivery_kind, :delivery_target, :delivery, :tz, :agent_session_id,
+                   :enabled, :ignore_quiet_hours,
                    :created_at, :updated_at, :next_run_at, :last_run_at,
                    :last_status, :last_result)
                 """,
@@ -429,35 +593,47 @@ class SchedulerStore:
             return None
         allowed = {
             "name", "schedule", "agent_slug", "agent_auth", "prompt", "flow_id",
-            "delivery_kind", "delivery_target", "enabled", "ignore_quiet_hours",
+            "delivery_kind", "delivery_target", "delivery", "tz", "enabled",
+            "ignore_quiet_hours",
         }
         updates: dict[str, Any] = {}
         for k, v in fields.items():
             if k not in allowed:
                 continue
             if k == "schedule":
-                validate_schedule(str(v).strip())
                 updates[k] = str(v).strip()
             elif k == "delivery_kind":
                 kind = str(v).strip().lower()
                 if kind not in _VALID_DELIVERY:
                     raise ValueError(f"delivery_kind must be one of {sorted(_VALID_DELIVERY)}")
                 updates[k] = kind
+            elif k == "delivery":
+                updates[k] = json.dumps(norm_delivery(v))
             elif k in ("enabled", "ignore_quiet_hours"):
                 updates[k] = 1 if v else 0
             else:
                 updates[k] = str(v).strip()
         if not updates:
             return existing
+        if "schedule" in updates or "tz" in updates:
+            validate_schedule(updates.get("schedule", existing["schedule"]),
+                              updates.get("tz", existing.get("tz") or ""))
+        if updates.get("delivery_kind", existing.get("delivery_kind")) == "agent":
+            _check_agent_delivery(norm_delivery(updates.get("delivery", existing.get("delivery"))))
+            updates["delivery_target"] = ""
         if "prompt" in updates:
             updates["prompt_author"] = _norm_prompt_author(prompt_author)
         updates["updated_at"] = _utcnow_iso()
-        # Recompute next_run if schedule changed or job (re)enabled.
-        recompute = "schedule" in updates or updates.get("enabled") == 1
+        # Recompute next_run if the schedule (or its zone) changed or the job
+        # was (re)enabled.
+        recompute = "schedule" in updates or "tz" in updates or updates.get("enabled") == 1
         if recompute:
             sched = updates.get("schedule", existing["schedule"])
             enabled = updates.get("enabled", existing["enabled"])
-            updates["next_run_at"] = compute_next_run(sched) if enabled else None
+            updates["next_run_at"] = (
+                compute_next_run(sched, tz=updates.get("tz", existing.get("tz") or ""))
+                if enabled else None
+            )
         if updates.get("enabled") == 0:
             updates["next_run_at"] = None
 
@@ -473,8 +649,121 @@ class SchedulerStore:
         with self._lock:
             conn = self._conn_or_open()
             cur = conn.execute("DELETE FROM scheduler_jobs WHERE id = ?", (job_id,))
+            conn.execute("DELETE FROM scheduler_runs WHERE job_id = ?", (job_id,))
             conn.commit()
             return cur.rowcount > 0
+
+    def claim(self, job_id: str, *, next_run_at: float | None, enabled: int | None = None) -> None:
+        """Move a due job on before it runs, so the next poll doesn't fire it
+        again while this run is still going."""
+        with self._lock:
+            conn = self._conn_or_open()
+            if enabled is None:
+                conn.execute("UPDATE scheduler_jobs SET next_run_at = ? WHERE id = ?",
+                             (next_run_at, job_id))
+            else:
+                conn.execute("UPDATE scheduler_jobs SET next_run_at = ?, enabled = ? WHERE id = ?",
+                             (next_run_at, enabled, job_id))
+            conn.commit()
+
+    def record_result(self, job_id: str, *, status: str, result: str, last_run_at: float) -> None:
+        """A run's outcome on its job, leaving its next run alone."""
+        with self._lock:
+            conn = self._conn_or_open()
+            conn.execute(
+                "UPDATE scheduler_jobs SET last_status = ?, last_result = ?, last_run_at = ?, "
+                "updated_at = ? WHERE id = ?",
+                (status, result[:2000], last_run_at, _utcnow_iso(), job_id),
+            )
+            conn.commit()
+
+    def set_session(self, job_id: str, session_id: str) -> None:
+        """The agent session a job's runs live in (reported by its first run)."""
+        with self._lock:
+            conn = self._conn_or_open()
+            conn.execute("UPDATE scheduler_jobs SET agent_session_id = ? WHERE id = ?",
+                         (session_id[:128], job_id))
+            conn.commit()
+
+    # ── run history ──
+
+    def start_run(self, job: dict[str, Any], trigger: str) -> int:
+        with self._lock:
+            conn = self._conn_or_open()
+            cur = conn.execute(
+                "INSERT INTO scheduler_runs (job_id, owner_id, job_name, agent_slug, trigger, "
+                "started_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (str(job.get("id") or ""), str(job.get("owner_id") or ""),
+                 str(job.get("name") or ""), str(job.get("agent_slug") or ""),
+                 trigger, time.time()),
+            )
+            conn.commit()
+            return int(cur.lastrowid or 0)
+
+    def finish_run(
+        self, run_id: int, *, status: str, result: str,
+        deliveries: list[dict[str, Any]] | None = None, session_id: str = "",
+    ) -> None:
+        with self._lock:
+            conn = self._conn_or_open()
+            conn.execute(
+                "UPDATE scheduler_runs SET status = ?, result = ?, deliveries = ?, session_id = ?, "
+                "finished_at = ? WHERE id = ?",
+                (status, (result or "")[:_RUN_RESULT_MAX], json.dumps(deliveries or []),
+                 session_id[:128], time.time(), run_id),
+            )
+            row = conn.execute("SELECT job_id FROM scheduler_runs WHERE id = ?", (run_id,)).fetchone()
+            if row:
+                conn.execute(
+                    "DELETE FROM scheduler_runs WHERE job_id = ? AND id NOT IN ("
+                    "SELECT id FROM scheduler_runs WHERE job_id = ? ORDER BY id DESC LIMIT ?)",
+                    (row["job_id"], row["job_id"], _RUNS_KEPT_PER_JOB),
+                )
+            conn.commit()
+
+    def get_run(self, run_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            r = self._conn_or_open().execute(
+                "SELECT * FROM scheduler_runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            return _run_row(r) if r else None
+
+    def list_runs(
+        self, *, owner_id: str | None = None, job_id: str = "", q: str = "",
+        limit: int = 50, before_id: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Newest first. ``owner_id`` None = everyone's (an admin); ``q``
+        matches the result text or the task's name, case-insensitively."""
+        where, args = ["1 = 1"], []
+        if owner_id is not None:
+            where.append("owner_id = ?")
+            args.append(owner_id)
+        if job_id:
+            where.append("job_id = ?")
+            args.append(job_id)
+        if before_id:
+            where.append("id < ?")
+            args.append(before_id)
+        for word in (q or "").split()[:8]:
+            like = "%" + word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            where.append("(result LIKE ? ESCAPE '\\' OR job_name LIKE ? ESCAPE '\\')")
+            args.extend([like, like])
+        args.append(max(1, min(int(limit or 50), 200)))
+        with self._lock:
+            rows = self._conn_or_open().execute(
+                f"SELECT * FROM scheduler_runs WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT ?",
+                args,
+            ).fetchall()
+            return [_run_row(r) for r in rows]
+
+    def run_stats(self) -> dict[str, dict[str, Any]]:
+        """Per job: how many runs are kept and whether one is going now."""
+        with self._lock:
+            rows = self._conn_or_open().execute(
+                "SELECT job_id, COUNT(*) AS n, SUM(status = 'running') AS running "
+                "FROM scheduler_runs GROUP BY job_id"
+            ).fetchall()
+            return {r["job_id"]: {"runs": int(r["n"] or 0), "running": bool(r["running"])} for r in rows}
 
     def mark_run(
         self,
@@ -511,6 +800,15 @@ class SchedulerStore:
                      enabled, _utcnow_iso(), job_id),
                 )
             conn.commit()
+
+
+def _run_row(r: sqlite3.Row) -> dict[str, Any]:
+    out = dict(r)
+    try:
+        out["deliveries"] = json.loads(out.get("deliveries") or "[]")
+    except ValueError:
+        out["deliveries"] = []
+    return out
 
 
 _STORE: SchedulerStore | None = None
@@ -565,9 +863,12 @@ async def run_prompt_and_capture(
     timeout: float = _REPLY_TIMEOUT_SECONDS,
     automation: dict[str, Any] | None = None,
     whatsapp_media_to: str = "",
+    meta: dict[str, Any] | None = None,
 ) -> str | None:
     """Inject ``prompt`` into a fresh ephemeral channel bound to the agent
     and return the first ``agent`` reply text, or None on timeout/failure.
+    ``meta`` (when given) receives what the reply said about itself: the
+    ``task_session`` a scheduled task ran in.
 
     ``automation`` (the automated-turn marker) rides on the chat frame when
     given, so the agent knows this turn is a scheduled job, not the user.
@@ -588,6 +889,8 @@ async def run_prompt_and_capture(
         # another automated turn that ended while this one waited for its lane.
         if (payload.get("type") == "agent" and payload.get("text")
                 and not payload.get("automation_lane") and not fut.done()):
+            if meta is not None and isinstance(payload.get("task_session"), dict):
+                meta["task_session"] = payload["task_session"]
             fut.set_result(str(payload["text"]))
 
     ch.callback_subscribers.append(_capture)
@@ -714,6 +1017,200 @@ async def _execute_flow_job(job: dict[str, Any], flow_id: str) -> tuple[str, str
     return (note, output)
 
 
+# What a run tells execute_job's caller beyond (status, text): the agent
+# session it ran in and how each delivery went. A contextvar, so execute_job
+# keeps its (job, *, force) shape.
+_RUN_REPORT: ContextVar[dict[str, Any] | None] = ContextVar("fd_scheduler_run_report", default=None)
+
+# Ahead of a task's prompt (delivery_kind "agent"): Flight Deck sends the reply.
+_TASK_NOTE = (
+    "This is a scheduled task. Your reply is delivered to the user for you "
+    "(their chat, email or Telegram, as they chose) — write the result itself; "
+    "do not send it by email or message yourself. Earlier runs of this task "
+    "are above in this session: build on them and say what changed rather "
+    "than repeating old items.\n\n"
+)
+
+
+def _task_title(job: dict[str, Any]) -> str:
+    """A task's name, or the start of its prompt."""
+    name = " ".join(str(job.get("name") or "").split())
+    if name:
+        return name[:80]
+    words = " ".join(str(job.get("prompt") or "").split())
+    return (words[:57] + "…") if len(words) > 60 else (words or "Scheduled task")
+
+
+def _agent_owner(slug: str) -> str | None:
+    """Who spawned agent ``slug`` per FD's process registry ("" = nobody
+    recorded), or None when FD doesn't know the slug."""
+    if not slug:
+        return None
+    try:
+        from captain_claw.flight_deck.server import _load_process_registry
+        entry = _load_process_registry().get(slug)
+    except Exception:
+        return None
+    if entry is None:
+        return None
+    return str(entry.get("owner") or "")
+
+
+async def _user_is_admin(user_id: str) -> bool:
+    try:
+        from captain_claw.flight_deck.auth import get_db
+        user = await get_db().get_user_by_id(user_id)
+    except Exception:
+        return False
+    return bool(user) and str(user.get("role") or "") == "admin"
+
+
+async def _owner_may_use_agent(owner: str, slug: str) -> bool:
+    """A job runs only on its owner's own agent (an admin's on any). An
+    ownerless legacy job, or an agent FD has no owner for, is unchecked."""
+    if not owner:
+        return True
+    agent_owner = _agent_owner(slug)
+    if not agent_owner or agent_owner == owner:
+        return True
+    return await _user_is_admin(owner)
+
+
+def _owner_telegram_chat(owner: str) -> str:
+    """The owner's approved chat with the deck's shared Telegram bot, or ""."""
+    if not owner:
+        return ""
+    try:
+        from captain_claw.flight_deck import telegram_shared
+        return telegram_shared.owner_chat(owner)
+    except Exception:
+        return ""
+
+
+async def _email_route(owner: str) -> dict[str, Any]:
+    """How a task of ``owner``'s can email: ``available``, ``provider``
+    (google | microsoft), ``from``, ``to`` (their own address) and ``reason``
+    when it can't. Stored tokens and scopes only — no network."""
+    out: dict[str, Any] = {"available": False, "provider": "", "from": "", "to": "", "reason": ""}
+    if not owner:
+        out["reason"] = "Email needs a signed-in account."
+        return out
+    try:
+        from captain_claw.flight_deck.auth import get_db
+        from captain_claw.flight_deck.invite_routes import mail_options
+        db = get_db()
+        user = await db.get_user_by_id(owner) or {}
+        out["to"] = str(user.get("email") or "")
+        options = await mail_options(db, owner)
+    except Exception as exc:  # noqa: BLE001 — an options probe never sinks a run
+        out["reason"] = f"Email isn't available here ({type(exc).__name__})."
+        return out
+    for provider in ("google", "microsoft"):
+        if options.get(provider, {}).get("available"):
+            out.update(available=True, provider=provider, **{"from": options[provider]["from"]})
+            return out
+    google, microsoft = options.get("google", {}), options.get("microsoft", {})
+    out["reason"] = (
+        "Connect Google or Microsoft in Connections to get results by email."
+        if not google.get("from") and not microsoft.get("from")
+        else (google.get("reason") or microsoft.get("reason") or "Email isn't available.")
+    )
+    return out
+
+
+def _email_parts(title: str, text: str, when: datetime) -> tuple[str, str, str]:
+    """(subject, plain text, HTML) for a task's result."""
+    from html import escape
+
+    from captain_claw.flight_deck.public_file_shares import _markdown_html
+
+    stamp = f"{when:%a %d %b %Y, %H:%M}"
+    subject = f"⏰ {title} — {when:%a %d %b}"
+    footer = f"Scheduled task “{title}” · ran {stamp} · Captain Claw"
+    plain = f"{text.strip()}\n\n—\n{footer}\n"
+    html_body = (
+        '<div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;'
+        'font-size:15px;line-height:1.55;color:#1f2328;max-width:680px">'
+        f'<div style="font-size:12px;color:#6e7781;margin-bottom:12px">⏰ {escape(title)} · {escape(stamp)}</div>'
+        f"{_markdown_html(text)}"
+        f'<hr style="border:none;border-top:1px solid #d0d7de;margin:20px 0 10px">'
+        f'<div style="font-size:12px;color:#6e7781">{escape(footer)}</div></div>'
+    )
+    return subject, plain, html_body
+
+
+async def _deliver_email(job: dict[str, Any], delivery: dict[str, Any], text: str) -> dict[str, Any]:
+    owner = str(job.get("owner_id") or "")
+    route = await _email_route(owner)
+    recipients = _clean_addresses(delivery.get("email_to")) or ([route["to"]] if route["to"] else [])
+    out: dict[str, Any] = {"via": "email", "ok": False, "note": "", "to": ", ".join(recipients)}
+    if not route["available"]:
+        out["note"] = route["reason"]
+        return out
+    if not recipients:
+        out["note"] = "No address to send to."
+        return out
+    from captain_claw.flight_deck.invite_routes import _MailError, _send_google, _send_microsoft
+
+    subject, plain, html_body = _email_parts(_task_title(job), text, datetime.now())
+    failed: list[str] = []
+    for to in recipients:
+        try:
+            if route["provider"] == "google":
+                await _send_google(owner, to, subject, plain, html_body)
+            else:
+                await _send_microsoft(owner, to, subject, html_body)
+        except _MailError as exc:
+            failed.append(f"{to}: {exc}")
+    out["ok"] = not failed
+    out["note"] = (f"sent from {route['from']}" if not failed else "; ".join(failed))[:500]
+    return out
+
+
+async def _deliver_telegram_owner(owner: str, text: str) -> dict[str, Any]:
+    out: dict[str, Any] = {"via": "telegram", "ok": False, "note": ""}
+    chat = _owner_telegram_chat(owner)
+    if not chat:
+        out["note"] = "Telegram isn't linked — link it in Connections → Telegram."
+        return out
+    from captain_claw.flight_deck import telegram_shared
+    from captain_claw.flight_deck.meta_webhook_bridge import strip_markdown
+
+    body = strip_markdown(text).strip()
+    try:
+        for i in range(0, max(1, len(body)), 3900):
+            if not await telegram_shared.send_text(chat, body[i:i + 3900]):
+                out["note"] = "Telegram refused the message."
+                return out
+    except Exception as exc:  # noqa: BLE001
+        out["note"] = f"Telegram failed ({type(exc).__name__})."
+        return out
+    out.update(ok=True, note="sent")
+    return out
+
+
+async def _deliver_task(job: dict[str, Any], delivery: dict[str, Any], text: str) -> list[dict[str, Any]]:
+    """Deliver a task's result every way it asks for; one outcome each."""
+    results: list[dict[str, Any]] = []
+    if delivery["chat"]:
+        # The agent posts it into its own chat (the mirror of this turn).
+        results.append({"via": "chat", "ok": True, "note": "posted in the agent's chat"})
+    if delivery["email"]:
+        results.append(await _deliver_email(job, delivery, text))
+    if delivery["telegram"]:
+        results.append(await _deliver_telegram_owner(str(job.get("owner_id") or ""), text))
+    return results
+
+
+def _task_status(results: list[dict[str, Any]]) -> str:
+    failed = [r["via"] for r in results if not r.get("ok")]
+    if not failed:
+        return "ok"
+    if len(failed) == len(results):
+        return "error:delivery " + ", ".join(failed)
+    return "partial: " + ", ".join(failed) + " failed"
+
+
 def _fire_time_preamble() -> str:
     """A dated header prepended to every scheduled text prompt at FIRE time.
 
@@ -756,6 +1253,8 @@ async def execute_job(job: dict[str, Any], *, force: bool = False) -> tuple[str,
         return await _execute_flow_job(job, flow_id)
 
     slug = str(job.get("agent_slug") or "")
+    if not await _owner_may_use_agent(str(job.get("owner_id") or ""), slug):
+        return ("error:agent-not-yours", f"agent '{slug}' belongs to someone else")
     host, port, auth = resolve_agent_by_slug(slug, str(job.get("agent_auth") or ""))
     if not port:
         return ("error:agent-not-running", f"agent slug '{slug}' not running")
@@ -766,25 +1265,53 @@ async def execute_job(job: dict[str, Any], *, force: bool = False) -> tuple[str,
     human_written = str(job.get("prompt_author") or "human") == "human"
     _kind = str(job.get("delivery_kind") or "").strip().lower()
     _target = str(job.get("delivery_target") or "").strip()
-    reply = await run_prompt_and_capture(
-        host=host, port=port, auth=auth,
-        prompt=_fire_time_preamble() + raw_prompt,
+    delivery = norm_delivery(job.get("delivery")) if _kind == "agent" else None
+    automation: dict[str, Any] = {
+        "kind": "fd_scheduler",
+        "job_text": (raw_prompt if human_written else "")[:4000],
         # fd_delivers: this run's result goes out through _deliver below, so
         # the agent's mirror of it into the main chat isn't relayed again by
-        # the chat bridges (a scheduled WhatsApp job arrived twice).
-        automation={"kind": "fd_scheduler",
-                    "job_text": (raw_prompt if human_written else "")[:4000],
-                    "mail_write": "intent", "fd_delivers": True},
+        # the chat bridges (a scheduled WhatsApp job arrived twice). A task
+        # delivering to the agent's chat lets the mirror through: that IS
+        # its delivery (the kiosk timeline and the bridges bound to it).
+        "mail_write": "intent", "fd_delivers": not (delivery and delivery["chat"]),
+    }
+    if job.get("id"):
+        # Each task runs in its own agent session, kept across its runs.
+        automation["task"] = {
+            "id": str(job["id"]), "name": _task_title(job),
+            "session_id": str(job.get("agent_session_id") or ""),
+            **({"mirror": False} if delivery is not None and not delivery["chat"] else {}),
+        }
+    meta: dict[str, Any] = {}
+    reply = await run_prompt_and_capture(
+        host=host, port=port, auth=auth,
+        prompt=_fire_time_preamble() + (_TASK_NOTE if delivery is not None else "") + raw_prompt,
+        timeout=_TASK_REPLY_TIMEOUT_SECONDS if delivery is not None else _REPLY_TIMEOUT_SECONDS,
+        automation=automation,
         whatsapp_media_to=_media_target(_kind, _target),
+        meta=meta,
     )
+    report = _RUN_REPORT.get()
+    task_session = meta.get("task_session") if isinstance(meta.get("task_session"), dict) else {}
+    if report is not None and task_session.get("id"):
+        report["session_id"] = str(task_session["id"])
     if reply is None:
         return ("error:no-reply", "agent produced no reply within timeout")
+
+    if delivery is not None:
+        results = await _deliver_task(job, delivery, reply)
+        if report is not None:
+            report["deliveries"] = results
+        return (_task_status(results), reply)
 
     delivered, note = await _deliver(
         str(job.get("delivery_kind") or ""),
         str(job.get("delivery_target") or ""),
         reply,
     )
+    if report is not None:
+        report["deliveries"] = [{"via": _kind, "ok": delivered, "note": note}]
     status = note if delivered else note
     return (status, reply)
 
@@ -792,37 +1319,83 @@ async def execute_job(job: dict[str, Any], *, force: bool = False) -> tuple[str,
 # ── Poll loop ─────────────────────────────────────────────────────────
 
 
-async def _run_due_job(store: SchedulerStore, job: dict[str, Any]) -> None:
-    now_epoch = time.time()
-    status, result = await execute_job(job)
+# Jobs with a run in flight in this process (scheduled or run-now).
+_IN_FLIGHT: set[str] = set()
+_BACKGROUND: set[asyncio.Task] = set()
+# One run at a time per agent: its automation lane takes one turn at a time
+# anyway, and a run's reply timeout must start when its turn does.
+_AGENT_LOCKS: dict[str, asyncio.Lock] = {}
 
-    if status == "skipped:quiet":
+
+def _next_after(job: dict[str, Any]) -> float | None:
+    try:
+        return compute_next_run(job["schedule"], tz=str(job.get("tz") or ""))
+    except ScheduleError:
+        return None
+
+
+async def run_job(
+    job: dict[str, Any], *, trigger: str = "scheduled", force: bool = False,
+    run_id: int = 0,
+) -> tuple[str, str, int]:
+    """Run one job and log the run: ``(status, result_text, run_id)``.
+    The job's last status/result follow; its next run is the caller's."""
+    store = get_store()
+    jid = str(job.get("id") or "")
+    run_id = run_id or store.start_run(job, trigger)
+    report: dict[str, Any] = {}
+    token = _RUN_REPORT.set(report)
+    _IN_FLIGHT.add(jid)
+    status, result = "error:failed", ""
+    lock = _AGENT_LOCKS.setdefault(str(job.get("agent_slug") or job.get("flow_id") or jid), asyncio.Lock())
+    try:
+        async with lock:
+            status, result = await execute_job(job, force=force)
+    except Exception as exc:  # noqa: BLE001 — a run always ends logged
+        _log.warning("scheduler job %s failed: %s", jid, exc)
+        status, result = f"error:{exc}", ""
+    finally:
+        _RUN_REPORT.reset(token)
+        _IN_FLIGHT.discard(jid)
+        session_id = str(report.get("session_id") or "")
+        store.finish_run(run_id, status=status, result=result,
+                         deliveries=report.get("deliveries") or [], session_id=session_id)
+        if status != "skipped:quiet":
+            store.record_result(jid, status=status, result=result, last_run_at=time.time())
+        if session_id and session_id != str(job.get("agent_session_id") or ""):
+            store.set_session(jid, session_id)
+    return status, result, run_id
+
+
+async def _run_due_job(store: SchedulerStore, job: dict[str, Any]) -> None:
+    if not job.get("ignore_quiet_hours") and _in_quiet_hours():
         # Retry when quiet hours end; don't consume a one-shot.
         store.mark_run(
-            job["id"], status=status, result="",
-            last_run_at=now_epoch, next_run_at=_quiet_hours_end_epoch(),
+            job["id"], status="skipped:quiet", result="",
+            last_run_at=time.time(), next_run_at=_quiet_hours_end_epoch(),
         )
         return
 
-    # Consumed. One-shots disable; recurring recompute.
+    # Consumed before it runs (a long run must not fire again on the next
+    # poll): one-shots disable, recurring jobs move to their next time.
     if is_one_shot(job["schedule"]):
-        store.mark_run(
-            job["id"], status=status, result=result,
-            last_run_at=now_epoch, next_run_at=None, enabled=0,
-        )
+        store.claim(job["id"], next_run_at=None, enabled=0)
     else:
-        try:
-            nxt = compute_next_run(job["schedule"])
-        except ScheduleError:
-            nxt = None
-        store.mark_run(
-            job["id"], status=status, result=result,
-            last_run_at=now_epoch, next_run_at=nxt,
-        )
+        store.claim(job["id"], next_run_at=_next_after(job))
+    await run_job(job, trigger="scheduled")
+
+
+def _spawn(coro: Any) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
+    return task
 
 
 async def scheduler_loop(stop_event: asyncio.Event) -> None:
-    """Background poll loop. Started from FD's lifespan."""
+    """Background poll loop. Started from FD's lifespan. Each due job runs
+    in its own task, so a long one (a task can take minutes) doesn't hold up
+    the others."""
     store = get_store()
     try:
         poll = float(os.environ.get("FD_SCHEDULER_POLL_SECONDS", "30") or 30)
@@ -834,19 +1407,22 @@ async def scheduler_loop(stop_event: asyncio.Event) -> None:
         try:
             due = store.list_due(time.time())
             for job in due:
+                if job["id"] in _IN_FLIGHT:
+                    continue
                 try:
-                    await _run_due_job(store, job)
+                    _spawn(_run_due_job(store, job))
                 except Exception as exc:
                     _log.warning("scheduler job %s failed: %s", job.get("id"), exc)
                     store.mark_run(
                         job["id"], status=f"error:{exc}", result="",
                         last_run_at=time.time(),
-                        next_run_at=(
-                            None if is_one_shot(job["schedule"])
-                            else compute_next_run(job["schedule"])
-                        ),
+                        next_run_at=None if is_one_shot(job["schedule"]) else _next_after(job),
                         enabled=(0 if is_one_shot(job["schedule"]) else None),
                     )
+            # Claim synchronously what was just spawned: the next poll must
+            # not see these as due again (a spawned task claims on its first
+            # step, which runs once this loop yields).
+            await asyncio.sleep(0)
         except Exception as exc:
             _log.warning("scheduler loop iteration error: %s", exc)
         try:
@@ -988,11 +1564,36 @@ def _job_for_caller(job_id: str, caller: _SchedulerCaller) -> dict[str, Any]:
     return job
 
 
-def _public_job(job: dict[str, Any]) -> dict[str, Any]:
-    """A job as the API returns it: ``agent_auth`` redacted to a placeholder."""
+def _public_job(job: dict[str, Any], stats: dict[str, dict[str, Any]] | None = None) -> dict[str, Any]:
+    """A job as the API returns it: ``agent_auth`` redacted to a placeholder,
+    ``delivery`` as an object, and its run count / whether it's running now."""
     out = dict(job)
     out["agent_auth"] = _AGENT_AUTH_MASK if job.get("agent_auth") else ""
+    out["delivery"] = norm_delivery(job.get("delivery")) if job.get("delivery_kind") == "agent" else None
+    st = (stats if stats is not None else get_store().run_stats()).get(str(job.get("id") or ""), {})
+    out["run_count"] = int(st.get("runs") or 0)
+    out["running"] = bool(st.get("running")) or str(job.get("id") or "") in _IN_FLIGHT
     return out
+
+
+def _check_agent_access(caller: _SchedulerCaller, body: dict[str, Any]) -> None:
+    """A caller's job may only drive its own agent (an admin's, any)."""
+    slug = str(body.get("agent_slug") or "").strip()
+    if caller.sees_all or not slug:
+        return
+    owner = _agent_owner(slug)
+    if owner and owner != caller.owner:
+        raise HTTPException(status_code=403, detail="that agent isn't yours")
+
+
+def _limit_agent_caller(caller: _SchedulerCaller, body: dict[str, Any]) -> None:
+    """Only a person picks who a task emails: an agent's job emails its
+    owner's own address, never one the agent wrote."""
+    if caller.is_human or "delivery" not in body:
+        return
+    d = body.get("delivery")
+    if isinstance(d, dict):
+        body["delivery"] = {**d, "email_to": ""}
 
 
 async def _json_object(request: Request) -> dict[str, Any]:
@@ -1018,7 +1619,8 @@ async def list_jobs(request: Request) -> JSONResponse:
         rows = get_store().list(owner_id=caller.owner)
     else:
         rows = []
-    return JSONResponse([_public_job(r) for r in rows], headers=_NO_CACHE)
+    stats = get_store().run_stats()
+    return JSONResponse([_public_job(r, stats) for r in rows], headers=_NO_CACHE)
 
 
 @router.get("/scheduler/recipients")
@@ -1037,6 +1639,8 @@ async def list_recipients(request: Request) -> JSONResponse:
 async def create_job(request: Request) -> JSONResponse:
     caller = _require_scheduler_caller(request)
     body = await _json_object(request)
+    _check_agent_access(caller, body)
+    _limit_agent_caller(caller, body)
     try:
         row = get_store().create(
             owner_id=caller.owner, prompt_author="human" if caller.is_human else "agent", **body,
@@ -1058,6 +1662,8 @@ async def update_job(job_id: str, request: Request) -> JSONResponse:
     caller = _require_scheduler_caller(request)
     _job_for_caller(job_id, caller)
     body = await _json_object(request)
+    _check_agent_access(caller, body)
+    _limit_agent_caller(caller, body)
     try:
         if "prompt" in body:
             row = get_store().update(
@@ -1082,20 +1688,87 @@ async def delete_job(job_id: str, request: Request) -> JSONResponse:
 
 
 @router.post("/scheduler/jobs/{job_id}/run")
-async def run_job_now(job_id: str, request: Request) -> JSONResponse:
+async def run_job_now(job_id: str, request: Request, background: bool = False) -> JSONResponse:
     """Manually fire a job immediately, bypassing schedule + quiet hours.
 
     Does NOT change the job's next_run_at — it's an out-of-band test fire.
+    ``?background=1`` answers at once with the run's id (the run shows as
+    ``running`` in /scheduler/runs until it ends); otherwise the call waits
+    for the result.
     """
     caller = _require_scheduler_caller(request)
     job = _job_for_caller(job_id, caller)
-    status, result = await execute_job(job, force=True)
-    get_store().mark_run(
-        job_id, status=status, result=result,
-        last_run_at=time.time(), next_run_at=job.get("next_run_at"),
-    )
+    if job_id in _IN_FLIGHT:
+        raise HTTPException(status_code=409, detail="this task is running right now")
+    if background:
+        run_id = get_store().start_run(job, "manual")
+        _IN_FLIGHT.add(job_id)
+        _spawn(run_job(job, trigger="manual", force=True, run_id=run_id))
+        return JSONResponse({"ok": True, "status": "running", "run_id": run_id}, headers=_NO_CACHE)
+    status, result, run_id = await run_job(job, trigger="manual", force=True)
     return JSONResponse(
-        {"ok": status.startswith("ok"), "status": status,
+        {"ok": status.startswith("ok"), "status": status, "run_id": run_id,
          "result_preview": result[:500]},
         headers=_NO_CACHE,
     )
+
+
+@router.get("/scheduler/runs")
+async def list_runs(
+    request: Request, job_id: str = "", q: str = "", limit: int = 50, before: int = 0,
+) -> JSONResponse:
+    """Run history, newest first — one task's (``job_id``) or every task the
+    caller can see; ``q`` searches the results and task names; ``before``
+    pages back past a run id."""
+    caller = _require_scheduler_caller(request)
+    if job_id:
+        _job_for_caller(job_id, caller)
+    if not caller.sees_all and not caller.owner:
+        return JSONResponse([], headers=_NO_CACHE)
+    rows = get_store().list_runs(
+        owner_id=None if caller.sees_all else caller.owner,
+        job_id=job_id, q=q[:200], limit=limit, before_id=before,
+    )
+    return JSONResponse(rows, headers=_NO_CACHE)
+
+
+@router.post("/scheduler/preview")
+async def preview_schedule(request: Request) -> JSONResponse:
+    """The next few times a schedule would fire: ``{schedule, tz}`` →
+    ``{ok, next: [epoch…], one_shot, error}``. Nothing is saved."""
+    _require_scheduler_caller(request)
+    body = await _json_object(request)
+    schedule = str(body.get("schedule") or "").strip()
+    tz = str(body.get("tz") or "").strip()
+    try:
+        first = compute_next_run(schedule, tz=tz)
+    except ScheduleError as exc:
+        return JSONResponse({"ok": False, "next": [], "one_shot": False, "error": str(exc)},
+                            headers=_NO_CACHE)
+    nxt: list[float] = [first] if first is not None else []
+    one_shot = is_one_shot(schedule)
+    if one_shot and first is not None and first < time.time() - 60:
+        return JSONResponse({"ok": False, "next": nxt, "one_shot": True,
+                             "error": "that time has already passed"}, headers=_NO_CACHE)
+    while not one_shot and nxt and len(nxt) < 3:
+        zone = _zone(tz)
+        base = datetime.fromtimestamp(nxt[-1] + 1, zone) if zone else datetime.fromtimestamp(nxt[-1] + 1)
+        nxt.append(compute_next_run(schedule, base=base, tz=tz))
+    return JSONResponse({"ok": True, "next": nxt, "one_shot": one_shot, "error": ""},
+                        headers=_NO_CACHE)
+
+
+@router.get("/scheduler/delivery-options")
+async def delivery_options(request: Request) -> JSONResponse:
+    """Where the caller's tasks can deliver: ``chat`` always; ``email`` from
+    their connected Gmail / Outlook (to their own address unless they name
+    others); ``telegram`` when they've linked the deck's shared bot."""
+    caller = _require_scheduler_caller(request)
+    email = await _email_route(caller.owner)
+    tg = bool(_owner_telegram_chat(caller.owner))
+    return JSONResponse({
+        "chat": {"available": True},
+        "email": email,
+        "telegram": {"available": tg,
+                     "reason": "" if tg else "Link Telegram in Connections → Telegram to get results there."},
+    }, headers=_NO_CACHE)

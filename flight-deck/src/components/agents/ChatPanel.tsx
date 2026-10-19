@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback, useMemo, memo } from 'react'
 import {
+  AlarmClock,
   X,
   Send,
   Loader2,
@@ -57,6 +58,7 @@ import { useClipboardStore } from '../../stores/clipboardStore'
 import { useTraceStore, selectSpanCount } from '../../stores/traceStore'
 import { useUIStore } from '../../stores/uiStore'
 import { useAuthStore, selectKioskLocked } from '../../stores/authStore'
+import { useScheduledStore } from '../../stores/scheduledStore'
 import { useSharedAgentStore } from '../../stores/sharedAgentStore'
 import { sharedCaps, sharedCloseInfo } from '../../utils/sharedAgent'
 import { SharedAgentNotice } from './SharedAgentNotice'
@@ -2097,7 +2099,10 @@ const MessageBubble = memo(function MessageBubble({ message, sourceName, agentId
             <Icon className="h-3.5 w-3.5 shrink-0 text-zinc-600" />
             <span className="truncate">
               {message.content || 'New topic'}
-              {message.topic.title && <span className="text-zinc-400"> · {message.topic.title}</span>}
+              {/* A session named like its title (a scheduled task's) says it once. */}
+              {message.topic.title && !(message.content || '').endsWith(message.topic.title) && (
+                <span className="text-zinc-400"> · {message.topic.title}</span>
+              )}
             </span>
             <span className="shrink-0 font-normal text-zinc-600">{formatTime(message.timestamp)}</span>
           </span>
@@ -2170,7 +2175,17 @@ const MessageBubble = memo(function MessageBubble({ message, sourceName, agentId
 
   return (
     <div className="group mb-3 flex flex-col items-start gap-0.5">
-      <div className={`max-w-[85%] rounded-xl rounded-bl-sm bg-zinc-800/60 px-3.5 py-2.5 ${message.replay ? 'opacity-60' : ''}`}>
+      <div className={`max-w-[85%] rounded-xl rounded-bl-sm bg-zinc-800/60 px-3.5 py-2.5 ${message.replay ? 'opacity-60' : ''} ${message.task ? 'border-l-2 border-amber-500/60' : ''}`}>
+        {message.task && (
+          <button
+            onClick={() => useScheduledStore.getState().openTasks(message.task!.id)}
+            className="mb-1.5 flex items-center gap-1.5 text-[11px] font-medium text-amber-700 hover:underline dark:text-amber-400"
+            title="Open this scheduled task and its history"
+          >
+            <AlarmClock className="h-3.5 w-3.5" />
+            Scheduled · {message.task.name}
+          </button>
+        )}
         <div className="fd-markdown text-sm text-zinc-300">
           <MarkdownMessage content={processImagePaths(cleanContent, agentConn?.host, agentConn?.port, agentConn?.auth)} />
         </div>

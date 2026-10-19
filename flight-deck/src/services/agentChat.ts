@@ -44,6 +44,16 @@ export interface ChatMessage {
    *  place (`clear`). Rendered as a divider; the Topics list is built from
    *  these rows. */
   topic?: TopicMark
+  /** The result of a scheduled task (Flight Deck's Scheduled tasks), posted
+   *  into this chat: labelled, and links back to the task. */
+  task?: TaskMark
+}
+
+export interface TaskMark {
+  id: string
+  name: string
+  /** The agent session the task's runs live in. */
+  session_id?: string
 }
 
 export interface TopicMark {

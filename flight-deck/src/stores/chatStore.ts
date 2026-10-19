@@ -86,6 +86,19 @@ function logRowToMessage(r: LogRow): ChatMessage {
     peer_name: meta.peer_name as string | undefined,
     ...(topic ? { topic } : {}),
     ...(meta.via ? { via: String(meta.via) } : {}),
+    ...(taskMark(meta.task) ? { task: taskMark(meta.task) } : {}),
+  }
+}
+
+/** A scheduled task's marker from a frame or a log row, or undefined. */
+function taskMark(raw: unknown): ChatMessage['task'] {
+  if (!raw || typeof raw !== 'object') return undefined
+  const t = raw as Record<string, unknown>
+  const id = String(t.id || '')
+  if (!id) return undefined
+  return {
+    id, name: String(t.name || 'Scheduled task'),
+    ...(t.session_id ? { session_id: String(t.session_id) } : {}),
   }
 }
 
@@ -334,6 +347,7 @@ async function _flushMessages() {
               ...(m.peer_name ? { peer_name: m.peer_name } : {}),
               ...(m.topic ? { topic: m.topic } : {}),
               ...(m.via ? { via: m.via } : {}),
+              ...(m.task ? { task: m.task } : {}),
             }),
           })),
         }),
@@ -1417,6 +1431,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         replay: data.replay as boolean || false,
         model: data.model as string || '',
         ...(via ? { via } : {}),
+        ...(taskMark(data.task) ? { task: taskMark(data.task) } : {}),
       }
       addMessage(key, msg)
       // A result the automation lane mirrored here is a note: it ends no turn
@@ -2586,6 +2601,7 @@ function replayToMessage(d: Record<string, unknown>): ChatMessage {
     timestamp: (d.timestamp as string) || new Date().toISOString(),
     replay: true,
     model: (d.model as string) || '',
+    ...(taskMark(d.task) ? { task: taskMark(d.task) } : {}),
   }
 }
 
