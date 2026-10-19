@@ -613,25 +613,50 @@ def test_rotated_token_goes_to_flight_deck_until_disconnect():
     assert out["listeners"] == 0
 
 
-def test_owner_socket_is_unchanged():
+def test_owner_socket_names_the_agent_and_is_usable_on_welcome():
     out = _ws_scenario("""
       sockets.length = 0; timers.length = 0; listeners.length = 0;
       const c = new AgentChatWS('proc-helper', 'localhost', 24001, 'agent-secret', '');
       const ev = [];
       for (const n of ['_connected', '_closed', '_reconnecting']) c.on(n, () => ev.push(n));
       c.connect();
-      sockets[0].onopen();
+      const beforeWelcome = c.connected;
+      frame(sockets[0], { type: 'welcome' });
       sockets[0].onclose({ code: 4403, reason: '' });
       await flush();
-      out = { url: sockets[0].url, ev, timers: timers.length, listeners: listeners.length };
+      out = { url: sockets[0].url, beforeWelcome, ev, timers: timers.length, listeners: listeners.length };
     """)
     parts = urlsplit(out["url"])
     assert parts.path == "/fd/agent-ws/localhost/24001"
-    assert parse_qs(parts.query) == {"token": ["agent-secret"], "fd_token": ["jwt-1"]}
+    # `agent` lets Flight Deck follow the agent to the port it restarted on.
+    assert parse_qs(parts.query) == {
+        "token": ["agent-secret"], "fd_token": ["jwt-1"], "agent": ["proc-helper"],
+    }
+    # FD's proxy opens the socket and then waits for the agent: open alone
+    # isn't "connected" — the agent's welcome is.
+    assert out["beforeWelcome"] is False
     # Owner chats keep reconnecting whatever the code, and never watch the token.
     assert out["ev"] == ["_connected", "_reconnecting"]
     assert out["timers"] == 1
     assert out["listeners"] == 0
+
+
+def test_owner_socket_follows_the_agent_to_its_new_port():
+    out = _ws_scenario("""
+      sockets.length = 0; timers.length = 0;
+      const c = new AgentChatWS('proc-helper', 'localhost', 24001, 'agent-secret', '');
+      c.connect();
+      frame(sockets[0], { type: 'fd_agent_waiting', port: 24001 });
+      frame(sockets[0], { type: 'fd_agent_endpoint', port: 24007 });
+      frame(sockets[0], { type: 'welcome' });
+      c.connect();
+      out = { port: c.port, urls: sockets.map((s) => s.url) };
+    """)
+    # The next connect goes to the port FD reported, not the stale one.
+    assert out["port"] == 24007
+    assert [urlsplit(u).path for u in out["urls"]] == [
+        "/fd/agent-ws/localhost/24001", "/fd/agent-ws/localhost/24007",
+    ]
 
 
 # ── a shared agent's queue doesn't outlive the session in this browser ──
