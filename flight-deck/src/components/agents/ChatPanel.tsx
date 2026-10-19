@@ -598,6 +598,9 @@ export function ChatPanel({ variant = 'default' }: { variant?: 'default' | 'simp
         trailing={phoneSimple ? queueToggle : undefined}
       />
 
+      {/* Today's plan allowance; when it's spent the composer stays closed */}
+      <PlanUsageBar simple={simple} />
+
       {shared && (
         <SharedAgentNotice
           key={shared.agentRef}
@@ -683,7 +686,6 @@ export function ChatPanel({ variant = 'default' }: { variant?: 'default' | 'simp
               sessionKey={session.key}
               shared={!!shared}
               minWidth={simple && !isMobile ? 300 : undefined}
-              simple={simple}
               onSend={(content) => sendMessage(session.key, content)}
               onCancel={() => cancelTask(session.key)}
             />
@@ -740,7 +742,6 @@ function ChatContent({
   sessionKey,
   shared = false,
   minWidth,
-  simple = false,
   onSend,
   onCancel,
 }: {
@@ -752,8 +753,6 @@ function ChatContent({
   shared?: boolean
   /** Conversation floor (simple layout): the queue column shrinks before this. */
   minWidth?: number
-  /** The simple (kiosk) layout: the daily-allowance line is always shown. */
-  simple?: boolean
   onSend: (content: string) => void
   onCancel: () => void
 }) {
@@ -979,9 +978,6 @@ function ChatContent({
           )}
         </div>
       )}
-
-      {/* Today's plan allowance; when it's spent the composer stays closed */}
-      <PlanUsageBar simple={simple} />
 
       {/* Input */}
       <div className="border-t border-zinc-800 p-3">

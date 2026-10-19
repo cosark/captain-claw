@@ -5,10 +5,10 @@ import { quotaLimited, useQuotaStore } from '../../stores/quotaStore'
 
 // ── Daily plan allowances, as the person sees them ──
 //
-// PlanUsageBar sits on the chat composer: in the simple (kiosk) layout it is
-// always there while the plan has daily limits; in the full layout only once
-// an allowance runs low. When one is spent the composer is closed and the bar
-// says why and when it comes back. PlanUsageMeters is the Info dialog's
+// PlanUsageBar sits at the top of the chat, under the lane tabs: in the simple
+// (kiosk) layout it is always there while the plan has daily limits; in the
+// full layout only once an allowance runs low. When one is spent the composer
+// is closed and the bar says why and when it comes back. PlanUsageMeters is the Info dialog's
 // detailed view. "Tokens" are "AI usage" here — a kiosk user needn't know
 // what a token is.
 
@@ -70,7 +70,7 @@ export function PlanUsageBar({ simple }: { simple: boolean }) {
 
   if (s.blocked) {
     return (
-      <div role="status" className="flex items-start gap-2.5 border-t border-red-500/30 bg-red-500/10 px-3 py-2.5 text-sm text-red-700 dark:text-red-300">
+      <div role="status" className="flex items-start gap-2.5 border-b border-red-500/30 bg-red-500/10 px-3 py-2.5 text-sm text-red-700 dark:text-red-300">
         <Hourglass className="mt-0.5 h-4 w-4 shrink-0" />
         <div className="min-w-0">
           <div className="font-medium">{quotaBlockedText(s)}</div>
@@ -92,7 +92,7 @@ export function PlanUsageBar({ simple }: { simple: boolean }) {
   const low = !!s.warning
   return (
     <div
-      className={`flex items-center gap-2 border-t px-3 py-1.5 text-xs ${low
+      className={`flex items-center gap-2 border-b px-3 py-1.5 text-xs ${low
         ? 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400'
         : 'border-zinc-800/60 text-zinc-500'}`}
       title={`${s.plan_label} plan · ${s.messages.limit > 0 ? `${s.messages.used} of ${s.messages.limit} messages` : 'unlimited messages'} · ${s.tokens.limit > 0 ? `${fmtTokens(s.tokens.used)} of ${fmtTokens(s.tokens.limit)} AI tokens` : 'unlimited AI usage'} today`}
