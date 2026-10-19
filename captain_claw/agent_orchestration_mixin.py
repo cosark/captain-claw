@@ -260,7 +260,12 @@ _ECO_INTENT_PATTERNS: list[tuple[_re.Pattern[str], frozenset[str]]] = [
      frozenset({"public_link"})),
     # Audio / TTS
     (_re.compile(r"\bspeak\b|\bsay\b|\baudio\b|\btts\b|\bvoice\b|\bread\s+aloud\b", _re.I),
-     frozenset({"pocket_tts"})),
+     frozenset({"pocket_tts", "audio"})),
+    # Speech-to-text (EN / HR) and audio files: the Soniox audio tool
+    (_re.compile(r"transcri\w*|transkri\w*|\bspeech\b|\brecording\b|\bpodcast\b|\bdictat\w*"
+                 r"|\bglasovn\w*|\bsnim\w*|\bgovor\w*|\bizgovor\w*|\bnaglas\b|\bzvu[čk]\w*"
+                 r"|\bmp3\b|\.(?:ogg|oga|opus|m4a|wav|flac|aac|amr|webm)\b", _re.I),
+     frozenset({"audio"})),
     # API
     (_re.compile(r"\bapi\b|\bendpoint\b|\brest\b|\bhttp\s+(?:get|post|put)\b", _re.I),
      frozenset({"direct_api"})),
@@ -2143,6 +2148,13 @@ class AgentOrchestrationMixin:
                 try:
                     from captain_claw import jev_client
                     await jev_client.refresh_connected()
+                except Exception:
+                    pass
+                # Soniox: is there a key for the audio tool (the owner's in
+                # Flight Deck — or the team's — or the agent's own)?
+                try:
+                    from captain_claw import soniox_client
+                    await soniox_client.available()
                 except Exception:
                     pass
 

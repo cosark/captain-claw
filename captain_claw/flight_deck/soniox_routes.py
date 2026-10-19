@@ -27,9 +27,10 @@ WhatsApp bridge its agent's owner's. Surfaces with none (the glasses pages,
 behind their shared bridge token) use the deck's: the team key, else the env.
 
 Agents never hold a long-lived key. ``/agent/transcribe`` transcribes a file
-with the calling agent's OWNER's key (the owner resolved from this deck's own
-records by ``X-Agent-Auth``, as for Google / Jev), and ``/agent/realtime-key``
-mints a short-lived Soniox key for one realtime session (the mic stream). No
+and ``/agent/speak`` turns text into speech with the calling agent's OWNER's key
+(the owner resolved from this deck's own records by ``X-Agent-Auth``, as for
+Google / Jev); ``/agent/realtime-key`` mints a short-lived Soniox key for one
+realtime session (the mic stream). The ``audio`` agent tool rides on these. No
 route ever returns a stored key — only :func:`soniox_api.key_hint`.
 
 The frontend reads a 401 as "the Flight Deck session expired", so a user route
@@ -46,7 +47,7 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel
 
 from captain_claw import soniox_api
@@ -316,6 +317,36 @@ async def transcribe_text(
         log.info("soniox STT: job completed but transcript was empty (silence / no speech?)")
         return "", "no speech detected in the audio"
     return out.text, ""
+
+
+async def speak_for(
+    owner: str | None, text: str, *, voice: str = "", language: str = "",
+    audio_format: str = "mp3", source: str = "", agent: str = "",
+) -> bytes:
+    """Speak *text* with the key *owner* uses (None: the deck's); the audio
+    bytes. Raises :class:`SonioxNotConnected` / :class:`SonioxError`."""
+    key = await key_for(owner)
+    if not key:
+        raise SonioxNotConnected(NOT_CONNECTED if owner else NOT_CONNECTED_DECK)
+    t0 = time.monotonic()
+    ok, status = False, 0
+    try:
+        out = await soniox_api.synthesize(
+            key, text, voice=voice, language=language, audio_format=audio_format,
+        )
+        ok, status = True, 200
+    except SonioxError as exc:
+        status = exc.status
+        if exc.refused:
+            await _mark_refused(owner)
+        raise
+    finally:
+        await _log_call(
+            owner, kind="tts", source=source, agent=agent, chars=len(text or ""),
+            ok=ok, status=status, latency_ms=int((time.monotonic() - t0) * 1000),
+        )
+    await _mark_ok(owner)
+    return out
 
 
 async def realtime_key_for(
@@ -602,6 +633,29 @@ async def soniox_agent_transcribe(request: Request) -> dict[str, Any]:
     except (SonioxNotConnected, SonioxError) as exc:
         raise http_error(exc) from None
     return {"text": out.text, "tokens": out.tokens}
+
+
+class SpeakBody(BaseModel):
+    text: str = ""
+    voice: str = ""
+    language: str = ""
+    audio_format: str = "mp3"
+
+
+@router.post("/agent/speak")
+async def soniox_agent_speak(request: Request, body: SpeakBody) -> Response:
+    """Text to speech for the calling agent, with its OWNER's key: the audio
+    bytes (``audio/mpeg`` for the default mp3)."""
+    owner, slug = await _agent_caller(request)
+    try:
+        audio = await speak_for(
+            owner, body.text, voice=body.voice, language=body.language,
+            audio_format=body.audio_format, source="agent", agent=slug,
+        )
+    except (SonioxNotConnected, SonioxError) as exc:
+        raise http_error(exc) from None
+    mime = soniox_api.TTS_FORMATS.get((body.audio_format or "mp3").lower(), "audio/mpeg")
+    return Response(content=audio, media_type=mime)
 
 
 class RealtimeKeyBody(BaseModel):

@@ -26,6 +26,7 @@ from captain_claw.tools.document_extract import (
     XlsxExtractTool,
 )
 from captain_claw.tools.pocket_tts import PocketTTSTool
+from captain_claw.tools.audio import AudioTool
 from captain_claw.tools.image_gen import ImageGenTool
 from captain_claw.tools.image_ocr import ImageOcrTool, ImageVisionTool
 from captain_claw.tools.send_mail import SendMailTool
@@ -116,6 +117,7 @@ __all__ = [
     "MicrosoftMailTool",
     "MicrosoftOneDriveTool",
     "JevTool",
+    "AudioTool",
     "TodoTool",
     "ContactsTool",
     "ScriptsTool",

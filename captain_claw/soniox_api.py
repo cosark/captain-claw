@@ -11,9 +11,10 @@ talks to Soniox with a key it is handed:
 * :func:`temporary_key` — a short-lived key for one realtime session
   (``transcribe_websocket`` or ``tts_rt``), so an agent can stream without ever
   holding the real key.
+* :func:`synthesize` — text to speech (one request; long text in chunks).
 
-``SONIOX_API_BASE`` points everything at another Soniox-compatible endpoint (a
-local stub in tests and live checks).
+``SONIOX_API_BASE`` / ``SONIOX_TTS_URL`` point everything at another
+Soniox-compatible endpoint (a local stub in tests and live checks).
 """
 
 from __future__ import annotations
@@ -33,6 +34,25 @@ DEFAULT_API_BASE = "https://api.soniox.com"
 STT_MODEL = "stt-async-v4"
 USAGE_TYPES = ("transcribe_websocket", "tts_rt")
 MAX_TEMP_KEY_SECONDS = 3600
+
+DEFAULT_TTS_URL = "https://tts-rt.soniox.com/tts"
+TTS_MODEL = "tts-rt-v1"
+DEFAULT_VOICE = "Adrian"
+# Soniox's voices (all multilingual), by accent — the glasses settings page
+# offers the same list.
+VOICES: dict[str, tuple[str, ...]] = {
+    "neutral": ("Maya", "Daniel", "Noah", "Nina", "Emma", "Jack", "Adrian", "Claire",
+                "Grace", "Owen", "Mina", "Kenji"),
+    "british": ("Oliver", "Arthur", "Isla", "Victoria"),
+    "spanish": ("Rafael", "Mateo", "Lucia", "Sofia"),
+    "australian": ("Cooper", "Mason", "Ruby", "Elise"),
+    "indian": ("Arjun", "Rohan", "Priya", "Meera"),
+}
+TTS_FORMATS = {"mp3": "audio/mpeg", "wav": "audio/wav", "aac": "audio/aac",
+               "opus": "audio/ogg", "flac": "audio/flac"}
+# One Soniox request at most (the glasses cap); longer text is spoken in chunks.
+TTS_CHUNK_CHARS = 4000
+MAX_TTS_CHARS = 40000
 
 
 class SonioxError(Exception):
@@ -58,6 +78,20 @@ class Transcript:
 
 def api_base() -> str:
     return ((os.environ.get("SONIOX_API_BASE") or "").strip() or DEFAULT_API_BASE).rstrip("/")
+
+
+def tts_url() -> str:
+    return (os.environ.get("SONIOX_TTS_URL") or "").strip() or DEFAULT_TTS_URL
+
+
+def all_voices() -> list[str]:
+    return [v for group in VOICES.values() for v in group]
+
+
+def voice_for(name: str) -> str:
+    """Soniox's spelling of a voice name ("emma" → "Emma"), or "" if unknown."""
+    wanted = str(name or "").strip().lower()
+    return next((v for v in all_voices() if v.lower() == wanted), "")
 
 
 def key_hint(api_key: str) -> str:
@@ -245,3 +279,84 @@ async def transcribe(
     except Exception as exc:
         log.warning("soniox STT: unexpected error: %s", exc)
         raise SonioxError(0, f"transcription error ({type(exc).__name__})") from None
+
+
+def _tts_chunks(text: str, limit: int = TTS_CHUNK_CHARS) -> list[str]:
+    """Split *text* at paragraph / sentence / word boundaries into pieces of at
+    most *limit* characters."""
+    import re
+
+    text = text.strip()
+    if len(text) <= limit:
+        return [text] if text else []
+    pieces: list[str] = []
+    current = ""
+    for sentence in re.split(r"(?<=[.!?…])\s+|\n{2,}", text):
+        sentence = sentence.strip()
+        while len(sentence) > limit:  # one huge "sentence": cut at a space
+            cut = sentence.rfind(" ", 0, limit)
+            cut = cut if cut > limit // 2 else limit
+            if current:
+                pieces.append(current)
+                current = ""
+            pieces.append(sentence[:cut].strip())
+            sentence = sentence[cut:].strip()
+        if not sentence:
+            continue
+        if current and len(current) + 1 + len(sentence) > limit:
+            pieces.append(current)
+            current = sentence
+        else:
+            current = f"{current} {sentence}".strip()
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+async def synthesize(
+    api_key: str, text: str, *, voice: str = "", language: str = "", audio_format: str = "mp3",
+    timeout: float = 90.0,
+) -> bytes:
+    """Speak *text* with Soniox TTS; the audio bytes in *audio_format*.
+
+    Text over :data:`TTS_CHUNK_CHARS` is spoken in pieces whose audio is
+    joined (mp3 frames play back to back). Raises :class:`SonioxError`."""
+    if not api_key:
+        raise SonioxError(0, "no Soniox API key")
+    text = str(text or "").strip()
+    if not text:
+        raise SonioxError(400, "nothing to speak (empty text)")
+    if len(text) > MAX_TTS_CHARS:
+        raise SonioxError(400, f"text too long to speak ({len(text)} characters, max {MAX_TTS_CHARS})")
+    audio_format = (audio_format or "mp3").strip().lower()
+    if audio_format not in TTS_FORMATS:
+        raise SonioxError(400, f"audio_format must be one of {', '.join(TTS_FORMATS)}")
+    chunks = _tts_chunks(text)
+    if len(chunks) > 1 and audio_format != "mp3":
+        raise SonioxError(400, f"text over {TTS_CHUNK_CHARS} characters can only be spoken as mp3")
+    payload = {
+        "model": os.environ.get("SONIOX_TTS_MODEL", "").strip() or TTS_MODEL,
+        "language": (language or os.environ.get("SONIOX_TTS_LANGUAGE", "") or "en").strip(),
+        "voice": (voice or os.environ.get("SONIOX_TTS_VOICE", "") or DEFAULT_VOICE).strip(),
+        "audio_format": audio_format,
+    }
+    out = bytearray()
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for chunk in chunks:
+                resp = await client.post(
+                    tts_url(), json={**payload, "text": chunk},
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+                if resp.status_code != 200:
+                    detail = _error_text(resp)
+                    log.warning("soniox TTS failed: HTTP %s — %s", resp.status_code, detail)
+                    if resp.status_code in (401, 403, 429):
+                        raise SonioxError(resp.status_code, _reason("speech", resp.status_code))
+                    raise SonioxError(resp.status_code, f"Soniox speech failed (HTTP {resp.status_code}){': ' + detail if detail else ''}")
+                out.extend(resp.content)
+    except httpx.HTTPError as exc:
+        raise SonioxError(0, f"Soniox couldn't be reached ({type(exc).__name__})") from None
+    if not out:
+        raise SonioxError(200, "Soniox returned no audio")
+    return bytes(out)

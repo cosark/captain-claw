@@ -17,6 +17,7 @@ from captain_claw.config import get_config
 from captain_claw.cron import now_utc, to_utc_iso
 from captain_claw.logging import log
 from captain_claw.turn_deliverables import (
+    SPEECH_TOOLS,
     keep_deliverables,
     named_new_files,
     saved_root_of,
@@ -63,7 +64,7 @@ def remote_user_requested_audio(text: str) -> bool:
 
 
 def extract_audio_paths_from_tool_output(content: str) -> list[Path]:
-    """Extract resolved MP3 paths from pocket_tts tool output text."""
+    """Extract resolved MP3 paths from speech tool output (pocket_tts, audio)."""
     text = str(content or "")
     paths: list[Path] = []
     seen: set[str] = set()
@@ -110,7 +111,7 @@ def effective_turn_start_idx(agent: Any, captured_idx: int) -> int:
 def collect_turn_generated_audio_paths(
     session: Any, turn_start_idx: int, *, saved_root: Path | None = None, since: float = 0.0,
 ) -> list[Path]:
-    """pocket_tts MP3s of the current turn — only deliverables (inside the
+    """Spoken MP3s of the current turn (pocket_tts, audio speak) — only deliverables (inside the
     agent's ``saved_root``, made this turn; see :mod:`turn_deliverables`)."""
     if not session:
         return []
@@ -119,7 +120,7 @@ def collect_turn_generated_audio_paths(
     for msg in session.messages[max(0, int(turn_start_idx)):]:
         if str(msg.get("role", "")).strip().lower() != "tool":
             continue
-        if str(msg.get("tool_name", "")).strip().lower() != "pocket_tts":
+        if str(msg.get("tool_name", "")).strip().lower() not in SPEECH_TOOLS:
             continue
         if str(msg.get("content", "")).strip().lower().startswith("error:"):
             continue
@@ -778,7 +779,21 @@ class PlatformAdapter:
 
         if not remote_user_requested_audio(user_prompt):
             return
-        if "pocket_tts" not in self.ctx.agent.tools.list_tools():
+        # Soniox's audio tool when the owner has Soniox (a far better voice),
+        # else the local pocket_tts.
+        tool_name = ""
+        registered = self.ctx.agent.tools.list_tools()
+        if "audio" in registered:
+            try:
+                from captain_claw import soniox_client
+
+                if soniox_client.soniox_usable():
+                    tool_name = "audio"
+            except Exception:
+                tool_name = ""
+        if not tool_name and "pocket_tts" in registered:
+            tool_name = "pocket_tts"
+        if not tool_name:
             return
 
         source_text = str(assistant_text or "").strip()
@@ -797,9 +812,11 @@ class PlatformAdapter:
         max_chars = max(1, int(getattr(cfg.tools.pocket_tts, "max_chars", 4000)))
         tts_text = source_text[:max_chars]
         tool_args: dict[str, object] = {"text": tts_text}
+        if tool_name == "audio":
+            tool_args = {"action": "speak", "text": tts_text}
         try:
             result = await self.ctx.agent._execute_tool_with_guard(
-                name="pocket_tts",
+                name=tool_name,
                 arguments=tool_args,
                 interaction_label=f"{self.platform}_auto_tts",
             )
@@ -807,10 +824,10 @@ class PlatformAdapter:
             self.ctx.agent._add_session_message(
                 role="tool",
                 content=tool_output,
-                tool_name="pocket_tts",
+                tool_name=tool_name,
                 tool_arguments=tool_args,
             )
-            self.ctx.agent._emit_tool_output("pocket_tts", tool_args, tool_output)
+            self.ctx.agent._emit_tool_output(tool_name, tool_args, tool_output)
             if self.ctx.agent.session:
                 await self.ctx.agent.session_manager.save_session(self.ctx.agent.session)
 

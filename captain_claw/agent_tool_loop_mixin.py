@@ -140,6 +140,14 @@ class AgentToolLoopMixin:
         # ── Media ──────────────────────────────────────────
         if name == "pocket_tts":
             return "Text-to-speech"
+        if name == "audio":
+            action = str(arguments.get("action", "")).strip().lower()
+            if action == "transcribe":
+                path = str(arguments.get("path", "")).strip()
+                return f"Transcribing {path.rsplit('/', 1)[-1]}" if path else "Transcribing audio"
+            if action == "speak":
+                return "Speaking"
+            return "Listing voices" if action == "voices" else "Audio"
         if name == "image_gen":
             prompt = str(arguments.get("prompt", "")).strip()
             return f"Generating image: {prompt[:50]}" if prompt else "Generating image"
