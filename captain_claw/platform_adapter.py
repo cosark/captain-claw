@@ -181,7 +181,7 @@ def collect_turn_generated_image_paths(
     for msg in session.messages[max(0, int(turn_start_idx)):]:
         if str(msg.get("role", "")).strip().lower() != "tool":
             continue
-        if str(msg.get("tool_name", "")).strip().lower() not in ("image_gen", "termux", "browser"):
+        if str(msg.get("tool_name", "")).strip().lower() not in ("image_gen", "termux", "browser", "payments"):
             continue
         if str(msg.get("content", "")).strip().lower().startswith("error:"):
             continue

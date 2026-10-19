@@ -316,8 +316,9 @@ async def _upload_and_send(
 
 
 # Made for the user, so always delivered: generated pictures, phone photos,
-# spoken audio. (Browser screenshots are the agent's own working views.)
-_DELIVERED_IMAGE_TOOLS = ("image_gen", "termux")
+# spoken audio, payment barcodes. (Browser screenshots are the agent's own
+# working views.)
+_DELIVERED_IMAGE_TOOLS = ("image_gen", "termux", "payments")
 _DELIVERED_AUDIO_TOOLS = tuple(sorted(_deliverables.SPEECH_TOOLS))
 # saved/ folders that never hold deliverables: working code, and inputs the
 # agent fetched (a Drive file it summarises isn't sent back unasked).

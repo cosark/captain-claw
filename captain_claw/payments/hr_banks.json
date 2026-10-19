@@ -1,0 +1,11 @@
+{
+  "_source": "VBDI (vodeći broj depozitne institucije), IBAN characters 5-11. Only codes seen on live Croatian IBANs are listed; 1001005 and 2340009 are confirmed against HNB's published decision, the rest come from IBANs in use and should be checked against HNB's current register before relying on them. Display only: an unknown code just shows no bank name.",
+  "1001005": "Hrvatska narodna banka",
+  "2340009": "Privredna banka Zagreb",
+  "2360000": "Zagrebačka banka",
+  "2390001": "Hrvatska poštanska banka",
+  "2402006": "Erste&Steiermärkische Bank",
+  "2407000": "OTP banka",
+  "2484008": "Raiffeisenbank Austria",
+  "2500009": "Addiko Bank"
+}

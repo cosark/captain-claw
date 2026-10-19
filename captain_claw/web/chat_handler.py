@@ -743,8 +743,12 @@ async def handle_chat(
     *task* (a Flight Deck scheduled task, :func:`task_marker`) runs the
     rerouted turn in the task's own session (see :func:`enter_task_session`).
     """
+    from captain_claw.card_scrub import scrub_user_text
     from captain_claw.speaker import speaker_error, speaker_key_of
 
+    # Card numbers / CVVs never go further — not to the echo, task naming,
+    # flows or the agent (card_scrub; Captain never needs them).
+    content = scrub_user_text(content)
     speaker_key = speaker_key_of(ws)
     if not server.agent:
         await server._send(ws, speaker_error("invalid", "Agent not initialized")

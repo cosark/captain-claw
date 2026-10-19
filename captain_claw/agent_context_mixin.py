@@ -2332,6 +2332,12 @@ class AgentContextMixin:
             await soniox_client.available()
         except Exception as _exc:
             log.debug("Soniox connection priming failed: %s", _exc)
+        # And payments: whether the owner's Flight Deck has them on.
+        try:
+            from captain_claw import payments_client
+            await payments_client.refresh(force=True)
+        except Exception as _exc:
+            log.debug("Payments priming failed: %s", _exc)
 
         self._initialized = True
         log.info("Agent initialized", session_id=self.session.id)
@@ -2666,6 +2672,11 @@ class AgentContextMixin:
             # when this agent wasn't spawned by a Flight Deck).
             from captain_claw.tools.public_link import PublicLinkTool
             self.tools.register(PublicLinkTool())
+            # Payments — bill pay by barcode. Hidden unless the owner's Flight
+            # Deck has payments on (FD_PAYMENTS), refreshed per turn — see the
+            # registry. Captain never moves money; the user pays in their bank app.
+            from captain_claw.tools.payments import PaymentsTool
+            self.tools.register(PaymentsTool(), metadata={"requires_payments": True})
             # Code-app authoring — always registered; calls return a clear error
             # if FD_URL isn't available, so registration cost is negligible.
             from captain_claw.tools.app_runner import AppRunnerTool
