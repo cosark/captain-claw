@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS payment_intents (
     paid_at         REAL,
     paid_via        TEXT NOT NULL DEFAULT '',
     handoff_rail    TEXT NOT NULL DEFAULT '',
-    rails_state     TEXT NOT NULL DEFAULT '{}'
+    rails_state     TEXT NOT NULL DEFAULT '{}',
+    rail_nonce      TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_payment_intents_owner ON payment_intents(owner_id, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_intents_page
@@ -97,12 +98,26 @@ CREATE TABLE IF NOT EXISTS payment_connections (
     updated_at        REAL NOT NULL,
     PRIMARY KEY (owner_id, provider)
 );
+-- Small per-owner preferences (Phase 2: the bank a pay-by-bank link opens).
+CREATE TABLE IF NOT EXISTS payment_prefs (
+    owner_id   TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (owner_id, key)
+);
 """
 
 # Columns added after a table first shipped: (table, column, DDL).
 _MIGRATIONS = (
     ("payment_intents", "handoff_rail", "TEXT NOT NULL DEFAULT ''"),
     ("payment_intents", "rails_state", "TEXT NOT NULL DEFAULT '{}'"),
+    ("payment_intents", "rail_nonce", "TEXT"),
+)
+# Indexes on migrated columns, created after the migrations ran.
+_POST_MIGRATION_DDL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_intents_rail_nonce"
+    " ON payment_intents(rail_nonce) WHERE rail_nonce IS NOT NULL"
 )
 
 _JSON_COLS = {"fields": {}, "provenance": {}, "warnings": [], "acks": {}, "barcodes": [], "rails_state": {}}
@@ -148,6 +163,7 @@ class PaymentsStore:
                 await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
             except aiosqlite.OperationalError:
                 pass   # already there
+        await db.execute(_POST_MIGRATION_DDL)
         await db.commit()
         self._db = db
         return db
@@ -226,6 +242,12 @@ class PaymentsStore:
                 return _row(await cur.fetchone())
         return None
 
+    async def get_by_nonce(self, nonce: str) -> dict | None:
+        """The payment a bank redirect's one-time state belongs to."""
+        db = await self._ensure_db()
+        async with db.execute("SELECT * FROM payment_intents WHERE rail_nonce = ?", (nonce,)) as cur:
+            return _row(await cur.fetchone())
+
     async def count_since(self, owner_id: str, since: float) -> int:
         db = await self._ensure_db()
         async with db.execute(
@@ -256,6 +278,29 @@ class PaymentsStore:
         await db.execute("DELETE FROM payment_events WHERE owner_id = ?", (owner_id,))
         await db.execute("DELETE FROM payment_settings WHERE owner_id = ?", (owner_id,))
         await db.execute("DELETE FROM payment_connections WHERE owner_id = ?", (owner_id,))
+        await db.execute("DELETE FROM payment_prefs WHERE owner_id = ?", (owner_id,))
+        await db.commit()
+
+    # ── preferences ──────────────────────────────────────────────────
+
+    async def get_pref(self, owner_id: str, key: str) -> Any:
+        db = await self._ensure_db()
+        async with db.execute("SELECT value FROM payment_prefs WHERE owner_id = ? AND key = ?",
+                              (owner_id, key)) as cur:
+            row = await cur.fetchone()
+            return _loads(row[0], None) if row else None
+
+    async def set_pref(self, owner_id: str, key: str, value: Any) -> None:
+        db = await self._ensure_db()
+        await db.execute(
+            "INSERT INTO payment_prefs (owner_id, key, value, updated_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            (owner_id, key, json.dumps(value, ensure_ascii=False), time.time()))
+        await db.commit()
+
+    async def delete_pref(self, owner_id: str, key: str) -> None:
+        db = await self._ensure_db()
+        await db.execute("DELETE FROM payment_prefs WHERE owner_id = ? AND key = ?", (owner_id, key))
         await db.commit()
 
     # ── bank connections ─────────────────────────────────────────────

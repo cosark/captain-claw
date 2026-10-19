@@ -53,7 +53,19 @@ export interface Payment {
   handoff_rail: string
   /** Revolut Business draft (Phase 1): its id, last state, reason, and the VoP check. */
   revolut: { draft_id?: string; state?: string; reason?: string; vop?: { result_code: string; name: string } }
+  /** Pay-by-bank link (Phase 2): the bank, its status in words, and the link while it's fresh. */
+  bank_link: { bank_name?: string; status?: string; label?: string; reason?: string; url?: string }
 }
+
+export interface BankLinkStatus {
+  configured: boolean
+  environment: string
+  redirect_url: string
+  bank: { name: string; country: string; psu_type: string } | null
+  error?: string
+}
+
+export interface BankOption { name: string; country: string; logo: string; beta: boolean; bic: string }
 
 export interface RevolutConnection {
   connected: boolean
@@ -119,6 +131,18 @@ export const getPayment = (id: string) =>
 
 export const sendToRevolut = (id: string) =>
   fdJson<{ intent: Payment }>(`/payments/${encodeURIComponent(id)}/revolut`, { method: 'POST' })
+
+// Pay-by-bank links (PSD2 via the deck's Enable Banking application).
+export const getBankLink = () => fdJson<BankLinkStatus>('/payments/bank/status')
+export const bankOptions = (country: string, psu_type: string) =>
+  fdJson<{ banks: BankOption[] }>(`/payments/bank/aspsps?country=${encodeURIComponent(country)}&psu_type=${psu_type}`)
+export const setBankChoice = (name: string, country: string, psu_type: string) =>
+  fdJson<{ bank: BankLinkStatus['bank'] }>('/payments/bank/choice', {
+    method: 'PUT', body: JSON.stringify({ name, country, psu_type }),
+  })
+export const clearBankChoice = () => fdJson<{ bank: null }>('/payments/bank/choice', { method: 'DELETE' })
+export const payByBank = (id: string) =>
+  fdJson<{ intent: Payment; url: string; bank_name: string }>(`/payments/${encodeURIComponent(id)}/bank`, { method: 'POST' })
 
 // Revolut Business connection (scope READ,WRITE: drafts only, never payments).
 export const getRevolut = () => fdJson<RevolutConnection>('/payments/revolut/status')

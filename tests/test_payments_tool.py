@@ -151,3 +151,19 @@ def test_a_settled_payment_says_bank_confirmed(fd):
                                                "revolut": {"draft_id": "draft-1", "state": "COMPLETED"}}}
     r = _run(action="get", id="pay_0123456789ab")
     assert "status: settled" in r.content and "confirmed by the bank" in r.content
+
+
+def test_handoff_to_the_bank_gives_one_link(fd):
+    calls, replies = fd
+    replies["/handoff"] = {"rail": "bank", "url": "https://bank.example/auth?p=1", "bank_name": "Zagrebačka banka",
+                           "intent": {**INTENT, "status": "handed_off", "handoff_rail": "bank"}}
+    r = _run(action="handoff", id="pay_0123456789ab", rail="bank")
+    assert r.success and calls[0][2] == {"rail": "bank"}
+    assert "Link: https://bank.example/auth?p=1" in r.content and "Nothing has been paid" in r.content
+
+
+def test_ready_lists_every_rail_on_offer(fd):
+    _, replies = fd
+    replies["/prepare"] = {"intent": INTENT, "rails": ["barcode", "revolut", "bank"]}
+    out = _run(action="prepare", payee_name="HEP", iban="HR1210010051863000160", amount="1").content
+    assert "rail='bank'" in out and "rail='revolut'" in out

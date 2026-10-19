@@ -6,9 +6,9 @@
 // approves it there. A blocking warning hides the barcode until the owner
 // checks it here — the agent can't clear one.
 import { useCallback, useEffect, useState } from 'react'
-import { AlertTriangle, Check, CheckCircle2, Copy, Info, Landmark, Loader2, Receipt, X } from 'lucide-react'
+import { AlertTriangle, Check, CheckCircle2, Copy, ExternalLink, Info, Landmark, Loader2, Receipt, X } from 'lucide-react'
 import {
-  ackWarnings, CLOSED, getPayment, markPayment, PAID, sendToRevolut, statusLabel, useBarcode,
+  ackWarnings, CLOSED, getPayment, markPayment, PAID, payByBank, sendToRevolut, statusLabel, useBarcode,
   type Payment, type PaymentWarning,
 } from '../../services/payments'
 
@@ -158,7 +158,9 @@ export function PaymentCard({ id, compact = false }: { id: string; compact?: boo
 
   const paid = PAID.includes(p.status)
   const draft = p.revolut?.draft_id ? p.revolut : null
-  const inRevolut = !!draft && p.status === 'handed_off'
+  const inRevolut = !!draft && p.status === 'handed_off' && p.handoff_rail === 'revolut'
+  const bank = p.bank_link?.status || p.bank_link?.url ? p.bank_link : null
+  const atBank = !!bank && p.status === 'handed_off' && p.handoff_rail === 'bank'
   const closed = CLOSED.includes(p.status)
   const payable = p.status === 'ready' || p.status === 'handed_off'
   const openBlocking = p.warnings.filter((w) => w.severity === 'blocking' && !w.acked)
@@ -189,6 +191,20 @@ export function PaymentCard({ id, compact = false }: { id: string; compact?: boo
         </div>
       )}
 
+      {bank && (
+        <div className="mt-2 flex flex-wrap items-center gap-1.5 text-xs text-sky-300">
+          <Landmark size={14} />
+          {bank.bank_name ? `${bank.bank_name}: ` : ''}{bank.label}
+          {bank.reason ? ` (${bank.reason})` : ''}
+          {bank.url && (
+            <a href={bank.url} target="_blank" rel="noreferrer"
+              className="ml-1 inline-flex items-center gap-1 rounded bg-sky-700 px-2 py-0.5 font-medium text-white hover:bg-sky-600">
+              Open your bank <ExternalLink size={11} />
+            </a>
+          )}
+        </div>
+      )}
+
       {draft && (
         <div className="mt-2 flex items-center gap-1.5 text-xs text-sky-300">
           <Landmark size={14} />
@@ -213,13 +229,39 @@ export function PaymentCard({ id, compact = false }: { id: string; compact?: boo
             <Field label="Model · poziv na broj" value={ref} copy={p.reference} source={p.provenance.reference} />
             <Field label="Description" value={p.description} />
           </div>
-          {payable && openBlocking.length === 0 && !inRevolut && <Barcode p={p} />}
+          {payable && openBlocking.length === 0 && !inRevolut && !atBank && <Barcode p={p} />}
         </div>
       )}
 
       {payable && (
         <div className="mt-3 flex flex-wrap gap-2">
-          {rails.includes('revolut') && !inRevolut && openBlocking.length === 0 && (
+          {rails.includes('bank') && !bank?.url && !inRevolut && openBlocking.length === 0 && (
+            <button
+              disabled={busy}
+              onClick={() => {
+                // Open the tab on the click itself (a popup opened after the
+                // network call can be blocked), then point it at the bank.
+                const tab = window.open('', '_blank')
+                if (tab) tab.opener = null
+                act(async () => {
+                  try {
+                    const r = await payByBank(p.id)
+                    if (tab) tab.location.href = r.url
+                    else window.location.href = r.url
+                    return r
+                  } catch (e) {
+                    tab?.close()
+                    throw e
+                  }
+                })
+              }}
+              title="Opens your bank, where you approve the payment"
+              className="inline-flex items-center gap-1 rounded-md bg-sky-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-600 disabled:opacity-50"
+            >
+              <Landmark size={13} /> Pay in my bank
+            </button>
+          )}
+          {rails.includes('revolut') && !inRevolut && !atBank && openBlocking.length === 0 && (
             <button
               disabled={busy}
               onClick={() => act(() => sendToRevolut(p.id))}
@@ -229,6 +271,7 @@ export function PaymentCard({ id, compact = false }: { id: string; compact?: boo
               <Landmark size={13} /> Send to Revolut
             </button>
           )}
+          {/* Some banks never report a final status: "I paid" stays for bank links. */}
           {!inRevolut && (
             <button
               disabled={busy}

@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { Loader2, Receipt } from 'lucide-react'
 import { PaymentCard } from '../components/payments/PaymentCard'
 import { RevolutPanel } from '../components/payments/RevolutPanel'
+import { BankLinkPanel } from '../components/payments/BankLinkPanel'
 import {
   CLOSED, listPayments, setPaymentsCap, statusLabel, type Payment, type PaymentsConfig,
 } from '../services/payments'
@@ -100,6 +101,7 @@ export function PaymentsPage() {
           </div>
         )}
         {config && <div className="mb-4"><CapEditor config={config} onSaved={setConfig} /></div>}
+        <BankLinkPanel />
         <RevolutPanel />
 
         <div className="mb-3 flex gap-1">

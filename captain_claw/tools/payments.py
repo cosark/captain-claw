@@ -53,9 +53,10 @@ class PaymentsTool(Tool):
         "description, due_date (YYYY-MM-DD). Flight Deck reads the invoice's own barcode when it has "
         "one and checks every field. To correct a prepared payment, prepare again with supersedes=<id>.\n"
         "action='handoff' (id): only when prepare says READY — makes the barcode the user scans plus "
-        "a link to a phone page; with rail='revolut' (when prepare lists it) it puts the payment into "
-        "the user's Revolut Business as a DRAFT they send in the Revolut app instead — Captain can't "
-        "send it. action='mark' (id, status paid|skip|cancel): only when the user "
+        "a link to a phone page; with rail='bank' (when prepare lists it) it returns ONE LINK to the "
+        "user's own bank where they approve the payment; with rail='revolut' it puts the payment into "
+        "the user's Revolut Business as a DRAFT they send in the Revolut app — Captain can't send or "
+        "approve anything itself. action='mark' (id, status paid|skip|cancel): only when the user "
         "themselves says they paid or want to skip it. action='list' (status, query) / 'get' (id): "
         "what is prepared, paid or due.\n"
         "Rules: never ask for or accept card numbers, CVVs or bank logins. Never say anything was "
@@ -86,8 +87,9 @@ class PaymentsTool(Tool):
             "supersedes": {"type": "string",
                            "description": "prepare: id of an earlier payment this one corrects."},
             "id": {"type": "string", "description": "handoff / mark / get: the payment id (pay_…)."},
-            "rail": {"type": "string", "enum": ["barcode", "revolut"],
-                     "description": "handoff: 'barcode' (default) or 'revolut' — a draft in Revolut Business."},
+            "rail": {"type": "string", "enum": ["barcode", "bank", "revolut"],
+                     "description": "handoff: 'barcode' (default); 'bank' — a link to approve it in the "
+                                    "user's bank; 'revolut' — a draft in Revolut Business."},
             "status": {"type": "string",
                        "description": "mark: paid | skip | cancel. list: filter, e.g. 'handed_off'."},
             "query": {"type": "string", "description": "list: text to match in payee or description."},
@@ -167,6 +169,18 @@ class PaymentsTool(Tool):
         if err:
             return ToolResult(success=False, error=err)
         intent = data.get("intent") or {}
+        if data.get("rail") == "bank":
+            return ToolResult(success=True, content="\n".join([
+                _status_line(intent),
+                f"DONE — a payment link to the user's bank ({data.get('bank_name')}) is ready. Nothing has "
+                "been paid: the user approves it in their bank.",
+                f"Link: {data.get('url', '')}",
+                f"Tell the user: {intent.get('payee_name')} · {intent.get('amount_text')} — open the link "
+                "(it opens their bank), check payee and amount, and approve it there. The link works for "
+                "about an hour; ask for a new one after that. Captain sees when the bank confirms. Do not "
+                "say it is paid.",
+                *_warning_lines(intent),
+            ]))
         if data.get("rail") == "revolut":
             done = "already waiting" if data.get("existing") else "now waiting"
             return ToolResult(success=True, content="\n".join([
@@ -311,16 +325,25 @@ def _describe(intent: dict, *, head: str = "", next_step: bool, rails: list[str]
     if revolut.get("draft_id"):
         lines.append(f"Revolut Business draft: {str(revolut.get('state') or 'CREATED').lower()}"
                      + (f" ({revolut['reason']})" if revolut.get("reason") else ""))
+    bank_link = intent.get("bank_link") or {}
+    if bank_link.get("status") or bank_link.get("url"):
+        lines.append(f"Bank ({bank_link.get('bank_name') or 'the user’s bank'}): {bank_link.get('label')}"
+                     + (f" ({bank_link['reason']})" if bank_link.get("reason") else "")
+                     + (f" — link: {bank_link['url']}" if bank_link.get("url") else ""))
     if intent.get("status") == "settled":
-        lines.append("Paid — confirmed by the bank (Revolut).")
+        lines.append("Paid — confirmed by the bank.")
     lines.extend(_warning_lines(intent))
     if not next_step:
         return "\n".join(lines)
     status = intent.get("status")
     if status == "ready":
+        extra = []
+        if "bank" in rails:
+            extra.append("rail='bank' for a link that opens the user's bank")
+        if "revolut" in rails:
+            extra.append("rail='revolut' to put it into the user's Revolut Business as a draft")
         lines.append(f"READY — next: payments handoff with id={intent.get('id')} to make the barcode"
-                     + (", or rail='revolut' to put it into the user's Revolut Business as a draft "
-                        "(ask the user which they prefer)." if "revolut" in rails else "."))
+                     + (", or " + ", or ".join(extra) + " (ask the user which they prefer)." if extra else "."))
     elif status == "needs_review":
         lines.append("NEEDS THE USER — tell them the warnings above and that they review and confirm "
                      f"them in Flight Deck → Payments ({intent.get('review_path')}). You can't clear a "

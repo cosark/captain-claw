@@ -230,7 +230,22 @@ def view(row: dict) -> dict:
         "review_path": f"/payments/{row['id']}",
         "handoff_rail": row.get("handoff_rail", ""),
         "revolut": _revolut_public((row.get("rails_state") or {}).get("revolut") or {}),
+        "bank_link": _bank_public(row),
     }
+
+
+def _bank_public(row: dict) -> dict:
+    from captain_claw.flight_deck import bank_link
+
+    bk = (row.get("rails_state") or {}).get("bank") or {}
+    if not bk:
+        return {}
+    fresh = (row.get("status") == "handed_off" and bk.get("url")
+             and time.time() - float(bk.get("created_at") or 0) < bank_link.LINK_LIFETIME
+             and (bk.get("status") or "RCVD") in ("RCVD", "PDNG"))
+    return {"bank_name": (bk.get("aspsp") or {}).get("name", ""), "status": bk.get("status", ""),
+            "label": bank_link.describe(bk.get("status", "")), "reason": bk.get("reason", ""),
+            "url": bk["url"] if fresh else ""}
 
 
 def _revolut_public(rv: dict) -> dict:
@@ -445,7 +460,7 @@ async def _link_base(request: Request, owner: str) -> tuple[str, bool]:
 
 
 class HandoffRequest(BaseModel):
-    rail: str = "barcode"        # barcode | revolut
+    rail: str = "barcode"        # barcode | revolut | bank
 
 
 def _handoff_gate(row: dict) -> None:
@@ -469,8 +484,11 @@ async def agent_handoff(intent_id: str, request: Request, req: HandoffRequest | 
     owner, slug = _agent_owner(request)
     row = await _owned(intent_id, owner)
     _handoff_gate(row)
-    if (req or HandoffRequest()).rail == "revolut":
+    rail = (req or HandoffRequest()).rail
+    if rail == REVOLUT:
         return await _handoff_revolut(row, owner, f"agent:{slug}")
+    if rail == BANK:
+        return await _handoff_bank(row, owner, f"agent:{slug}", request)
     _require_deps()
     images = render_barcodes(row)
     token = secrets.token_urlsafe(24)
@@ -522,7 +540,7 @@ async def agent_list(request: Request, status: str = "", q: str = "", limit: int
 async def agent_get(intent_id: str, request: Request):
     _require_on()
     owner, _ = _agent_owner(request)
-    row = await _sync_revolut(await _owned(intent_id, owner))
+    row = await _sync_rail(await _owned(intent_id, owner))
     return {"intent": view(row), "rails": await _rails(owner)}
 
 
@@ -575,7 +593,7 @@ async def owner_list(status: str = "", user: dict = Depends(get_current_user)):
 @router.get("/fd/payments/{intent_id}")
 async def owner_get(intent_id: str, user: dict = Depends(get_current_user)):
     _require_on()
-    row = await _sync_revolut(await _owned(intent_id, user["id"]))
+    row = await _sync_rail(await _owned(intent_id, user["id"]))
     return {"intent": view(row), "events": await store().events(intent_id), "rails": await _rails(user["id"])}
 
 
@@ -646,8 +664,15 @@ async def _revolut_conn(owner: str) -> dict | None:
 
 
 async def _rails(owner: str) -> list[str]:
+    from captain_claw.flight_deck import bank_link
+
+    rails = ["barcode"]
     conn = await _revolut_conn(owner)
-    return ["barcode", REVOLUT] if conn and conn.get("account_id") else ["barcode"]
+    if conn and conn.get("account_id"):
+        rails.append(REVOLUT)
+    if bank_link.configured() and await store().get_pref(owner, BANK_PREF):
+        rails.append(BANK)
+    return rails
 
 
 def _client(conn: dict):
@@ -707,9 +732,9 @@ async def _sync_revolut(row: dict) -> dict:
 async def _sync_rows(rows: list[dict]) -> list[dict]:
     out, left = [], _SYNC_MAX
     for row in rows:
-        if left and row.get("status") == "handed_off" and row.get("handoff_rail") == REVOLUT:
+        if left and row.get("status") == "handed_off" and row.get("handoff_rail") in (REVOLUT, BANK):
             left -= 1
-            row = await _sync_revolut(row)
+            row = await _sync_rail(row)
         out.append(row)
     return out
 
@@ -1005,6 +1030,198 @@ async def revolut_callback(code: str = "", state: str = "", error: str = ""):
                 "drafts for you to send. It can't send them itself. You can close this tab.</p>")
 
 
+# ── Pay-by-bank links: PSD2 payment initiation (Phase 2) ──────────────
+#
+# docs/payments-phase2-plan.md. Flight Deck creates the payment at Enable
+# Banking (the deck's application, FD_ENABLEBANKING_*) and hands the user one
+# link to their own bank, where they approve it with the bank's SCA. No bank
+# login or long-lived token is ever held here.
+
+BANK = "bank"
+BANK_PREF = "bank"
+
+
+async def _sync_rail(row: dict) -> dict:
+    if row.get("handoff_rail") == BANK:
+        return await _sync_bank(row)
+    return await _sync_revolut(row)
+
+
+async def _bank_redirect(request: Request, owner: str) -> str:
+    override = os.environ.get("FD_ENABLEBANKING_REDIRECT_URL", "").strip()
+    if override:
+        return override
+    base, _ = await _link_base(request, owner)
+    return f"{base}/fd/payments/bank/callback"
+
+
+async def _sync_bank(row: dict) -> dict:
+    """Read the bank's status and move the ledger on (ACSC/ACCC or final
+    accepted → settled, RJCT → failed, final cancellation → cancelled)."""
+    from captain_claw.flight_deck import bank_link
+
+    bk = dict((row.get("rails_state") or {}).get(BANK) or {})
+    if row.get("status") != "handed_off" or not bk.get("payment_id") or not bank_link.configured():
+        return row
+    try:
+        data = await bank_link.get_payment(bk["payment_id"])
+    except bank_link.BankLinkError as exc:
+        log.info("Bank payment read failed", id=row["id"], error=exc.message)
+        return row
+    status = str(data.get("status") or "").upper()
+    final = bool(data.get("final_status"))
+    reason_info = data.get("status_reason_information") or {}
+    reason = str(reason_info.get("status_reason_description") or reason_info.get("status_reason_code") or "")
+    if status == bk.get("status") and final == bool(bk.get("final")):
+        return row
+    bk.update(status=status, final=final, reason=reason[:200], checked_at=time.time())
+    row = await store().update(row["id"], rails_state={**(row.get("rails_state") or {}), BANK: bk})
+    target = bank_link.ledger_status(status, final)
+    if target == "settled":
+        row = await _set_status(row, "settled", "bank", via=BANK, detail={"payment_id": bk["payment_id"],
+                                                                            "status": status})
+    elif target == "failed":
+        row = await store().update(row["id"], warnings=_warn(
+            row, "bank_rejected", "info", f"Your bank rejected the payment"
+            + (f": {reason}" if reason else "") + ". Nothing was paid; hand it over again to retry."))
+        row = await _set_status(row, "failed", "bank", via=BANK, detail={"status": status, "reason": reason})
+    elif target == "cancelled":
+        row = await _set_status(row, "cancelled", "bank", via=BANK, detail={"status": status})
+    return row
+
+
+async def _handoff_bank(row: dict, owner: str, actor: str, request: Request) -> dict:
+    """Create the payment at the user's bank (gate already passed) → the link."""
+    from captain_claw.flight_deck import bank_link
+    from captain_claw.payments import iban as iban_mod
+
+    if not bank_link.configured():
+        raise HTTPException(409, "Pay-by-bank links aren't set up on this deck.")
+    choice = await store().get_pref(owner, BANK_PREF)
+    if not choice:
+        raise HTTPException(409, "Choose your bank on the Payments page first.")
+    fields = row["fields"]
+    if (fields.get("currency") or "EUR") != "EUR" or not iban_mod.is_sepa(fields.get("iban", "")):
+        raise HTTPException(409, "Pay-by-bank links here are for EUR payments to SEPA IBANs.")
+    try:
+        banks = await bank_link.aspsps(choice["country"], choice["psu_type"])
+        aspsp = next((b for b in banks if b.get("name") == choice["name"]), None)
+        if aspsp is None:
+            raise HTTPException(409, f"{choice['name']} can't take payments through the bank link right now.")
+        nonce = secrets.token_urlsafe(18)
+        created = await bank_link.create_payment(
+            aspsp=aspsp, psu_type=choice["psu_type"], fields=fields, state=nonce,
+            redirect_url=await _bank_redirect(request, owner))
+    except bank_link.BankLinkError as exc:
+        raise HTTPException(502, f"The bank link couldn't be made: {exc.message}")
+    bk = {"payment_id": created["payment_id"], "url": created["url"], "status": created.get("status") or "RCVD",
+          "aspsp": {"name": aspsp["name"], "country": aspsp["country"]}, "created_at": time.time()}
+    row = await store().update(row["id"], status="handed_off", handoff_rail=BANK, rail_nonce=nonce,
+                               rails_state={**(row.get("rails_state") or {}), BANK: bk})
+    await store().add_event(row["id"], owner, actor, "bank_link",
+                            {"payment_id": created["payment_id"], "bank": aspsp["name"]})
+    log.info("Bank payment link created", id=row["id"], bank=aspsp["name"])
+    return {"intent": view(row), "rail": BANK, "url": created["url"], "bank_name": aspsp["name"]}
+
+
+class BankChoiceRequest(BaseModel):
+    name: str
+    country: str = "HR"
+    psu_type: str = "personal"
+
+
+@router.get("/fd/payments/bank/status")
+async def bank_status(request: Request, user: dict = Depends(get_current_user)):
+    from captain_claw.flight_deck import bank_link
+
+    _require_on()
+    out = {"configured": bank_link.configured(), "environment": "", "redirect_url": "",
+           "bank": await store().get_pref(user["id"], BANK_PREF)}
+    if out["configured"]:
+        out["redirect_url"] = await _bank_redirect(request, user["id"])
+        try:
+            out["environment"] = str((await bank_link.application()).get("environment") or "").lower()
+        except bank_link.BankLinkError as exc:
+            out["error"] = exc.message
+    return out
+
+
+@router.get("/fd/payments/bank/aspsps")
+async def bank_aspsps(country: str = "HR", psu_type: str = "personal", user: dict = Depends(get_current_user)):
+    from captain_claw.flight_deck import bank_link
+
+    _require_on()
+    if psu_type not in ("personal", "business") or not re.fullmatch(r"[A-Za-z]{2}", country):
+        raise HTTPException(422, "country is a two-letter code; psu_type is personal or business")
+    try:
+        banks = await bank_link.aspsps(country, psu_type)
+    except bank_link.BankLinkError as exc:
+        raise HTTPException(exc.status if exc.status in (409, 503) else 502, exc.message)
+    return {"banks": [{"name": b.get("name"), "country": b.get("country"), "logo": b.get("logo", ""),
+                       "beta": bool(b.get("beta")), "bic": b.get("bic", "")} for b in banks]}
+
+
+@router.put("/fd/payments/bank/choice")
+async def bank_choice(req: BankChoiceRequest, user: dict = Depends(get_current_user)):
+    _require_on()
+    banks = (await bank_aspsps(req.country.upper(), req.psu_type, user))["banks"]
+    if not any(b["name"] == req.name for b in banks):
+        raise HTTPException(422, "That bank can't take payments through the bank link")
+    choice = {"name": req.name, "country": req.country.upper(), "psu_type": req.psu_type}
+    await store().set_pref(user["id"], BANK_PREF, choice)
+    return {"bank": choice}
+
+
+@router.delete("/fd/payments/bank/choice")
+async def bank_choice_clear(user: dict = Depends(get_current_user)):
+    _require_on()
+    await store().delete_pref(user["id"], BANK_PREF)
+    return {"bank": None}
+
+
+@router.post("/fd/payments/{intent_id}/bank")
+async def owner_pay_by_bank(intent_id: str, request: Request, user: dict = Depends(get_current_user)):
+    _require_on()
+    row = await _owned(intent_id, user["id"])
+    _handoff_gate(row)
+    return await _handoff_bank(row, user["id"], f"user:{user['id']}", request)
+
+
+@public_router.get("/fd/payments/bank/callback")
+async def bank_callback(state: str = "", error: str = "", error_description: str = ""):
+    """The bank (via Enable Banking) sends the user back here after approving
+    — or not. The one-time state names the payment."""
+    from captain_claw.flight_deck import bank_link
+
+    def page(title: str, body: str, status: int = 200) -> HTMLResponse:
+        return HTMLResponse(
+            f'<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
+            f'<title>{html.escape(title)}</title><body style="font:16px system-ui;max-width:520px;'
+            f'margin:40px auto;padding:0 16px"><h2>{html.escape(title)}</h2>{body}</body>',
+            status_code=status, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+    row = await store().get_by_nonce(state) if enabled() and state else None
+    if not row:
+        return page("Link unavailable", "<p>This payment link isn't known here any more.</p>", 404)
+    bk = dict((row.get("rails_state") or {}).get(BANK) or {})
+    if error:
+        bk["last_error"] = (error_description or error)[:200]
+        row = await store().update(row["id"], rails_state={**(row.get("rails_state") or {}), BANK: bk})
+        await store().add_event(row["id"], row["owner_id"], "bank", "bank_not_approved", {"error": error})
+    row = await _sync_bank(row)
+    v = view(row)
+    who = f"{html.escape(v['payee_name'] or 'the payee')} · {html.escape(v['amount_text'])}"
+    if row["status"] == "settled":
+        return page("Paid", f"<p>{who} — your bank completed the payment. You can close this tab.</p>")
+    if row["status"] in ("failed", "cancelled") or error:
+        reason = bk.get("last_error") or (row.get("rails_state") or {}).get(BANK, {}).get("reason") or ""
+        return page("Not paid", f"<p>{who} wasn't approved at your bank"
+                    + (f" ({html.escape(reason)})" if reason else "") + ". Nothing was paid. Ask Captain "
+                    "for a new link when you're ready.</p>")
+    return page("Approved at your bank", f"<p>{who} — {html.escape(bank_link.describe(bk.get('status') or ''))}. "
+                "Captain shows it as paid once your bank confirms. You can close this tab.</p>")
+
+
 # ── the phone page: /p/{token} ────────────────────────────────────────
 
 _COPY_JS = ("document.querySelectorAll('[data-copy]').forEach(function(b){b.addEventListener('click',"
@@ -1093,6 +1310,12 @@ def _render_page(row: dict, token: str) -> str:
         _row_html("Description", v["description"]),
     ])
     info = "".join(f'<li>{esc(w["message"])}</li>' for w in v["warnings"] if w.get("severity") == "info")
+    bank = v.get("bank_link") or {}
+    if bank.get("url"):
+        head += (f'<section class="actions"><a class="btn primary" href="{esc(bank["url"])}" '
+                 f'rel="noreferrer">Pay in {esc(bank["bank_name"] or "your bank")} →</a></section>'
+                 '<p class="muted small">Opens your bank, where you approve the payment. Or scan the '
+                 'barcode below.</p>')
     return (head + f'<section class="codes">{codes}</section>'
             '<p class="muted small">On this phone? Save the barcode and use your bank app\'s "scan from '
             'gallery", if it has one — or copy the details below.</p>'
