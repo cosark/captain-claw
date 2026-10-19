@@ -1,11 +1,16 @@
-"""Render the StopWatch screens to PNGs (and one contact sheet).
+"""Render the StopWatch or PaperColor screens to PNGs (and one contact sheet).
 
     pio run -e preview
     uv run --no-project --with pillow python preview/render.py [out dir]
 
-Runs the preview program (the real ui_round.cpp built for the Mac), then
-masks every frame to the round screen with a bezel, the way it looks on the
-watch. Frames: <out>/NN_name.png; all of them: <out>/sheet.png.
+    pio run -e preview_paper
+    uv run --no-project --with pillow python preview/render.py paper [out dir]
+
+Runs the preview program (the real ui_round.cpp / ui_paper.cpp built for the
+Mac), then shows every frame the way it looks on the device: the StopWatch's
+round screen in its bezel; the PaperColor's six inks in the muted colours an
+E Ink Spectra 6 panel really has, in its frame. Frames: <out>/NN_name.png;
+all of them: <out>/sheet.png.
 """
 
 import math
@@ -60,37 +65,106 @@ def framed(ppm: Path) -> Image.Image:
     return bg
 
 
+# The panel's inks as the firmware draws them → as they look on the paper.
+PAPER_INKS = [
+    ((0, 0, 0), (40, 40, 46)),
+    ((255, 255, 255), (228, 226, 216)),
+    ((255, 243, 56), (224, 198, 46)),
+    ((191, 0, 0), (170, 40, 38)),
+    ((100, 64, 255), (52, 74, 152)),
+    ((67, 138, 28), (60, 114, 68)),
+]
+PAPER_MARGIN = 46
+
+
+def sample_paper_picture(path: Path) -> None:
+    """A 4:3 picture as the deck sends it with paper=1 (its own shape,
+    fitted to 400 wide): a sunset over hills and the sea."""
+    w, h = 400, 300
+    im = Image.new("RGB", (w, h))
+    px = im.load()
+    for y in range(h):
+        t = y / h
+        for x in range(w):
+            px[x, y] = (int(255 - 90 * t), int(170 - 110 * t + 30 * (x / w)), int(80 + 140 * t))
+    d = ImageDraw.Draw(im)
+    d.ellipse((w * 0.58, h * 0.30, w * 0.58 + 70, h * 0.30 + 70), fill=(255, 236, 150))
+    d.polygon([(0, h * 0.72), (w * 0.22, h * 0.42), (w * 0.4, h * 0.6), (w * 0.62, h * 0.38), (w * 0.82, h * 0.58),
+               (w, h * 0.5), (w, h * 0.78), (0, h * 0.78)], fill=(70, 60, 110))
+    d.rectangle((0, h * 0.78, w, h), fill=(30, 70, 130))
+    for i in range(9):
+        y = h * 0.8 + i * 7
+        d.line((w * 0.6 - 30 + i * 2, y, w * 0.6 + 60 - i * 3, y), fill=(250, 200, 120), width=2)
+    im.save(path, "JPEG", quality=88)
+
+
+def paper_framed(ppm: Path) -> Image.Image:
+    """The frame as it looks on the PaperColor: inks mapped to the panel's
+    muted colours, inside the device's light frame."""
+    screen = Image.open(ppm).convert("RGB")
+    pal = Image.new("P", (1, 1))
+    pal.putpalette([c for ink, _ in PAPER_INKS for c in ink] + [0] * (768 - 3 * len(PAPER_INKS)))
+    q = screen.quantize(palette=pal, dither=Image.Dither.NONE)
+    q.putpalette([c for _, look in PAPER_INKS for c in look] + [0] * (768 - 3 * len(PAPER_INKS)))
+    screen = q.convert("RGB")
+    w, h = screen.size
+    m = PAPER_MARGIN
+    size = (w + 2 * m, h + 2 * m)
+    out = Image.new("RGB", size, (244, 244, 246))
+    body = Image.new("L", (size[0] * 4, size[1] * 4), 0)
+    ImageDraw.Draw(body).rounded_rectangle((0, 0, size[0] * 4 - 1, size[1] * 4 - 1), radius=120, fill=255)
+    body = body.resize(size, Image.LANCZOS)
+    out.paste(Image.new("RGB", size, (206, 207, 211)), (0, 0), body)
+    d = ImageDraw.Draw(out)
+    d.rectangle((m - 6, m - 6, m + w + 5, m + h + 5), fill=(196, 196, 198))
+    out.paste(screen, (m, m))
+    return out
+
+
 def main() -> None:
-    out = Path(sys.argv[1] if len(sys.argv) > 1 else ROOT / "preview" / "out").resolve()
+    args = sys.argv[1:]
+    paper = bool(args) and args[0] == "paper"
+    if paper:
+        args = args[1:]
+    default = ROOT / "preview" / "out" / ("paper" if paper else "")
+    out = Path(args[0] if args else default).resolve()
     out.mkdir(parents=True, exist_ok=True)
     for old in out.glob("*.ppm"):
         old.unlink()
-    sample_picture(out / "sample.jpg")
-    program = ROOT / ".pio" / "build" / "preview" / "program"
+    (sample_paper_picture if paper else sample_picture)(out / "sample.jpg")
+    program = ROOT / ".pio" / "build" / ("preview_paper" if paper else "preview") / "program"
     subprocess.run([str(program), str(out), str(ROOT)], check=True, stdout=subprocess.DEVNULL)
     frames = []
     for ppm in sorted(out.glob("*.ppm")):
-        img = framed(ppm)
+        img = paper_framed(ppm) if paper else framed(ppm)
         img.save(ppm.with_suffix(".png"))
         ppm.unlink()
         frames.append((ppm.stem, img))
-    cols = 5
-    cell = D + 2 * BEZEL
+    if paper:
+        cell = (max(f.width for _, f in frames), max(f.height for _, f in frames))  # landscape too
+        sheet(out, frames, cols=5, cell=cell)
+    else:
+        sheet(out, frames, cols=5, cell=(D + 2 * BEZEL, D + 2 * BEZEL))
+
+
+def sheet(out: Path, frames: list, cols: int, cell: tuple[int, int]) -> None:
+    """All frames on one contact sheet, each named under it."""
+    cw, ch = cell
     pad, label = 24, 34
     rows = math.ceil(len(frames) / cols)
-    sheet = Image.new("RGB", (cols * (cell + pad) + pad, rows * (cell + label + pad) + pad), (244, 244, 246))
-    d = ImageDraw.Draw(sheet)
+    board = Image.new("RGB", (cols * (cw + pad) + pad, rows * (ch + label + pad) + pad), (244, 244, 246))
+    d = ImageDraw.Draw(board)
     try:
         font = ImageFont.truetype("/System/Library/Fonts/SFNS.ttf", 22)
     except OSError:
         font = ImageFont.load_default()
     for i, (name, img) in enumerate(frames):
-        x = pad + (i % cols) * (cell + pad)
-        y = pad + (i // cols) * (cell + label + pad)
-        sheet.paste(img, (x, y))
-        d.text((x + cell // 2, y + cell + 6), name.split("_", 1)[1].replace("_", " "), fill=(60, 62, 70),
+        x = pad + (i % cols) * (cw + pad)
+        y = pad + (i // cols) * (ch + label + pad)
+        board.paste(img, (x + (cw - img.width) // 2, y + (ch - img.height) // 2))
+        d.text((x + cw // 2, y + ch + 6), name.split("_", 1)[1].replace("_", " "), fill=(60, 62, 70),
                font=font, anchor="ma")
-    sheet.save(out / "sheet.png")
+    board.save(out / "sheet.png")
     print(f"{len(frames)} screens → {out}/sheet.png")
 
 

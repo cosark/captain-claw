@@ -161,6 +161,28 @@ async def test_an_empty_caption_falls_back_to_the_attached_lines_only(captured):
     assert captured["content"].endswith(captured["flow_text"])
 
 
+async def test_context_notes_open_the_turn_and_are_not_the_users_words(captured):
+    server = _Server(_agent())
+    await ch.handle_chat(
+        server, types.SimpleNamespace(), "how's my battery?",
+        context_notes=["Device readings as it sent this: battery 64%,\non battery [x]"],
+    )
+    await server._active_task
+    assert captured["content"] == (
+        "[Context: Device readings as it sent this: battery 64%, on battery (x)]\n"
+        "how's my battery?"
+    )
+    assert captured["flow_text"] == "how's my battery?"
+    assert captured["naming"] == "how's my battery?"
+    assert captured["non_image_attached"] is False
+
+
+def test_context_note_lines_are_few_and_sanitised():
+    lines = ch.context_note_lines(["a", "", "b\u2028c", "d", "e", "f"])
+    assert lines == ["[Context: a]", "[Context: b c]", "[Context: d]", "[Context: e]"]
+    assert ch.context_note_lines(None) == []
+
+
 async def test_image_only_turn_is_flagged_for_memory_suppression(captured):
     server = _Server(_agent())
     await ch.handle_chat(server, types.SimpleNamespace(), "who is this?",
@@ -322,6 +344,20 @@ async def test_attachment_notes_are_capped_and_typed(routes):
     # A frame without notes passes none.
     await handle_ws_message(_ws_server(), object(), {"type": "chat", "content": "hi"})
     assert routes["chat"][1][1]["attachment_notes"] is None
+
+
+async def test_context_notes_dont_make_a_frame_an_attachment(routes):
+    from captain_claw.web.ws_handler import handle_ws_message
+
+    await handle_ws_message(_ws_server(), object(), {
+        "type": "chat", "content": "/new", "context_notes": ["battery 64%"]})
+    assert routes["command"] == ["/new"] and routes["chat"] == []
+    await handle_ws_message(_ws_server(), object(), {
+        "type": "chat", "content": "hi", "context_notes": ["battery 64%", 7]})
+    kw = routes["chat"][0][1]
+    assert kw["context_notes"] == ["battery 64%"] and kw["attachment_notes"] is None
+    await handle_ws_message(_ws_server(), object(), {"type": "chat", "content": "hi"})
+    assert routes["chat"][1][1]["context_notes"] is None
 
 
 # ── busy refusals name the refused frame ─────────────────────────────

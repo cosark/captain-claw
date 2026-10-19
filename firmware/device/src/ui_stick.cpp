@@ -54,6 +54,11 @@ void brightness(uint8_t level) { M5.Display.setBrightness(level); }
 
 bool animated() { return false; }
 
+void tick() {}
+void flush() {}
+bool busy() { return false; }
+void setRotation(uint8_t) {}
+
 static void push() { canvas.pushSprite(0, 0); }
 
 static uint16_t healthColor(Health h) {
@@ -226,6 +231,28 @@ void showSetup(const char* reason, const char* apName, const char* ip) {
   push();
 }
 
+void showLink(const char* title, const String& url, const String& note) {
+  canvas.fillScreen(TFT_BLACK);
+  canvas.qrcode(url.c_str(), 2, 2, 110, 4);
+  canvas.setFont(kSmall);
+  canvas.setTextDatum(top_left);
+  canvas.setTextColor(TFT_ORANGE);
+  canvas.drawString(title, 118, 4);
+  canvas.setTextColor(TFT_CYAN);
+  String u = url.startsWith("http://") ? url.substring(7) : url;
+  canvas.drawString(fit(u, W - 120), 118, 24);
+  canvas.setTextColor(TFT_WHITE);
+  int y = 46;
+  for (auto& l : wrap(note, W - 122)) {  // sets the reading font
+    if (y > H - 14) break;
+    canvas.drawString(l, 118, y);
+    y += ts().line;
+  }
+  push();
+}
+
+void showSleeping(const String& hint, uint8_t) { showMessage("Sleeping", hint, TFT_DARKGREY); }
+
 void showMessage(const char* title, const String& body, uint16_t color) {
   canvas.fillScreen(TFT_BLACK);
   drawBar();
@@ -292,6 +319,12 @@ void showWorking(const String& heard, const std::vector<String>& activity, const
   push();
 }
 
+void setQuestion(const String&) {}
+bool canPin() { return false; }
+bool pinned() { return false; }
+void pin(bool) {}
+bool restoreAnswer() { return false; }
+
 void setReply(const String& text) {
   replyText = text;
   lines = wrap(text, W - 2 * PAD - 4);
@@ -333,6 +366,13 @@ bool nextPage() {
   page = (page + 1) % pages;
   showReply();
   return page != 0;
+}
+
+bool prevPage() {
+  if (page == 0) return false;
+  --page;
+  showReply();
+  return true;
 }
 
 // Panels (status page, idle health) follow the text size too: compact rows
@@ -460,7 +500,7 @@ void showStoredImage() {
   push();
 }
 
-void showPicker(const std::vector<Item>& items, int selected, int current) {
+void showPicker(const std::vector<Item>& items, int selected, int current, const char*) {
   std::vector<String> names;
   for (const Item& it : items) names.push_back(it.label);
   canvas.fillScreen(TFT_BLACK);

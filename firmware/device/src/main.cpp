@@ -1,15 +1,20 @@
-// Captain Claw voice client for the M5Stack StickS3 and StopWatch (board.h).
+// Captain Claw voice client for the M5Stack StickS3, StopWatch and PaperColor
+// (board.h).
 //
-//   Button A  (StickS3 front, StopWatch yellow)
+//   Button A  (StickS3 front, StopWatch yellow, PaperColor A)
 //             hold = talk, release = send · tap = stop speaking / flip picture↔text
 //             in the menu: choose / change the row
-//   Button B  (StickS3 side, StopWatch the other one)
+//   Button B  (StickS3 side, StopWatch the other one, PaperColor B)
 //             click = next page / next row · hold = menu (hold again = close)
 //             double-click on an answer = hear it again (also Menu → Replay answer)
+//   Button C  (PaperColor only)
+//             click = previous page / previous row / back · hold = home screen
 //   Hold A while switching on (or no Wi-Fi saved) = setup hotspot
+//   Asleep: hold A and talk at once — it records while it reconnects
 //
 // Talks to Flight Deck's /device/ws (captain_claw/flight_deck/device_bridge.py):
-// 16 kHz PCM up; reply text, 24 kHz PCM speech and JPEG pictures down.
+// 16 kHz PCM up, with the device's readings (telemetry.h) on each turn; reply
+// text, 24 kHz PCM speech and JPEG pictures down.
 
 #include <ArduinoJson.h>
 #include <M5Unified.h>
@@ -17,20 +22,29 @@
 #include <WiFi.h>
 #include <WiFiMulti.h>
 #include <driver/gpio.h>
+#include <driver/rtc_io.h>
 #include <esp_sleep.h>
 #include <esp_timer.h>
 
 #include "audio.h"
 #include "board.h"
 #include "face.h"
+#include "leds.h"
 #include "ota.h"
 #include "portal.h"
 #include "settings.h"
+#include "telemetry.h"
 #include "ui.h"
 
-#define FW_VERSION "0.9.0"
+#if defined(BOARD_PAPERCOLOR)
+#include <M5PM1.h>
+#endif
 
-enum class Mode { Idle, Listening, Waiting, Reply, Image, Menu, Agents, CharPick, Status, Notice };
+#define FW_VERSION "0.10.0"
+
+// Home: the PaperColor's home screen even while there's an answer (C hold).
+// Link: the "settings on your phone" address.
+enum class Mode { Idle, Listening, Waiting, Reply, Image, Menu, Agents, CharPick, Status, Notice, Home, Link };
 
 static WebSocketsClient ws;
 static WiFiMulti wifiMulti;
@@ -70,6 +84,26 @@ static uint32_t sideClickMs = 0;     // a side click on an answer, waiting for a
 static Mode sideClickMode = Mode::Idle;
 static bool sideClickWoke = false;   // that click only woke the screen
 
+// Talking from sleep: the talk button woke the device and is still held. The
+// mic records into PSRAM at once (M5Unified fills the buffer by itself) while
+// Wi-Fi and the deck connect; then it all goes up, as if spoken just now.
+static constexpr uint32_t kPrerollMaxMs = 30000;
+static constexpr uint32_t kPrerollMinMs = 1000;    // less than this recorded is a press that woke it
+static constexpr int kPrerollQuietPeak = 900;      // a short recording that never got louder is too
+static int16_t* preroll = nullptr;
+static size_t prerollCap = 0, prerollSent = 0;  // in samples
+static uint32_t prerollStartMs = 0;
+static volatile uint32_t prerollEndMs = 0;     // when the button was let go (0 = still held)
+static bool prerollOn = false, prerollStreaming = false, prerollChecked = false;
+
+// A menu row to read aloud (e-paper), once the presses settle.
+static String sayText;
+static uint32_t sayAtMs = 0;
+static bool asideOpen = false;  // the deck is sending a line spoken aside
+
+// The agent's name survives a deep sleep for the sleeping screen.
+RTC_DATA_ATTR static char rtcAgent[48] = "";
+
 static constexpr uint32_t kTapMs = 300;      // shorter press = tap, not talk
 static constexpr uint32_t kDoubleMs = 350;   // a second click within this = double-click
 static constexpr uint32_t kDimLeadMs = 2000;  // dims this long before the screen goes off
@@ -79,6 +113,8 @@ static constexpr uint16_t kGreen = ui::rgb(40, 200, 90), kRed = ui::rgb(230, 50,
 static constexpr uint16_t kYellow = ui::rgb(250, 200, 40), kCyan = ui::rgb(60, 210, 240);
 static constexpr uint16_t kOrange = ui::rgb(255, 150, 40), kText = ui::rgb(230, 230, 230);
 static constexpr size_t kMaxImage = 256 * 1024;
+static constexpr uint64_t kButtonPins = (1ULL << board::kTalkPin) | (1ULL << board::kSidePin) |
+                                        (board::kBackPin >= 0 ? (1ULL << board::kBackPin) : 0);
 
 // ── helpers ──────────────────────────────────────────────────────────
 
@@ -221,6 +257,10 @@ static std::vector<ui::Row> statusRows() {
   bool chg = M5.Power.isCharging() == m5::Power_Class::is_charging;
   rows.push_back({"Battery", String(pct) + "%  " + String(mv / 1000.0f, 2) + " V" + (chg ? "  charging" : ""),
                   pct >= 40 ? kGreen : pct >= 20 ? kYellow : kRed});
+  float tC, rh;
+  if (telemetry::climate(&tC, &rh)) {
+    rows.push_back({"Room", String(tC, 1) + " °C  " + String((int)lroundf(rh)) + "% humidity", kText});
+  }
   rows.push_back({"Voice", String(settings.femaleVoice ? "female" : "male") + "  vol " +
                                String((settings.volume * 100 + 127) / 255) + "%" +
                                (settings.boostDb ? "  +" + String(settings.boostDb) + " dB" : String("")) +
@@ -257,23 +297,50 @@ static void showIdle() {
   home.rows.push_back({"Deck", wsUp ? serverHost() : String("connecting…"), wsUp ? kGreen : kRed});
   home.rows.push_back({"Agent", agentLinked ? agentName : (wsUp ? String("waiting for agent") : String("-")),
                        agentLinked ? kGreen : kYellow});
+  home.character = settings.character;
   ui::showHome(home);
 }
 
 // ── menu ─────────────────────────────────────────────────────────────
 
-enum MenuRow { MReplay, MStatus, MAgent, MVolume, MBoost, MVoice, MDisplay, MTextSize, MCharacter, MBeep, MFlash,
-               MBuzz, MLead, MScreenOff, MPowerOff, MUpdate, MAutoUpdate, MSetup, MCount };
+enum MenuRow { MReplay, MPin, MStatus, MAgent, MVolume, MBoost, MVoice, MDisplay, MTextSize, MCharacter, MBeep,
+               MFlash, MBuzz, MLead, MScreenOff, MPowerOff, MRotation, MLeds, MClicks, MSayMenu, MAsleep, MPhone,
+               MUpdate, MAutoUpdate, MSetup, MCount };
 
 // The last answer can be heard again: from memory, or (part of it never
 // arrived) from the deck.
 static bool canReplay() { return audio::hasClip() || (audio::clipCut() && wsUp); }
 
 // Rows this device has now (only a device with a motor can buzz; Replay only
-// while there's an answer to replay).
+// while there's an answer to replay; the paper has no backlight to switch
+// off and can't animate a character, but can turn and has lights).
 static bool rowShown(int row) {
-  if (row == MReplay) return canReplay();
-  return row != MBuzz || board::kHasMotor;
+  switch (row) {
+    case MReplay: return canReplay();
+    case MPin: return ui::canPin();
+    case MBuzz: return board::kHasMotor;
+    case MDisplay:
+    case MScreenOff: return !board::kEpaper;
+    case MRotation:
+    case MLeds:
+    case MClicks:
+    case MSayMenu:
+    case MAsleep: return board::kEpaper;
+    default: return true;
+  }
+}
+
+static const char* const kRotations[] = {"portrait", "landscape", "portrait, flipped", "landscape, flipped"};
+static const char* const kLedLevels[] = {"off", "low", "bright"};
+
+static String asleepLabel() {
+  if (!settings.asleepRefreshMin) return "never";
+  return settings.asleepRefreshMin >= 60 ? "every " + String(settings.asleepRefreshMin / 60) + " h"
+                                         : "every " + String(settings.asleepRefreshMin) + " min";
+}
+
+static String powerOffLabel() {
+  return board::kEpaper ? String(settings.powerOffMin) + " min" : String(settings.powerOffS) + " s";
 }
 
 static constexpr uint8_t kVolumeSteps[] = {64, 128, 191, 255};  // 25 / 50 / 75 / 100 %
@@ -282,6 +349,7 @@ static constexpr uint8_t kBoostSteps[] = {0, 6, 10};
 static String menuLabel(int row) {
   switch (row) {
     case MReplay: return "Replay answer";
+    case MPin: return ui::pinned() ? "Unpin answer" : "Pin answer to home";
     case MStatus: return "Status";
     case MAgent: return "Agent: " + (agentName.length() ? agentName : String("none")) + " »";
     case MVolume: return "Volume " + String((settings.volume * 100 + 127) / 255) + "%";
@@ -294,11 +362,18 @@ static String menuLabel(int row) {
     }
     case MCharacter: return String("Character: ") + face::name(settings.character) + " »";
     case MBeep: return String("Beep before speech: ") + (settings.cueBeep ? "on" : "off");
-    case MFlash: return String("Flash before speech: ") + (settings.cueFlash ? "on" : "off");
+    case MFlash:
+      return String(board::kEpaper ? "Light" : "Flash") + " before speech: " + (settings.cueFlash ? "on" : "off");
     case MBuzz: return String("Buzz before speech: ") + (settings.cueBuzz ? "on" : "off");
     case MLead: return "Cue lead: " + String(settings.cueLeadS) + " s";
     case MScreenOff: return "Screen off: " + String(settings.screenOffS) + " s";
-    case MPowerOff: return "Power off: " + String(settings.powerOffS) + " s";
+    case MPowerOff: return "Power off: " + powerOffLabel();
+    case MRotation: return String("Orientation: ") + kRotations[settings.rotation & 3];
+    case MLeds: return String("Status lights: ") + kLedLevels[settings.ledLevel % 3];
+    case MClicks: return String("Key clicks: ") + (settings.keyClicks ? "on" : "off");
+    case MSayMenu: return String("Read menu aloud: ") + (settings.speakMenu ? "on" : "off");
+    case MAsleep: return "Redraw asleep: " + asleepLabel();
+    case MPhone: return "Settings on phone »";
     case MUpdate: return offer.valid() ? "Update to " + offer.version + " »" : String("Software " FW_VERSION " · check");
     case MAutoUpdate: return String("Auto update: ") + (settings.autoUpdate ? "on" : "off");
     default: return "Wi-Fi & settings…";
@@ -314,6 +389,11 @@ static ui::Item menuItem(int row) {
   it.note = "yellow = change";
   switch (row) {
     case MReplay: it.title = "Replay answer"; it.glyph = ui::Glyph::Replay; it.note = "yellow = hear it again"; break;
+    case MPin:
+      it.title = ui::pinned() ? "Unpin answer" : "Pin answer";
+      it.badge = ui::pinned() ? "pinned" : "";
+      it.note = ui::pinned() ? "the home screen shows the newest again" : "keeps it on the home screen, asleep too";
+      break;
     case MStatus: it.title = "Status"; it.glyph = ui::Glyph::Info; it.note = "Wi-Fi, deck, battery…"; break;
     case MAgent:
       it.title = "Agent";
@@ -336,11 +416,36 @@ static ui::Item menuItem(int row) {
       break;
     case MCharacter: it.title = "Character"; it.badge = face::name(settings.character); it.note = "yellow = browse"; break;
     case MBeep: it.title = "Beep before speech"; it.badge = onOff(settings.cueBeep); it.on = settings.cueBeep; break;
-    case MFlash: it.title = "Flash before speech"; it.badge = onOff(settings.cueFlash); it.on = settings.cueFlash; break;
+    case MFlash:
+      it.title = board::kEpaper ? "Light before speech" : "Flash before speech";
+      it.badge = onOff(settings.cueFlash);
+      it.on = settings.cueFlash;
+      break;
     case MBuzz: it.title = "Buzz before speech"; it.badge = onOff(settings.cueBuzz); it.on = settings.cueBuzz; break;
     case MLead: it.title = "Cue lead"; it.badge = String(settings.cueLeadS) + " s"; it.note = "how early the cue comes"; break;
     case MScreenOff: it.title = "Screen off"; it.badge = String(settings.screenOffS) + " s"; it.note = "after this long idle"; break;
-    case MPowerOff: it.title = "Power off"; it.badge = String(settings.powerOffS) + " s"; it.note = "after this long idle"; break;
+    case MPowerOff: it.title = "Power off"; it.badge = powerOffLabel(); it.note = "after this long idle"; break;
+    case MRotation: it.title = "Orientation"; it.badge = kRotations[settings.rotation & 3]; it.note = "turns the paper"; break;
+    case MLeds:
+      it.title = "Status lights";
+      it.badge = kLedLevels[settings.ledLevel % 3];
+      it.on = settings.ledLevel > 0;
+      it.note = "red listens, amber works, cyan speaks";
+      break;
+    case MClicks: it.title = "Key clicks"; it.badge = onOff(settings.keyClicks); it.on = settings.keyClicks; break;
+    case MSayMenu:
+      it.title = "Read menu aloud";
+      it.badge = onOff(settings.speakMenu);
+      it.on = settings.speakMenu;
+      it.note = "hear each row before the paper shows it";
+      break;
+    case MAsleep:
+      it.title = "Redraw asleep";
+      it.badge = asleepLabel();
+      it.on = settings.asleepRefreshMin > 0;
+      it.note = "date, room and battery on the sleeping paper";
+      break;
+    case MPhone: it.title = "Settings on phone"; it.glyph = ui::Glyph::Wifi; it.note = "every setting, from your phone"; break;
     case MUpdate:
       it.title = "Software update";
       it.badge = offer.valid() ? offer.version : String(FW_VERSION);
@@ -398,10 +503,29 @@ static uint8_t nextStep(const uint8_t (&steps)[N], uint8_t now) {
   return steps[0];
 }
 
+// Reads a row aloud a moment after the last press (e-paper: the paper shows
+// it ~20 s later). Quick presses say only where they stopped.
+static void sayLater(String text) {
+  if (!board::kEpaper || !settings.speakMenu) return;
+  text.replace(" »", "");
+  text.replace(":", ",");  // "Volume, 75%" reads better than "Volume: 75%"
+  sayText = text;
+  sayAtMs = millis() + 350;
+  if (!sayAtMs) sayAtMs = 1;
+}
+
+static void sayRow() {
+  if (mode == Mode::Menu) sayLater(menuLabel(menuSel));
+  else if (mode == Mode::Agents && !agentsLoading && agentSel < (int)agentNames.size())
+    sayLater(agentSel + 1 == (int)agentNames.size() ? String("Back") : agentNames[agentSel] + (agentSel == agentCur ? ", current" : ""));
+  else if (mode == Mode::CharPick) sayLater(face::name(charSel));
+}
+
 static void backToMain();
 static void startInstall();
 static void connectServer();
 static void replayAnswer();
+static String phoneUrl;  // "settings on phone" address while it's open
 
 static void redraw() {
   setBarState();
@@ -422,10 +546,10 @@ static void redraw() {
     case Mode::Menu: {
       int sel = 0;
       auto items = menuItems(&sel);
-      ui::showPicker(items, sel, -1);
+      ui::showPicker(items, sel, -1, "Menu");
       break;
     }
-    case Mode::Agents: ui::showPicker(agentItems(), agentSel, agentCur); break;
+    case Mode::Agents: ui::showPicker(agentItems(), agentSel, agentCur, "Agent"); break;
     case Mode::CharPick: {
       // Cycle through the poses so the preview shows everything it does.
       static const face::Pose poses[] = {face::Pose::Idle, face::Pose::Listening, face::Pose::Thinking,
@@ -449,6 +573,11 @@ static void redraw() {
       break;
     }
     case Mode::Notice: break;  // stays until the next event
+    case Mode::Link:
+      ui::showLink("Phone settings", phoneUrl,
+                   "Scan it with your phone (same Wi-Fi). Saving restarts the " + String(board::kNoun) + ".");
+      break;
+    case Mode::Home: showIdle(); break;
     case Mode::Idle:
       if (ui::hasReply()) ui::showReply();
       else showIdle();
@@ -472,6 +601,7 @@ static void openMenu() {
   menuOpenedMs = millis();
   mode = Mode::Menu;
   redraw();
+  sayRow();
 }
 
 static void chooseMenuRow() {
@@ -488,7 +618,7 @@ static void chooseMenuRow() {
       return;
     case MAgent:
       if (!wsUp) {
-        notice("Offline", "Can't list agents until the stick is connected.", kRed);
+        notice("Offline", "Can't list agents until the " + String(board::kNoun) + " is connected.", kRed);
         return;
       }
       agentNames = {"Loading agents…"};
@@ -501,7 +631,38 @@ static void chooseMenuRow() {
       redraw();
       return;
     case MSetup:
+      ui::flush();
       runSetupPortal("Settings");
+    case MPin:
+      ui::pin(!ui::pinned());
+      mode = board::kEpaper ? Mode::Home : Mode::Idle;  // the home screen shows what it keeps now
+      redraw();
+      return;
+    case MPhone:
+      phoneUrl = phoneSettingsBegin();
+      if (phoneUrl.isEmpty()) {
+        notice("Not connected", "Join Wi-Fi first, or use Wi-Fi & settings.", kRed);
+        return;
+      }
+      mode = Mode::Link;
+      redraw();
+      return;
+    case MRotation:
+      settings.rotation = (settings.rotation + 1) & 3;
+      ui::setRotation(settings.rotation);
+      break;
+    case MLeds:
+      settings.ledLevel = (settings.ledLevel + 1) % 3;
+      leds::setLevel(settings.ledLevel);
+      break;
+    case MClicks: settings.keyClicks = !settings.keyClicks; break;
+    case MSayMenu: settings.speakMenu = !settings.speakMenu; break;
+    case MAsleep:
+      settings.asleepRefreshMin = settings.asleepRefreshMin == 0    ? 30
+                                  : settings.asleepRefreshMin == 30 ? 60
+                                  : settings.asleepRefreshMin == 60 ? 180
+                                                                    : 0;
+      break;
     case MVolume:
       settings.volume = nextStep(kVolumeSteps, settings.volume);
       audio::setVolume(settings.volume);
@@ -523,6 +684,7 @@ static void chooseMenuRow() {
       charSel = settings.character;
       mode = Mode::CharPick;
       redraw();
+      sayRow();
       return;
     case MBeep: settings.cueBeep = !settings.cueBeep; break;
     case MFlash: settings.cueFlash = !settings.cueFlash; break;
@@ -532,7 +694,10 @@ static void chooseMenuRow() {
       break;
     case MLead: settings.cueLeadS = settings.cueLeadS == 1 ? 2 : 1; break;
     case MScreenOff: settings.screenOffS = settings.screenOffS == 5 ? 10 : settings.screenOffS == 10 ? 15 : 5; break;
-    case MPowerOff: settings.powerOffS = settings.powerOffS == 15 ? 30 : settings.powerOffS == 30 ? 60 : 15; break;
+    case MPowerOff:
+      if (board::kEpaper) settings.powerOffMin = settings.powerOffMin == 1 ? 3 : settings.powerOffMin == 3 ? 10 : 1;
+      else settings.powerOffS = settings.powerOffS == 15 ? 30 : settings.powerOffS == 30 ? 60 : 15;
+      break;
     case MUpdate:
       if (offer.valid()) {
         startInstall();
@@ -550,6 +715,7 @@ static void chooseMenuRow() {
   redraw();
   if (menuSel == MVolume || menuSel == MBoost) audio::beep();
   if (menuSel == MBeep && settings.cueBeep) audio::cue();
+  sayRow();  // the new value
 }
 
 static void chooseAgent() {
@@ -581,6 +747,7 @@ static void startTalking() {
   }
   flashing = false;
   quietSpeech = false;
+  ui::setQuestion("");
   audio::micStart();  // also stops any playback
   JsonDocument d;
   d["type"] = "rec_start";
@@ -592,9 +759,19 @@ static void startTalking() {
   redraw();
 }
 
+// The end of a recording goes up with the device's readings (battery,
+// Wi-Fi, motion, room climate, clock): the agent gets them as context.
+static void sendRecEnd() {
+  JsonDocument d;
+  d["type"] = "rec_end";
+  telemetry::fill(d["ctx"].to<JsonObject>());
+  sendJson(d);
+}
+
 static void stopTalking(bool send) {
   audio::micStop(send ? micSink : [](const int16_t*, size_t) {});
-  sendType(send ? "rec_end" : "rec_cancel");
+  if (send) sendRecEnd();
+  else sendType("rec_cancel");
   if (send) {
     heard = "";
     statusLine = "Transcribing…";
@@ -617,11 +794,128 @@ static void startSpeech(uint32_t rate) {
   if (goesOn || quiet) return;  // goesOn: the answer's next sound, straight after the last
   if (settings.cueBeep) audio::cue();
   if (buzzCue) buzz(160);
-  if (settings.cueFlash) {
+  if (settings.cueFlash && board::kEpaper) {
+    leds::flash();  // the paper can't flash; the lights can
+  } else if (settings.cueFlash) {
     M5.Display.setBrightness(255);
     flashing = true;
     flashStartMs = millis();
   }
+}
+
+// ── talking from sleep ───────────────────────────────────────────────
+
+// Woken by the talk button, and it's still held: they're talking already.
+static bool wokenToTalk() {
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  bool byTalk = cause == ESP_SLEEP_WAKEUP_EXT0 ||
+                (cause == ESP_SLEEP_WAKEUP_EXT1 && (esp_sleep_get_ext1_wakeup_status() & (1ULL << board::kTalkPin)));
+  return byTalk && gpio_get_level(board::kTalkPin) == 0;
+}
+
+static void startPreroll() {
+  prerollCap = kPrerollMaxMs / 1000 * audio::kMicRate;
+  preroll = (int16_t*)ps_calloc(prerollCap, sizeof(int16_t));  // anything unwritten is silence
+  if (!preroll) return;
+  M5.Speaker.end();
+  M5.Mic.begin();
+  if (!M5.Mic.record(preroll, prerollCap, audio::kMicRate)) {  // fills in the background, in real time
+    M5.Mic.end();
+    free(preroll);
+    preroll = nullptr;
+    return;
+  }
+  prerollStartMs = millis();
+  prerollEndMs = 0;
+  prerollSent = 0;
+  prerollOn = true;
+  prerollStreaming = prerollChecked = false;
+  leds::set(leds::State::Listening, 50);
+}
+
+static void stopPreroll() {
+  M5.Mic.end();
+  free(preroll);
+  preroll = nullptr;
+  prerollOn = prerollStreaming = false;
+}
+
+// The samples the mic has surely written by `atMs` (it runs in real time).
+static size_t prerollReady(uint32_t atMs) {
+  if ((int32_t)(atMs - prerollStartMs) <= 0) return 0;
+  return min(prerollCap, (size_t)((atMs - prerollStartMs) * (uint64_t)audio::kMicRate / 1000));
+}
+
+static void prerollSend(size_t upTo) {
+  while (prerollSent < upTo) {
+    size_t n = min(upTo - prerollSent, (size_t)2048);
+    ws.sendBIN((const uint8_t*)(preroll + prerollSent), n * sizeof(int16_t));
+    prerollSent += n;
+  }
+}
+
+// A press that only woke it: too little recorded, or a short stretch that
+// never got louder than the room (the press itself began before the mic).
+static bool prerollWokeOnly(uint32_t end) {
+  uint32_t ms = end - prerollStartMs;
+  if (ms < kPrerollMinMs) return true;
+  if (ms > 4000) return false;
+  size_t n = prerollReady(end);
+  int peak = 0;
+  for (size_t i = audio::kMicRate / 10; i < n; i += 2) peak = max(peak, abs((int)preroll[i]));  // past the mic's start
+  return peak < kPrerollQuietPeak;
+}
+
+// From loop(): once the deck is reached, what was said goes up — and the
+// rest follows live until the button is let go (or 30 s are used).
+static void pumpPreroll() {
+  if (!prerollOn) return;
+  const uint32_t end = prerollEndMs;  // before `now`: the sampler may set it any moment
+  const uint32_t now = millis();
+  if (end && !prerollChecked && (int32_t)(now - end) >= 150) {
+    prerollChecked = true;  // once: it reads the whole recording
+    if (prerollWokeOnly(end)) {
+      bool sent = prerollStreaming;
+      stopPreroll();
+      if (sent) {  // nothing worth hearing went up after all
+        sendType("rec_cancel");
+        backToMain();
+      }
+      return;
+    }
+  }
+  if (!wsUp) {
+    if ((int32_t)(now - prerollStartMs) > 45000 || (end && (int32_t)(now - end) > 25000)) {
+      stopPreroll();
+      notice("Not sent", "Couldn't reach Flight Deck in time — try again.", kRed);
+    }
+    return;
+  }
+  if (!prerollStreaming) {
+    prerollStreaming = true;
+    JsonDocument d;
+    d["type"] = "rec_start";
+    d["rate"] = audio::kMicRate;
+    sendJson(d);
+    recStartMs = prerollStartMs;
+    mode = Mode::Listening;
+    redraw();
+  }
+  bool full = (int32_t)(now - prerollStartMs) >= (int32_t)kPrerollMaxMs;
+  if (!end && !full) {
+    prerollSend(prerollReady(now - 120));  // stay behind the mic
+    return;
+  }
+  uint32_t stopAt = end ? end : prerollStartMs + kPrerollMaxMs;
+  if ((int32_t)(now - stopAt) < 150) return;  // let the last of it land
+  prerollSend(prerollReady(stopAt));
+  stopPreroll();
+  sendRecEnd();
+  heard = "";
+  statusLine = "Transcribing…";
+  startWork();
+  mode = Mode::Waiting;
+  redraw();
 }
 
 static void pollFlash() {
@@ -679,6 +973,7 @@ static void onText(const char* payload, size_t len) {
 
   if (type == "bound") {
     agentName = doc["agent"] | "";
+    strlcpy(rtcAgent, agentName.c_str(), sizeof(rtcAgent));
     agentSlug = doc["slug"] | "";
     agentLinked = doc["linked"] | true;
     if (mode == Mode::Agents || mode == Mode::Idle || mode == Mode::Notice) backToMain();
@@ -698,7 +993,10 @@ static void onText(const char* payload, size_t len) {
     agentSlugs.push_back("");
     agentSel = max(0, agentCur);
     agentsLoading = false;
-    if (mode == Mode::Agents) redraw();
+    if (mode == Mode::Agents) {
+      redraw();
+      sayRow();
+    }
   } else if (type == "state") {
     String st = doc["state"] | "";
     if (st == "connected") {
@@ -719,6 +1017,7 @@ static void onText(const char* payload, size_t len) {
     if (mode != Mode::Listening && !flashing) redraw();
   } else if (type == "transcript") {
     heard = doc["text"] | "";
+    ui::setQuestion(heard);
     statusLine = "Thinking…";
     workDirty = true;
   } else if (type == "status") {
@@ -744,7 +1043,14 @@ static void onText(const char* payload, size_t len) {
     deckReplay = quietSpeech = false;
     mode = Mode::Reply;
     if (!flashing) redraw();
+  } else if (type == "audio_start" && (doc["aside"] | false)) {
+    asideOpen = true;  // a menu row read aloud: apart from the answer
+    audio::asideBegin(doc["rate"] | 24000);
+  } else if (type == "audio_end" && asideOpen) {
+    asideOpen = false;
+    audio::asideEnd();
   } else if (type == "audio_start") {
+    asideOpen = false;  // an answer's sound: whatever came before is over
     if (deckReplay) {  // the deck's copy of the answer replaces what arrived
       deckReplay = false;
       audio::newClip();
@@ -787,6 +1093,7 @@ static void onText(const char* payload, size_t len) {
   } else if (type == "error") {
     touch();
     buzz(250);
+    leds::alert();
     notice("Hmm", doc["text"] | "Something went wrong.", kOrange);
   }
 }
@@ -814,7 +1121,10 @@ static void imageData(const uint8_t* data, size_t len, bool last) {
   ui::storeImage(imgPart, imgPartLen);  // the screen keeps the bytes
   imgPart = nullptr;
   imgPartLen = 0;
-  if (!(settings.iconMode && audio::playing())) {
+  if (board::kEpaper && ui::hasReply()) {
+    // The answer card has room for it beside the words.
+    if (mode == Mode::Reply || mode == Mode::Idle) redraw();
+  } else if (!(settings.iconMode && audio::playing())) {
     mode = Mode::Image;
     if (!flashing) redraw();
   }
@@ -823,7 +1133,8 @@ static void imageData(const uint8_t* data, size_t len, bool last) {
 static void onBinary(const uint8_t* data, size_t len) {
   if (len < 2) return;
   if (data[0] == 0x01) {
-    audio::playFeed(data + 1, len - 1);
+    if (asideOpen) audio::asideFeed(data + 1, len - 1);
+    else audio::playFeed(data + 1, len - 1);
   } else if (data[0] == 0x02 || data[0] == 0x03) {
     imageData(data + 1, len - 1, data[0] == 0x02);
   }
@@ -847,6 +1158,11 @@ static void onWs(WStype_t type, uint8_t* payload, size_t length) {
         audio::playStop();
         dropImagePart();
         deckReplay = false;
+        asideOpen = false;
+        if (prerollOn) {  // the deck dropped that recording: send it all again on the next link
+          prerollStreaming = false;
+          prerollSent = 0;
+        }
         if (mode == Mode::Listening || mode == Mode::Waiting) mode = ui::hasReply() ? Mode::Reply : Mode::Idle;
         redraw();
       }
@@ -878,9 +1194,11 @@ static void connectServer() {
   host = "deck.invalid";
 #endif
 
-  String path = prefix + "/device/ws?device=" + urlEncode(deviceId()) + "&sw=" + String(board::kScreenW) +
-                "&sh=" + String(board::kScreenH);
+  int sw = board::kScreenW, sh = board::kScreenH;
+  if (settings.rotation & 1 && board::kEpaper) std::swap(sw, sh);  // turned paper
+  String path = prefix + "/device/ws?device=" + urlEncode(deviceId()) + "&sw=" + String(sw) + "&sh=" + String(sh);
   if (board::kRound) path += "&round=1";               // fit pictures inside the circle
+  if (board::kEpaper) path += "&paper=1";              // pictures at their own shape, on white
   if (board::kChunkedImages) path += "&img=chunks";    // pictures bigger than one frame
   if (settings.token.length()) path += "&token=" + urlEncode(settings.token);
   if (settings.agent.length()) path += "&agent=" + urlEncode(settings.agent);
@@ -912,12 +1230,6 @@ static String httpBase() {
   return b;
 }
 
-static bool onUsbPower() {
-  int vbus = M5.Power.getVBUSVoltage();
-  if (vbus > 0) return vbus > 4000;
-  return M5.Power.isCharging() == m5::Power_Class::is_charging || M5.Power.getBatteryLevel() >= 99;
-}
-
 static void installProgress(size_t done, size_t total) {
   static int lastPct = -1;
   int pct = total ? (int)(done * 100 / total) : 0;
@@ -936,7 +1248,7 @@ static void startInstall() {
     return;
   }
   int pct = M5.Power.getBatteryLevel();
-  if (!onUsbPower() && pct >= 0 && pct < 30) {
+  if (!telemetry::onUsbPower() && pct >= 0 && pct < 30) {
     notice("Battery low", "Charge to 30% (or plug in) to update.", kOrange);
     return;
   }
@@ -947,7 +1259,10 @@ static void startInstall() {
   agentLinked = false;
   ui::setHealth(wifiHealth(), ui::Partial);
   ui::setBar(agentName, "updating", kCyan);
-  ui::showMessage(("Updating to " + offer.version).c_str(), String("Downloading…"), kCyan);
+  ui::showMessage(("Updating to " + offer.version).c_str(), String("Downloading… keep it on."), kCyan);
+  leds::set(leds::State::Updating);
+  leds::tick();
+  ui::flush();  // e-paper: on the paper before the download takes over
   String err = ota::install(offer, httpBase(), settings.token, installProgress);
   if (err.isEmpty()) {
     ui::showMessage("Update installed", "Restarting into " + offer.version + "…", kGreen);
@@ -961,46 +1276,95 @@ static void startInstall() {
 
 // ── power ────────────────────────────────────────────────────────────
 
+static volatile uint32_t buttonSeenMs = 0;
+
+static const char* sleepHint() {
+  return board::kEpaper ? "Asleep · hold A and talk" : "Press the talk button to wake.";
+}
+
+// Deep sleep. The talk button wakes it (on the paper any button does, and
+// a timer redraws the sleeping screen now and then).
+[[noreturn]] static void sleepNow() {
+  leds::off();
+  ui::brightness(0);
+  // The paper's panel powers itself down after every redraw and keeps its
+  // picture; its controller's deep sleep would need a reset pulse to wake,
+  // which a boot that keeps the picture doesn't send.
+  if (!board::kEpaper) M5.Display.sleep();
+  if (board::kEpaper) {
+    for (gpio_num_t pin : {board::kTalkPin, board::kSidePin, board::kBackPin}) {
+      if (pin < 0) continue;
+      rtc_gpio_pullup_en(pin);
+      rtc_gpio_pulldown_dis(pin);
+    }
+    esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
+    esp_sleep_enable_ext1_wakeup(kButtonPins, ESP_EXT1_WAKEUP_ANY_LOW);
+    if (settings.asleepRefreshMin) esp_sleep_enable_timer_wakeup(settings.asleepRefreshMin * 60ULL * 1000000ULL);
+  } else {
+    esp_sleep_enable_ext0_wakeup(board::kTalkPin, 0);  // the talk button pulls low
+  }
+  esp_deep_sleep_start();
+}
+
 static void goToSleep() {
-  ui::showMessage("Sleeping", String("Press the ") + board::kTalkButton + " to wake.", TFT_DARKGREY);
-  delay(1200);
+  audio::playStop();
+  uint32_t t0 = millis();
+  if (board::kEpaper) {
+    ui::setBar(agentName, "asleep", kText);
+    ui::showSleeping(sleepHint(), settings.character);  // waits for the paper (~20 s)
+    if ((int32_t)(buttonSeenMs - t0) > 0) {  // pressed meanwhile: stay awake
+      touch();
+      backToMain();
+      return;
+    }
+  } else {
+    ui::showSleeping(String("Press the ") + board::kTalkButton + " to wake.", settings.character);
+    delay(1200);
+  }
   ws.disconnect();
   WiFi.disconnect(true);
   if (board::kHasMotor) M5.Power.setVibration(0);
-  ui::brightness(0);
-  M5.Display.sleep();
-  esp_sleep_enable_ext0_wakeup(board::kTalkPin, 0);  // the talk button pulls low
-  esp_deep_sleep_start();
+  sleepNow();
 }
 
 // "Nothing happening" = no button, no new reply, and not listening, speaking,
 // flashing or waiting for the agent: then the screen goes off, later the
 // stick powers off (deep sleep; the front button wakes it).
 static void handleIdlePower() {
-  if (mode == Mode::Listening || mode == Mode::Waiting || audio::playing() || flashing || probation) {
+  if (mode == Mode::Listening || mode == Mode::Waiting || mode == Mode::Link || audio::playing() || flashing ||
+      probation || prerollOn) {
     lastActivityMs = millis();
     return;
   }
   uint32_t idle = millis() - lastActivityMs;
   uint32_t offMs = settings.screenOffS * 1000UL;
-  if (!dimmed && idle > offMs - min(offMs / 2, kDimLeadMs)) {
-    ui::brightness(24);
-    dimmed = true;
+  if (!board::kEpaper) {  // paper has no backlight: what it shows costs nothing
+    if (!dimmed && idle > offMs - min(offMs / 2, kDimLeadMs)) {
+      ui::brightness(24);
+      dimmed = true;
+    }
+    if (!screenOff && idle > offMs) {
+      ui::brightness(0);
+      screenOff = true;
+    }
   }
-  if (!screenOff && idle > offMs) {
-    ui::brightness(0);
-    screenOff = true;
-  }
-  if (idle > settings.powerOffS * 1000UL) goToSleep();
+  if (idle > settings.powerOffMs() && !ui::busy()) goToSleep();
 }
 
-// Both buttons are sampled every 20 ms off the main loop, so any press (or a
+// The buttons are sampled every 20 ms off the main loop, so any press (or a
 // held button) counts as activity even when a loop pass is slow — drawing,
 // TLS, saving settings — and a quick click would slip between two passes.
-static volatile uint32_t buttonSeenMs = 0;
-
+// It also notes when a talk-from-sleep press ends, even while setup() waits
+// for Wi-Fi.
 static void sampleButtons(void*) {
-  if (gpio_get_level(board::kTalkPin) == 0 || gpio_get_level(board::kSidePin) == 0) buttonSeenMs = millis();
+  bool talk = gpio_get_level(board::kTalkPin) == 0;
+  if (talk || gpio_get_level(board::kSidePin) == 0 || (board::kBackPin >= 0 && gpio_get_level(board::kBackPin) == 0)) {
+    buttonSeenMs = millis();
+  }
+  if (prerollOn && !talk && !prerollEndMs) {
+    uint32_t t = millis();
+    prerollEndMs = t ? t : 1;
+  }
 }
 
 static void noteButtonActivity() {
@@ -1034,14 +1398,17 @@ static void sideClick() {
     while (!rowShown(menuSel));
     menuOpenedMs = millis();
     redraw();
+    sayRow();
   } else if (mode == Mode::CharPick) {
     charSel = (charSel + 1) % face::KindCount;
     menuOpenedMs = millis();
     redraw();
+    sayRow();
   } else if (mode == Mode::Agents) {
     if (!agentsLoading) agentSel = (agentSel + 1) % agentNames.size();
     menuOpenedMs = millis();
     redraw();
+    sayRow();
   } else if (mode == Mode::Status) {
     if (statusPage + 1 < statusPages) {
       ++statusPage;
@@ -1049,7 +1416,7 @@ static void sideClick() {
     } else {
       backToMain();  // after the last page
     }
-  } else if (mode == Mode::Image || mode == Mode::Notice) {
+  } else if (mode == Mode::Image || mode == Mode::Notice || mode == Mode::Link) {
     backToMain();
   } else if (mode == Mode::Reply) {
     if (audio::playing() && settings.iconMode) {
@@ -1059,11 +1426,103 @@ static void sideClick() {
     } else {
       ui::nextPage();
     }
-  } else if (mode == Mode::Idle) {
+  } else if (mode == Mode::Idle || mode == Mode::Home) {
     statusPage = 0;
     mode = Mode::Status;
     redraw();
   }
+}
+
+// The PaperColor's C button: one step back — the row or page before, else
+// out to the main screen; from the home screen, to the answer.
+static void backClick() {
+  if (mode == Mode::Menu) {
+    do menuSel = (menuSel + MCount - 1) % MCount;
+    while (!rowShown(menuSel));
+    menuOpenedMs = millis();
+    redraw();
+    sayRow();
+  } else if (mode == Mode::CharPick) {
+    charSel = (charSel + face::KindCount - 1) % face::KindCount;
+    menuOpenedMs = millis();
+    redraw();
+    sayRow();
+  } else if (mode == Mode::Agents) {
+    if (!agentsLoading) agentSel = (agentSel + agentNames.size() - 1) % agentNames.size();
+    menuOpenedMs = millis();
+    redraw();
+    sayRow();
+  } else if (mode == Mode::Status) {
+    if (statusPage > 0) {
+      --statusPage;
+      redraw();
+    } else {
+      backToMain();
+    }
+  } else if (mode == Mode::Reply) {
+    if (!ui::prevPage()) {  // on its first page: the home screen
+      mode = Mode::Home;
+      redraw();
+    }
+  } else if (mode == Mode::Home || (mode == Mode::Idle && !ui::hasReply())) {
+    if (ui::hasReply() || ui::restoreAnswer()) {  // the answer from before a sleep, too
+      mode = Mode::Reply;
+      redraw();
+    }
+  } else if (mode == Mode::Image || mode == Mode::Notice || mode == Mode::Link) {
+    backToMain();
+  }
+}
+
+// ── status lights ────────────────────────────────────────────────────
+
+static int micLevel = 0;
+static uint32_t linkChangeMs = 0;  // when the deck link last came or went
+
+static void updateLeds() {
+  using S = leds::State;
+  static int batteryPct = 100;
+  static uint32_t batteryAt = 0;
+  if (millis() - batteryAt > 30000 || !batteryAt) {
+    batteryAt = millis();
+    batteryPct = telemetry::onUsbPower() ? 100 : M5.Power.getBatteryLevel();
+  }
+  if (prerollOn || mode == Mode::Listening) leds::set(S::Listening, prerollOn ? 60 : micLevel);
+  else if (audio::playing()) leds::set(S::Speaking, audio::outputLevel());
+  else if (mode == Mode::Waiting) leds::set(S::Working);
+  else if (!wsUp && millis() - linkChangeMs < 60000) leds::set(S::Connecting);  // not forever
+  else if (ui::busy()) leds::set(S::Redrawing);
+  else if (batteryPct >= 0 && batteryPct < 15) leds::set(S::LowBattery);
+  else leds::set(S::Off);
+  leds::tick();
+}
+
+// ── PaperColor power ─────────────────────────────────────────────────
+
+#if defined(BOARD_PAPERCOLOR)
+// Charging on (M5Stack's own firmware does this through the PMIC); an empty
+// battery leaves "charge me" on the paper — which costs nothing to keep —
+// and switches off.
+static void paperPower() {
+  static M5PM1 pm1;
+  if (pm1.begin(&M5.In_I2C, M5PM1_DEFAULT_ADDR, M5PM1_I2C_FREQ_100K) == M5PM1_OK) pm1.setChargeEnable(true);
+  int mv = M5.Power.getBatteryVoltage();
+  if (mv > 0 && mv < 3300 && !telemetry::onUsbPower()) {
+    ui::showMessage("Battery empty", "Charge it over USB-C, then press the power button.", kRed);
+    ui::flush();
+    M5.Power.powerOff();
+  }
+}
+#endif
+
+// A timer woke the paper: redraw the sleeping screen (date, room, battery)
+// without Wi-Fi and sleep again — unless a button was pressed meanwhile.
+static void asleepRedraw() {
+  uint32_t t0 = millis();
+  ui::setBar(rtcAgent, "asleep", kText);
+  ui::showSleeping(sleepHint(), settings.character);
+  if ((int32_t)(buttonSeenMs - t0) > 0 || gpio_get_level(board::kTalkPin) == 0) return;  // awake after all
+  sleepNow();
 }
 
 // ── setup / loop ─────────────────────────────────────────────────────
@@ -1072,31 +1531,59 @@ void setup() {
   auto cfg = M5.config();
   cfg.internal_mic = true;
   cfg.internal_spk = true;
+  if (board::kEpaper) cfg.clear_display = false;  // the paper keeps what it showed while asleep
   M5.begin(cfg);
   Serial.begin(115200);
-  ui::begin();
-  ui::brightness(kBright);
   settings.load();
-  probation = ota::onProbation();
-  ui::setTextSize(settings.textSize);
-  Serial.printf("[claw] boot %s fw %s%s: %d network(s), server '%s'\n", deviceId().c_str(), FW_VERSION,
-                probation ? " (on probation)" : "", settings.netCount, settings.server.c_str());
+  setenv("TZ", settings.tz.c_str(), 1);  // local time before NTP (the RTC keeps UTC)
+  tzset();
   audio::begin(settings.volume, settings.boostDb);
+  // Woken by holding the talk button: they're speaking already, so the mic
+  // starts before anything slow (it records while Wi-Fi connects).
+  bool talking = settings.configured() && wokenToTalk();
+  if (talking) startPreroll();
   M5.BtnB.setHoldThresh(800);
+  M5.BtnC.setHoldThresh(800);
   esp_timer_create_args_t sampler = {};
   sampler.callback = sampleButtons;
   sampler.name = "buttons";
   esp_timer_handle_t samplerTimer;
   if (esp_timer_create(&sampler, &samplerTimer) == ESP_OK) esp_timer_start_periodic(samplerTimer, 20000);
 
+  ui::begin();
+  ui::setRotation(settings.rotation);
+  ui::brightness(kBright);
+  ui::setTextSize(settings.textSize);
+  telemetry::begin();
+  leds::begin();
+  leds::setLevel(settings.ledLevel);
+#if defined(BOARD_PAPERCOLOR)
+  paperPower();
+#endif
+  if (board::kEpaper && esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
+    asleepRedraw();  // returns only when a button was pressed meanwhile
+    if (settings.configured() && gpio_get_level(board::kTalkPin) == 0) {
+      talking = true;  // "hold A and talk", as the paper says
+      startPreroll();
+    }
+  }
+  probation = ota::onProbation();
+  Serial.printf("[claw] boot %s fw %s%s%s: %d network(s), server '%s'\n", deviceId().c_str(), FW_VERSION,
+                probation ? " (on probation)" : "", talking ? " (talking)" : "", settings.netCount,
+                settings.server.c_str());
+
   M5.update();
-  if (M5.BtnA.isPressed() || !settings.configured()) {
+  if ((!talking && M5.BtnA.isPressed()) || !settings.configured()) {
     runSetupPortal(settings.configured() ? "Setup" : "First-time setup");
   }
 
   ui::setHealth(ui::Down, ui::Down);
   ui::setBar("", "wi-fi…", kYellow);
-  ui::showMessage("Connecting to Wi-Fi", settings.nets[0].ssid, kText);
+  leds::set(leds::State::Connecting);
+  leds::tick();
+  // The paper keeps the sleeping screen while it connects (a redraw would
+  // take longer than connecting); the lights blink blue.
+  if (!board::kEpaper) ui::showMessage("Connecting to Wi-Fi", settings.nets[0].ssid, kText);
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(deviceId().c_str());
   for (int i = 0; i < settings.netCount; ++i) {
@@ -1108,14 +1595,15 @@ void setup() {
     // A fresh update that can't even reach Wi-Fi goes back to the old version
     // (which may well be fine) rather than into setup.
     if (probation && millis() - t0 > 30000) ota::rollBack();
-    if (!probation && (M5.BtnA.wasPressed() || millis() - t0 > 30000)) {
+    if (!probation && ((!prerollOn && M5.BtnA.wasPressed()) || millis() - t0 > 30000)) {
+      if (prerollOn) stopPreroll();
       runSetupPortal("No Wi-Fi in reach");
     }
   }
   Serial.printf("[claw] wifi %s ip %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
   ui::setHealth(wifiHealth(), ui::Down);
-  ui::showMessage("Wi-Fi connected", WiFi.SSID() + "  " + WiFi.localIP().toString(), kGreen);
-  configTzTime(settings.tz.c_str(), "pool.ntp.org", "time.google.com");  // the round screen's clock
+  if (!board::kEpaper) ui::showMessage("Wi-Fi connected", WiFi.SSID() + "  " + WiFi.localIP().toString(), kGreen);
+  configTzTime(settings.tz.c_str(), "pool.ntp.org", "time.google.com");  // clocks; the RTC follows
   connectServer();
   lastActivityMs = millis();
 }
@@ -1123,15 +1611,30 @@ void setup() {
 void loop() {
   M5.update();
   noteButtonActivity();
+  bool wasUp = wsUp;
   ws.loop();
+  if (wsUp != wasUp) linkChangeMs = millis();
   if (WiFi.status() != WL_CONNECTED) wifiMulti.run(0);
+  telemetry::poll();
+  pumpPreroll();
+  if (phoneSettingsActive()) {
+    if (mode == Mode::Link) phoneSettingsPoll();
+    else phoneSettingsEnd();
+  }
   bool inMenu = mode == Mode::Menu || mode == Mode::Agents || mode == Mode::Status || mode == Mode::CharPick;
   // On a dark screen a press only wakes it — except the front button on the
   // main screen, which starts talking right away.
   bool dark = screenOff;
 
+  // The paper changes slowly: a click says the press was heard.
+  if (board::kEpaper && settings.keyClicks && !prerollOn &&
+      (M5.BtnB.wasPressed() || M5.BtnC.wasPressed() || (M5.BtnA.wasPressed() && (inMenu || mode == Mode::Link)))) {
+    audio::click();
+  }
+
   // Front button: hold to talk, tap for quick actions; in the menu, choose.
-  if (M5.BtnA.wasPressed()) {
+  // (Not while a talk-from-sleep recording holds it.)
+  if (M5.BtnA.wasPressed() && !prerollOn) {
     touch();
     if (dark && inMenu) {
       // woken only
@@ -1147,13 +1650,15 @@ void loop() {
       redraw();
     } else if (mode == Mode::Status) {
       openMenu();
+    } else if (mode == Mode::Link) {
+      backToMain();
     } else {
       bool wasSpeaking = audio::playing();
       startTalking();
       if (wasSpeaking) sendType("stop");
     }
   }
-  if (M5.BtnA.wasReleased() && mode == Mode::Listening) {
+  if (M5.BtnA.wasReleased() && mode == Mode::Listening && !prerollOn) {
     bool tap = millis() - recStartMs < kTapMs;
     stopTalking(!tap);
     if (tap) {
@@ -1195,8 +1700,41 @@ void loop() {
     sideClickMs = 0;  // just the one click
     if (!sideClickWoke && mode == sideClickMode) sideClick();
   }
-  if ((mode == Mode::Menu || mode == Mode::Agents) && millis() - menuOpenedMs > 20000) backToMain();
-  if (mode == Mode::CharPick && millis() - menuOpenedMs > 60000) backToMain();
+
+  // Third button (PaperColor C): back · hold = the home screen.
+  if (board::kBackPin >= 0) {
+    if (M5.BtnC.wasHold()) {
+      touch();
+      if (inMenu || mode == Mode::Link) {
+        backToMain();
+      } else if (mode != Mode::Listening) {
+        mode = Mode::Home;
+        redraw();
+      }
+    } else if (M5.BtnC.wasClicked()) {
+      touch();
+      backClick();
+    }
+  }
+
+  // Menus close by themselves after a while — on paper much later, since
+  // each step takes a redraw to show.
+  const uint32_t menuIdle = board::kEpaper ? 180000 : 20000;
+  if ((mode == Mode::Menu || mode == Mode::Agents) && millis() - menuOpenedMs > menuIdle) backToMain();
+  if (mode == Mode::CharPick && millis() - menuOpenedMs > menuIdle * 3) backToMain();
+  if (mode == Mode::Link && millis() - menuOpenedMs > 600000) backToMain();
+
+  // The menu row to read aloud, once the presses have settled.
+  if (sayAtMs && (int32_t)(millis() - sayAtMs) >= 0) {
+    sayAtMs = 0;
+    bool inList = mode == Mode::Menu || mode == Mode::Agents || mode == Mode::CharPick;
+    if (wsUp && inList && !audio::playing()) {
+      JsonDocument d;
+      d["type"] = "say";
+      d["text"] = sayText;
+      sendJson(d);
+    }
+  }
 
   // A deck too old to replay never answers: play what did arrive.
   if (deckReplay && millis() - deckReplayMs > 4000) {
@@ -1214,8 +1752,8 @@ void loop() {
   }
 
   // Keep the mic stream and the speaker fed.
-  if (mode == Mode::Listening) {
-    int level = audio::micPoll(micSink);
+  if (mode == Mode::Listening && !prerollOn) {
+    int level = micLevel = audio::micPoll(micSink);
     if (millis() - lastDrawMs > 80) {
       lastDrawMs = millis();
       setBarState();
@@ -1285,11 +1823,13 @@ void loop() {
     }
   }
   if (settings.autoUpdate && offer.valid() && !offerAutoTried && !audio::playing() &&
-      (mode == Mode::Idle || mode == Mode::Reply || mode == Mode::Image) && onUsbPower()) {
+      (mode == Mode::Idle || mode == Mode::Reply || mode == Mode::Image) && telemetry::onUsbPower()) {
     offerAutoTried = true;
     startInstall();
   }
 
+  ui::tick();
+  updateLeds();
   noteButtonActivity();
   handleIdlePower();
   delay(1);

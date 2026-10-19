@@ -13,6 +13,21 @@
 static WebServer server(80);
 static DNSServer dns;
 static String scanOptions;
+static String accessKey;      // phone mode: every request must carry it (k=…)
+static bool phoneOn = false;
+
+// Phone mode: the request carries the one-time key (the hotspot needs none —
+// being on its Wi-Fi takes standing next to the device).
+static bool allowed() {
+  if (accessKey.isEmpty()) return true;
+  if (server.arg("k") == accessKey) return true;
+  server.send(403, "text/plain", "Open the link the device shows.");
+  return false;
+}
+
+static String option(const String& value, const String& label, bool selected) {
+  return "<option value=\"" + value + "\"" + (selected ? " selected>" : ">") + label + "</option>";
+}
 
 static String esc(const String& s) {
   String o;
@@ -53,6 +68,7 @@ border-bottom:1px solid #333}.net label{margin:0;color:#eee;font-size:14px}.net 
 small{color:#888}</style>)";
 
 static void handleRoot() {
+  if (!allowed()) return;
   String h;
   h.reserve(6000);
   h += F("<!doctype html><html><head><meta charset=utf-8><title>Claw ");
@@ -62,6 +78,7 @@ static void handleRoot() {
   h += F("</head><body><h1>Captain Claw &middot; ");
   h += board::kModel;
   h += F("</h1><form method=post action=/save>");
+  if (accessKey.length()) h += "<input type=hidden name=k value=\"" + esc(accessKey) + "\">";
 
   h += F("<h2>Wi-Fi networks</h2>");
   if (settings.netCount == 0) h += F("<small>None saved yet.</small>");
@@ -103,10 +120,11 @@ static void handleRoot() {
   h += settings.femaleVoice ? F("<option value=male>Male</option><option value=female selected>Female</option>")
                             : F("<option value=male selected>Male</option><option value=female>Female</option>");
   h += F("</select><label>Before speaking</label><select name=cue>");
+  // The paper can't flash; its status lights do.
   struct { const char* v; const char* label; bool on; } cues[] = {
-      {"both", "Beep + flash", settings.cueBeep && settings.cueFlash},
+      {"both", board::kEpaper ? "Beep + light" : "Beep + flash", settings.cueBeep && settings.cueFlash},
       {"beep", "Beep only", settings.cueBeep && !settings.cueFlash},
-      {"flash", "Flash only", !settings.cueBeep && settings.cueFlash},
+      {"flash", board::kEpaper ? "Light only" : "Flash only", !settings.cueBeep && settings.cueFlash},
       {"none", "Nothing", !settings.cueBeep && !settings.cueFlash}};
   for (auto& c : cues) {
     h += String("<option value=") + c.v + (c.on ? " selected>" : ">") + c.label + "</option>";
@@ -119,10 +137,19 @@ static void handleRoot() {
   h += F("</select><label>Cue comes</label><select name=lead>");
   h += settings.cueLeadS == 2 ? F("<option value=1>1 s before speech</option><option value=2 selected>2 s before speech</option>")
                               : F("<option value=1 selected>1 s before speech</option><option value=2>2 s before speech</option>");
-  h += F("</select><h2>Screen</h2><label>Show</label><select name=display>");
-  h += settings.iconMode ? F("<option value=text>Text (stages, activity)</option><option value=icons selected>Icons (animated character)</option>")
-                         : F("<option value=text selected>Text (stages, activity)</option><option value=icons>Icons (animated character)</option>");
-  h += F("</select><label>Text size</label><select name=tsize>");
+  h += F("</select><h2>Screen</h2>");
+  if (board::kEpaper) {
+    h += F("<label>Orientation</label><select name=rot>");
+    const char* rots[] = {"Portrait", "Landscape", "Portrait, flipped", "Landscape, flipped"};
+    for (int k = 0; k < 4; ++k) h += option(String(k), rots[k], settings.rotation == k);
+    h += F("</select>");
+  } else {
+    h += F("<label>Show</label><select name=display>");
+    h += settings.iconMode ? F("<option value=text>Text (stages, activity)</option><option value=icons selected>Icons (animated character)</option>")
+                           : F("<option value=text selected>Text (stages, activity)</option><option value=icons>Icons (animated character)</option>");
+    h += F("</select>");
+  }
+  h += F("<label>Text size</label><select name=tsize>");
   {
     const char* sizes[] = {"Small", "Medium", "Large"};
     for (int k = 0; k < 3; ++k) {
@@ -134,21 +161,46 @@ static void handleRoot() {
     h += "<option value=" + String(k) + (settings.character == k ? " selected>" : ">") + face::name(k) + "</option>";
   }
   h += F("</select>");
-  if (board::kRound) {  // the round screen shows a clock
+  if (board::kEpaper) {
+    h += F("<small>The home screen shows the character until there's an answer to keep.</small>"
+           "<label>Status lights</label><select name=leds>");
+    const char* lv[] = {"Off", "Low", "Bright"};
+    for (int k = 0; k < 3; ++k) h += option(String(k), lv[k], settings.ledLevel == k);
+    h += F("</select><label>Key clicks</label><select name=clicks>");
+    h += option("1", "On", settings.keyClicks) + option("0", "Off", !settings.keyClicks);
+    h += F("</select><label>Read the menu aloud</label><select name=saymenu>");
+    h += option("1", "On", settings.speakMenu) + option("0", "Off", !settings.speakMenu);
+    h += F("</select><small>The paper takes ~20 s to show a menu step; you hear each row at once.</small>");
+  }
+  if (board::kRound || board::kEpaper) {  // these show the time
     h += F("<label>Time zone</label><input name=tz autocapitalize=none value=\"");
     h += esc(settings.tz);
     h += F("\"><small>POSIX TZ for the clock, e.g. CET-1CEST,M3.5.0,M10.5.0/3 (Central Europe),"
            " GMT0BST,M3.5.0/1,M10.5.0 (UK), EST5EDT,M3.2.0,M11.1.0 (US East)</small>");
   }
-  h += F("<h2>Power</h2><label>Screen off when idle</label><select name=scroff>");
-  for (int s : {5, 10, 15}) {
-    h += "<option value=" + String(s) + (settings.screenOffS == s ? " selected>" : ">") + String(s) + " s</option>";
+  h += F("<h2>Power</h2>");
+  if (board::kEpaper) {
+    h += F("<label>Power off when idle</label><select name=pwroffm>");
+    for (int m : {1, 3, 10}) h += option(String(m), String(m) + " min", settings.powerOffMin == m);
+    h += F("</select><label>Redraw the sleeping screen</label><select name=slpref>");
+    h += option("0", "Never", settings.asleepRefreshMin == 0);
+    h += option("30", "Every 30 min", settings.asleepRefreshMin == 30);
+    h += option("60", "Every hour", settings.asleepRefreshMin == 60);
+    h += option("180", "Every 3 hours", settings.asleepRefreshMin == 180);
+    h += F("</select><small>Asleep, the paper keeps the last answer (or a pinned one) with the date, the room's"
+           " temperature and the battery; a redraw takes ~20 s of battery.</small>");
+  } else {
+    h += F("<label>Screen off when idle</label><select name=scroff>");
+    for (int s : {5, 10, 15}) {
+      h += "<option value=" + String(s) + (settings.screenOffS == s ? " selected>" : ">") + String(s) + " s</option>";
+    }
+    h += F("</select><label>Power off when idle</label><select name=pwroff>");
+    for (int s : {15, 30, 60}) {
+      h += "<option value=" + String(s) + (settings.powerOffS == s ? " selected>" : ">") + String(s) + " s</option>";
+    }
+    h += F("</select>");
   }
-  h += F("</select><label>Power off when idle</label><select name=pwroff>");
-  for (int s : {15, 30, 60}) {
-    h += "<option value=" + String(s) + (settings.powerOffS == s ? " selected>" : ">") + String(s) + " s</option>";
-  }
-  h += F("</select><label>Software updates</label><select name=autoupd>");
+  h += F("<label>Software updates</label><select name=autoupd>");
   h += settings.autoUpdate ? F("<option value=0>Ask me (menu → Software update)</option><option value=1 selected>Install by themselves (idle, on USB)</option>")
                            : F("<option value=0 selected>Ask me (menu → Software update)</option><option value=1>Install by themselves (idle, on USB)</option>");
   h += F("</select><small>Power off = deep sleep; the ");
@@ -162,6 +214,7 @@ static void handleRoot() {
 }
 
 static void handleSave() {
+  if (!allowed()) return;
   for (int i = settings.netCount - 1; i >= 0; --i) {
     if (server.hasArg("del" + String(i))) settings.removeNetwork(i);
   }
@@ -189,9 +242,19 @@ static void handleSave() {
   settings.speak = server.arg("speak") != "0";
   settings.volume = constrain(server.arg("vol").toInt(), 0, 100) * 255 / 100;
   settings.boostDb = constrain(server.arg("boost").toInt(), 0, 10);
-  int so = server.arg("scroff").toInt(), po = server.arg("pwroff").toInt();
-  settings.screenOffS = (so == 5 || so == 10) ? so : 15;
-  settings.powerOffS = (po == 15 || po == 30) ? po : 60;
+  if (board::kEpaper) {
+    int pm = server.arg("pwroffm").toInt(), sr = server.arg("slpref").toInt();
+    settings.powerOffMin = (pm == 1 || pm == 10) ? pm : 3;
+    settings.asleepRefreshMin = (sr == 0 || sr == 30 || sr == 180) ? sr : 60;
+    settings.rotation = constrain(server.arg("rot").toInt(), 0, 3);
+    settings.ledLevel = constrain(server.arg("leds").toInt(), 0, 2);
+    settings.keyClicks = server.arg("clicks") != "0";
+    settings.speakMenu = server.arg("saymenu") != "0";
+  } else {
+    int so = server.arg("scroff").toInt(), po = server.arg("pwroff").toInt();
+    settings.screenOffS = (so == 5 || so == 10) ? so : 15;
+    settings.powerOffS = (po == 15 || po == 30) ? po : 60;
+  }
   settings.autoUpdate = server.arg("autoupd") == "1";
   settings.femaleVoice = server.arg("voice") == "female";
   String cue = server.arg("cue");
@@ -199,12 +262,12 @@ static void handleSave() {
   settings.cueFlash = cue == "both" || cue == "flash";
   settings.cueLeadS = server.arg("lead") == "2" ? 2 : 1;
   if (board::kHasMotor) settings.cueBuzz = server.arg("buzz") != "0";
-  if (board::kRound) {
+  if (board::kRound || board::kEpaper) {
     String tz = server.arg("tz");
     tz.trim();
     settings.tz = tz.length() ? tz : String(kDefaultTz);
   }
-  settings.iconMode = server.arg("display") == "icons";
+  settings.iconMode = !board::kEpaper && server.arg("display") == "icons";
   settings.character = constrain(server.arg("char").toInt(), 0, face::KindCount - 1);
   settings.textSize = constrain(server.arg("tsize").toInt(), 0, 2);
   settings.save();
@@ -215,6 +278,7 @@ static void handleSave() {
                        "<h2>Saved.</h2><p>The ")) +
                   board::kNoun + F(" restarts and connects now. You can close this page.</p>"));
   delay(800);
+  ui::flush();  // e-paper: never restart in the middle of a redraw
   ESP.restart();
 }
 
@@ -224,6 +288,7 @@ static void handleCaptive() {
 }
 
 void runSetupPortal(const char* reason) {
+  phoneSettingsEnd();  // the hotspot needs no key: being on it takes standing next to the device
   WiFi.disconnect(true);
   WiFi.mode(WIFI_AP_STA);
   scanNetworks();
@@ -257,3 +322,39 @@ void runSetupPortal(const char* reason) {
     delay(2);
   }
 }
+
+// ── settings on a phone, over the device's Wi-Fi ─────────────────────
+
+String phoneSettingsBegin() {
+  if (WiFi.status() != WL_CONNECTED) return "";
+  if (!phoneOn) {
+    char key[13];
+    snprintf(key, sizeof(key), "%06lx%06lx", (unsigned long)(esp_random() & 0xFFFFFF),
+             (unsigned long)(esp_random() & 0xFFFFFF));
+    accessKey = key;
+    scanNetworks();
+    static bool routed = false;  // the server keeps its routes across stop/begin
+    if (!routed) {
+      routed = true;
+      server.on("/", HTTP_GET, handleRoot);
+      server.on("/save", HTTP_POST, handleSave);
+    }
+    server.onNotFound([] { server.send(404, "text/plain", "Not here."); });
+    server.begin();
+    phoneOn = true;
+  }
+  return "http://" + WiFi.localIP().toString() + "/?k=" + accessKey;
+}
+
+void phoneSettingsPoll() {
+  if (phoneOn) server.handleClient();
+}
+
+void phoneSettingsEnd() {
+  if (!phoneOn) return;
+  server.stop();
+  phoneOn = false;
+  accessKey = "";  // the next time gets a new link
+}
+
+bool phoneSettingsActive() { return phoneOn; }

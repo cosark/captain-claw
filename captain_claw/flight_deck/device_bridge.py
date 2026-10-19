@@ -5,7 +5,9 @@ One WebSocket per device: ``/device/ws?token=<cc_pat_…>&device=<id>``
 ``voice=male|female|<Soniox voice>``, ``hw=sticks3&fw=0.8.0`` for updates,
 ``sw``/``sh`` = screen size for pictures, default 240×135,
 ``round=1`` = a round screen: pictures fit inside the circle,
-``img=chunks`` = pictures may span several frames, so they can be bigger).
+``img=chunks`` = pictures may span several frames, so they can be bigger,
+``paper=1`` = a colour e-paper screen: pictures come at their own shape on
+white, for the device to lay out with the text).
 
 The device records while its button is held and streams the audio here;
 Flight Deck transcribes it (Soniox), sends the words to one of the owner's
@@ -17,15 +19,21 @@ Device → Flight Deck
   text  {"type":"hello", ...}                    optional, informational
   text  {"type":"rec_start","rate":16000}        starts a recording (stops playback)
   bin   raw PCM s16le mono at that rate          while recording
-  text  {"type":"rec_end"}                       → transcribe → agent
+  text  {"type":"rec_end","ctx":{…}}             → transcribe → agent; ctx = the device's
+                                                 readings as it sent (battery, Wi-Fi, motion,
+                                                 temperature, clock), optional — see
+                                                 device_context_line()
   text  {"type":"rec_cancel"}                    drop the recording
-  text  {"type":"text","text":"…"}               send typed words instead
+  text  {"type":"text","text":"…","ctx":{…}}     send typed words instead
   text  {"type":"stop"}                          stop playback, clear the queue
   text  {"type":"replay"}                        play the last answer's sounds again (its speech
                                                  is synthesized afresh) → audio, or {"type":"replay_none"}
   text  {"type":"agents"} / {"type":"select","agent":"<slug>"}
   text  {"type":"prefs","voice":"male|female|<name>","speak":bool}   change voice / speaking live
   text  {"type":"ping","t":<device ms>}          echoed back (round-trip time)
+  text  {"type":"say","text":"…"}                speak a short line aside (an e-paper's menu row):
+                                                 audio_start with "aside":true; never over an
+                                                 answer, never kept for a replay
   text  {"type":"update_check"}                  → update offer or {"type":"update_none"}
 
 Flight Deck → device
@@ -35,7 +43,7 @@ Flight Deck → device
   text  {"type":"status","text":"…"}             progress narration
   text  {"type":"activity","text":"…","tool":"…"} what the agent is doing (tools, LLM calls)
   text  {"type":"reply","text":"…","proactive":bool}
-  text  {"type":"audio_start","rate":24000} … {"type":"audio_end"}
+  text  {"type":"audio_start","rate":24000[,"aside":true]} … {"type":"audio_end"}
   bin   0x01 + PCM s16le mono                    audio chunks between those two
   text  {"type":"image","name":"…","w":240,"h":135,"size":n} then bin 0x02 + baseline JPEG
         (img=chunks: bin 0x03 + part … while more follow, then 0x02 + the last part)
@@ -85,7 +93,11 @@ _DEVICE_SYSTEM_CONTEXT = (
     "audio you make (audio speak, pocket_tts) is played on it, automatically.\n"
     "  - The transcript of their speech may contain recognition errors; read it "
     "charitably.\n"
-    "  - Do not mention the device, this context, or these rules.\n"
+    "  - A message may open with a [Context: Device readings …] line: the device's "
+    "battery, Wi-Fi, sensors and clock as it sent the message. Use them when they "
+    "matter (the user asks about them, or the battery is nearly empty); never recite "
+    "them otherwise.\n"
+    "  - Do not mention the device (unless they ask about it), this context, or these rules.\n"
     "Apply these rules to this and every subsequent message until told otherwise.\n"
     "---\n"
     "USER MESSAGE:\n"
@@ -105,6 +117,7 @@ MEDIA_WINDOW_S = 180.0           # turn_media trails the reply; accept it this l
 AUDIO_FILE_MAX_S = 300
 MAX_JPEG_BYTES = 14000           # the device's WebSocket library takes ≤15 KB frames
 MAX_CHUNKED_JPEG_BYTES = 120_000  # a picture sent in parts (img=chunks)
+MAX_SAY_CHARS = 120              # a spoken menu row, not a reply
 
 # The last answer's sounds per device channel, for a replay — kept here, not
 # on the connection, so it survives a reconnect (a dropped link cuts an
@@ -187,24 +200,31 @@ def round_fit(width: int, height: int, aspect: float) -> tuple[int, int]:
 
 
 def fit_jpeg(blob: bytes, width: int, height: int, quality: int = 85,
-             max_bytes: int = MAX_JPEG_BYTES, round_screen: bool = False) -> bytes:
+             max_bytes: int = MAX_JPEG_BYTES, round_screen: bool = False,
+             paper: bool = False) -> bytes:
     """Any picture as a baseline JPEG of exactly width×height (letterboxed on
     black) — what the device's decoder takes — no larger than *max_bytes*
     (the device's WebSocket frame limit; quality steps down to fit). On a
-    round screen the picture fits inside the circle, corners and all."""
+    round screen the picture fits inside the circle, corners and all. For
+    e-paper (*paper*) it keeps its own shape within width×height, on white,
+    and the device lays it out with the text."""
     from PIL import Image, ImageOps
 
+    bg_rgb = (255, 255, 255) if paper else (0, 0, 0)
     im = Image.open(io.BytesIO(blob))
     im = ImageOps.exif_transpose(im)
     if im.mode in ("RGBA", "LA", "P"):
         im = im.convert("RGBA")
-        bg = Image.new("RGBA", im.size, (0, 0, 0, 255))
+        bg = Image.new("RGBA", im.size, bg_rgb + (255,))
         im = Image.alpha_composite(bg, im)
     im = im.convert("RGB")
     box = round_fit(width, height, im.width / im.height) if round_screen else (width, height)
     im = ImageOps.contain(im, box, Image.LANCZOS)
-    canvas = Image.new("RGB", (width, height), (0, 0, 0))
-    canvas.paste(im, ((width - im.width) // 2, (height - im.height) // 2))
+    if paper:
+        canvas = im
+    else:
+        canvas = Image.new("RGB", (width, height), bg_rgb)
+        canvas.paste(im, ((width - im.width) // 2, (height - im.height) // 2))
     while True:
         out = io.BytesIO()
         canvas.save(out, "JPEG", quality=quality, progressive=False, optimize=False)
@@ -235,6 +255,71 @@ def voice_name(choice: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "", c)[:32]
 
 
+_DEVICE_MODELS = {"sticks3": "M5Stack StickS3", "stopwatch": "M5Stack StopWatch",
+                  "papercolor": "M5Stack PaperColor"}
+_CTX_TEXT = re.compile(r"[^\w .,:+\-/()'’@#&°%]")
+
+
+def _num(value: Any, lo: float, hi: float) -> float | None:
+    """A reading as a number within [lo, hi], else None (missing, junk)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    v = float(value)
+    return v if math.isfinite(v) and lo <= v <= hi else None
+
+
+def _ctx_text(value: Any, limit: int = 40) -> str:
+    return _CTX_TEXT.sub("", str(value or "")).strip()[:limit]
+
+
+def device_context_line(ctx: Any, hw: str = "") -> str:
+    """One line for the agent from the readings a device sent with a turn::
+
+        {"battery": {"percent": 64, "mv": 3920, "charging": false, "usb": false},
+         "wifi": {"ssid": "Home", "rssi": -61},
+         "motion": {"orientation": "face up", "movement": "still"},
+         "environment": {"temperature_c": 23.1, "humidity": 41.2},
+         "local_time": "2026-10-19 14:32 (+0200)", "uptime_s": 3600}
+
+    Every part is optional; anything missing or malformed is left out, and
+    "" when nothing usable came."""
+    if not isinstance(ctx, dict):
+        return ""
+    parts: list[str] = []
+    bat = ctx.get("battery") if isinstance(ctx.get("battery"), dict) else {}
+    pct = _num(bat.get("percent"), 0, 100)
+    volts = _num(bat.get("mv"), 2000, 5500)
+    if pct is not None:
+        power = ("charging" if bat.get("charging") is True
+                 else "on USB power" if bat.get("usb") is True else "on battery")
+        parts.append(f"battery {pct:.0f}%" + (f" ({volts / 1000:.2f} V)" if volts else "") + f", {power}")
+    wifi = ctx.get("wifi") if isinstance(ctx.get("wifi"), dict) else {}
+    rssi = _num(wifi.get("rssi"), -120, 0)
+    if rssi is not None:
+        quality = "strong" if rssi > -55 else "good" if rssi > -67 else "fair" if rssi > -75 else "weak"
+        ssid = _ctx_text(wifi.get("ssid"), 32)
+        parts.append(f"Wi-Fi {ssid + ' ' if ssid else ''}{rssi:.0f} dBm ({quality})")
+    motion = ctx.get("motion") if isinstance(ctx.get("motion"), dict) else {}
+    pose = ", ".join(t for t in (_ctx_text(motion.get("orientation"), 24),
+                                    _ctx_text(motion.get("movement"), 24)) if t)
+    if pose:
+        parts.append(pose)
+    env = ctx.get("environment") if isinstance(ctx.get("environment"), dict) else {}
+    temp = _num(env.get("temperature_c"), -40, 85)
+    hum = _num(env.get("humidity"), 0, 100)
+    if temp is not None or hum is not None:
+        reading = " and ".join(t for t in (f"{temp:.1f} °C" if temp is not None else "",
+                                           f"{hum:.0f}% humidity" if hum is not None else "") if t)
+        parts.append(f"{reading} (sensor inside the device; reads a little warm while it's busy)")
+    clock = _ctx_text(ctx.get("local_time"), 40)
+    if clock:
+        parts.append(f"device clock {clock}")
+    if not parts:
+        return ""
+    model = _DEVICE_MODELS.get(hw, "")
+    return f"Device readings{' (' + model + ')' if model else ''} as it sent this: " + "; ".join(parts) + "."
+
+
 def _int_param(value: str, default: int, lo: int, hi: int) -> int:
     try:
         return max(lo, min(hi, int(value)))
@@ -244,12 +329,15 @@ def _int_param(value: str, default: int, lo: int, hi: int) -> int:
 
 def _picture_options(q) -> dict:
     """How pictures are made for a device, from its query (sw, sh, round,
-    img); with none of them, the StickS3's 240×135 in one frame."""
-    return {
+    img, paper); with none of them, the StickS3's 240×135 in one frame."""
+    opts = {
         "screen": (_int_param(q.get("sw", ""), 240, 32, 800), _int_param(q.get("sh", ""), 135, 32, 800)),
         "round_screen": q.get("round", "") in ("1", "true", "on"),
         "chunked": q.get("img", "") == "chunks",
     }
+    if q.get("paper", "") in ("1", "true", "on"):
+        opts["paper"] = True
+    return opts
 
 
 # ── Auth + agent choice ───────────────────────────────────────────────
@@ -310,7 +398,7 @@ class _DeviceConn:
     def __init__(self, ws: WebSocket, user: dict, device_id: str, *, lang: str,
                  speak: bool, screen: tuple[int, int], voice: str = "",
                  round_screen: bool = False, chunked: bool = False,
-                 hw: str = "", fw: str = "") -> None:
+                 paper: bool = False, hw: str = "", fw: str = "") -> None:
         self.ws = ws
         self.hw = hw  # device kind + firmware version, for over-the-air updates
         self.fw = fw
@@ -323,6 +411,7 @@ class _DeviceConn:
         self.screen = screen
         self.round_screen = round_screen  # pictures fit inside the circle
         self.chunked = chunked            # pictures may span several frames
+        self.paper = paper                # colour e-paper: pictures at their own shape
         self._image_lock = asyncio.Lock()  # one picture's parts at a time
         self.ch: gb._ChannelState | None = None
         self.agent: dict | None = None
@@ -337,6 +426,7 @@ class _DeviceConn:
         self._audio_q: asyncio.Queue = asyncio.Queue()
         self._audio_task: asyncio.Task | None = None
         self._audio_worker: asyncio.Task | None = None
+        self._say_task: asyncio.Task | None = None
         self._bg: set[asyncio.Task] = set()
 
     # ── over-the-air updates ──
@@ -407,8 +497,8 @@ class _DeviceConn:
             if not text.strip():
                 return
             self.last_reply_at = time.monotonic()
-            # Round screens are the StopWatch, whose font has Đ.
-            await self.send_json({"type": "reply", "text": screen_text(text, has_dj=self.round_screen),
+            # Round screens (the StopWatch) and e-paper use Inter, which has Đ.
+            await self.send_json({"type": "reply", "text": screen_text(text, has_dj=self.round_screen or self.paper),
                                   "proactive": proactive})
             sounds = _answers[self.channel_id] = []  # a new answer
             if self.speak:
@@ -465,10 +555,16 @@ class _DeviceConn:
     # ── device → agent ──
     def system_context(self) -> str:
         w, h = self.screen
-        screen = f"small round {min(w, h)} px" if self.round_screen else f"{w}×{h} pixel"
+        if self.paper:
+            screen = (f"4-inch colour e-paper ({w}×{h} px; it takes about 20 s to redraw, "
+                      "so your reply is heard first and stays readable on it after)")
+        elif self.round_screen:
+            screen = f"small round {min(w, h)} px"
+        else:
+            screen = f"{w}×{h} pixel"
         return _DEVICE_SYSTEM_CONTEXT.replace("{screen}", screen)
 
-    async def send_to_agent(self, text: str) -> None:
+    async def send_to_agent(self, text: str, ctx: Any = None) -> None:
         ch = self.ch
         if ch is None:
             await self.send_json({"type": "error", "text": "No agent bound."})
@@ -486,6 +582,9 @@ class _DeviceConn:
                 "type": "chat", "content": content, "surface": "device",
                 "client_msg_id": "dev_" + secrets.token_hex(6),
             }
+            readings = device_context_line(ctx, self.hw)
+            if readings:
+                payload["context_notes"] = [readings]
             try:
                 await ch.agent_ws.send(json.dumps(payload))
                 ch.context_sent = True
@@ -496,7 +595,7 @@ class _DeviceConn:
         self._last_activity = ""
         await self.send_json({"type": "state", "state": "thinking"})
 
-    async def finish_recording(self) -> None:
+    async def finish_recording(self, ctx: Any = None) -> None:
         pcm = bytes(self.rec)
         self.rec = bytearray()
         seconds = len(pcm) / (2 * self.rec_rate)
@@ -519,7 +618,7 @@ class _DeviceConn:
             await self.send_json({"type": "state", "state": "ready"})
             return
         await self.send_json({"type": "transcript", "text": text})
-        await self.send_to_agent(text)
+        await self.send_to_agent(text, ctx)
 
     # ── pictures ──
     async def _fetch_from_agent(self, path: str) -> bytes:
@@ -545,8 +644,12 @@ class _DeviceConn:
             w, h = self.screen
             max_bytes = MAX_CHUNKED_JPEG_BYTES if self.chunked else MAX_JPEG_BYTES
             jpeg = await asyncio.to_thread(fit_jpeg, blob, w, h, max_bytes=max_bytes,
-                                           round_screen=self.round_screen)
+                                           round_screen=self.round_screen, paper=self.paper)
             frames = jpeg_frames(jpeg) if self.chunked else [(BIN_JPEG, jpeg)]
+            if self.paper:  # its own shape: say which
+                from PIL import Image
+
+                w, h = Image.open(io.BytesIO(jpeg)).size
             async with self._image_lock:  # two pictures' parts must not interleave
                 await self.send_json({"type": "image", "name": str(item.get("name", "")), "w": w, "h": h,
                                       "size": len(jpeg)})
@@ -563,6 +666,7 @@ class _DeviceConn:
     async def _audio_loop(self) -> None:
         while True:
             kind, arg = await self._audio_q.get()
+            await self._stop_say()  # an answer's sound never shares the wire with an aside
             job = self._play_tts(arg) if kind == "tts" else self._play_file(arg)
             self._audio_task = asyncio.create_task(job)
             try:
@@ -588,7 +692,31 @@ class _DeviceConn:
             await self._audio_q.put(sound)
         return True
 
+    async def say(self, text: str) -> bool:
+        """Speak a short line aside from the answer (an e-paper's menu row,
+        which the paper takes ~20 s to show): never while an answer plays or
+        waits, the newest replaces one still speaking, in English (the
+        device's own words), and never kept for a replay."""
+        line = speakable(text, MAX_SAY_CHARS)
+        busy = (self._audio_task is not None and not self._audio_task.done()) or not self._audio_q.empty()
+        if not line or busy:
+            return False
+        await self._stop_say()
+        self._say_task = asyncio.create_task(self._play_tts(line, aside=True, language="en"))
+        return True
+
+    async def _stop_say(self) -> None:
+        task = self._say_task
+        self._say_task = None
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
+
     async def stop_audio(self) -> None:
+        await self._stop_say()
         while not self._audio_q.empty():
             self._audio_q.get_nowait()
         task = self._audio_task
@@ -599,8 +727,11 @@ class _DeviceConn:
             except BaseException:
                 pass
 
-    async def _stream_pcm(self, chunks) -> None:
-        await self.send_json({"type": "audio_start", "rate": TTS_RATE})
+    async def _stream_pcm(self, chunks, aside: bool = False) -> None:
+        start: dict = {"type": "audio_start", "rate": TTS_RATE}
+        if aside:
+            start["aside"] = True
+        await self.send_json(start)
         try:
             pending = b""
             async for chunk in chunks:
@@ -618,13 +749,13 @@ class _DeviceConn:
             except Exception:
                 pass
 
-    async def _play_tts(self, text: str) -> None:
+    async def _play_tts(self, text: str, aside: bool = False, language: str | None = None) -> None:
         from captain_claw.flight_deck.soniox_routes import key_for
 
-        gen = gb.soniox_tts_pcm(text, language=self.lang, voice=self.voice,
+        gen = gb.soniox_tts_pcm(text, language=language or self.lang, voice=self.voice,
                                 api_key=await key_for(self.user_id or None))
         try:
-            await self._stream_pcm(gen)
+            await self._stream_pcm(gen, aside=aside)
         except gb.SonioxTTSError as exc:
             await self.send_json({"type": "status", "text": f"Voice unavailable: {exc}"[:200]})
         finally:
@@ -741,7 +872,7 @@ async def device_ws(ws: WebSocket) -> None:
             elif mtype == "rec_end":
                 if conn.recording:
                     conn.recording = False
-                    conn._spawn(conn.finish_recording())
+                    conn._spawn(conn.finish_recording(obj.get("ctx")))
             elif mtype == "rec_cancel":
                 conn.recording = False
                 conn.rec = bytearray()
@@ -749,11 +880,13 @@ async def device_ws(ws: WebSocket) -> None:
                 text = str(obj.get("text", "")).strip()
                 if text:
                     await conn.stop_audio()
-                    conn._spawn(conn.send_to_agent(text))
+                    conn._spawn(conn.send_to_agent(text, obj.get("ctx")))
             elif mtype == "stop":
                 await conn.stop_audio()
             elif mtype == "replay":
                 await conn.replay()
+            elif mtype == "say":
+                await conn.say(str(obj.get("text", "")))
             elif mtype == "agents":
                 items = [{"slug": a.get("slug"), "name": a.get("name")} for a in _running_agents(conn.user_id)]
                 await conn.send_json({"type": "agents", "items": items,

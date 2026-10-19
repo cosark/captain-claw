@@ -1,5 +1,5 @@
-// A stand-in for M5Unified in the preview renderer: the "display" is a plain
-// 466×466 sprite the renderer saves to a file, the battery reads what the
+// A stand-in for M5Unified in the preview renderers: the "display" is a plain
+// sprite (466×466 round, 400×600 paper) the renderer saves to a file, the battery reads what the
 // renderer sets. Not used on the devices.
 #pragma once
 
@@ -21,6 +21,8 @@ struct Power_Class {
 struct PreviewDisplay : public lgfx::LGFX_Sprite {
   void setBrightness(uint8_t) {}
   void sleep() {}
+  void setEpdMode(lgfx::epd_mode_t) {}  // the e-paper's (ui_paper.cpp)
+  void setAutoDisplay(bool) {}
 };
 
 struct PreviewM5 {

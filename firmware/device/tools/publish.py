@@ -7,7 +7,7 @@
 keygen   makes the signing key pair once: the private key stays on this Mac
          (~/.captain-claw/firmware-signing/ota-key.pem, mode 600); the public
          key goes into src/ota_pubkey.h, compiled into every build.
-<env>    builds that PlatformIO env (sticks3 / stopwatch), reads FW_VERSION
+<env>    builds that PlatformIO env (sticks3 / stopwatch / papercolor), reads FW_VERSION
          from src/main.cpp, signs the SHA-256 of firmware.bin (ECDSA P-256)
          and uploads it to the deck (admin token: a cc_pat_… or an admin JWT).
          Devices of that kind are offered it on their next connect.
@@ -109,7 +109,7 @@ def upload(deck: str, token: str, fields: dict[str, str], blob: bytes) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("target", help="keygen, or a PlatformIO env to publish (sticks3, stopwatch)")
+    ap.add_argument("target", help="keygen, or a PlatformIO env to publish (sticks3, stopwatch, papercolor)")
     ap.add_argument("--deck", help="Flight Deck URL, e.g. https://glasses.captain-claw.com")
     ap.add_argument("--token", default=os.environ.get("FD_TOKEN", ""),
                     help=f"admin token (or FD_TOKEN, or the file {TOKEN_FILE})")

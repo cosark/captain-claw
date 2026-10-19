@@ -14,6 +14,7 @@ void setVolume(uint8_t volume);
 void setBoost(uint8_t db);
 void beep();  // short tone at the current volume (feedback for volume changes)
 void cue();   // two-tone "about to speak" chime
+void click(); // a short tick for a button press (the paper changes slowly)
 
 // ── microphone ──
 void micStart();
@@ -39,6 +40,13 @@ void playPoll();                           // keep the speaker fed; call from lo
 bool playing();                            // a stream is buffered or sounding
 bool sounding();                           // the speaker is actually outputting it
 int outputLevel();                         // 0..100 loudness of what's sounding now
+
+// ── a line spoken aside (the e-paper's menu rows) ──
+// Kept apart from the answer's clip (a replay never plays it), played once
+// it has all arrived; skipped while the mic or an answer is on.
+void asideBegin(uint32_t rate);
+void asideFeed(const uint8_t* data, size_t len);
+void asideEnd();
 
 // ── the last answer's clip ──
 void newClip();   // a new answer: its first stream replaces the clip
