@@ -545,6 +545,73 @@ def _session_summary(server: Any) -> dict[str, Any]:
     }
 
 
+async def apply_pending_session_change(server: Any, agent: Any = None) -> bool:
+    """Carry out what a ``sessions`` tool call asked for during the turn that
+    just ended — switch to another of the owner's sessions, or start a new
+    one — and tell every client on the lane the way ``/session switch`` and
+    ``/new`` do (``session_info``, ``session_switched``, a
+    ``command_result``), so chat timelines mark the boundary, the HUD
+    reopens and bridges re-send their rules. True when the session changed."""
+    agent = agent or getattr(server, "agent", None)
+    change = getattr(agent, "_pending_session_change", None) if agent is not None else None
+    if not isinstance(change, dict):
+        return False
+    agent._pending_session_change = None
+    action = str(change.get("action") or "")
+    sm = agent.session_manager
+
+    def _announce(command: str, content: str) -> None:
+        server._broadcast({"type": "session_info", **server._session_info()})
+        server._broadcast({"type": "session_switched"})
+        server._broadcast({
+            "type": "command_result", "command": command, "content": content,
+            "session": _session_summary(server),
+        })
+
+    def _notice(content: str) -> None:
+        server._broadcast({
+            "type": "command_result", "command": "/session switch", "content": content,
+            "session": _session_summary(server),
+        })
+
+    if action == "new":
+        outgoing = getattr(agent, "session", None)
+        agent.archive_current_session_to_history()
+        session = await _create_new_session(server, str(change.get("name") or "").strip() or None)
+        agent.refresh_session_runtime_flags()
+        if not _is_view(server):
+            await sm.set_last_active_session(session.id)
+        agent.last_usage = agent._empty_usage()
+        agent.last_context_window = {}
+        _announce("/new", f"New session created: **{session.name}** (`{session.id[:8]}`)")
+        if session is not outgoing:
+            _title_session_in_background(server, outgoing)
+        return True
+
+    if action == "switch":
+        from captain_claw.speaker import member_session_refusal
+
+        sid = str(change.get("id") or "")
+        session = await sm.load_session(sid) if sid else None
+        if session is None:
+            _notice(f"Topic not found: `{sid}`")
+            return False
+        refusal = member_session_refusal(session)
+        if refusal:
+            _notice(refusal)
+            return False
+        if _held_elsewhere(server, session.id):
+            _notice("That topic is open on another lane or chat right now — switch to it there.")
+            return False
+        agent.session = session
+        if not _is_view(server):
+            await sm.set_last_active_session(session.id)
+        agent._sync_runtime_flags_from_session()
+        _announce(f"/session switch {session.id}", f"Switched to session **{session.name}**.")
+        return True
+    return False
+
+
 # Background title tasks, held so the event loop doesn't drop them half-way.
 _TITLE_TASKS: set[Any] = set()
 

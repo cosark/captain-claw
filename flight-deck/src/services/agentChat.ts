@@ -36,6 +36,9 @@ export interface ChatMessage {
   /** Flight Deck chat-log row id — set when the row came from the log or
    *  once it was persisted to it. Topics jump to a divider by this. */
   rowId?: number
+  /** A user turn that came from another surface ("whatsapp", "device",
+   *  "glasses"); absent for turns typed here. Shown as "via WhatsApp". */
+  via?: string
   /** A topic boundary in the continuous per-lane transcript: the agent's
    *  context moved to another session (`new`, `resume`) or was reset in
    *  place (`clear`). Rendered as a divider; the Topics list is built from
@@ -334,11 +337,23 @@ export class AgentChatWS {
     if (this._unsubAuth) { this._unsubAuth(); this._unsubAuth = null }
   }
 
+  /** Ids of the turns this socket sent (the agent echoes them back on the
+   *  user frame, so our own echo is told apart from another surface's turn). */
+  private sentIds: string[] = []
+
+  isOwnMessage(clientMsgId: string): boolean {
+    return this.sentIds.includes(clientMsgId)
+  }
+
   send(content: string, opts?: { noNextSteps?: boolean; imagePaths?: string[] }) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
+    const clientMsgId = `web_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
+    this.sentIds.push(clientMsgId)
+    if (this.sentIds.length > 200) this.sentIds.splice(0, this.sentIds.length - 200)
     this.ws.send(JSON.stringify({
       type: 'chat',
       content,
+      client_msg_id: clientMsgId,
       // Queue-dispatched turns don't want the post-turn "suggested next
       // steps" round-trip — the next message is already written — nor a
       // task-rephrase, which would rewrite instructions the user chose

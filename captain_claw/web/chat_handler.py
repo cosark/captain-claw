@@ -533,6 +533,32 @@ def accepted_fields(client_msg_id: str = "") -> dict[str, Any]:
     return {"client_msg_id": client_msg_id} if client_msg_id else {}
 
 
+def turn_via(surface: str | None, ws: Any, whatsapp_waid: str = "", origin: Any = None) -> str:
+    """Where a turn came from, as the clients on the lane see it: the frame's
+    surface ("device", "glasses" …), "whatsapp" for the WhatsApp bridge,
+    else "web"."""
+    via = str(surface or getattr(ws, "_claw_surface", None) or "").strip().lower()
+    if not via:
+        kind = str((origin or {}).get("kind", "") or "").strip().lower() if isinstance(origin, dict) else ""
+        if whatsapp_waid or kind == "whatsapp":
+            via = "whatsapp"
+    return via or "web"
+
+
+def user_turn_frame(content: str, via: str, client_msg_id: str = "") -> dict[str, Any]:
+    """The user turn as every client on the lane sees it. ``via`` names the
+    surface it came from and ``client_msg_id`` the frame, so a web tab can
+    tell its own echo (dropped) from another surface's turn (kept, labelled
+    "via WhatsApp", "via stick")."""
+    return {
+        "type": "chat_message", "role": "user",
+        "content": content,
+        "timestamp": datetime.now(UTC).isoformat(),
+        "via": via,
+        **accepted_fields(client_msg_id),
+    }
+
+
 async def handle_chat(
     server: WebServer,
     ws: web.WebSocketResponse,
@@ -769,20 +795,14 @@ async def handle_chat(
         else:
             _send_msg = server._lane_send(lane)
         _send_msg({"type": "status", "status": "thinking", **accepted_fields(client_msg_id)})
-        _send_msg({
-            "type": "chat_message", "role": "user",
-            "content": effective_content,
-            "timestamp": datetime.now(UTC).isoformat(),
-        })
+        _send_msg(user_turn_frame(
+            effective_content, turn_via(surface, ws, whatsapp_waid, origin), client_msg_id))
     else:
         server._busy = True
         server._broadcast({"type": "status", "status": "thinking", **accepted_fields(client_msg_id)})
         server._thinking_callback("Thinking\u2026", phase="reasoning")
-        server._broadcast({
-            "type": "chat_message", "role": "user",
-            "content": effective_content,
-            "timestamp": datetime.now(UTC).isoformat(),
-        })
+        server._broadcast(user_turn_frame(
+            effective_content, turn_via(surface, ws, whatsapp_waid, origin), client_msg_id))
 
     # ── Task naming (runs concurrently with the agent) ────────────
     if not hasattr(server, "_recent_prompts"):
@@ -1734,6 +1754,16 @@ async def _run_agent(
             "type": "status", "status": "ready",
             **({"turn_end": speaker_turn} if speaker_key else {}),
         })
+        # A `sessions` tool call asked to move the conversation: now that the
+        # turn is over and the reply delivered, switch or start the session
+        # (never for a public visitor's or a member's turn).
+        if not is_public and not speaker_key:
+            try:
+                from captain_claw.web.slash_commands import apply_pending_session_change
+                _change_view = server if lane == server.LANE_MAIN else server.lane_view(ws, agent)
+                await apply_pending_session_change(_change_view, agent)
+            except Exception as exc:
+                log.warning("Pending session change failed", error=str(exc))
         # The turn's WhatsApp chat ends with it (a later cron or channel turn
         # on this session must not inherit it).
         _wa_files.reset_turn(agent)

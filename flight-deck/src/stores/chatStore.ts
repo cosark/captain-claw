@@ -85,6 +85,73 @@ function logRowToMessage(r: LogRow): ChatMessage {
     model: meta.model as string | undefined,
     peer_name: meta.peer_name as string | undefined,
     ...(topic ? { topic } : {}),
+    ...(meta.via ? { via: String(meta.via) } : {}),
+  }
+}
+
+/** Message ids withdrawn from the transcript before or while their flush
+ *  ran: skipped if still queued, deleted from the log once their row id is
+ *  known. */
+const _dropped = new Set<string>()
+
+async function serverDeleteMessage(sessionId: string, rowId: number): Promise<void> {
+  if (!useAuthStore.getState().authEnabled) return
+  try {
+    await fetch(`/fd/chat/sessions/${encodeURIComponent(sessionId)}/messages/${rowId}`, {
+      method: 'DELETE',
+      headers: _chatHeaders(),
+      credentials: 'include',
+    })
+  } catch { /* ignore */ }
+}
+
+/** Whether a user frame the agent broadcast is this socket's own turn: the
+ *  echoed client_msg_id says so; an agent build that sends neither an id nor
+ *  a surface is read as an echo, as before. */
+function isOwnTurn(ws: AgentChatWS, data: Record<string, unknown>): boolean {
+  const id = String(data.client_msg_id || '')
+  if (id) return ws.isOwnMessage(id)
+  return !data.via
+}
+
+// The agent's new-session cues (config `session.rotation_cues` defaults):
+// "new topic: …" opening a message starts a new session, then the rest is
+// re-sent as the turn. The composer already echoed the whole line.
+const CUE_RE = /^(?:new topic|new conversation|nova tema|novi razgovor)(?:\s*(?:$|\n)|\s*[:\-–—.,!]\s*)/i
+
+function stripCue(text: string): string | null {
+  const t = text.trimStart()
+  const m = CUE_RE.exec(t)
+  return m ? t.slice(m[0].length).trim() : null
+}
+
+const foldSpace = (s: string) => s.replace(/\s+/g, ' ').trim()
+
+/** The composer's echo of a "new topic: <rest>" line — sitting above the
+ *  divider the cue produced — is withdrawn once the agent re-sends <rest>
+ *  as the new topic's first turn, so the message shows once, below. */
+function dropCueEcho(key: string, rest: string) {
+  const s = useChatStore.getState().sessions.get(key)
+  if (!s) return
+  const want = foldSpace(rest)
+  for (let i = s.messages.length - 1; i >= 0 && i >= s.messages.length - 8; i--) {
+    const m = s.messages[i]
+    if (m.role !== 'user' || m.replay || m.via) continue
+    const stripped = stripCue(m.content)
+    if (stripped === null || foldSpace(stripped) !== want) continue
+    _dropped.add(m.id)
+    useChatStore.setState((state) => {
+      const cur = state.sessions.get(key)
+      if (!cur) return state
+      const sessions = new Map(state.sessions)
+      sessions.set(key, { ...cur, messages: cur.messages.filter((x) => x.id !== m.id) })
+      return { sessions }
+    })
+    if (m.rowId !== undefined) {
+      _dropped.delete(m.id)
+      void serverDeleteMessage(key, m.rowId)
+    }
+    return
   }
 }
 
@@ -243,9 +310,13 @@ async function _flushMessages() {
   _msgQueue.clear()
   for (const [sessionId, queued] of batches) {
     // Serialize the latest version of each row: a divider may have been
-    // titled or renamed since it was queued.
+    // titled or renamed since it was queued. A row withdrawn meanwhile (a
+    // "new topic:" echo) is not written at all.
     const live = useChatStore.getState().sessions.get(sessionId)?.messages
-    const msgs = queued.map((m) => live?.find((x) => x.id === m.id) ?? m)
+    const msgs = queued
+      .filter((m) => { if (_dropped.has(m.id)) { _dropped.delete(m.id); return false } return true })
+      .map((m) => live?.find((x) => x.id === m.id) ?? m)
+    if (msgs.length === 0) continue
     try {
       const res = await fetch(`/fd/chat/sessions/${encodeURIComponent(sessionId)}/messages`, {
         method: 'POST',
@@ -262,6 +333,7 @@ async function _flushMessages() {
               ...(m.model ? { model: m.model } : {}),
               ...(m.peer_name ? { peer_name: m.peer_name } : {}),
               ...(m.topic ? { topic: m.topic } : {}),
+              ...(m.via ? { via: m.via } : {}),
             }),
           })),
         }),
@@ -272,6 +344,13 @@ async function _flushMessages() {
       const body = await res.json().catch(() => null) as { ids?: number[] } | null
       const ids = body?.ids
       if (!ids || ids.length !== msgs.length) continue
+      // A row withdrawn while this batch was in flight is deleted now.
+      msgs.forEach((m, i) => {
+        if (_dropped.has(m.id)) {
+          _dropped.delete(m.id)
+          void serverDeleteMessage(sessionId, ids[i])
+        }
+      })
       const rowIds = new Map(msgs.map((m, i) => [m.id, ids[i]] as const))
       useChatStore.setState((state) => {
         const s = state.sessions.get(sessionId)
@@ -1309,11 +1388,23 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     })
 
     ws.on('chat_message', (data) => {
-      // Skip echoed user messages — we already add them locally in sendMessage
-      // — except the rest of a "new topic" message: the transcript was just
-      // cleared for the new session, so it goes back in.
-      if (data.role === 'user' && !data.replay && !data.rotation_cue) return
       const rawContent = (data.content as string) || ''
+      let via = ''
+      if (data.role === 'user' && !data.replay) {
+        if (data.rotation_cue) {
+          // The rest of a "new topic" message, re-sent after the divider:
+          // the composer's echo of the whole line, above it, goes.
+          dropCueEcho(key, rawContent)
+        } else if (isOwnTurn(ws, data)) {
+          // Our own send — already on screen from sendMessage.
+          return
+        } else {
+          // Another surface's turn on this lane (WhatsApp, the stick, another
+          // tab): part of the transcript, labelled where it came from.
+          const from = String(data.via || '')
+          via = from && from !== 'web' ? from : ''
+        }
+      }
       // Sanitize assistant content: strip thinking blocks, council protocol
       // headers (SUITABILITY/ACTION/TARGET), insight echoes, and other
       // instruction/memory leaks. User content is left as-is.
@@ -1325,6 +1416,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         timestamp: data.timestamp as string || new Date().toISOString(),
         replay: data.replay as boolean || false,
         model: data.model as string || '',
+        ...(via ? { via } : {}),
       }
       addMessage(key, msg)
       // A result the automation lane mirrored here is a note: it ends no turn

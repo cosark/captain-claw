@@ -204,6 +204,9 @@ async def _tg_get_or_create_agent(server: WebServer, message: TelegramMessage) -
     agent.session = session
     agent.session_manager = sm
     agent._sync_runtime_flags_from_session()
+    # A Telegram user's agent: the `sessions` tool refuses to move between
+    # topics here (the list would be the owner's; /new is the way).
+    agent._channel = "telegram"
 
     # Share deep-memory index if available.
     main_dm = getattr(server.agent, "_deep_memory", None)
