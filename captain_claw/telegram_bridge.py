@@ -71,6 +71,22 @@ class TelegramMessage:
     contact_last_name: str = ""
     contact_vcard: str = ""
     business_connection_id: str = ""
+    # A voice note, audio file, video, round video message or GIF ("voice",
+    # "audio", "video", "video_note", "animation"): Telegram sends each as its
+    # own type, never as a document.
+    media_kind: str = ""
+    media_file_id: str = ""
+    media_file_name: str = ""
+    media_mime: str = ""
+    media_size: int = 0
+    media_duration: int = 0
+    # Forwarded from someone else (a forwarded voice note isn't the user speaking).
+    forwarded: bool = False
+
+
+# Telegram's own types for sound and moving pictures, in the order a message
+# is checked (a GIF also carries a ``document``; the animation wins).
+MEDIA_KINDS = ("voice", "audio", "video", "video_note", "animation")
 
 
 @dataclass
@@ -196,6 +212,27 @@ class TelegramBridge:
                 if not text:
                     text = str(msg.get("caption", "")).strip()
 
+            # Voice notes, audio files, videos, round video messages, GIFs.
+            media_kind = media_file_id = media_file_name = media_mime = ""
+            media_size = media_duration = 0
+            for kind in MEDIA_KINDS:
+                media = msg.get(kind)
+                if isinstance(media, dict) and str(media.get("file_id", "")).strip():
+                    media_kind = kind
+                    media_file_id = str(media.get("file_id", "")).strip()
+                    media_file_name = str(media.get("file_name", "") or "").strip()
+                    media_mime = str(media.get("mime_type", "") or "").strip()
+                    try:
+                        media_size = int(media.get("file_size") or 0)
+                        media_duration = int(media.get("duration") or 0)
+                    except (TypeError, ValueError):
+                        media_size = media_duration = 0
+                    if kind == "animation":
+                        document_file_id = document_file_name = ""  # same file, sent twice
+                    if not text:
+                        text = str(msg.get("caption", "")).strip()
+                    break
+
             # Contact messages.
             contact = msg.get("contact")
             if isinstance(contact, dict):
@@ -204,7 +241,8 @@ class TelegramBridge:
                 contact_last_name = str(contact.get("last_name", "")).strip()
                 contact_vcard = str(contact.get("vcard", "")).strip()
 
-            if not text and not photo_file_id and not document_file_id and not contact_phone:
+            if (not text and not photo_file_id and not document_file_id and not contact_phone
+                    and not media_file_id):
                 continue
             from_user = msg.get("from")
             chat = msg.get("chat")
@@ -231,6 +269,13 @@ class TelegramBridge:
                     contact_last_name=contact_last_name,
                     contact_vcard=contact_vcard,
                     business_connection_id=str(msg.get("business_connection_id", "")).strip(),
+                    media_kind=media_kind,
+                    media_file_id=media_file_id,
+                    media_file_name=media_file_name,
+                    media_mime=media_mime,
+                    media_size=media_size,
+                    media_duration=media_duration,
+                    forwarded=isinstance(msg.get("forward_origin"), dict),
                 )
             )
         return updates
@@ -495,10 +540,15 @@ class TelegramBridge:
         resp = await self._client.post(
             self._url("getFile"), json={"file_id": file_id},
         )
-        resp.raise_for_status()
-        data = resp.json()
-        if not isinstance(data, dict) or not data.get("ok"):
-            raise RuntimeError(f"getFile failed: {data}")
+        try:
+            data = resp.json()
+        except ValueError:
+            data = None
+        if resp.status_code >= 400 or not isinstance(data, dict) or not data.get("ok"):
+            # Keep Telegram's reason ("Bad Request: file is too big" past the
+            # Bot API's 20 MB download limit) — a bare HTTP 400 tells no one anything.
+            reason = data.get("description") if isinstance(data, dict) else ""
+            raise RuntimeError(f"getFile failed: {reason or f'HTTP {resp.status_code}'}")
         file_path = data.get("result", {}).get("file_path", "")
         if not file_path:
             raise RuntimeError("getFile returned no file_path")

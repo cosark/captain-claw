@@ -37,6 +37,96 @@ _TG_DISABLED_COMMANDS = frozenset({"/sessions"})
 _TG_DISABLED_SESSION_SUBCMDS = frozenset({"list", "switch", "load"})
 
 
+# ── Voice notes, audio, video ───────────────────────────────────────
+
+# The Bot API lets a bot download files up to this size (getFile).
+_TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024
+_MEDIA_LABEL = {
+    "voice": "voice note", "audio": "audio file", "video": "video",
+    "video_note": "video message", "animation": "GIF",
+}
+_MEDIA_DEFAULT_EXT = {
+    "voice": ".ogg", "audio": ".mp3", "video": ".mp4", "video_note": ".mp4", "animation": ".mp4",
+}
+# Extensions the attachment hints and the video analysis know.
+_MEDIA_MIME_EXT = {
+    "audio/ogg": ".ogg", "audio/opus": ".opus", "audio/mpeg": ".mp3", "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/m4a": ".m4a", "audio/aac": ".aac",
+    "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/flac": ".flac", "audio/x-flac": ".flac",
+    "audio/amr": ".amr", "video/mp4": ".mp4", "video/quicktime": ".mov", "video/webm": ".webm",
+    "video/x-matroska": ".mkv", "video/x-msvideo": ".avi", "video/x-m4v": ".m4v",
+}
+_MEDIA_KNOWN_EXT = frozenset(_MEDIA_MIME_EXT.values())
+_VIDEO_KINDS = frozenset({"video", "video_note", "animation"})
+
+
+def _tg_media_filename(message: TelegramMessage, stamp: str) -> str:
+    """``tg-<kind>[-<name>]-<stamp><ext>`` with an extension the attachment
+    hints and the video analysis recognise."""
+    from pathlib import Path
+
+    name = Path(message.media_file_name or "")
+    ext = name.suffix.lower()
+    if ext not in _MEDIA_KNOWN_EXT:
+        mime = (message.media_mime or "").split(";", 1)[0].strip().lower()
+        ext = _MEDIA_MIME_EXT.get(mime) or _MEDIA_DEFAULT_EXT.get(message.media_kind, ".bin")
+    stem = "".join(c if c.isalnum() or c in "-_." else "_" for c in name.stem)[:50]
+    kind = message.media_kind.replace("_", "")
+    return f"tg-{kind}{'-' + stem if stem else ''}-{stamp}{ext}"
+
+
+async def _tg_download_media(
+    bridge: TelegramBridge, user_agent: Agent, message: TelegramMessage,
+) -> tuple[str | None, str]:
+    """Save the message's voice note / audio / video under the session's
+    media folder: ``(path, "")``, or ``(None, what to tell the user)``."""
+    label = _MEDIA_LABEL.get(message.media_kind, "file")
+    too_big = (
+        f"That {label} is too big for me to fetch — Telegram only lets bots download files "
+        "up to 20 MB. Send a shorter one, or share a link to it."
+    )
+    if message.media_size > _TG_DOWNLOAD_LIMIT:
+        return None, too_big
+    try:
+        from captain_claw.config import get_config
+
+        workspace = get_config().resolved_workspace_path()
+        session_id = user_agent.session.id if user_agent.session else "uploads"
+        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+        dest = workspace / "saved" / "media" / session_id / _tg_media_filename(message, stamp)
+        await bridge.download_file(message.media_file_id, dest)
+    except Exception as exc:
+        if "too big" in str(exc).lower():
+            return None, too_big
+        log.warning("Telegram media download failed", kind=message.media_kind, error=str(exc))
+        return None, f"Couldn't fetch that {label} ({type(exc).__name__})."
+    log.info("Telegram media downloaded", kind=message.media_kind, path=str(dest))
+    return str(dest), ""
+
+
+async def _tg_transcribe(path: str, mime: str) -> tuple[str, str]:
+    """A voice note's transcript (Soniox, the owner's key through Flight Deck):
+    ``(text, "")`` or ``("", why not)``."""
+    from pathlib import Path
+
+    from captain_claw import soniox_client
+    from captain_claw.soniox_api import SonioxError
+
+    if not await soniox_client.available():
+        return "", ("speech-to-text isn't set up — connect Soniox in Flight Deck → "
+                    "Connections → Soniox")
+    try:
+        blob = Path(path).read_bytes()
+        result = await soniox_client.transcribe(
+            blob, filename=Path(path).name, mime=(mime or "audio/ogg").split(";", 1)[0])
+    except SonioxError as exc:
+        return "", str(exc)
+    except Exception as exc:
+        return "", type(exc).__name__
+    text = (result.text or "").strip()
+    return (text, "") if text else ("", "no speech was recognised")
+
+
 # ── Lifecycle ────────────────────────────────────────────────────
 
 
@@ -385,7 +475,43 @@ async def _handle_telegram_message(server: WebServer, message: TelegramMessage) 
                 except Exception as vcf_exc:
                     log.warning("Telegram vCard save failed", error=str(vcf_exc))
 
-        if not text and not image_path and not file_path and not contact_text:
+        # Voice notes, audio files, videos, round video messages, GIFs.
+        media_kind = str(getattr(message, "media_kind", "") or "")
+        forwarded = bool(getattr(message, "forwarded", False))
+        media_path: str | None = None
+        attachment_notes: list[str] = []
+        if getattr(message, "media_file_id", ""):
+            media_path, problem = await _tg_download_media(bridge, user_agent, message)
+            if problem:
+                await _tg_send(server, message.chat_id, problem,
+                               reply_to_message_id=message.message_id)
+        if media_path and media_kind == "voice" and not forwarded:
+            # The user speaking to the agent: the transcript is the message (as on
+            # WhatsApp). The recording is named in a note, not attached — an
+            # attached .ogg only invites a weak model to transcribe it again.
+            voice_path, media_path = media_path, None
+            await _tg_send(server, message.chat_id, "🎙 Transcribing voice note…",
+                           reply_to_message_id=message.message_id)
+            transcript, why = await _tg_transcribe(voice_path, message.media_mime)
+            if not transcript:
+                await _tg_send(
+                    server, message.chat_id,
+                    f"Couldn't transcribe that — {why}. Please type it or send it again.",
+                    reply_to_message_id=message.message_id,
+                )
+                return
+            await _tg_send(server, message.chat_id, f"🎙 Transcription:\n\n\"{transcript}\"",
+                           reply_to_message_id=message.message_id)
+            text = f"{text}\n\n{transcript}" if text else transcript
+            attachment_notes.append(
+                "This message is the transcript of the user's Telegram voice note; "
+                f"the recording is saved at {voice_path}."
+            )
+        elif media_path and media_kind == "voice":
+            attachment_notes.append(
+                "A forwarded voice note — someone else's words, not the user's own.")
+
+        if not text and not image_path and not file_path and not contact_text and not media_path:
             return
 
         # Strip @botname suffix from commands.
@@ -442,19 +568,36 @@ async def _handle_telegram_message(server: WebServer, message: TelegramMessage) 
                 )
                 return
 
-        # Build effective text with attachment context if present.
+        # Build effective text with attachment context if present — the same
+        # lines the web chat and WhatsApp get (reader hints, video guidance,
+        # attachment notes).
+        from captain_claw.web.chat_handler import (
+            agent_sees_attached_images,
+            build_attachment_prefix,
+        )
+
+        sees_inline = agent_sees_attached_images(user_agent)
+        attached = build_attachment_prefix(
+            [image_path] if image_path else [],
+            [p for p in (file_path, media_path) if p],
+            attachment_notes,
+            sees_inline=sees_inline,
+        )
         effective_text = text
-        attachment_lines: list[str] = []
-        if image_path:
-            attachment_lines.append(f"[Attached image: {image_path}]")
-        if file_path:
-            attachment_lines.append(f"[Attached file: {file_path}]")
+        attachment_lines = list(attached.lines)
         if contact_text:
             attachment_lines.append(contact_text)
         if attachment_lines:
             prefix = "\n".join(attachment_lines) + "\n"
-            default_msg = "Please analyze this image." if image_path else "I've attached a file."
-            if contact_text and not image_path and not file_path:
+            if image_path:
+                default_msg = "Please analyze this image."
+            elif media_path and media_kind in _VIDEO_KINDS:
+                default_msg = "I've sent a video."
+            elif media_path:
+                default_msg = "I've sent an audio file."
+            elif file_path:
+                default_msg = "I've attached a file."
+            else:
                 default_msg = "I'm sharing this contact."
             effective_text = prefix + (text or default_msg)
 
@@ -471,14 +614,13 @@ async def _handle_telegram_message(server: WebServer, message: TelegramMessage) 
         # A model that sees images gets the photo inline (its marker); any other
         # has it described first — a vision model or a multimodal peer — as the
         # chat path does for WhatsApp and Flight Deck.
-        from captain_claw.web.chat_handler import agent_sees_attached_images
-
-        describe = [image_path] if image_path and not agent_sees_attached_images(user_agent) else None
+        describe = [image_path] if image_path and not sees_inline else None
         await _tg_process_with_typing(
             server, message.chat_id, effective_text, message.message_id,
             user_agent=user_agent,
             user_id=str(message.user_id),
             describe_images=describe,
+            analyze_videos=attached.videos or None,
         )
 
     except Exception as exc:
@@ -1002,14 +1144,16 @@ async def _tg_process_with_typing(
     user_agent: Agent,
     user_id: str,
     describe_images: list[str] | None = None,
+    analyze_videos: list[str] | None = None,
 ) -> None:
     """Run user_agent.complete() with typing indicator and per-user lock.
 
     Different Telegram users run concurrently.  Requests from the *same*
     user are serialised by a per-user asyncio lock. *describe_images* are
-    described server-side first (for a model that doesn't see images); the
-    description goes to the agent, never into the user's words the mail
-    guard reads.
+    described server-side first (for a model that doesn't see images), and
+    *analyze_videos* run through video_vision first (frames + transcript), as
+    the web chat does; both go to the agent, never into the user's words the
+    mail guard reads.
     """
     bridge = server._telegram_bridge
     if not bridge:
@@ -1066,11 +1210,18 @@ async def _tg_process_with_typing(
                 narration = _TgNarration(server, chat_id) if _stream_narration() else None
                 user_agent.narration_callback = narration
                 agent_text = text
+                if analyze_videos:
+                    from captain_claw.web.chat_handler import _prefix_video_analysis
+
+                    await _tg_send(server, chat_id, "🎬 Watching the video…",
+                                   reply_to_message_id=reply_to_message_id)
+                    agent_text = await _prefix_video_analysis(
+                        user_agent, agent_text, analyze_videos, lambda _event: None)
                 if describe_images:
                     from captain_claw.web.chat_handler import _prefix_image_analysis
 
                     agent_text = await _prefix_image_analysis(
-                        user_agent, text, describe_images, lambda _event: None)
+                        user_agent, agent_text, describe_images, lambda _event: None)
                 try:
                     with mail_authority.bound(mail_authority.interactive(text)):
                         from captain_claw import msg_origin as _msg_origin

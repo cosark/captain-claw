@@ -5531,6 +5531,10 @@ Each Telegram user automatically gets a dedicated session and agent instance:
 - **Disabled commands** — listing and switching sessions (`/sessions`, `/session list`, `/session switch`, `/session load`) are not available on Telegram: each user has one session at a time
 - **Available session commands** — `/clear`, `/history`, `/compact`, `/session info`, `/session rename` operate on the user's own session
 - **Photo attachments** — images sent to the bot are processed through the `image_vision` tool
+- **Voice notes** — the user's own voice note is transcribed (Soniox, the owner's key through Flight Deck) and the transcript becomes the message; the bot shows it back ("🎙 Transcription: …"). Without a Soniox key, or when nothing was recognised, the bot says so and no turn runs. A *forwarded* voice note is someone else's words: it reaches the agent as an audio file instead.
+- **Audio files** — reach the agent as attached files; when Soniox is connected the attachment hint names the `audio` tool to transcribe them.
+- **Videos, round video messages and GIFs** — reach the agent as attached files and are analyzed before the turn (`video_vision`: frames + audio transcript), like a video uploaded in the web chat.
+- **20 MB limit** — the Bot API only lets a bot download files up to 20 MB; a bigger one is answered with that reason (a caption sent with it still reaches the agent).
 - **Generated images**: images that `image_gen`, `termux` or a browser screenshot made this turn are sent back to the user automatically.
 - **Files the reply names**: a document or picture the agent wrote this turn is sent back when the reply names it by file name ("here's report.docx"). Only files in the user's session folders under `saved/` count, never `scripts/`, `tools/`, `skills/` or `downloads/`. A file the agent only read (a Drive download, an email attachment) is never sent.
 - **Only deliverables**: a file is sent only if the turn made it, inside the agent's own `saved/` area. A `Path:` line in tool output, an email body or a web page can't send a file. The CLI chat bridges (Telegram, Slack, Discord) and WhatsApp follow the same rule.
