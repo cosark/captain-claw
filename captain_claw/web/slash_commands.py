@@ -519,7 +519,26 @@ async def handle_command(server: WebServer, ws: web.WebSocketResponse, raw: str)
         "type": "command_result",
         "command": raw,
         "content": result,
+        # The session this lane is on AFTER the command: a client that keeps
+        # one continuous transcript marks a topic boundary from it when
+        # /new, /session switch or /clear moved or reset the context.
+        "session": _session_summary(server),
     })
+
+
+def _session_summary(server: Any) -> dict[str, Any]:
+    """``{id, name, message_count}`` of the lane's current session, or ``{}``."""
+    try:
+        info = server._session_info() or {}
+    except Exception:
+        return {}
+    if not info.get("id"):
+        return {}
+    return {
+        "id": str(info.get("id", "")),
+        "name": str(info.get("name", "") or ""),
+        "message_count": int(info.get("message_count", 0) or 0),
+    }
 
 
 async def _execute_nuke(server: WebServer) -> str:

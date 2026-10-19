@@ -66,12 +66,23 @@ async def upsert_session(body: UpsertSessionRequest, user: dict = Depends(get_cu
 
 @router.get("/sessions/{session_id}/messages")
 async def get_messages(
-    session_id: str, limit: int = 100, before: int | None = None,
+    session_id: str, limit: int = 100, before: int | None = None, since_id: int | None = None,
     user: dict = Depends(get_current_user),
 ):
+    """The newest page of the lane's log (or the page before ``before``), or
+    with ``since_id`` the log from that row on — oldest first either way."""
     db = get_db()
     return await db.get_chat_messages(
-        _store_id(session_id, user["id"]), user["id"], limit=limit, before_id=before)
+        _store_id(session_id, user["id"]), user["id"],
+        limit=limit, before_id=before, since_id=since_id)
+
+
+@router.get("/sessions/{session_id}/topics")
+async def list_topics(session_id: str, user: dict = Depends(get_current_user)):
+    """The lane's topic dividers, oldest first, each with its first user
+    message and how many turns followed before the next divider."""
+    db = get_db()
+    return await db.list_chat_topics(_store_id(session_id, user["id"]), user["id"])
 
 
 @router.post("/sessions/{session_id}/messages")

@@ -1517,13 +1517,23 @@ class FlightDeckDB:
 
     async def get_chat_messages(
         self, session_id: str, user_id: str,
-        limit: int = 100, before_id: int | None = None,
+        limit: int = 100, before_id: int | None = None, since_id: int | None = None,
     ) -> list[dict]:
+        """Rows of one chat log, oldest first: the newest ``limit`` (those
+        before ``before_id`` when given), or with ``since_id`` the log from
+        that row on (a topic divider the reader jumped to)."""
         assert self._db is not None
         # Verify ownership
         sess = await self.get_chat_session(session_id, user_id)
         if not sess:
             return []
+        if since_id is not None:
+            async with self._db.execute(
+                "SELECT * FROM chat_messages WHERE session_id = ? AND id >= ?"
+                " ORDER BY id ASC LIMIT ?",
+                (session_id, int(since_id), max(1, min(int(limit), 2000))),
+            ) as cur:
+                return [dict(r) for r in await cur.fetchall()]
         query = "SELECT * FROM chat_messages WHERE session_id = ?"
         params: list = [session_id]
         if before_id is not None:
@@ -1535,6 +1545,71 @@ class FlightDeckDB:
             rows = [dict(r) for r in await cur.fetchall()]
         rows.reverse()  # Return chronological order
         return rows
+
+    async def list_chat_topics(self, session_id: str, user_id: str) -> list[dict]:
+        """The topic dividers of one chat log, oldest first — ``system`` rows
+        whose metadata carries a ``topic`` object (the chat timeline's "New
+        topic" / "Back on …" / "Context cleared" marks) — each with the first
+        user message after it and the number of user+assistant turns before
+        the next divider. Unknown or foreign session: ``[]``."""
+        assert self._db is not None
+        sess = await self.get_chat_session(session_id, user_id)
+        if not sess:
+            return []
+        async with self._db.execute(
+            "SELECT id, metadata, created_at FROM chat_messages"
+            " WHERE session_id = ? AND role = 'system' AND metadata LIKE '%\"topic\"%'"
+            " ORDER BY id ASC",
+            (session_id,),
+        ) as cur:
+            divider_rows = [dict(r) for r in await cur.fetchall()]
+        dividers: list[tuple[int, dict, str]] = []
+        for r in divider_rows:
+            try:
+                meta = json.loads(r.get("metadata") or "{}")
+            except (TypeError, ValueError):
+                continue
+            topic = meta.get("topic") if isinstance(meta, dict) else None
+            if isinstance(topic, dict):
+                dividers.append((int(r["id"]), topic, str(r.get("created_at") or "")))
+        if not dividers:
+            return []
+        async with self._db.execute(
+            "SELECT id, role, content FROM chat_messages"
+            " WHERE session_id = ? AND role IN ('user', 'assistant') AND id > ?"
+            " ORDER BY id ASC",
+            (session_id, dividers[0][0]),
+        ) as cur:
+            turns = [dict(r) for r in await cur.fetchall()]
+        out: list[dict] = []
+        ti = 0
+        for i, (row_id, topic, started_at) in enumerate(dividers):
+            end = dividers[i + 1][0] if i + 1 < len(dividers) else None
+            count = 0
+            first_user = ""
+            while ti < len(turns) and (end is None or int(turns[ti]["id"]) < end):
+                t = turns[ti]
+                ti += 1
+                if int(t["id"]) <= row_id:
+                    continue
+                content = str(t.get("content") or "")
+                # A typed slash command (/clear, /session switch …) is a
+                # control line, not a turn: it names no topic and counts for none.
+                if t.get("role") == "user" and content.lstrip().startswith("/"):
+                    continue
+                count += 1
+                if not first_user and t.get("role") == "user":
+                    first_user = content
+            out.append({
+                "row_id": row_id,
+                "agent_session_id": str(topic.get("agentSessionId") or ""),
+                "action": str(topic.get("action") or "new"),
+                "title": str(topic.get("title") or ""),
+                "started_at": started_at,
+                "first_user_message": first_user,
+                "message_count": count,
+            })
+        return out
 
     async def add_chat_messages(
         self, session_id: str, user_id: str, messages: list[dict],

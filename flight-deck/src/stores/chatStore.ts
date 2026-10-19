@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { AgentChatWS, splitImageRefs, type ChatMessage, type TokenUsage } from '../services/agentChat'
+import { AgentChatWS, splitImageRefs, type ChatMessage, type TokenUsage, type TopicMark } from '../services/agentChat'
 import { useAuthStore, registerSignOutFlush, registerSignOutTeardown } from './authStore'
 import { useContainerStore } from './containerStore'
 import { useLocalAgentStore } from './localAgentStore'
@@ -29,32 +29,56 @@ async function serverUpsertSession(id: string, agentId: string, agentName: strin
   } catch { /* ignore */ }
 }
 
-async function serverLoadMessages(sessionId: string): Promise<ChatMessage[]> {
+/** Rows per page of the lane's chat log. */
+const HISTORY_PAGE = 500
+
+interface LogRow { id: number; role: string; content: string; metadata: string; created_at: string }
+
+/** Rows of this lane's Flight Deck chat log, oldest first: the newest page,
+ *  the page before `before`, or everything from row `since` on. Null when
+ *  the log could not be read (the caller then keeps what the agent replays
+ *  rather than treating an empty answer as an empty log). */
+async function serverFetchMessages(
+  sessionId: string, q: { limit?: number; before?: number; since?: number } = {},
+): Promise<ChatMessage[] | null> {
   try {
-    const res = await fetch(`/fd/chat/sessions/${encodeURIComponent(sessionId)}/messages?limit=500`, {
+    const params = new URLSearchParams({ limit: String(q.limit ?? HISTORY_PAGE) })
+    if (q.before !== undefined) params.set('before', String(q.before))
+    if (q.since !== undefined) params.set('since_id', String(q.since))
+    const res = await fetch(`/fd/chat/sessions/${encodeURIComponent(sessionId)}/messages?${params}`, {
       headers: _chatHeaders(),
       credentials: 'include',
     })
-    if (!res.ok) return []
-    const rows = await res.json() as { role: string; content: string; metadata: string; created_at: string }[]
-    return rows.map((r, i) => {
-      let meta: Record<string, unknown> = {}
-      try { meta = JSON.parse(r.metadata || '{}') } catch { /* ignore */ }
-      const role = r.role as ChatMessage['role']
-      return {
-        id: `hist-${i}-${Date.now()}`,
-        role,
-        content: role === 'assistant' ? sanitizeAgentContent(r.content) : r.content,
-        timestamp: r.created_at,
-        replay: true,
-        tool_name: meta.tool_name as string | undefined,
-        tool_arguments: meta.tool_arguments as Record<string, unknown> | undefined,
-        tool_output: meta.tool_output as string | undefined,
-        model: meta.model as string | undefined,
-        peer_name: meta.peer_name as string | undefined,
-      }
-    })
-  } catch { return [] }
+    if (!res.ok) return null
+    const rows = await res.json() as LogRow[]
+    return rows.map(logRowToMessage)
+  } catch { return null }
+}
+
+function serverLoadMessages(sessionId: string): Promise<ChatMessage[] | null> {
+  return serverFetchMessages(sessionId)
+}
+
+/** A log row as a transcript message. Log rows are the transcript itself,
+ *  not a replay: they carry their row id and are never re-persisted. */
+function logRowToMessage(r: LogRow): ChatMessage {
+  let meta: Record<string, unknown> = {}
+  try { meta = JSON.parse(r.metadata || '{}') } catch { /* ignore */ }
+  const role = r.role as ChatMessage['role']
+  const topic = meta.topic && typeof meta.topic === 'object' ? meta.topic as TopicMark : undefined
+  return {
+    id: `hist-${r.id}`,
+    rowId: r.id,
+    role,
+    content: role === 'assistant' ? sanitizeAgentContent(r.content) : r.content,
+    timestamp: r.created_at,
+    tool_name: meta.tool_name as string | undefined,
+    tool_arguments: meta.tool_arguments as Record<string, unknown> | undefined,
+    tool_output: meta.tool_output as string | undefined,
+    model: meta.model as string | undefined,
+    peer_name: meta.peer_name as string | undefined,
+    ...(topic ? { topic } : {}),
+  }
 }
 
 // ── Plan-state localStorage persistence ──
@@ -212,7 +236,7 @@ async function _flushMessages() {
   _msgQueue.clear()
   for (const [sessionId, msgs] of batches) {
     try {
-      await fetch(`/fd/chat/sessions/${encodeURIComponent(sessionId)}/messages`, {
+      const res = await fetch(`/fd/chat/sessions/${encodeURIComponent(sessionId)}/messages`, {
         method: 'POST',
         headers: _chatHeaders(),
         credentials: 'include',
@@ -226,9 +250,32 @@ async function _flushMessages() {
               ...(m.tool_output ? { tool_output: m.tool_output } : {}),
               ...(m.model ? { model: m.model } : {}),
               ...(m.peer_name ? { peer_name: m.peer_name } : {}),
+              ...(m.topic ? { topic: m.topic } : {}),
             }),
           })),
         }),
+      })
+      if (!res.ok) continue
+      // The log's row ids come back in order: stamp them on the messages so a
+      // divider just inserted is jumpable and "earlier" paging knows the edge.
+      const body = await res.json().catch(() => null) as { ids?: number[] } | null
+      const ids = body?.ids
+      if (!ids || ids.length !== msgs.length) continue
+      const rowIds = new Map(msgs.map((m, i) => [m.id, ids[i]] as const))
+      useChatStore.setState((state) => {
+        const s = state.sessions.get(sessionId)
+        if (!s) return state
+        let changed = false
+        const messages = s.messages.map((m) => {
+          const rid = rowIds.get(m.id)
+          if (rid === undefined || m.rowId === rid) return m
+          changed = true
+          return { ...m, rowId: rid }
+        })
+        if (!changed) return state
+        const sessions = new Map(state.sessions)
+        sessions.set(sessionId, { ...s, messages })
+        return { sessions }
       })
     } catch { /* ignore */ }
   }
@@ -812,6 +859,20 @@ interface ChatSession {
   /** Why the agent can't be reached while the chat keeps reconnecting (it is
    *  restarting, or gone). Shown on the chat in place of an error per retry. */
   unreachable?: string | null
+  /** The agent session this lane's context is on — from `welcome`,
+   *  `session_info` and command results. Empty until the agent says. */
+  agentSessionId: string
+  /** Flight Deck's chat log for this lane is loaded (auth on). From then on
+   *  the log IS the transcript: the agent's replay is folded into it, and
+   *  /new, /session switch and /clear add topic dividers instead of wiping
+   *  the screen. */
+  historyLoaded: boolean
+  /** The loaded window of the log starts after older rows ("Earlier
+   *  messages" fetches the page before it). */
+  hasOlder: boolean
+  /** Until this time, a change in message count must not auto-scroll to the
+   *  bottom: older rows were prepended, or the view jumped to a topic. */
+  holdScrollUntil: number
 }
 
 /** What the internal opener needs; `shared` marks an agent shared with you. */
@@ -851,8 +912,18 @@ interface ChatStore {
   /** `fromQueue` marks a turn the queue dispatched: no next-step suggestions. */
   sendMessage: (containerId: string, content: string, opts?: { fromQueue?: boolean }) => void
   sendBtw: (containerId: string, content: string) => void
-  /** Start a new session on this lane (the agent's /new). */
+  /** Start a new topic on this lane (the agent's /new): the agent's context
+   *  starts fresh; the transcript keeps going, with a divider. */
   newSession: (containerId: string) => void
+  /** Put the lane's context back on an earlier topic's agent session (the
+   *  agent's /session switch); shown as a "Back on …" divider. */
+  resumeTopic: (containerId: string, agentSessionId: string) => void
+  /** Prepend the page of the chat log before the loaded window. */
+  loadOlder: (containerId: string) => Promise<void>
+  /** Make the divider with this log row id part of the loaded window —
+   *  fetching the log from it on when it isn't — and return that message's
+   *  id to scroll to (null when it can't be found). */
+  jumpToTopic: (containerId: string, rowId: number) => Promise<string | null>
   /** Append a local system note to the chat (no agent turn) — e.g. "started flow X". */
   addLocalNote: (containerId: string, content: string) => void
   cancelTask: (containerId: string) => void
@@ -949,6 +1020,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       auth,
       ws,
       messages: [],
+      agentSessionId: '',
+      historyLoaded: false,
+      hasOlder: false,
+      holdScrollUntil: 0,
       connected: false,
       busy: false,
       statusText: '',
@@ -981,19 +1056,27 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     if (useAuthStore.getState().authEnabled) {
       serverUpsertSession(key, containerId, containerName).then(() =>
         serverLoadMessages(key).then((history) => {
-          if (history.length > 0) {
-            useChatStore.setState((state) => {
-              const s = state.sessions.get(key)
-              if (!s) return state
-              // Only prepend history if session still has no real messages (avoid duplication)
-              if (s.messages.length > 0 && !s.messages[0].replay) return state
-              const merged = [...history, ...s.messages.filter((m) => !m.replay)]
-              const updated = { ...s, messages: merged }
-              const newSessions = new Map(state.sessions)
-              newSessions.set(key, updated)
-              return { sessions: newSessions }
-            })
-          }
+          // Unreadable log: keep whatever the agent replays, as before.
+          if (history === null) return
+          // The log is the transcript. A replay that arrived first is folded
+          // into it (only what the log is missing gets appended, and
+          // persisted); live rows that arrived meanwhile stay at the end.
+          const pendingReplay: ChatMessage[] = []
+          useChatStore.setState((state) => {
+            const s = state.sessions.get(key)
+            if (!s || s.historyLoaded) return state
+            pendingReplay.push(...s.messages.filter((m) => m.replay))
+            const live = s.messages.filter((m) => !m.replay)
+            const updated = {
+              ...s, messages: [...history, ...live],
+              historyLoaded: true, hasOlder: history.length >= HISTORY_PAGE,
+            }
+            const newSessions = new Map(state.sessions)
+            newSessions.set(key, updated)
+            return { sessions: newSessions }
+          })
+          if (pendingReplay.length) mergeReplay(key, pendingReplay)
+          reconcileTopic(key)
         })
       )
     }
@@ -1046,16 +1129,30 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       })
     })
 
+    // The agent's session changed under this lane — a /new or /session
+    // switch typed on another channel, a "new topic" cue — or just a
+    // rename/model change on the same one (then nothing to mark).
+    ws.on('session_info', (data) => {
+      const id = String(data.id ?? '')
+      if (!id) return
+      const count = Number(data.message_count ?? 0)
+      markTopic(key, {
+        id, name: String(data.name ?? ''),
+        action: count > 0 ? 'resume' : 'new', source: 'agent',
+      })
+    })
+
     ws.on('welcome', (data) => {
       const sessionInfo = data.session as Record<string, unknown> | undefined
       const name = sessionInfo?.name as string || ''
+      const agentSessionId = String(sessionInfo?.id ?? '')
       if (shared) {
         // A shared agent offers no model or persona choice, and it must NOT
         // get the peer_agents handshake below — that would hand the member's
         // own agents (and their tokens) to somebody else's agent.
         const sp = data.speaker as Record<string, unknown> | undefined
         const patch: Partial<ChatSession> = {
-          models: [], personalities: [],
+          models: [], personalities: [], agentSessionId,
           speaker: sp ? {
             id: String(sp.id ?? ''), name: String(sp.name ?? ''),
             owner_name: String(sp.owner_name ?? ''), lane: String(sp.lane ?? ''),
@@ -1063,13 +1160,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         }
         if (name) patch.statusText = `Session: ${name}`
         updateSession(key, patch)
+        reconcileTopic(key)
         return
       }
       const models = (data.models as AgentModelInfo[] || [])
       const personalities = (data.personalities as AgentPersonalityInfo[] || [])
-      const patch: Partial<ChatSession> = { models, personalities }
+      const patch: Partial<ChatSession> = { models, personalities, agentSessionId }
       if (name) patch.statusText = `Session: ${name}`
       updateSession(key, patch)
+      reconcileTopic(key)
 
       // Send peer agent awareness to the connected agent
       const containers = useContainerStore.getState().containers
@@ -1257,36 +1356,19 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     ws.on('replay_batch', (data) => {
       const messages = (data.messages as Array<Record<string, unknown>>) || []
       if (messages.length === 0) return
+      const replayed = messages.map(replayToMessage)
+      // With the lane's log loaded, the log is the transcript: fold in only
+      // what it is missing (a reply that finished while no tab was open, a
+      // turn from another channel) instead of showing the session twice.
+      if (useChatStore.getState().sessions.get(key)?.historyLoaded) {
+        mergeReplay(key, replayed)
+        return
+      }
       // Clear old replay messages before adding new batch (prevents piling on reconnect)
       useChatStore.setState((state) => {
         const s = state.sessions.get(key)
         if (!s) return state
         const kept = s.messages.filter((m) => !m.replay)
-        const replayed: ChatMessage[] = messages.map((d) => {
-          const type = d.type as string
-          const role = d.role as string || ''
-          const rawContent = (d.content as string) || ''
-          if (type === 'monitor') {
-            return {
-              id: nextId(),
-              role: 'tool' as const,
-              content: (d.output as string) || '',
-              timestamp: new Date().toISOString(),
-              replay: true,
-              tool_name: d.tool_name as string,
-              tool_arguments: d.arguments as Record<string, unknown>,
-              tool_output: (d.output as string) || '',
-            }
-          }
-          return {
-            id: nextId(),
-            role: role as ChatMessage['role'],
-            content: role === 'assistant' ? sanitizeAgentContent(rawContent) : rawContent,
-            timestamp: (d.timestamp as string) || new Date().toISOString(),
-            replay: true,
-            model: (d.model as string) || '',
-          }
-        })
         const updated = { ...s, messages: [...replayed, ...kept] }
         const newSessions = new Map(state.sessions)
         newSessions.set(key, updated)
@@ -1406,20 +1488,33 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
     ws.on('command_result', (data) => {
       const command = (data.command as string || '').trim().toLowerCase()
-      // /clear and /new (typed, the New-session button, or a "new topic"
-      // cue the agent acted on) leave an empty conversation: wipe local
-      // messages first.
-      const created = String(data.content || '').startsWith('New session created')
-      if (command === '/clear' || ((command === '/new' || command.startsWith('/new ')) && created)) {
+      const content = String(data.content || '')
+      // /new (typed, the New-topic button, or a "new topic" cue the agent
+      // acted on), /session new|switch and /clear move or reset the agent's
+      // context. The transcript is one continuous timeline: they mark a
+      // topic boundary from the session the agent reports it is on now,
+      // instead of wiping the screen.
+      const created = content.startsWith('New session created')
+      const isNew = (command === '/new' || command.startsWith('/new ')) && created
+      const isSessionNew = /^\/session new\b/.test(command) && content.startsWith('Created and switched')
+      const isSwitch = /^\/session (switch|load)\b/.test(command) && content.startsWith('Switched to session')
+      const isClear = command === '/clear'
+      const after = data.session as { id?: unknown; name?: unknown } | undefined
+      const afterId = after?.id ? String(after.id) : ''
+      let marked = false
+      if (afterId && (isNew || isSessionNew || isSwitch || isClear)) {
+        marked = markTopic(key, {
+          id: afterId, name: String(after?.name ?? ''),
+          action: isClear ? 'clear' : isSwitch ? 'resume' : 'new', source: 'web',
+        }) !== 'none'
+      } else if (isClear || isNew) {
+        // An agent build that doesn't report its session: wipe, as before.
         clearMessages(key)
       }
-      const msg: ChatMessage = {
-        id: nextId(),
-        role: 'system',
-        content: data.content as string || '',
-        timestamp: new Date().toISOString(),
+      // The divider says it; the agent's one-liner would only repeat it.
+      if (!marked) {
+        addMessage(key, { id: nextId(), role: 'system', content, timestamp: new Date().toISOString() })
       }
-      addMessage(key, msg)
       // Slash commands run synchronously in the handler — once the
       // command_result arrives the agent is idle again. Without this
       // the "Thinking..." spinner stays pinned after `/plan`, `/help`,
@@ -1939,6 +2034,60 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     session.ws.sendJSON({ type: 'command', command: '/new' })
   },
 
+  resumeTopic: (containerId, agentSessionId) => {
+    const session = get().sessions.get(containerId)
+    if (!session || session.busy || !agentSessionId) return
+    if (session.agentSessionId === agentSessionId) return
+    session.ws.sendJSON({ type: 'command', command: `/session switch ${agentSessionId}` })
+  },
+
+  loadOlder: async (containerId) => {
+    const session = get().sessions.get(containerId)
+    if (!session || !session.hasOlder) return
+    const first = session.messages.find((m) => m.rowId !== undefined)
+    if (!first || first.rowId === undefined) {
+      updateSession(containerId, { hasOlder: false })
+      return
+    }
+    const rows = await serverFetchMessages(containerId, { before: first.rowId, limit: HISTORY_PAGE })
+    if (rows === null) return
+    useChatStore.setState((state) => {
+      const s = state.sessions.get(containerId)
+      if (!s) return state
+      const sessions = new Map(state.sessions)
+      sessions.set(containerId, {
+        ...s, messages: [...rows, ...s.messages],
+        hasOlder: rows.length >= HISTORY_PAGE, holdScrollUntil: Date.now() + 1500,
+      })
+      return { sessions }
+    })
+  },
+
+  jumpToTopic: async (containerId, rowId) => {
+    const session = get().sessions.get(containerId)
+    if (!session) return null
+    const have = session.messages.find((m) => m.rowId === rowId)
+    if (have) {
+      updateSession(containerId, { holdScrollUntil: Date.now() + 1500 })
+      return have.id
+    }
+    const rows = await serverFetchMessages(containerId, { since: rowId, limit: 2000 })
+    if (!rows || rows.length === 0) return null
+    useChatStore.setState((state) => {
+      const s = state.sessions.get(containerId)
+      if (!s) return state
+      // The window becomes the log from that divider on; rows that only
+      // exist here so far (not persisted yet) stay at the end.
+      const live = s.messages.filter((m) => m.rowId === undefined && !m.replay)
+      const sessions = new Map(state.sessions)
+      sessions.set(containerId, {
+        ...s, messages: [...rows, ...live], hasOlder: true, holdScrollUntil: Date.now() + 1500,
+      })
+      return { sessions }
+    })
+    return rows[0].id
+  },
+
   addLocalNote: (containerId, content) => {
     if (!get().sessions.get(containerId)) return
     addMessage(containerId, {
@@ -2221,6 +2370,201 @@ function clearMessages(containerId: string) {
     sessions.set(containerId, updated)
     return { sessions }
   })
+}
+
+// ── Topics: the continuous timeline's dividers ──
+
+/** A replayed session message (user/assistant turn or a monitor card) as a
+ *  transcript message flagged `replay`. */
+function replayToMessage(d: Record<string, unknown>): ChatMessage {
+  const type = d.type as string
+  const role = d.role as string || ''
+  const rawContent = (d.content as string) || ''
+  if (type === 'monitor') {
+    return {
+      id: nextId(),
+      role: 'tool' as const,
+      content: (d.output as string) || '',
+      timestamp: new Date().toISOString(),
+      replay: true,
+      tool_name: d.tool_name as string,
+      tool_arguments: d.arguments as Record<string, unknown>,
+      tool_output: (d.output as string) || '',
+    }
+  }
+  return {
+    id: nextId(),
+    role: role as ChatMessage['role'],
+    content: role === 'assistant' ? sanitizeAgentContent(rawContent) : rawContent,
+    timestamp: (d.timestamp as string) || new Date().toISOString(),
+    replay: true,
+    model: (d.model as string) || '',
+  }
+}
+
+/** Index of the last divider, or of the last divider for `agentSessionId`
+ *  when given; -1 when there is none. */
+function lastTopicIndex(messages: ChatMessage[], agentSessionId?: string): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const t = messages[i].topic
+    if (t && (!agentSessionId || t.agentSessionId === agentSessionId)) return i
+  }
+  return -1
+}
+
+function topicLabel(action: TopicMark['action'], name: string): string {
+  if (action === 'clear') return 'Context cleared'
+  if (action === 'resume') {
+    // Agent sessions are mostly named by default ("web-session", lanes):
+    // only a name somebody chose is worth repeating.
+    const n = name.trim()
+    const generic = !n || n === 'web-session' || n === 'default' || /^lane-/i.test(n)
+    return generic ? 'Back on an earlier topic' : `Back on: ${n}`
+  }
+  return 'New topic'
+}
+
+/** Mark that the lane's context is now on agent session `id`.
+ *  'inserted' — a divider was added; 'present' — the transcript already
+ *  ends on a divider for that session; 'deferred' — the log isn't loaded
+ *  yet (reconcileTopic adds the divider once it is); 'none' — no session. */
+function markTopic(
+  key: string,
+  t: { id: string; name: string; action: TopicMark['action']; source: TopicMark['source'] },
+): 'inserted' | 'present' | 'deferred' | 'none' {
+  const s = useChatStore.getState().sessions.get(key)
+  if (!s) return 'none'
+  if (useAuthStore.getState().authEnabled && !s.historyLoaded) {
+    if (s.agentSessionId !== t.id) updateSession(key, { agentSessionId: t.id })
+    return 'deferred'
+  }
+  const last = lastTopicIndex(s.messages)
+  if (t.action !== 'clear' && last >= 0 && s.messages[last].topic?.agentSessionId === t.id) {
+    if (s.agentSessionId !== t.id) updateSession(key, { agentSessionId: t.id })
+    return 'present'
+  }
+  const topic: TopicMark = { action: t.action, agentSessionId: t.id, source: t.source }
+  addMessage(key, {
+    id: nextId(), role: 'system', content: topicLabel(t.action, t.name),
+    timestamp: new Date().toISOString(), topic,
+  })
+  updateSession(key, { agentSessionId: t.id, nextStepOptions: [] })
+  return 'inserted'
+}
+
+/** With the log loaded and the agent's session known: when the transcript
+ *  doesn't end on a divider for that session (started on another channel,
+ *  after a restart, or before dividers existed), add one. */
+function reconcileTopic(key: string) {
+  if (!useAuthStore.getState().authEnabled) return
+  const s = useChatStore.getState().sessions.get(key)
+  if (!s || !s.historyLoaded || !s.agentSessionId) return
+  markTopic(key, { id: s.agentSessionId, name: '', action: 'new', source: 'agent' })
+}
+
+/** What identifies a turn when matching the agent's replay against the log:
+ *  the role and the words (whitespace folded, attached-image lines dropped —
+ *  the agent words those itself). */
+function turnKey(m: ChatMessage): string {
+  const text = m.content
+    .split('\n')
+    .filter((line) => !/^\[Attached image:\s*.+\]$/.test(line.trim()))
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 400)
+  return `${m.role}\n${text}`
+}
+
+/** Fold the agent's replay of its current session into the loaded log:
+ *  user/assistant turns the log doesn't have since the session's divider
+ *  (or anywhere in the window when it has none) are appended as persisted
+ *  rows, so the log heals. Replays never add tool cards. */
+function mergeReplay(key: string, replayed: ChatMessage[]) {
+  const s = useChatStore.getState().sessions.get(key)
+  if (!s) return
+  const start = lastTopicIndex(s.messages, s.agentSessionId || undefined)
+  const seen = new Set<string>()
+  for (let i = start + 1; i < s.messages.length; i++) {
+    const m = s.messages[i]
+    if (m.role === 'user' || m.role === 'assistant') seen.add(turnKey(m))
+  }
+  for (const m of replayed) {
+    if (m.role !== 'user' && m.role !== 'assistant') continue
+    const k = turnKey(m)
+    if (seen.has(k)) continue
+    seen.add(k)
+    addMessage(key, { ...m, replay: false })
+  }
+}
+
+export interface TopicInfo {
+  /** Log row id of the divider (absent for one not persisted yet). */
+  rowId?: number
+  /** The divider's message id in the loaded window, when it is there. */
+  messageId?: string
+  agentSessionId: string
+  action: TopicMark['action']
+  title: string
+  startedAt: string
+  firstUserMessage: string
+  messageCount: number
+}
+
+/** Topics from the dividers in the loaded window. */
+function topicsFromMessages(messages: ChatMessage[]): TopicInfo[] {
+  const out: TopicInfo[] = []
+  let cur: TopicInfo | null = null
+  for (const m of messages) {
+    if (m.topic) {
+      cur = {
+        rowId: m.rowId, messageId: m.id, agentSessionId: m.topic.agentSessionId,
+        action: m.topic.action, title: m.topic.title || '', startedAt: m.timestamp,
+        firstUserMessage: '', messageCount: 0,
+      }
+      out.push(cur)
+      continue
+    }
+    if (!cur) continue
+    if (m.role === 'user' || m.role === 'assistant') {
+      // A typed slash command is a control line, not a turn.
+      if (m.role === 'user' && m.content.trimStart().startsWith('/')) continue
+      cur.messageCount++
+      if (m.role === 'user' && !cur.firstUserMessage) cur.firstUserMessage = m.content
+    }
+  }
+  return out
+}
+
+/** The lane's topics, oldest first: from the log when it is loaded (so
+ *  topics beyond the loaded window are listed too), plus any divider only
+ *  this tab holds so far; otherwise from the loaded messages. */
+export async function fetchTopics(key: string): Promise<TopicInfo[]> {
+  const s = useChatStore.getState().sessions.get(key)
+  if (!s) return []
+  const local = topicsFromMessages(s.messages)
+  if (!useAuthStore.getState().authEnabled || !s.historyLoaded) return local
+  try {
+    const res = await fetch(`/fd/chat/sessions/${encodeURIComponent(key)}/topics`, {
+      headers: _chatHeaders(), credentials: 'include',
+    })
+    if (!res.ok) return local
+    const rows = await res.json() as Array<Record<string, unknown>>
+    const byRow = new Map(local.filter((t) => t.rowId !== undefined).map((t) => [t.rowId, t] as const))
+    const listed = rows.map((r): TopicInfo => {
+      const rowId = Number(r.row_id)
+      return {
+        rowId, messageId: byRow.get(rowId)?.messageId,
+        agentSessionId: String(r.agent_session_id ?? ''),
+        action: (String(r.action ?? 'new') as TopicMark['action']),
+        title: String(r.title ?? ''), startedAt: String(r.started_at ?? ''),
+        firstUserMessage: String(r.first_user_message ?? ''),
+        messageCount: Number(r.message_count ?? 0),
+      }
+    })
+    const known = new Set(listed.map((t) => t.rowId))
+    return [...listed, ...local.filter((t) => t.rowId === undefined || !known.has(t.rowId))]
+  } catch { return local }
 }
 
 function addMessage(containerId: string, msg: ChatMessage) {

@@ -33,6 +33,26 @@ export interface ChatMessage {
   /** Frozen cumulative turn token usage, stamped onto the last tool message
    *  of an activity group when the turn ends. */
   usage?: TokenUsage
+  /** Flight Deck chat-log row id — set when the row came from the log or
+   *  once it was persisted to it. Topics jump to a divider by this. */
+  rowId?: number
+  /** A topic boundary in the continuous per-lane transcript: the agent's
+   *  context moved to another session (`new`, `resume`) or was reset in
+   *  place (`clear`). Rendered as a divider; the Topics list is built from
+   *  these rows. */
+  topic?: TopicMark
+}
+
+export interface TopicMark {
+  action: 'new' | 'resume' | 'clear'
+  /** The agent session the lane's context is on from this row down. */
+  agentSessionId: string
+  /** Optional title (phase 2: agent-generated); the Topics list otherwise
+   *  names a topic after its first user message. */
+  title?: string
+  /** `web` — this client sent the command; `agent` — the agent reported a
+   *  session the transcript had no divider for (another channel, a restart). */
+  source: 'web' | 'agent'
 }
 
 type EventHandler = (data: Record<string, unknown>) => void
