@@ -5,8 +5,10 @@ Both ways in go through the deck's shared bot, which only Flight Deck polls
 (telegram_shared.route_update hands every update here first):
 
 * **Private chats** — the user connects the bot to their own account in
-  Telegram → Settings → Chat Automation (a Bot API "business connection"; no
-  Premium needed since Bot API 10.0) and picks which chats it covers. Telegram
+  Telegram → Settings → Chat Automation (Telegram 12.7+; with Premium also
+  Settings → Telegram Business → Chatbots) — a Bot API "business connection",
+  no Premium needed since Bot API 10.0 — and picks which chats it covers. The
+  bot needs Secretary Mode on in BotFather (getMe ``can_connect_to_business``). Telegram
   then hands the bot both sides of those chats, their edits and deletions.
   It never gets older history: the inbox starts when the connection does.
 * **Groups** — the user adds the bot to a group. It sees every message once
@@ -26,7 +28,8 @@ off — or disconnecting Telegram — deletes everything kept.
 
 What's kept: per user, in Flight Deck's database, text and names sealed with
 fd_crypto, for ``retention_days`` (default 30); deleted messages lose their
-text. Agents read it through ``/fd/telegram-inbox/agent/*`` (owner only).
+text. Agents read it through ``/fd/telegram-inbox/agent/*`` (owner only), and
+on each of the owner's own turns get one line of what's new (:func:`news`).
 """
 
 from __future__ import annotations
@@ -64,11 +67,12 @@ _unknown: dict[str, float] = {}
 _NOT_LINKED = (
     "This bot only reads chats for Flight Deck users who connected Telegram "
     "(Flight Deck → Connections → Telegram). Nothing is kept — you can remove it "
-    "in Settings → Chat Automation."
+    "in Settings → Chat Automation (or Settings → Telegram Business → Chatbots)."
 )
 _NOT_AVAILABLE = (
     "The Telegram inbox isn't available on this Flight Deck, so nothing is kept. "
-    "You can remove the bot in Settings → Chat Automation."
+    "You can remove the bot in Settings → Chat Automation (or Settings → Telegram "
+    "Business → Chatbots)."
 )
 _INBOX_OFF = (
     "Connected, but your Telegram inbox is off, so nothing is kept yet. Turn it on in "
@@ -80,8 +84,8 @@ _CONNECTED = (
     "never marks anything read."
 )
 _RIGHTS_TIP = (
-    "\n\nIt needs no permissions — you can switch them all off in Settings → Chat "
-    "Automation."
+    "\n\nIt needs no permissions — you can switch them all off where you connected it "
+    "(Settings → Chat Automation, or Telegram Business → Chatbots)."
 )
 _DISCONNECTED = "📭 Disconnected — nothing new from your private chats is kept."
 _JOINED = (
@@ -612,6 +616,7 @@ def _view(row: dict, chat: dict | None) -> dict[str, Any]:
     body = body if isinstance(body, dict) else {}
     deleted = bool(row.get("deleted"))
     return {
+        "id": row["id"],
         "chat_id": row["chat_id"],
         "chat": (chat or {}).get("title") or row["chat_id"],
         "kind": (chat or {}).get("kind") or "",
@@ -654,3 +659,46 @@ async def messages(
         if len(out) >= limit:
             break
     return out
+
+
+# ── what's new, per agent ───────────────────────────────────────────
+
+# An agent's first look covers this much (not the whole kept history).
+FIRST_LOOK_SECONDS = 86400
+
+
+async def news(db, user_id: str, agent_slug: str) -> dict[str, Any]:
+    """What others wrote since this agent last looked, per chat (counts and
+    chat names, never text), newest activity first — and the look itself: the
+    agent's cursor moves to the newest message kept. The first look covers the
+    last day."""
+    cursors = await db.tg_inbox_cursors(user_id, agent_slug)
+    first = "" not in cursors
+    top = await db.tg_inbox_max_id(user_id)
+    rows = await db.tg_inbox_unseen(
+        user_id, after_id=cursors.get("", 0),
+        since=int(time.time()) - FIRST_LOOK_SECONDS if first else None)
+    counts: dict[str, int] = {}
+    for row in rows:
+        chat_id = str(row["chat_id"])
+        if int(row["id"]) > cursors.get(chat_id, 0):  # not read further already
+            counts[chat_id] = counts.get(chat_id, 0) + 1
+    await db.set_tg_inbox_seen_all(user_id, agent_slug, top)
+    out = []
+    if counts:
+        for c in await chats(db, user_id):
+            if c["chat_id"] in counts:
+                out.append({"chat_id": c["chat_id"], "title": c["title"], "kind": c["kind"],
+                            "new": counts[c["chat_id"]]})
+    return {"chats": out, "total": sum(counts.values()), "first_look": first}
+
+
+async def mark_read(db, user_id: str, agent_slug: str, items: list[dict]) -> None:
+    """The agent read these: each chat's cursor moves to the newest of them."""
+    newest: dict[str, int] = {}
+    for item in items:
+        chat_id, row_id = str(item.get("chat_id") or ""), int(item.get("id") or 0)
+        if chat_id and row_id > newest.get(chat_id, 0):
+            newest[chat_id] = row_id
+    for chat_id, row_id in newest.items():
+        await db.advance_tg_inbox_cursor(user_id, agent_slug, chat_id, row_id)

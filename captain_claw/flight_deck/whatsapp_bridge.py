@@ -2103,6 +2103,10 @@ async def _handle_message(waid: str, message: dict[str, Any]) -> None:
     # 4. Text only. If empty, nothing to do.
     if not text:
         return
+    # Card numbers / CVVs never go further — not to flows, the reaction call,
+    # the bus mirror or the agent (card_scrub; Captain never needs them).
+    from captain_claw.card_scrub import scrub_user_text
+    text = scrub_user_text(text)
 
     # 4b. Face follow-up: "who is this?" / "remember this is Ana" right after a
     #     bare photo runs face recognition on it (Flight Deck). Only a whole

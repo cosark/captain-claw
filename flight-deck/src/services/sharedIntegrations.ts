@@ -139,7 +139,7 @@ export const decideTelegramLink = (userId: string, decision: 'approve' | 'reject
   )
 
 // What BotFather allows the bot (null: not checked yet): connecting to people's
-// accounts through Chat Automation (Business Mode), reading every group message
+// accounts through Chat Automation (Secretary Mode), reading every group message
 // (privacy mode off).
 export interface BotFlags {
   business: boolean | null

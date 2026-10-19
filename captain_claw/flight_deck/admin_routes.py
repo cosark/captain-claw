@@ -224,6 +224,9 @@ async def delete_user(user_id: str, admin: dict = Depends(require_admin)):
     deleted = await db.delete_user(user_id)
     if not deleted:
         raise HTTPException(404, "User not found")
+    from captain_claw.flight_deck import payments_routes
+
+    await payments_routes.forget_user(user_id)
     # Their profile went with them: their agents' copies of it go too.
     try:
         from captain_claw.flight_deck import tenant_profile

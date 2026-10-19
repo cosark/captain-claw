@@ -61,8 +61,14 @@ def test_a_reader_hint_for_each_data_file():
     ("a.ogg", "audio recording — there is no transcription tool"),
     ("a.xls", "no built-in reader"),
 ])
-def test_reader_hint_by_type(name, expected):
+def test_reader_hint_by_type(name, expected, monkeypatch):
+    monkeypatch.setattr(ch, "_transcription_usable", lambda: False)
     assert expected in ch.attachment_reader_hint(f"/w/{name}")
+
+
+def test_an_audio_file_names_the_audio_tool_when_it_can_transcribe(monkeypatch):
+    monkeypatch.setattr(ch, "_transcription_usable", lambda: True)
+    assert "transcribe it with the audio tool" in ch.attachment_reader_hint("/w/a.ogg")
 
 
 def test_an_extracted_zip_folder_is_listed_with_glob(tmp_path):

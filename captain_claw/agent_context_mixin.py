@@ -2332,6 +2332,12 @@ class AgentContextMixin:
             await soniox_client.available()
         except Exception as _exc:
             log.debug("Soniox connection priming failed: %s", _exc)
+        # And payments: whether the owner's Flight Deck has them on.
+        try:
+            from captain_claw import payments_client
+            await payments_client.refresh(force=True)
+        except Exception as _exc:
+            log.debug("Payments priming failed: %s", _exc)
 
         self._initialized = True
         log.info("Agent initialized", session_id=self.session.id)
@@ -2666,6 +2672,11 @@ class AgentContextMixin:
             # when this agent wasn't spawned by a Flight Deck).
             from captain_claw.tools.public_link import PublicLinkTool
             self.tools.register(PublicLinkTool())
+            # Payments — bill pay by barcode. Hidden unless the owner's Flight
+            # Deck has payments on (FD_PAYMENTS), refreshed per turn — see the
+            # registry. Captain never moves money; the user pays in their bank app.
+            from captain_claw.tools.payments import PaymentsTool
+            self.tools.register(PaymentsTool(), metadata={"requires_payments": True})
             # Code-app authoring — always registered; calls return a clear error
             # if FD_URL isn't available, so registration cost is negligible.
             from captain_claw.tools.app_runner import AppRunnerTool
@@ -4404,6 +4415,22 @@ class AgentContextMixin:
             )
         return "Your reply goes to a WhatsApp chat. To send a file or picture there, use whatsapp_send_file."
 
+    def _telegram_news_note(self) -> str:
+        """One line of what others wrote on the owner's Telegram since this
+        agent's last look — only when the turn fetched it (owner's live turns)."""
+        news = getattr(self, "_turn_telegram_news", None)
+        if not news:
+            return ""
+        from captain_claw.telegram_inbox_client import news_line
+
+        if self.instructions.use_nano:
+            detail = "nano"
+        elif self.instructions.use_micro:
+            detail = "micro"
+        else:
+            detail = "normal"
+        return news_line(news, detail=detail)
+
     def _surface_rules_for_turn(self) -> str:
         """The chat surface's rules when this turn came from one (glasses,
         WhatsApp, Messenger): stored when the surface's block first arrived,
@@ -4896,6 +4923,10 @@ class AgentContextMixin:
             _delivery_text = self._whatsapp_delivery_note()
             if _delivery_text:
                 env_note = [("whatsapp_delivery", _delivery_text)] + env_note
+            # What's new on the owner's Telegram (fetched at turn start).
+            _telegram_text = self._telegram_news_note()
+            if _telegram_text:
+                env_note = [("telegram_news", _telegram_text)] + env_note
             self._turn_env_tokens = self._count_tokens(_env_text) if _env_text else 0
             reserved_tokens = 0
             if turn_anchor_pos is not None:

@@ -1697,3 +1697,100 @@ def test_a_calendar_change_goes_into_the_ledger() -> None:
     later = fg.ledger_with(ledger, _tool_msg("Thread t-9  |  Newest msg: m-9", "google_mail",
                                              action="search"))
     assert later["events"] == [_EVENT]
+
+
+# ── Payment claims ───────────────────────────────────────────────────
+
+_PREPARED = ToolStep("payments", "handoff", {"id": "pay_0123456789ab"},
+                     "payment_intent: pay_0123456789ab status: handed_off\nDONE — the payment is ready "
+                     "for the user to pay in their bank app. Nothing has been paid.")
+_MARKED = ToolStep("payments", "mark", {"id": "pay_0123456789ab"},
+                   "payment_intent: pay_0123456789ab status: user_paid\nThe user marked it paid.")
+
+
+def _pay_facts(*steps: ToolStep, offered: bool = True) -> TurnFacts:
+    return TurnFacts(request="plati HEP", turn_steps=steps, session_steps=steps,
+                     mail_tools=frozenset(), calendar_tools=frozenset(),
+                     payment_tools=fg.PAYMENT_TOOLS if offered else frozenset())
+
+
+@pytest.mark.parametrize("reply", [
+    "I paid the HEP bill, 84,20 EUR.",
+    "Done — I've transferred the money to HEP.",
+    "Platio sam račun za struju.",
+    "Račun sam platio jutros.",
+    "Izvršio sam plaćanje prema HEP-u.",
+    "Poslao sam novac Ani.",
+    "Paid ✓",
+    "The invoice has been paid.",
+    "Račun je plaćen.",
+    "Uplata je izvršena.",
+    "Payment went through.",
+])
+def test_a_payment_claim_without_the_ledger_is_false(reply) -> None:
+    verdict = fg.judge_reply(reply, reply, _pay_facts(_PREPARED))
+    assert verdict.kinds == (fg.PAYMENT_CLAIM,)
+    assert verdict.corrective == fg.payment_corrective()
+    assert verdict.backstop == fg.PAYMENT_BACKSTOP
+    assert fg.has_backstop(reply + "\n\n" + verdict.backstop)
+
+
+@pytest.mark.parametrize("reply", [
+    "The barcode is ready — scan it in your bank app and approve the payment there.",
+    "It's not paid yet; the barcode is ready.",
+    "Račun nije plaćen — evo barkoda.",
+    "Once you've paid, tap 'I paid' on the page.",
+    "Kad platiš, javi mi.",
+    "Is the invoice paid?",
+    "You marked it as paid on 19.10.",
+    "Platio si račun, super.",
+    "This is a paid plan, so the invoice comes monthly.",
+    'You wrote "platio sam", so I marked it.',
+    "- **HEP**: payment was received, thanks.",
+])
+def test_not_payment_claims(reply) -> None:
+    assert fg.judge_reply(reply, reply, _pay_facts(_PREPARED)).kinds == ()
+
+
+def test_the_ledger_backs_a_bill_being_paid_but_never_the_agent_paying() -> None:
+    assert fg.judge_reply("The HEP bill is paid.", "The HEP bill is paid.", _pay_facts(_MARKED)).kinds == ()
+    assert fg.judge_reply("Račun je plaćen ✓", "Račun je plaćen ✓", _pay_facts(_MARKED)).kinds == ()
+    verdict = fg.judge_reply("I paid it.", "I paid it.", _pay_facts(_MARKED))
+    assert verdict.kinds == (fg.PAYMENT_CLAIM,)
+
+
+def test_no_payments_tool_means_no_payment_verdict() -> None:
+    assert fg.judge_reply("I paid it.", "I paid it.", _pay_facts(offered=False)).kinds == ()
+
+
+def test_a_made_up_payment_id_is_caught() -> None:
+    reply = "Payment pay_ffffffffffff is ready for you."
+    assert fg.fabricated_ids(reply, ["payment_intent: pay_0123456789ab status: ready"]) == ("pay_ffffffffffff",)
+    assert fg.fabricated_ids("pay_0123456789ab is ready", ["payment_intent: pay_0123456789ab"]) == ()
+
+
+def test_the_payment_corrective_never_asks_to_pay() -> None:
+    text = fg.payment_corrective()
+    assert not re.search(r"(?i)\b(?:pay|transfer|send)\s+(?:it|now|the\s+money)\b", text)
+
+
+# ── Purchase claims (Phase 3: Captain pays only for an approved, confirmed purchase) ──
+
+_PURCHASED = ToolStep("payments", "checkout_pay", {"id": "pur_0123456789ab"},
+                      "purchase_intent: pur_0123456789ab status: ordered\nThe checkout confirmed the order.")
+_PURCHASE_PENDING = ToolStep("payments", "purchase", {"id": "pur_0123456789ab"},
+                             "purchase_intent: pur_0123456789ab status: awaiting_approval")
+
+
+@pytest.mark.parametrize("reply", ["I ordered the shoes.", "I've placed the order.", "Naručio sam knjigu.",
+                                   "Your order is confirmed.", "I paid with the one-time card."])
+def test_a_purchase_claim_needs_a_confirmed_purchase(reply) -> None:
+    assert fg.judge_reply(reply, reply, _pay_facts(_PURCHASE_PENDING)).kinds == (fg.PAYMENT_CLAIM,)
+    assert fg.judge_reply(reply, reply, _pay_facts(_PURCHASED)).kinds == ()
+
+
+def test_a_confirmed_purchase_doesnt_make_a_bill_paid_by_captain_true_elsewhere() -> None:
+    # "I paid" is backed by the purchase; the bill's state still needs the ledger.
+    assert fg.judge_reply("I paid it.", "I paid it.", _pay_facts(_PURCHASED)).kinds == ()
+    assert fg.judge_reply("Once you approve, I'll place the order.", "Once you approve, I'll place the order.",
+                          _pay_facts(_PURCHASE_PENDING)).kinds == ()

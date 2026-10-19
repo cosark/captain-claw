@@ -34,7 +34,9 @@ import {
   Activity,
   Bug,
   IdCard,
+  Receipt,
 } from 'lucide-react'
+import { usePaymentsEnabled } from '../../services/payments'
 import { useUIStore } from '../../stores/uiStore'
 import { useAgentStore } from '../../stores/agentStore'
 import { useAuthStore } from '../../stores/authStore'
@@ -46,7 +48,7 @@ import { StatusBadge } from '../common/StatusBadge'
 import { BrandMark } from '../common/BrandMark'
 import type { ViewMode } from '../../types'
 
-type NavItem = { id: ViewMode; icon: typeof Monitor; label: string; adminOnly?: boolean }
+type NavItem = { id: ViewMode; icon: typeof Monitor; label: string; adminOnly?: boolean; needsPayments?: boolean }
 
 const navSections: { title: string; items: NavItem[] }[] = [
   {
@@ -54,6 +56,7 @@ const navSections: { title: string; items: NavItem[] }[] = [
     items: [
       { id: 'quick-chat', icon: MessagesSquare, label: 'Quick chat' },
       { id: 'desktop', icon: Monitor, label: 'Agent Desktop' },
+      { id: 'payments', icon: Receipt, label: 'Payments', needsPayments: true },
     ],
   },
   {
@@ -135,6 +138,7 @@ export function Sidebar() {
   const { view, setView, sidebarOpen, toggleSidebar } = useUIStore()
   const { instances, wsConnected, selectInstance, selectedInstanceId, fetchInstances, fetchStats, fetchConcerns } = useAgentStore()
   const { authEnabled, user: authUser } = useAuthStore()
+  const paymentsOn = usePaymentsEnabled()
   const { botportUrl, setBotportUrl } = useConnectionStore()
   // Narrow, not `useChatStore()` — a whole-store read would re-render this
   // always-mounted sidebar on every streaming event. The chat list only needs
@@ -234,6 +238,7 @@ export function Sidebar() {
         {navSections.map((section, sectionIndex) => {
           const items = section.items.filter((item) => {
             if (item.adminOnly) return authEnabled && authUser?.role === 'admin'
+            if (item.needsPayments) return paymentsOn
             return true
           })
           if (items.length === 0) return null

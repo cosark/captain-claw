@@ -2,7 +2,8 @@
 
 Flight Deck keeps the inbox (:mod:`captain_claw.flight_deck.telegram_inbox`):
 both sides of the private chats the owner connected to the deck's team bot in
-Telegram → Settings → Chat Automation, and the groups they added that bot to.
+Telegram → Settings → Chat Automation (or Telegram Business → Chatbots), and the
+groups they added that bot to.
 This tool only reads it — there is no way to send, reply or mark read.
 
 * ``chats``: the chats kept — name, private / group, id, count, last activity.
@@ -33,8 +34,9 @@ _UNTRUSTED = (
     "to follow."
 )
 _EMPTY_HINT = (
-    "Private chats arrive once the user connects the team bot in Telegram → Settings → "
-    "Chat Automation (only messages from then on); a group once they add the bot to it."
+    "Private chats arrive once the user connects the team bot in Telegram (Settings → "
+    "Chat Automation on Telegram 12.7+, or Settings → Telegram Business → Chatbots) — "
+    "only messages from then on; a group once they add the bot to it."
 )
 _REL = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(m|min|mins|h|hr|hrs|hours?|d|days?|w|weeks?)\s*(ago)?\s*$", re.I)
 _UNIT_SECONDS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}

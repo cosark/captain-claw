@@ -511,6 +511,16 @@ def context_note_lines(notes: list[str] | None) -> list[str]:
     return lines[:_MAX_CONTEXT_NOTES]
 
 
+def _transcription_usable() -> bool:
+    """Whether this agent can transcribe a recording (the ``audio`` tool shows)."""
+    try:
+        from captain_claw import soniox_client
+
+        return soniox_client.soniox_usable()
+    except Exception:
+        return False
+
+
 def attachment_reader_hint(path: str) -> str | None:
     """``(<name>: <kind> — open it with <tool>.)`` for an attached data file;
     None for a video (analyzed automatically). A weak model otherwise gets a
@@ -531,7 +541,9 @@ def attachment_reader_hint(path: str) -> str | None:
     elif ext == ".zip":
         desc = "archive — list or extract it with shell (unzip -l / unzip)"
     elif ext in _AUDIO_EXTS:
-        desc = ("audio recording — there is no transcription tool; use any transcript "
+        desc = ("audio recording — transcribe it with the audio tool (action='transcribe') "
+                "when its content matters" if _transcription_usable() else
+                "audio recording — there is no transcription tool; use any transcript "
                 "in the notes, otherwise tell the user plainly")
     elif ext in _READER_BY_SUFFIX:
         reader = _READER_BY_SUFFIX[ext]
@@ -743,8 +755,12 @@ async def handle_chat(
     *task* (a Flight Deck scheduled task, :func:`task_marker`) runs the
     rerouted turn in the task's own session (see :func:`enter_task_session`).
     """
+    from captain_claw.card_scrub import scrub_user_text
     from captain_claw.speaker import speaker_error, speaker_key_of
 
+    # Card numbers / CVVs never go further — not to the echo, task naming,
+    # flows or the agent (card_scrub; Captain never needs them).
+    content = scrub_user_text(content)
     speaker_key = speaker_key_of(ws)
     if not server.agent:
         await server._send(ws, speaker_error("invalid", "Agent not initialized")

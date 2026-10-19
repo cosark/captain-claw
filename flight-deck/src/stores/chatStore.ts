@@ -9,6 +9,7 @@ import { useQuotaStore } from './quotaStore'
 import type { QuotaStatus } from '../services/profile'
 import type { TraceSpan } from '../types'
 import { sanitizeAgentContent } from '../utils/sanitizeAgentContent'
+import { scrubUserText } from '../utils/cardScrub'
 import { SHARED_PREFIX, sharedContainerId, sharedSliceId } from '../utils/sharedAgent'
 
 // ── Chat persistence helpers ──
@@ -2158,6 +2159,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   sendMessage: (containerId, content, opts) => {
     const session = get().sessions.get(containerId)
     if (!session) return
+    // A card number / CVV never reaches the bubble, Flight Deck's chat log or
+    // the agent (utils/cardScrub — Captain never needs one).
+    content = scrubUserText(content)
     // An answer ends the hold — the agent's next reply is re-evaluated fresh.
     cancelQuestionWatch(containerId)
     // Add user message to local state
