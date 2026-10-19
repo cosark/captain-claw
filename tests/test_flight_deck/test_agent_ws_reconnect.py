@@ -155,6 +155,25 @@ def test_a_stopped_agent_is_not_waited_for(deck):
     assert took < 1.0
 
 
+def test_a_refused_token_is_a_close_code_not_a_failed_handshake(deck, monkeypatch):
+    # After a restart without FD_JWT_SECRET the browser's token is signed with
+    # the old key. It must learn that (4001) to refresh it — a rejected
+    # handshake looks like any network failure and was retried forever.
+    monkeypatch.setattr(srv, "AUTH_ENABLED", True)
+    deck["helper"] = {"name": "helper", "web_port": _free_port(), "web_auth": "secret"}
+
+    async def scenario(fd_port):
+        url = (f"ws://127.0.0.1:{fd_port}/fd/agent-ws/localhost/24001"
+               "?fd_token=signed-before-restart&agent=proc-helper")
+        async with websockets.connect(url) as c:
+            try:
+                await asyncio.wait_for(c.recv(), 5)
+            except websockets.ConnectionClosed as exc:
+                return exc.rcvd.code if exc.rcvd else None
+
+    assert _run(scenario) == 4001
+
+
 def _accepted(path: str) -> logging.LogRecord:
     return logging.LogRecord("uvicorn.error", logging.INFO, "", 0,
                              '%s - "WebSocket %s" [accepted]', ("127.0.0.1:5000", path), None)
