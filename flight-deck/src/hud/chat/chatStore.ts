@@ -636,8 +636,10 @@ function onMonitor(d: Data): void {
   set({ busy: true, status: get().status || 'Working…' })
 }
 
-/** Own agent: a connection attempt ended before the agent's welcome. */
-function onFailedAttempt(sock: AgentChatWS): void {
+/** Own agent: a connection attempt ended before the agent's welcome.
+ *  `code` 4001: Flight Deck refused the FD token (expired, or signed before
+ *  it restarted) — the retry gets a fresh one. */
+function onFailedAttempt(sock: AgentChatWS, code: number): void {
   // AgentChatWS would keep retrying an agent that is down for good. Back off
   // here instead, and stop after a few tries (Reconnect chip).
   sock.disconnect()
@@ -651,7 +653,7 @@ function onFailedAttempt(sock: AgentChatWS): void {
   retryTimer = setTimeout(() => {
     retryTimer = null
     void (async () => {
-      await ensureFreshToken(120_000, failedAttempts >= 3)
+      await ensureFreshToken(120_000, failedAttempts >= 3 || code === 4001)
       if (ws !== sock || pausedHidden || retryTimer || get().closed) return
       sock.connect()
     })()
@@ -669,14 +671,14 @@ function bind(sock: AgentChatWS): void {
     welcomed = false
   })
   on('welcome', onWelcome)
-  on('_disconnected', () => {
+  on('_disconnected', (d) => {
     const live = welcomed
     welcomed = false
     set({ connected: false })
     idle()
     // A live socket that dropped: AgentChatWS reconnects (its backoff works
     // then). Shared sockets only count as open on the welcome anyway.
-    if (!live && attached?.kind !== 'shared') onFailedAttempt(sock)
+    if (!live && attached?.kind !== 'shared') onFailedAttempt(sock, Number(d.code) || 0)
   })
   on('_reconnecting', (d) => {
     const attempt = Number(d.attempt) || 0

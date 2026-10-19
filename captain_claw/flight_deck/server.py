@@ -4232,6 +4232,11 @@ async def agent_ws_proxy(ws: WebSocket, host: str, port: int, token: str = "", l
             except HTTPException:
                 payload = None
         if not payload:
+            # Accept first, so the browser sees 4001 rather than a bare failed
+            # handshake: its token is expired, or was signed before Flight Deck
+            # restarted (without FD_JWT_SECRET every start re-keys). It then
+            # refreshes the token and reopens instead of retrying it forever.
+            await ws.accept()
             await ws.close(code=4001, reason="Missing or invalid token")
             return
         if payload.get("role", "user") != "admin":

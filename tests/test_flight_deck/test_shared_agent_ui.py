@@ -659,6 +659,29 @@ def test_owner_socket_follows_the_agent_to_its_new_port():
     ]
 
 
+def test_owner_socket_refreshes_a_refused_token_and_reopens():
+    out = _ws_scenario("""
+      sockets.length = 0; timers.length = 0; refreshCalls = 0; refreshOk = true; token = 'jwt-1';
+      const c = new AgentChatWS('proc-helper', 'localhost', 24001, 'agent-secret', '');
+      c.connect();
+      sockets[0].onclose({ code: 4001, reason: 'Missing or invalid token' });
+      await flush();
+      const afterFirst = { sockets: sockets.length, timers: timers.length, refreshCalls };
+      sockets[1].onclose({ code: 4001, reason: 'Missing or invalid token' });
+      await flush();
+      out = { afterFirst, sockets: sockets.length, timers: timers.length, refreshCalls,
+              urls: sockets.map((s) => s.url) };
+    """)
+    # Flight Deck restarted and no longer takes the old token: one refresh,
+    # reopened at once with the new token — no backoff in between.
+    assert out["afterFirst"] == {"sockets": 2, "timers": 0, "refreshCalls": 1}
+    assert parse_qs(urlsplit(out["urls"][1]).query)["fd_token"] == ["jwt-r1"]
+    # Refused again right away: no refresh loop — the backoff takes over.
+    assert out["refreshCalls"] == 1
+    assert out["sockets"] == 2
+    assert out["timers"] == 1
+
+
 # ── a shared agent's queue doesn't outlive the session in this browser ──
 
 # A Map-backed localStorage and a switchable signed-in user: `user = …` is a
