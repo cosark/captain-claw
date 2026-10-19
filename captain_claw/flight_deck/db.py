@@ -1611,6 +1611,42 @@ class FlightDeckDB:
             })
         return out
 
+    async def set_chat_topic_title(
+        self, session_id: str, user_id: str, row_id: int, title: str,
+    ) -> bool:
+        """Rename one topic divider of the user's chat log (its
+        ``metadata.topic.title``). False when the session isn't the user's or
+        the row isn't a divider."""
+        assert self._db is not None
+        sess = await self.get_chat_session(session_id, user_id)
+        if not sess:
+            return False
+        async with self._db.execute(
+            "SELECT id, role, metadata FROM chat_messages WHERE id = ? AND session_id = ?",
+            (int(row_id), session_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return False
+        row = dict(row)
+        if row.get("role") != "system":
+            return False
+        try:
+            meta = json.loads(row.get("metadata") or "{}")
+        except (TypeError, ValueError):
+            return False
+        topic = meta.get("topic") if isinstance(meta, dict) else None
+        if not isinstance(topic, dict):
+            return False
+        topic["title"] = " ".join(str(title or "").split())[:120]
+        meta["topic"] = topic
+        await self._db.execute(
+            "UPDATE chat_messages SET metadata = ? WHERE id = ?",
+            (json.dumps(meta), int(row_id)),
+        )
+        await self._db.commit()
+        return True
+
     async def add_chat_messages(
         self, session_id: str, user_id: str, messages: list[dict],
     ) -> list[int]:

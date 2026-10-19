@@ -35,6 +35,9 @@ _BACKGROUND_MAINTENANCE_LABELS = {
     "insight_extraction",
     "nervous_system_dream",
     "conversation_topics",
+    # Naming the session just left behind (/new): the user is already typing
+    # into the new topic, so this must not flip the chat to busy.
+    "session_title",
 }
 
 

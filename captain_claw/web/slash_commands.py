@@ -249,6 +249,7 @@ async def handle_command(server: WebServer, ws: web.WebSocketResponse, raw: str)
 
         elif cmd in ("/new",):
             name = args.strip() or None
+            outgoing = getattr(server.agent, "session", None)
             # Freeze the outgoing session into history before switching, so the
             # conversation stays verbatim-searchable (same as before compaction).
             server.agent.archive_current_session_to_history()
@@ -269,6 +270,8 @@ async def handle_command(server: WebServer, ws: web.WebSocketResponse, raw: str)
             server.agent.last_context_window = {}
             result = f"New session created: **{session.name}** (`{session.id[:8]}`)"
             server._broadcast({"type": "session_info", **server._session_info()})
+            if session is not outgoing:
+                _title_session_in_background(server, outgoing)
 
         elif cmd in ("/session",):
             if not args.strip():
@@ -527,7 +530,7 @@ async def handle_command(server: WebServer, ws: web.WebSocketResponse, raw: str)
 
 
 def _session_summary(server: Any) -> dict[str, Any]:
-    """``{id, name, message_count}`` of the lane's current session, or ``{}``."""
+    """``{id, name, title, message_count}`` of the lane's current session, or ``{}``."""
     try:
         info = server._session_info() or {}
     except Exception:
@@ -537,8 +540,51 @@ def _session_summary(server: Any) -> dict[str, Any]:
     return {
         "id": str(info.get("id", "")),
         "name": str(info.get("name", "") or ""),
+        "title": str(info.get("title", "") or ""),
         "message_count": int(info.get("message_count", 0) or 0),
     }
+
+
+# Background title tasks, held so the event loop doesn't drop them half-way.
+_TITLE_TASKS: set[Any] = set()
+
+
+def _title_session_in_background(server: Any, session: Any) -> None:
+    """Give the session just left behind a short title — one small LLM call
+    over its opening turns — so a client's Topics list can name it, and tell
+    the lane's sockets (``session_title``) when it lands. /new stays instant:
+    the call runs as a task. A session with no turns, or one already titled,
+    gets nothing."""
+    import asyncio
+
+    agent = getattr(server, "agent", None)
+    if agent is None or session is None or not getattr(session, "messages", None):
+        return
+    if (getattr(session, "metadata", None) or {}).get("title"):
+        return
+    generate = getattr(agent, "generate_session_title", None)
+    if generate is None:
+        return
+
+    async def _run() -> None:
+        try:
+            title = await generate(session)
+            if not title:
+                return
+            session.metadata = session.metadata or {}
+            session.metadata["title"] = title
+            session.metadata["title_source"] = "auto"
+            await agent.session_manager.save_session(session)
+            server._broadcast({"type": "session_title", "id": session.id, "title": title})
+        except Exception as exc:
+            log.warning("Session titling failed", session_id=getattr(session, "id", "?"), error=str(exc))
+
+    try:
+        task = asyncio.get_running_loop().create_task(_run())
+    except RuntimeError:
+        return
+    _TITLE_TASKS.add(task)
+    task.add_done_callback(_TITLE_TASKS.discard)
 
 
 async def _execute_nuke(server: WebServer) -> str:
@@ -826,6 +872,7 @@ async def handle_session_subcommand(server: WebServer, args: str) -> str:
         return f"Session not found: `{subargs}`"
 
     elif subcmd in ("new",):
+        outgoing = getattr(server.agent, "session", None)
         session = await _create_new_session(server, subargs or None)
         server.agent.refresh_session_runtime_flags()
         if not _is_view(server):
@@ -834,6 +881,8 @@ async def handle_session_subcommand(server: WebServer, args: str) -> str:
         server.agent.last_context_window = {}
         server._broadcast({"type": "session_info", **server._session_info()})
         server._broadcast({"type": "session_switched"})
+        if session is not outgoing:
+            _title_session_in_background(server, outgoing)
         return f"Created and switched to session **{session.name}**."
 
     elif subcmd in ("rename",):

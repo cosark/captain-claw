@@ -234,7 +234,11 @@ async function _flushMessages() {
   _msgTimer = null
   const batches = new Map(_msgQueue)
   _msgQueue.clear()
-  for (const [sessionId, msgs] of batches) {
+  for (const [sessionId, queued] of batches) {
+    // Serialize the latest version of each row: a divider may have been
+    // titled or renamed since it was queued.
+    const live = useChatStore.getState().sessions.get(sessionId)?.messages
+    const msgs = queued.map((m) => live?.find((x) => x.id === m.id) ?? m)
     try {
       const res = await fetch(`/fd/chat/sessions/${encodeURIComponent(sessionId)}/messages`, {
         method: 'POST',
@@ -924,6 +928,8 @@ interface ChatStore {
    *  fetching the log from it on when it isn't — and return that message's
    *  id to scroll to (null when it can't be found). */
   jumpToTopic: (containerId: string, rowId: number) => Promise<string | null>
+  /** Name one topic divider (the user's own title; overrides a generated one). */
+  renameTopic: (containerId: string, ref: { rowId?: number; messageId?: string }, title: string) => void
   /** Append a local system note to the chat (no agent turn) — e.g. "started flow X". */
   addLocalNote: (containerId: string, content: string) => void
   cancelTask: (containerId: string) => void
@@ -1140,6 +1146,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         id, name: String(data.name ?? ''),
         action: count > 0 ? 'resume' : 'new', source: 'agent',
       })
+      if (data.title) applyTopicTitle(key, id, String(data.title))
+    })
+
+    // The agent named a session it was asked to leave (a short title from
+    // its opening turns): the Topics list and that session's dividers show it.
+    ws.on('session_title', (data) => {
+      const id = String(data.id ?? '')
+      const title = String(data.title ?? '')
+      if (id && title) applyTopicTitle(key, id, title)
     })
 
     ws.on('welcome', (data) => {
@@ -1499,7 +1514,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       const isSessionNew = /^\/session new\b/.test(command) && content.startsWith('Created and switched')
       const isSwitch = /^\/session (switch|load)\b/.test(command) && content.startsWith('Switched to session')
       const isClear = command === '/clear'
-      const after = data.session as { id?: unknown; name?: unknown } | undefined
+      const after = data.session as { id?: unknown; name?: unknown; title?: unknown } | undefined
       const afterId = after?.id ? String(after.id) : ''
       let marked = false
       if (afterId && (isNew || isSessionNew || isSwitch || isClear)) {
@@ -1511,6 +1526,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         // An agent build that doesn't report its session: wipe, as before.
         clearMessages(key)
       }
+      if (afterId && after?.title) applyTopicTitle(key, afterId, String(after.title))
       // The divider says it; the agent's one-liner would only repeat it.
       if (!marked) {
         addMessage(key, { id: nextId(), role: 'system', content, timestamp: new Date().toISOString() })
@@ -2088,6 +2104,31 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     return rows[0].id
   },
 
+  renameTopic: (containerId, ref, title) => {
+    const clean = title.replace(/\s+/g, ' ').trim().slice(0, 120)
+    let rowId: number | undefined
+    useChatStore.setState((state) => {
+      const s = state.sessions.get(containerId)
+      if (!s) return state
+      let changed = false
+      const messages = s.messages.map((m) => {
+        if (!m.topic) return m
+        const hit = (ref.messageId !== undefined && m.id === ref.messageId)
+          || (ref.rowId !== undefined && m.rowId === ref.rowId)
+        if (!hit || m.topic.title === clean) return m
+        changed = true
+        rowId = m.rowId
+        return { ...m, topic: { ...m.topic, title: clean } }
+      })
+      if (!changed) return state
+      const sessions = new Map(state.sessions)
+      sessions.set(containerId, { ...s, messages })
+      return { sessions }
+    })
+    const persisted = rowId ?? ref.rowId
+    if (persisted !== undefined) void serverSetTopicTitle(containerId, persisted, clean)
+  },
+
   addLocalNote: (containerId, content) => {
     if (!get().sessions.get(containerId)) return
     addMessage(containerId, {
@@ -2443,13 +2484,54 @@ function markTopic(
     if (s.agentSessionId !== t.id) updateSession(key, { agentSessionId: t.id })
     return 'present'
   }
-  const topic: TopicMark = { action: t.action, agentSessionId: t.id, source: t.source }
+  // A topic resumed or re-entered keeps the name it already has.
+  const known = s.messages.find((m) => m.topic?.agentSessionId === t.id && m.topic.title)?.topic?.title
+  const topic: TopicMark = {
+    action: t.action, agentSessionId: t.id, source: t.source, ...(known ? { title: known } : {}),
+  }
   addMessage(key, {
     id: nextId(), role: 'system', content: topicLabel(t.action, t.name),
     timestamp: new Date().toISOString(), topic,
   })
   updateSession(key, { agentSessionId: t.id, nextStepOptions: [] })
   return 'inserted'
+}
+
+/** The agent named session `agentSessionId`: every loaded divider of that
+ *  session without a title gets it (a title the user typed stays), and the
+ *  persisted ones are renamed in the log. */
+function applyTopicTitle(key: string, agentSessionId: string, title: string) {
+  const clean = title.replace(/\s+/g, ' ').trim().slice(0, 120)
+  if (!clean) return
+  const rowIds: number[] = []
+  useChatStore.setState((state) => {
+    const s = state.sessions.get(key)
+    if (!s) return state
+    let changed = false
+    const messages = s.messages.map((m) => {
+      if (!m.topic || m.topic.agentSessionId !== agentSessionId || m.topic.title) return m
+      changed = true
+      if (m.rowId !== undefined) rowIds.push(m.rowId)
+      return { ...m, topic: { ...m.topic, title: clean } }
+    })
+    if (!changed) return state
+    const sessions = new Map(state.sessions)
+    sessions.set(key, { ...s, messages })
+    return { sessions }
+  })
+  for (const rowId of rowIds) void serverSetTopicTitle(key, rowId, clean)
+}
+
+async function serverSetTopicTitle(sessionId: string, rowId: number, title: string): Promise<void> {
+  if (!useAuthStore.getState().authEnabled) return
+  try {
+    await fetch(`/fd/chat/sessions/${encodeURIComponent(sessionId)}/topics/${rowId}`, {
+      method: 'PATCH',
+      headers: _chatHeaders(),
+      credentials: 'include',
+      body: JSON.stringify({ title }),
+    })
+  } catch { /* ignore */ }
 }
 
 /** With the log loaded and the agent's session known: when the transcript
