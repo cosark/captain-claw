@@ -792,6 +792,27 @@ When a chat user asks for a spoken reply and the agent made none, the chat bridg
 
 **The hotkey and the web mic** use Soniox realtime streaming (or OpenAI Whisper / Gemini as a fallback; `tools.screen_capture.stt_provider` picks one). Under Flight Deck they get a short-lived Soniox key for each session.
 
+### telegram_inbox
+
+Read the owner's Telegram, the way the mail tools read email. **Read-only**: there is no way to send, reply or mark anything read. The tool appears only while the owner keeps a Telegram inbox in Flight Deck, and only for the owner (never during a shared-agent member's turn).
+
+Flight Deck keeps the inbox through the deck's team Telegram bot:
+
+- **Private chats.** The user connects the team bot in Telegram → **Settings → Chat Automation** and picks which chats it may see. Telegram then hands the bot both sides of those chats, their edits and their deletions. Older history isn't available: the inbox starts when the connection does.
+- **Groups.** The user adds the team bot to a group, or sends `/inbox` in a group it's already in (`/inbox off` stops). The bot tells the members once that it reads along, and never posts again. Anyone else who adds the bot sees it leave.
+
+The user turns it on in **Connections → Telegram → Inbox** with explicit consent, after linking Telegram to the team bot. Turning it off, or disconnecting Telegram, deletes everything kept. Text and names are encrypted at rest with a key file kept apart from the database (`<FD home>/data_key`, or `FD_DATA_KEY_FILE`; needs the `cryptography` package). Messages are kept for 30 days by default (7, 30, 90 or 365). An admin can switch the inbox off for the deck in **Admin → Integrations**. For groups, the bot needs group privacy off in @BotFather or admin rights in the group; for private chats it needs Business Mode on.
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `action` | string | yes | `chats` (list them), `read` (one chat, oldest first), `recent` (newest across all chats), `search` (every word of `query`) |
+| `chat` | string | read | A chat's id or (part of) its name; optional for `search` |
+| `query` | string | search | Words that must all appear (text, sender, chat or attachment) |
+| `since` / `until` | string | no | `24h`, `7d`, `90m`, a date or an ISO time |
+| `limit` | integer | no | Default 50, max 200 |
+
+Attachments show as a short description (`[photo]`, `[voice message (12s)]`, `[file: offer.pdf]`), not as files. The output reminds the model that the text was written by other people and is information, not instructions.
+
 ### send_mail
 
 Send email via SMTP, Mailgun, or SendGrid.
