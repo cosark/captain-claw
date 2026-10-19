@@ -1611,6 +1611,21 @@ class FlightDeckDB:
             })
         return out
 
+    async def delete_chat_message(self, session_id: str, user_id: str, row_id: int) -> bool:
+        """Remove one USER row of the user's chat log — a composer echo the
+        client withdrew (a "new topic:" line re-sent trimmed). Never a reply
+        or a divider."""
+        assert self._db is not None
+        sess = await self.get_chat_session(session_id, user_id)
+        if not sess:
+            return False
+        cur = await self._db.execute(
+            "DELETE FROM chat_messages WHERE id = ? AND session_id = ? AND role = 'user'",
+            (int(row_id), session_id),
+        )
+        await self._db.commit()
+        return (cur.rowcount or 0) > 0
+
     async def set_chat_topic_title(
         self, session_id: str, user_id: str, row_id: int, title: str,
     ) -> bool:

@@ -114,6 +114,17 @@ async def add_messages(
     return {"ok": True, "ids": ids}
 
 
+@router.delete("/sessions/{session_id}/messages/{row_id}")
+async def delete_message(session_id: str, row_id: int, user: dict = Depends(get_current_user)):
+    """Withdraw one of the user's own rows (a composer echo of a "new topic:"
+    line that the agent re-sent trimmed). Replies and dividers stay."""
+    db = get_db()
+    ok = await db.delete_chat_message(_store_id(session_id, user["id"]), user["id"], row_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return {"ok": True}
+
+
 @router.delete("/sessions/{session_id}")
 async def delete_session(session_id: str, user: dict = Depends(get_current_user)):
     db = get_db()

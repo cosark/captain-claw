@@ -1373,6 +1373,17 @@ function topicTitle(t: TopicInfo): string {
   return 'New topic'
 }
 
+/** Where a turn came from, as the person would say it. */
+function viaLabel(via: string): string {
+  switch (via) {
+    case 'whatsapp': return 'WhatsApp'
+    case 'telegram': return 'Telegram'
+    case 'device': return 'stick'
+    case 'glasses': return 'glasses'
+    default: return via
+  }
+}
+
 function fmtTopicWhen(ts: string): string {
   if (!ts) return ''
   try {
@@ -2040,6 +2051,7 @@ const MessageBubble = memo(function MessageBubble({ message, sourceName, agentId
             <MarkdownMessage content={processImagePaths(message.content, agentConn?.host, agentConn?.port, agentConn?.auth)} />
           </div>
           <span className="mt-1 block text-right text-[10px] text-zinc-500">
+            {message.via && <span className="mr-1.5 text-zinc-400">via {viaLabel(message.via)}</span>}
             {formatTime(message.timestamp)}
           </span>
         </div>

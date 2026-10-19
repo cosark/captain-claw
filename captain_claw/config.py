@@ -686,7 +686,7 @@ class ToolsConfig(BaseModel):
         "microsoft_onedrive", "microsoft_calendar", "microsoft_mail",
         "jev", "audio",
         "whatsapp_send_file", "intentions", "image_vision", "video_vision", "cv", "topics",
-        "history", "vfs",
+        "sessions", "history", "vfs",
         # Deep memory is reached through Flight Deck, which owns the Typesense
         # connection and the credentials — so from an agent's side the archive
         # is simply always there. A per-agent opt-in would mean an agent could

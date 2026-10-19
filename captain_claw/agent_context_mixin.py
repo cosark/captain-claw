@@ -2431,6 +2431,7 @@ class AgentContextMixin:
             IntentionsTool,
             VideoVisionTool,
             TopicsTool,
+            SessionsTool,
             SessionHistoryTool,
             VfsTool,
             CvTool,
@@ -2524,6 +2525,8 @@ class AgentContextMixin:
                 self.tools.register(IntentionsTool())
             elif tool_name == "topics":
                 self.tools.register(TopicsTool())
+            elif tool_name == "sessions":
+                self.tools.register(SessionsTool())
             elif tool_name == "vfs":
                 self.tools.register(VfsTool())
             elif tool_name == "history":
