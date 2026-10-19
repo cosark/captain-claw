@@ -25,6 +25,7 @@ import {
   X,
   Info,
   Compass,
+  AlarmClock,
 } from 'lucide-react'
 import { useUIStore } from '../../stores/uiStore'
 import { useAgentStore } from '../../stores/agentStore'
@@ -37,6 +38,8 @@ import { useProcessStore } from '../../stores/processStore'
 import { useThemeStore } from '../../stores/themeStore'
 import { useOnboardingStore } from '../../stores/onboardingStore'
 import { useSharedAgentStore } from '../../stores/sharedAgentStore'
+import { useScheduledStore } from '../../stores/scheduledStore'
+import { ScheduledTasks } from '../scheduler/ScheduledTasks'
 import { isManagedAgent } from '../../utils/managedAgents'
 import { SHARED_PREFIX, sharedCaps, sharedContainerId } from '../../utils/sharedAgent'
 import { CHAT_ONLY_TEXT, workspaceVisible } from '../../utils/sharedWorkspace'
@@ -181,6 +184,22 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
   }
   // A phone gets its own layout: the agent list, or one chat, full screen.
   const { isMobile } = useIsMobile()
+  // Scheduled tasks: the dialog (opened from the agent column, Settings, or a
+  // task's result in the chat) and the task list its buttons count.
+  const scheduledOpen = useScheduledStore((s) => s.open)
+  const scheduledFocus = useScheduledStore((s) => s.focusTaskId)
+  const scheduledNewFor = useScheduledStore((s) => s.newForAgent)
+  const openScheduled = useScheduledStore((s) => s.openTasks)
+  const closeScheduled = useScheduledStore((s) => s.close)
+  const fetchScheduled = useScheduledStore((s) => s.fetchJobs)
+  const scheduledCount = useScheduledStore((s) => s.jobs.filter((j) => j.enabled === 1).length)
+  const scheduledRunning = useScheduledStore((s) => s.jobs.some((j) => j.running))
+  useEffect(() => {
+    if (authEnabled === true && !isAuthenticated) return
+    fetchScheduled()
+    const t = setInterval(fetchScheduled, 30000)
+    return () => clearInterval(t)
+  }, [fetchScheduled, authEnabled, isAuthenticated])
 
   // Keep the agent list fresh — the Desktop page normally does this polling,
   // and it isn't mounted here. Same auth guard as there: with auth on and no
@@ -365,6 +384,30 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
 
   const refresh = () => { fetchContainers(); fetchProcesses(); fetchShared(); probeAll() }
 
+  // "Continue in chat": the task's agent opens on the task's own session
+  // (the agent's /session switch, as a Topics resume) once its chat is up.
+  const openTaskChat = (slug: string, sessionId: string) => {
+    const a = agents.find((x) => x.id === `proc-${slug}`)
+    if (!a || (!a.reachable && !useChatStore.getState().sessions.has(a.id))) {
+      useNotificationStore.getState().add('warning', 'Agent is off', 'Power the agent on to open this task in its chat.')
+      return
+    }
+    closeScheduled()
+    handleOpen(a)
+    let tries = 0
+    const attempt = () => {
+      const s = useChatStore.getState().sessions.get(a.id)
+      if (s?.connected && !s.busy) { useChatStore.getState().resumeTopic(a.id, sessionId); return }
+      if (++tries < 40) setTimeout(attempt, 250)
+    }
+    setTimeout(attempt, 250)
+  }
+  const scheduledConnections = () => {
+    closeScheduled()
+    if (locked) { openConnections(); return }
+    useChatStore.setState({ chatFullscreen: false }); setLayoutMode('full'); setView('connections')
+  }
+
   // A guide step's button: the guide gives way to that part of the kiosk.
   const guideAction = (action: OnboardingAction) => {
     setGuideOpen(false)
@@ -440,6 +483,7 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
           onConnections={() => { setSettingsOpen(false); openConnections() }}
           onProfile={() => { setSettingsOpen(false); setProfileOpen(true) }}
           onGuide={() => { setSettingsOpen(false); setGuideOpen(true) }}
+          onScheduled={() => { setSettingsOpen(false); openScheduled() }}
         />
       )}
       {locked && infoOpen && (
@@ -453,6 +497,19 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
       )}
       {locked && guideOpen && (
         <KioskOnboardingDialog phone={isMobile} onClose={() => setGuideOpen(false)} onAction={guideAction} />
+      )}
+      {scheduledOpen && (
+        <KioskScheduledDialog phone={isMobile} onClose={closeScheduled}>
+          <ScheduledTasks
+            phone={isMobile}
+            initialTaskId={scheduledFocus}
+            newForAgent={scheduledNewFor}
+            defaultAgentSlug={activeAgent?.kind === 'process' ? activeAgent.startKey : undefined}
+            onClose={closeScheduled}
+            onOpenChat={openTaskChat}
+            onOpenConnections={scheduledConnections}
+          />
+        </KioskScheduledDialog>
       )}
       {locked && connectionsOpen && <KioskConnectionsDialog initialTab={connectionsTab} onClose={() => setConnectionsOpen(false)} />}
       {locked && profileOpen && <KioskProfileDialog onClose={() => setProfileOpen(false)} />}
@@ -486,6 +543,8 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
           onSpawn={goSpawn}
           onSettings={locked ? () => setSettingsOpen(true) : undefined}
           onInfo={locked ? () => setInfoOpen(true) : undefined}
+          onScheduled={() => openScheduled()}
+          scheduledRunning={scheduledRunning}
           locked={locked}
         />
         {dialogs}
@@ -509,6 +568,9 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
         onOptions={setOptionsAgent}
         onSettings={locked ? () => setSettingsOpen(true) : undefined}
         onInfo={locked ? () => setInfoOpen(true) : undefined}
+        onScheduled={() => openScheduled()}
+        scheduledCount={scheduledCount}
+        scheduledRunning={scheduledRunning}
         locked={locked}
       />
 
@@ -536,12 +598,13 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
 // the Getting started guide, and sign-out (how a shared kiosk hands the
 // screen to the next person).
 
-function KioskSettingsDialog({ onClose, onRefresh, onConnections, onProfile, onGuide }: {
+function KioskSettingsDialog({ onClose, onRefresh, onConnections, onProfile, onGuide, onScheduled }: {
   onClose: () => void
   onRefresh: () => void
   onConnections: () => void
   onProfile: () => void
   onGuide: () => void
+  onScheduled: () => void
 }) {
   const { theme, toggle: toggleTheme } = useThemeStore()
   const authEnabled = useAuthStore((s) => s.authEnabled)
@@ -558,6 +621,7 @@ function KioskSettingsDialog({ onClose, onRefresh, onConnections, onProfile, onG
   const tiles: { icon: typeof Plug; title: string; detail: string; onClick: () => void }[] = [
     { icon: dark ? Sun : Moon, title: dark ? 'Light theme' : 'Dark theme', detail: `Switch to the ${dark ? 'light' : 'dark'} look`, onClick: toggleTheme },
     { icon: Plug, title: 'Connections', detail: 'Google, Microsoft, MCP and Jev', onClick: onConnections },
+    { icon: AlarmClock, title: 'Scheduled tasks', detail: 'Your agents on a timer — results by chat or email', onClick: onScheduled },
     { icon: IdCard, title: 'Profile', detail: 'About you, your company, your preferences', onClick: onProfile },
     { icon: RefreshCw, title: 'Refresh agents', detail: 'Check every agent again', onClick: onRefresh },
     { icon: Compass, title: 'Getting started', detail: 'A short tour: agents, connections, Telegram and more', onClick: onGuide },
@@ -697,10 +761,53 @@ function KioskDialog({ label, onClose, children }: { label: string; onClose: () 
   )
 }
 
+// ── Scheduled tasks in a dialog ──────────────────────────────────────
+//
+// Wider than the other kiosk dialogs: a task list beside the selected task's
+// history. Escape is the component's (it keeps an unsaved edit open).
+
+function KioskScheduledDialog({ phone, onClose, children }: { phone: boolean; onClose: () => void; children: ReactNode }) {
+  return createPortal(
+    <div className="fixed inset-0 z-50 flex items-stretch justify-center bg-black/60 wide:items-center wide:p-4" onClick={phone ? undefined : onClose}>
+      <div
+        role="dialog"
+        aria-label="Scheduled tasks"
+        className="relative flex h-[100dvh] w-full flex-col overflow-hidden bg-zinc-950 pb-[env(safe-area-inset-bottom)] shadow-2xl wide:h-[88vh] wide:max-w-5xl wide:rounded-xl wide:border wide:border-zinc-800 wide:pb-0"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {children}
+      </div>
+    </div>,
+    document.body,
+  )
+}
+
+/** The agent column's way into Scheduled tasks: how many are active, and a
+ *  pulse while one runs. */
+function ScheduledButton({ count, running, onClick }: { count: number; running: boolean; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium text-zinc-300 transition-colors hover:bg-zinc-800 hover:text-zinc-100"
+      title="Scheduled tasks — your agents on a timer"
+    >
+      <span className="relative">
+        <AlarmClock className="h-[18px] w-[18px] text-amber-600 dark:text-amber-400" />
+        {running && <span className="absolute -right-0.5 -top-0.5 h-2 w-2 animate-pulse rounded-full bg-amber-500 ring-2 ring-zinc-900 dark:bg-amber-400" />}
+      </span>
+      Scheduled tasks
+      {count > 0 && (
+        <span className="ml-auto rounded-full bg-zinc-800 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-300">{count}</span>
+      )}
+    </button>
+  )
+}
+
 // ── Left: agents ─────────────────────────────────────────────────────
 
 function AgentsColumn({
-  agents, activeAgentId, sessionInfo, switching, booting, onOpen, onPower, onLeave, onRefresh, onSpawn, onOptions, onSettings, onInfo, locked = false,
+  agents, activeAgentId, sessionInfo, switching, booting, onOpen, onPower, onLeave, onRefresh, onSpawn, onOptions, onSettings, onInfo,
+  onScheduled, scheduledCount = 0, scheduledRunning = false, locked = false,
 }: {
   agents: SimpleAgent[]
   activeAgentId: string | null
@@ -720,6 +827,10 @@ function AgentsColumn({
   onSettings?: () => void
   /** Kiosk only: the Info button beside Settings. */
   onInfo?: () => void
+  /** Opens Scheduled tasks. */
+  onScheduled?: () => void
+  scheduledCount?: number
+  scheduledRunning?: boolean
   locked?: boolean
 }) {
   const open = useUIStore((s) => s.simpleLeftOpen)
@@ -800,6 +911,19 @@ function AgentsColumn({
             <Plus className="h-4 w-4" />
           </button>
         </div>
+        {onScheduled && (
+          <div className="flex flex-col items-center border-t border-zinc-800 py-2">
+            <button
+              onClick={onScheduled}
+              title="Scheduled tasks"
+              aria-label="Scheduled tasks"
+              className="relative flex h-10 w-10 items-center justify-center rounded-lg text-amber-600 transition-colors hover:bg-zinc-800 dark:text-amber-400"
+            >
+              <AlarmClock className="h-5 w-5" />
+              {scheduledRunning && <span className="absolute right-1.5 top-1.5 h-2 w-2 animate-pulse rounded-full bg-amber-500 ring-2 ring-zinc-900 dark:bg-amber-400" />}
+            </button>
+          </div>
+        )}
         {onSettings ? (
           <div className="flex flex-col items-center gap-0.5 border-t border-zinc-800 py-2">
             {onInfo && (
@@ -1013,6 +1137,12 @@ function AgentsColumn({
           })}
         </ul>
       </div>
+
+      {onScheduled && (
+        <div className="border-t border-zinc-800 p-2 pb-0">
+          <ScheduledButton count={scheduledCount} running={scheduledRunning} onClick={onScheduled} />
+        </div>
+      )}
 
       {/* Footer — the kiosk's is one Settings button (KioskSettingsDialog). */}
       {onSettings ? (
@@ -1306,7 +1436,7 @@ function ContextColumn({ agentId, agentName, onOptions }: { agentId: string | nu
 
 function PhoneLayout({
   agents, activeAgent, activeAgentId, activeSessionName, sessionInfo, switching, booting,
-  onOpen, onPower, onLeave, onSpawn, onSettings, onInfo, locked,
+  onOpen, onPower, onLeave, onSpawn, onSettings, onInfo, onScheduled, scheduledRunning = false, locked,
 }: {
   agents: SimpleAgent[]
   activeAgent: SimpleAgent | null
@@ -1321,6 +1451,8 @@ function PhoneLayout({
   onSpawn: () => void
   onSettings?: () => void
   onInfo?: () => void
+  onScheduled?: () => void
+  scheduledRunning?: boolean
   locked: boolean
 }) {
   const wsConnected = useAgentStore((s) => s.wsConnected)
@@ -1408,6 +1540,12 @@ function PhoneLayout({
       <header className="flex h-14 shrink-0 items-center gap-1 border-b border-zinc-800 pl-3 pr-1.5">
         <div className="min-w-0 flex-1"><BrandMark connected={wsConnected} /></div>
         <NotificationBell />
+        {onScheduled && (
+          <button onClick={onScheduled} className={`${phoneBtn} relative`} aria-label="Scheduled tasks" title="Scheduled tasks">
+            <AlarmClock className="h-5 w-5 text-amber-600 dark:text-amber-400" />
+            {scheduledRunning && <span className="absolute right-2 top-2 h-2 w-2 animate-pulse rounded-full bg-amber-500 ring-2 ring-zinc-950 dark:bg-amber-400" />}
+          </button>
+        )}
         {onInfo && (
           <button onClick={onInfo} className={phoneBtn} aria-label="Info" title="Info">
             <Info className="h-5 w-5" />

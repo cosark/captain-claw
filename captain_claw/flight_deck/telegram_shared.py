@@ -293,6 +293,16 @@ def chats_for_slug(slug: str, owner: str | None = None) -> set[str]:
     }
 
 
+def owner_chat(user_id: str) -> str:
+    """The user's own approved, linked chat with the shared bot ("" when
+    none) — where Flight Deck sends them things itself (a scheduled task's
+    result)."""
+    link = _state.links_by_user.get(str(user_id or ""))
+    if not link or link.get("status") != "approved":
+        return ""
+    return str(link.get("tg_user_id") or "")
+
+
 # ── poller ──────────────────────────────────────────────────────────
 
 
