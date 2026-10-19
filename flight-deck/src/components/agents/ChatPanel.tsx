@@ -39,6 +39,7 @@ import {
   Undo2,
   Sparkles,
   Eraser,
+  Pencil,
 } from 'lucide-react'
 import { createPortal } from 'react-dom'
 import { fetchTopics, type TopicInfo } from '../../stores/chatStore'
@@ -1219,12 +1220,25 @@ function TopicsMenu({ sessionKey, anchor, onClose }: {
   const busy = useChatStore((s) => s.sessions.get(sessionKey)?.busy ?? false)
   const jumpToTopic = useChatStore((s) => s.jumpToTopic)
   const resumeTopic = useChatStore((s) => s.resumeTopic)
+  const renameTopic = useChatStore((s) => s.renameTopic)
+  // The row being renamed (by its log row id, else its message id) and the draft.
+  const [editing, setEditing] = useState<{ id: string; value: string } | null>(null)
 
   useEffect(() => {
     let alive = true
     fetchTopics(sessionKey).then((list) => { if (alive) setTopics(list) })
     return () => { alive = false }
   }, [sessionKey])
+
+  const rowKey = (t: TopicInfo) => (t.rowId !== undefined ? `r${t.rowId}` : (t.messageId ?? ''))
+  const commitRename = (t: TopicInfo) => {
+    if (!editing) return
+    const value = editing.value.replace(/\s+/g, ' ').trim().slice(0, 120)
+    setEditing(null)
+    if (value === (t.title || '')) return
+    renameTopic(sessionKey, { rowId: t.rowId, messageId: t.messageId }, value)
+    setTopics((prev) => prev ? prev.map((x) => (x === t ? { ...x, title: value } : x)) : prev)
+  }
 
   // Newest first; the current topic is the newest row on the agent's session.
   const rows = useMemo(() => (topics ? [...topics].reverse() : null), [topics])
@@ -1275,20 +1289,48 @@ function TopicsMenu({ sessionKey, anchor, onClose }: {
           {rows?.map((t, i) => {
             const current = i === currentIdx
             const canResume = !!t.agentSessionId && t.agentSessionId !== agentSessionId
+            const isEditing = editing?.id === rowKey(t)
             return (
               <div key={t.rowId ?? t.messageId ?? i} className="flex items-center gap-1 px-2 py-0.5">
-                <button
-                  onClick={() => jump(t)}
-                  title="Jump to this topic"
-                  className="min-w-0 flex-1 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-zinc-800/60"
-                >
-                  <div className="truncate text-sm text-zinc-200">{topicTitle(t)}</div>
-                  <div className="truncate text-[11px] text-zinc-500">
-                    {fmtTopicWhen(t.startedAt)} · {t.messageCount} message{t.messageCount === 1 ? '' : 's'}
-                    {current && <span className="ml-1.5 rounded bg-violet-600/20 px-1 text-[10px] text-violet-700 dark:text-violet-300">current</span>}
-                  </div>
-                </button>
-                {canResume && (
+                {isEditing ? (
+                  <input
+                    autoFocus
+                    value={editing.value}
+                    maxLength={120}
+                    placeholder={topicTitle(t)}
+                    aria-label="Topic title"
+                    onChange={(e) => setEditing({ id: rowKey(t), value: e.target.value })}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') { e.preventDefault(); commitRename(t) }
+                      if (e.key === 'Escape') { e.preventDefault(); setEditing(null) }
+                    }}
+                    onBlur={() => commitRename(t)}
+                    className="min-w-0 flex-1 rounded-md border border-violet-500/50 bg-zinc-950 px-2 py-1.5 text-sm text-zinc-100 outline-none"
+                  />
+                ) : (
+                  <button
+                    onClick={() => jump(t)}
+                    title="Jump to this topic"
+                    className="min-w-0 flex-1 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-zinc-800/60"
+                  >
+                    <div className="truncate text-sm text-zinc-200">{topicTitle(t)}</div>
+                    <div className="truncate text-[11px] text-zinc-500">
+                      {fmtTopicWhen(t.startedAt)} · {t.messageCount} message{t.messageCount === 1 ? '' : 's'}
+                      {current && <span className="ml-1.5 rounded bg-violet-600/20 px-1 text-[10px] text-violet-700 dark:text-violet-300">current</span>}
+                    </div>
+                  </button>
+                )}
+                {!isEditing && (
+                  <button
+                    onClick={() => setEditing({ id: rowKey(t), value: t.title || '' })}
+                    title="Rename this topic"
+                    aria-label="Rename topic"
+                    className="shrink-0 rounded-md p-1.5 text-zinc-600 transition-colors hover:bg-zinc-800/60 hover:text-zinc-200"
+                  >
+                    <Pencil className="h-3.5 w-3.5" />
+                  </button>
+                )}
+                {canResume && !isEditing && (
                   <button
                     onClick={() => resume(t)}
                     disabled={busy}
@@ -2026,10 +2068,13 @@ const MessageBubble = memo(function MessageBubble({ message, sourceName, agentId
       return (
         <div id={`fd-msg-${message.id}`} data-topic={action} className="my-4 flex items-center gap-3 text-[11px] text-zinc-500">
           <div className="h-px flex-1 bg-zinc-800" />
-          <span className="flex items-center gap-1.5 whitespace-nowrap font-medium">
-            <Icon className="h-3.5 w-3.5 text-zinc-600" />
-            {message.content || 'New topic'}
-            <span className="font-normal text-zinc-600">{formatTime(message.timestamp)}</span>
+          <span className="flex min-w-0 items-center gap-1.5 whitespace-nowrap font-medium">
+            <Icon className="h-3.5 w-3.5 shrink-0 text-zinc-600" />
+            <span className="truncate">
+              {message.content || 'New topic'}
+              {message.topic.title && <span className="text-zinc-400"> · {message.topic.title}</span>}
+            </span>
+            <span className="shrink-0 font-normal text-zinc-600">{formatTime(message.timestamp)}</span>
           </span>
           <div className="h-px flex-1 bg-zinc-800" />
         </div>

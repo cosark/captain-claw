@@ -85,6 +85,23 @@ async def list_topics(session_id: str, user: dict = Depends(get_current_user)):
     return await db.list_chat_topics(_store_id(session_id, user["id"]), user["id"])
 
 
+class TopicTitleRequest(BaseModel):
+    title: str = ""
+
+
+@router.patch("/sessions/{session_id}/topics/{row_id}")
+async def set_topic_title(
+    session_id: str, row_id: int, body: TopicTitleRequest,
+    user: dict = Depends(get_current_user),
+):
+    """Name a topic: the agent's generated title, or one the user typed."""
+    db = get_db()
+    ok = await db.set_chat_topic_title(_store_id(session_id, user["id"]), user["id"], row_id, body.title)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Topic not found")
+    return {"ok": True, "title": " ".join(body.title.split())[:120]}
+
+
 @router.post("/sessions/{session_id}/messages")
 async def add_messages(
     session_id: str, body: AddMessagesRequest,
