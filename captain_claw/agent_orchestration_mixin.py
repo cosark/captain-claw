@@ -920,6 +920,7 @@ class AgentOrchestrationMixin:
                 and self._turn_made_no_tool_call(turn_start_idx)
             ),
             tools=offered,
+            payment_tools=offered & fabrication_guard.PAYMENT_TOOLS,
         )
         return fabrication_guard.judge_reply(raw, text, facts)
 
@@ -2186,6 +2187,12 @@ class AgentOrchestrationMixin:
                 try:
                     from captain_claw import soniox_client
                     await soniox_client.available()
+                except Exception:
+                    pass
+                # Payments: is FD_PAYMENTS on for the owner's Flight Deck?
+                try:
+                    from captain_claw import payments_client
+                    await payments_client.refresh()
                 except Exception:
                     pass
                 # Telegram inbox (owner-only): does the owner keep one?

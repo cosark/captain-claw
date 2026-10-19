@@ -78,6 +78,17 @@ cv = [
     "opencv-python-headless>=5.0",
     "numpy>=1.24.0",
 ]
+payments = [
+    # Bill pay by barcode (Flight Deck only): HUB3 PDF417 + EPC QR out,
+    # barcodes in invoices back in. pdf417gen is pinned to a minor version
+    # because payments/hub3.py swaps one of its internals (byte compaction).
+    "segno>=1.6,<2",
+    "pdf417gen>=0.8,<0.9",
+    "zxing-cpp>=3.1,<4",
+    "pypdfium2>=4",
+    # Revolut Business (Phase 1): RS256 client-assertion JWT + its key/cert.
+    "cryptography>=42",
+]
 browser = [
     # Included in core deps; kept for backward compat with pip install captain-claw[browser].
     "playwright>=1.40.0",
@@ -137,5 +148,5 @@ where = [".", "botport"]
 include = ["captain_claw*", "botport", "botport.dashboard"]
 
 [tool.setuptools.package-data]
-captain_claw = ["web/static/**/*", "instructions/**/*", "flight_deck/static/**/*"]
+captain_claw = ["web/static/**/*", "instructions/**/*", "flight_deck/static/**/*", "payments/*.json"]
 botport = ["dashboard/static/**/*"]

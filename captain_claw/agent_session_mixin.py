@@ -13,6 +13,10 @@ from captain_claw.session import Session
 
 log = get_logger(__name__)
 
+# Tools whose results are what the model read off a picture: card numbers in
+# them are scrubbed before they're stored (see _add_session_message).
+_CARD_SCRUBBED_TOOLS = frozenset({"image_ocr", "image_vision", "video_vision", "cv"})
+
 # Compaction also runs when everything stored (old tool output included)
 # passes this many times the context budget, even if little of it is sent.
 _STORAGE_COMPACTION_FACTOR = 4
@@ -1414,6 +1418,14 @@ class AgentSessionMixin:
         """
         if not self.session:
             return
+        # A model that read a photo of a card must not keep or repeat its
+        # number: the agent's own words and what the vision / OCR tools read
+        # are scrubbed before they're stored (other tool results carry IDs the
+        # agent must use verbatim, so they're left alone).
+        if content and (role == "assistant" or (role == "tool" and tool_name in _CARD_SCRUBBED_TOOLS)):
+            from captain_claw.card_scrub import scrub
+
+            content = scrub(content)[0]
         # Attach model label for assistant messages so the UI can display it.
         model_label = ""
         if role == "assistant":
