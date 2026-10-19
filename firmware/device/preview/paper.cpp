@@ -119,7 +119,7 @@ static std::vector<ui::Item> menu() {
       row("Voice", "female", "yellow = change"),
       row("Text size", "Aa", "medium · change"),
       row("Character", "Captain", "yellow = browse"),
-      row("Beep before speech", "on", "yellow = change"),
+      row("Beeps around speech", "on", "yellow = change"),
       row("Light before speech", "on", "yellow = change"),
       row("Cue lead", "1 s", "how early the cue comes"),
       row("Power off", "3 min", "after this long idle"),

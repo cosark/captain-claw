@@ -109,7 +109,7 @@ static std::vector<ui::Item> menu() {
       card("Display", "text", "yellow = change"),
       card("Text size", "Aa", "medium · change"),
       card("Character", "Captain", "yellow = browse"),
-      card("Beep before speech", "on", "yellow = change"),
+      card("Beeps around speech", "on", "yellow = change"),
       card("Flash before speech", "on", "yellow = change"),
       card("Buzz before speech", "on", "yellow = change"),
       card("Cue lead", "1 s", "how early the cue comes"),

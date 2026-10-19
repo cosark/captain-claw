@@ -98,6 +98,13 @@ pio run -e preview
 uv run --no-project --with pillow python preview/render.py   # → preview/out/sheet.png
 ```
 
+## Speech chime
+
+With *Beeps around speech* on (the default), the device plays a short rising
+chime (C6 → G6) before it speaks and the same two tones falling (G6 → C6)
+once the answer has played to its end, so you know it's done. A stopped
+answer or a replay gets neither.
+
 ## Buttons
 
 | | Front (A) | Side (B) |
