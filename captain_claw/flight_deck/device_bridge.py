@@ -82,7 +82,7 @@ _DEVICE_SYSTEM_CONTEXT = (
     "items when the task produced several (never drop results to stay short).\n"
     "  - Plain text only: no tables, code blocks, headings or URLs unless asked.\n"
     "  - Pictures you generate with image_gen are shown on the device's screen and "
-    "audio you make with pocket_tts is played on it, automatically.\n"
+    "audio you make (audio speak, pocket_tts) is played on it, automatically.\n"
     "  - The transcript of their speech may contain recognition errors; read it "
     "charitably.\n"
     "  - Do not mention the device, this context, or these rules.\n"

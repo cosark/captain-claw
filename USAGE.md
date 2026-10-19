@@ -766,22 +766,31 @@ Uses `pocket-tts`. Output saved to `saved/media/<session-id>/`.
 
 **Server-side playback:** When the agent generates audio, it is automatically played on the server machine's speakers using the system audio player (`afplay` on macOS, `ffplay` or `mpv` on Linux). This works regardless of browser tab focus — no need to have the web UI in the foreground. An `<audio>` player element also appears in the chat for manual replay.
 
-### stt
+### audio
 
-Speech-to-text transcription. Used internally by the hotkey daemon for voice commands, but also available as a standalone tool.
+Speech-to-text and text-to-speech with Soniox. The tool appears on its own as soon as a Soniox key is usable, and stays hidden otherwise.
+
+- **Under Flight Deck** the key is the agent owner's: their own in **Connections → Soniox**, else the team key an admin shares in **Admin → Integrations**, else the deck's `SONIOX_API_KEY`. Flight Deck holds the key and makes the Soniox calls; the agent never sees it.
+- **Standalone**, the agent's own `SONIOX_API_KEY`.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `audio` | string | yes | Path to audio file (WAV, MP3, etc.) or base64-encoded audio |
-| `provider` | string | no | `soniox`, `openai`, or `gemini` (default: auto-detect) |
+| `action` | string | yes | `transcribe`, `speak` or `voices` |
+| `path` | string | transcribe | Audio or video file: `.ogg` `.opus` `.mp3` `.m4a` `.wav` `.flac` `.aac` `.amr` `.webm` `.mp4` `.mov` … (saved/, vfs or absolute) |
+| `timestamps` | boolean | no | transcribe: add `[mm:ss]` segments (~15 s each, split at sentences) |
+| `language_hints` | string[] | no | transcribe: ISO codes likely spoken, e.g. `["hr","en"]` (languages are detected anyway) |
+| `text` | string | speak | Text to say, up to 40,000 characters (long text is spoken in 4,000-character pieces) |
+| `voice` | string | no | speak: a Soniox voice (`action: voices` lists them; default `Adrian`) |
+| `language` | string | no | speak: ISO code of the text's language (default `en`) |
+| `output_path` | string | no | speak: file name, kept under `saved/media/<session-id>/` as `.mp3` |
 
-**Providers (in priority order):**
+`speak` saves an MP3 and reports it on a `Path:` line, so it is delivered like `pocket_tts` audio: WhatsApp and Telegram send it, the StickS3 / StopWatch play it, and the web chat shows a player. `transcribe` reports its input as `Source:`, so the user's own recording is never sent back. A transcript over 30,000 characters is also saved as a `.txt` next to the session's media.
 
-1. **Soniox** (recommended) — Realtime streaming transcription. Under Flight Deck, connect it in **Connections → Soniox** (or use the team key your admin shares); standalone, set `SONIOX_API_KEY`. When used via the hotkey, audio streams directly from the microphone to Soniox over WebSocket — no audio files are saved.
-2. **OpenAI Whisper** — File-upload transcription. Uses the configured OpenAI API key.
-3. **Gemini** — File-upload transcription via a Gemini model with audio understanding.
+When a chat user asks for a spoken reply and the agent made none, the chat bridge speaks the reply itself: with `audio` when Soniox is connected, else with `pocket_tts`.
 
-The provider is auto-detected based on available API keys, or set explicitly via `tools.screen_capture.stt_provider` in config.
+**Voices** (all speak every supported language; the group is the accent): Maya, Daniel, Noah, Nina, Emma, Jack, Adrian, Claire, Grace, Owen, Mina, Kenji · British: Oliver, Arthur, Isla, Victoria · Spanish: Rafael, Mateo, Lucia, Sofia · Australian: Cooper, Mason, Ruby, Elise · Indian: Arjun, Rohan, Priya, Meera.
+
+**The hotkey and the web mic** use Soniox realtime streaming (or OpenAI Whisper / Gemini as a fallback; `tools.screen_capture.stt_provider` picks one). Under Flight Deck they get a short-lived Soniox key for each session.
 
 ### send_mail
 
@@ -1326,7 +1335,7 @@ Auth is handled per-call; the caller just needs the target slug + the path the s
 
 Send a file the agent saved (its `saved/` workspace) to a WhatsApp chat through the Cloud API: JPEG and 8-bit PNG up to 5 MB arrive as **photos**, H.264/AAC MP4 up to 16 MB as **videos**, MP3, AAC M4A, AMR or Opus audio up to 16 MB as **audio** — the file's bytes are checked, not just its extension. Everything else, anything larger, or a file WhatsApp wouldn't play (an HEVC clip, a Vorbis .ogg, ALAC) goes as a **document**, which always arrives; a photo/video/audio Meta refuses for its format is sent again as a document, and `send_as: "document"` sends the original file. By default it sends into the chat the turn answers (on an automated turn without one — a cron job, a muted scheduled job — it needs an explicit `to`). Requires `WHATSAPP_ACCESS_TOKEN` + `WHATSAPP_PHONE_NUMBER_ID` (Flight Deck passes them to process agents; Docker agents need them in their own `.env`). WhatsApp only allows free-form messages within 24h of the recipient's last message.
 
-**Delivered at the end of a WhatsApp turn.** When a turn arrived over WhatsApp — or is a Flight Deck scheduled job delivering to a WhatsApp number that may receive pushes now (on the allowlist, not muted with `/mute`) — the agent sends what it made for the user into that chat once the reply is out: pictures it generated (`image_gen`) or took with the phone (`termux`), audio it spoke (`pocket_tts`), and **any file this session wrote during the turn that the reply names by its whole file name** ("here's report.docx"; under `saved/<category>/<session>/`, including `tmp/` where bare writes land — not `scripts/`, `tools/`, `skills/` or `downloads/`, so a Drive file it only read isn't sent back). Nothing it already sent with this tool, at most `whatsapp.max_media_per_turn` (6) files; when something can't be sent or the cap cuts the list, the chat gets one short line saying so. The agent is told this on those turns (and told plainly when it has no WhatsApp credentials). Agent-local cron jobs don't deliver files (they can't see `/mute`); the agent can still send with this tool. Turn it off with `whatsapp.auto_send_media: false`.
+**Delivered at the end of a WhatsApp turn.** When a turn arrived over WhatsApp — or is a Flight Deck scheduled job delivering to a WhatsApp number that may receive pushes now (on the allowlist, not muted with `/mute`) — the agent sends what it made for the user into that chat once the reply is out: pictures it generated (`image_gen`) or took with the phone (`termux`), audio it spoke (`audio` speak or `pocket_tts`), and **any file this session wrote during the turn that the reply names by its whole file name** ("here's report.docx"; under `saved/<category>/<session>/`, including `tmp/` where bare writes land — not `scripts/`, `tools/`, `skills/` or `downloads/`, so a Drive file it only read isn't sent back). Nothing it already sent with this tool, at most `whatsapp.max_media_per_turn` (6) files; when something can't be sent or the cap cuts the list, the chat gets one short line saying so. The agent is told this on those turns (and told plainly when it has no WhatsApp credentials). Agent-local cron jobs don't deliver files (they can't see `/mute`); the agent can still send with this tool. Turn it off with `whatsapp.auto_send_media: false`.
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|

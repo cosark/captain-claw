@@ -101,6 +101,7 @@ _TOOL_PROMPT_DESCRIPTIONS: dict[str, str] = {
     "xlsx_extract": "Extract a single .xlsx file into markdown tables. ONLY for .xlsx files — never use on .pdf/.docx/.pptx. For multiple files in a folder use summarize_files instead.",
     "pptx_extract": "Extract a single .pptx file into markdown. ONLY for .pptx files — never use on .pdf/.docx/.xlsx. For multiple files in a folder use summarize_files instead.",
     "pocket_tts": "Convert text to local speech audio and save as MP3",
+    "audio": "Speech-to-text and text-to-speech (Soniox): transcribe an audio/video file (voice note, recording, meeting) to text, optionally with timestamps; speak text as an MP3 voice recording the chat sends to the user automatically; list voices.",
     "send_mail": "Send emails via SMTP — only when the user asked for that email. Supports to, cc, bcc, subject, body, and file attachments.",
     "clipboard": "Read or write the system clipboard. Supports text, images, and files.",
     "google_drive": "Google Drive/Docs/Sheets/Slides — list (folder_id), search, read (returns content inline: Docs/Sheets/Slides exported, PDF/DOCX/XLSX/PPTX extracted), info (metadata), download (saves a local copy and returns its path — for scripts/extract tools), upload (local file → Drive), create, update. Takes a file/folder ID or a full Drive/Docs URL — never web_fetch/browser/curl a Google URL. Edit an existing Google Sheet/Doc IN PLACE — sheet_read/sheet_update/sheet_append/sheet_clear, doc_read/doc_replace_text/doc_append_text/doc_insert_text — never upload a modified copy.",
@@ -158,6 +159,7 @@ _TOOL_PROMPT_DESCRIPTIONS_MICRO: dict[str, str] = {
     "xlsx_extract": "single .xlsx → markdown (ONLY .xlsx, never .pdf; for multiple files use summarize_files)",
     "pptx_extract": "single .pptx → markdown (ONLY .pptx, never .pdf; for multiple files use summarize_files)",
     "pocket_tts": "text-to-speech MP3",
+    "audio": "Soniox: transcribe an audio/video file to text (timestamps optional); speak text as an MP3 sent to the user; list voices",
     "send_mail": "send emails via SMTP (only when asked)",
     "whatsapp_send_file": "send a saved file or picture to a WhatsApp chat (defaults to current chat; photos as images)",
     "intentions": "record future actions: user notes-to-self + your own proactive intentions",
@@ -2322,6 +2324,12 @@ class AgentContextMixin:
             await jev_client.refresh_connected()
         except Exception as _exc:
             log.debug("Jev connection priming failed: %s", _exc)
+        # And Soniox: whether the owner's audio tool can work.
+        try:
+            from captain_claw import soniox_client
+            await soniox_client.available()
+        except Exception as _exc:
+            log.debug("Soniox connection priming failed: %s", _exc)
 
         self._initialized = True
         log.info("Agent initialized", session_id=self.session.id)
@@ -2341,6 +2349,7 @@ class AgentContextMixin:
         "xlsx_extract": ["xlsx_extract"],
         "pptx_extract": ["pptx_extract"],
         "pocket_tts": ["pocket_tts"],
+        "audio": ["audio"],
         "image_gen": ["image_gen"],
         "image_ocr": ["image_ocr"],
         "image_vision": ["image_vision"],
@@ -2387,6 +2396,7 @@ class AgentContextMixin:
             GoogleMailTool,
             ImageGenTool,
             JevTool,
+            AudioTool,
             MicrosoftCalendarTool,
             MicrosoftMailTool,
             MicrosoftOneDriveTool,
@@ -2504,6 +2514,10 @@ class AgentContextMixin:
                 self.tools.register(MicrosoftMailTool(), metadata={"requires_microsoft": True})
             elif tool_name == "jev":
                 self.tools.register(JevTool(), metadata={"requires_jev": True})
+            elif tool_name == "audio":
+                # Hidden until a Soniox key is usable (the owner's in Flight
+                # Deck, or SONIOX_API_KEY standalone) — see the registry.
+                self.tools.register(AudioTool(), metadata={"requires_soniox": True})
             elif tool_name == "whatsapp_send_file":
                 self.tools.register(WhatsAppSendFileTool())
             elif tool_name == "intentions":
@@ -4374,7 +4388,7 @@ class AgentContextMixin:
         if get_config().whatsapp.auto_send_media and answering:
             return (
                 "Your reply goes to a WhatsApp chat. Pictures you generate (image_gen), phone "
-                "photos and audio you speak (pocket_tts) are sent there automatically after your "
+                "photos and audio you speak (audio speak, pocket_tts) are sent there automatically after your "
                 "reply. A file you write in this turn (a document, spreadsheet, chart…) is sent when "
                 "your reply names it by its file name, e.g. report.docx. For anything else — an "
                 "older file, a download, a screenshot — use whatsapp_send_file."

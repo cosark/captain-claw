@@ -8,6 +8,10 @@ given its own ``SONIOX_API_KEY`` in its env — that key is used directly.
 
 Flight Deck no longer passes its own ``SONIOX_API_KEY`` to the agents it
 starts, so a key in the agent's env is always one somebody gave it on purpose.
+
+:func:`soniox_usable` is the synchronous answer the tool registry needs (the
+``audio`` tool shows only while it is True); :func:`available` refreshes it and
+runs once per turn.
 """
 
 from __future__ import annotations
@@ -33,6 +37,10 @@ NOT_CONFIGURED = "Soniox isn't configured — set SONIOX_API_KEY"
 # local lookup in Flight Deck).
 _CONNECTED: tuple[bool, float] = (False, 0.0)
 _CACHE_SECONDS = 60.0
+# How long a positive check keeps the audio tool listed without a fresh one —
+# long enough that a long turn never loses it mid-way; a key removed meanwhile
+# just makes the next call fail with Flight Deck's own explanation.
+_USABLE_MAX_AGE = 900.0
 
 
 def own_key() -> str:
@@ -71,6 +79,18 @@ def _fd_error(resp: httpx.Response) -> SonioxError:
     if resp.status_code in (404, 405) and detail in ("", "Not Found", "Method Not Allowed"):
         return SonioxError(404, _OLD_DECK)
     return SonioxError(resp.status_code, detail or f"Flight Deck refused the Soniox request (HTTP {resp.status_code})")
+
+
+def soniox_usable() -> bool:
+    """Whether Soniox can be used right now, without awaiting (for the tool
+    registry): a key of the agent's own, or a recent "connected" from Flight
+    Deck (refreshed per turn by :func:`available`)."""
+    if own_key():
+        return True
+    if not under_flight_deck():
+        return False
+    connected, at = _CONNECTED
+    return connected and at > 0 and time.time() - at <= _USABLE_MAX_AGE
 
 
 async def available() -> bool:
@@ -131,6 +151,33 @@ async def transcribe(
     data = resp.json() or {}
     tokens = [t for t in data.get("tokens") or [] if isinstance(t, dict)]
     return Transcript(text=str(data.get("text") or "").strip(), tokens=tokens)
+
+
+async def speak(
+    text: str, *, voice: str = "", language: str = "", audio_format: str = "mp3",
+) -> bytes:
+    """Speak *text*: the audio bytes. Raises :class:`SonioxError`."""
+    key = own_key()
+    if key:
+        return await soniox_api.synthesize(key, text, voice=voice, language=language, audio_format=audio_format)
+    if not under_flight_deck():
+        raise SonioxError(0, NOT_CONFIGURED)
+    try:
+        # Long text is spoken in up to ten Soniox requests behind Flight Deck.
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            resp = await client.post(
+                f"{_fd_base()}/fd/soniox/agent/speak", headers=_fd_headers(),
+                json={"text": text, "voice": voice, "language": language, "audio_format": audio_format},
+            )
+    except httpx.TimeoutException:
+        raise SonioxError(0, "Flight Deck didn't finish the speech in time") from None
+    except httpx.HTTPError as exc:
+        raise SonioxError(0, f"Could not reach Flight Deck for Soniox ({type(exc).__name__})") from None
+    if resp.status_code != 200:
+        raise _fd_error(resp)
+    if not resp.content:
+        raise SonioxError(200, "Flight Deck returned no audio")
+    return resp.content
 
 
 async def realtime_key(usage_type: str = "transcribe_websocket", *, expires_in_seconds: int = 600) -> str:

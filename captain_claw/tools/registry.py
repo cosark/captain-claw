@@ -529,6 +529,20 @@ class ToolRegistry:
         except Exception:
             tools = [t for t in tools if not self._tool_metadata.get(t.name, {}).get("requires_jev")]
 
+        # Soniox (the audio tool): shown only while a key is usable — the
+        # owner's (or team's) in Flight Deck, refreshed per turn by
+        # ``soniox_client.available()``, or the agent's own SONIOX_API_KEY.
+        # Fails closed. (A shared agent's member sees it only if the member
+        # allowlist names it — it doesn't today.)
+        try:
+            if any(self._tool_metadata.get(t.name, {}).get("requires_soniox") for t in tools):
+                from captain_claw import soniox_client
+
+                if not soniox_client.soniox_usable():
+                    tools = [t for t in tools if not self._tool_metadata.get(t.name, {}).get("requires_soniox")]
+        except Exception:
+            tools = [t for t in tools if not self._tool_metadata.get(t.name, {}).get("requires_soniox")]
+
         # Same idea for deep memory. Under Flight Deck the tool always shows:
         # FD owns the Typesense connection and can gain one at any moment, and
         # its error names the exact place to fix it. Standalone with no key and

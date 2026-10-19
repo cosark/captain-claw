@@ -310,7 +310,7 @@ Captain Claw ships with 33 built-in tools. The agent picks the right tool for ea
 | `image_ocr` | Extract text from images via vision-capable LLMs |
 | `image_vision` | Analyze and describe images via vision-capable LLMs |
 | `pocket_tts` | Generate speech audio (MP3) locally with 8 built-in voices |
-| `stt` | Speech-to-text transcription (Soniox realtime, OpenAI Whisper, Gemini) |
+| `audio` | Soniox speech-to-text (audio/video files → text, timestamps) and text-to-speech (MP3 sent to the chat); shown when a Soniox key is connected |
 | `send_mail` | Send email via SMTP, Mailgun, or SendGrid |
 | `google_drive` | Google Drive — list, search, read, download, upload, create and update files (Docs/Sheets/Slides exported); accepts Drive URLs |
 | `google_calendar` | Google Calendar — list, search, create, update and delete events |
@@ -367,7 +367,7 @@ tools:
   enabled: ["shell", "read", "write", "glob", "web_fetch", "web_search",
             "pdf_extract", "docx_extract", "xlsx_extract", "pptx_extract",
             "image_gen", "image_ocr", "image_vision",
-            "pocket_tts", "stt", "send_mail", "google_drive", "google_calendar",
+            "pocket_tts", "audio", "send_mail", "google_drive", "google_calendar",
             "google_mail", "todo", "contacts",
             "scripts", "apis", "datastore", "playbooks", "personality",
             "botport", "termux", "screen_capture", "desktop_action"]

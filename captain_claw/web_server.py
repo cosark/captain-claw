@@ -1073,8 +1073,8 @@ class WebServer:
                     "role": "image",
                     "content": str(img_path),
                 })
-        # Auto-broadcast audio player when pocket_tts (or similar) produces a file.
-        if normalized in ("pocket_tts", "tts") and output and not str(output).strip().lower().startswith("error"):
+        # Auto-broadcast audio player when pocket_tts / audio speak (or similar) produces a file.
+        if normalized in ("pocket_tts", "tts", "audio") and output and not str(output).strip().lower().startswith("error"):
             import re
             audio_match = re.search(r"Path:\s*(\S+\.(?:mp3|wav|ogg|flac|m4a|aac))", str(output))
             if audio_match:

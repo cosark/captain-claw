@@ -29,6 +29,10 @@ from typing import Any
 # saved/ folders that never hold deliverables: working code, and inputs the
 # agent fetched (a Drive file it summarises isn't sent back unasked).
 WORKING_DIRS = ("scripts", "tools", "skills", "downloads")
+# Tools whose "Path:" MP3 is speech made FOR the user (sent / played on every
+# chat surface): local pocket_tts and the Soniox audio tool's speak action.
+# (audio transcribe prints "Source:", never "Path:" — the input stays put.)
+SPEECH_TOOLS: frozenset[str] = frozenset({"pocket_tts", "audio"})
 
 
 def saved_root_of(agent: Any) -> Path | None:

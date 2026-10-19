@@ -103,6 +103,8 @@ def soniox(monkeypatch):
             return httpx.Response(200, json={"status": state.job_status, "error_message": "bad audio"})
         if path == "/v1/transcriptions/tr-1/transcript":
             return httpx.Response(200, json={"text": "Hello world", "tokens": TOKENS})
+        if path == "/tts":
+            return httpx.Response(200, content=b"ID3-speech:" + request.content[:40])
         if path == "/v1/auth/temporary-api-key":
             return httpx.Response(201, json={"api_key": "temp:abc123", "expires_at": "2026-10-19T12:10:00Z"})
         return httpx.Response(404, json={"message": "no route"})
@@ -404,6 +406,30 @@ class TestAgent:
         assert payload["usage_type"] == "transcribe_websocket"
         assert payload["expires_in_seconds"] == 3600  # capped
         assert KEY_BOB not in r.text
+
+    async def test_agent_speaks_with_its_owners_key(self, db, soniox, agents):
+        await _save(ALICE, KEY_ALICE)
+        await _save(BOB, KEY_BOB)
+        r = _client().post("/fd/soniox/agent/speak", headers={"X-Agent-Auth": "tok-bob"},
+                           json={"text": "Dobro jutro", "voice": "Emma", "language": "hr"})
+        assert r.status_code == 200, r.text
+        assert r.headers["content-type"] == "audio/mpeg" and r.content.startswith(b"ID3-speech:")
+        (sent,) = [c for c in soniox.requests if c["path"] == "/tts"]
+        assert sent["auth"] == f"Bearer {KEY_BOB}"
+        (logged,) = await _usage(db, BOB)
+        assert logged["kind"] == "tts" and logged["chars"] == len("Dobro jutro") and logged["ok"] is True
+
+    async def test_speak_needs_a_key_text_and_an_agent(self, db, soniox, agents):
+        c = _client()
+        r = c.post("/fd/soniox/agent/speak", headers={"X-Agent-Auth": "tok-bob"}, json={"text": "hi"})
+        assert r.status_code == 404 and r.json()["detail"] == sr.NOT_CONNECTED
+        await _save(BOB, KEY_BOB)
+        r = c.post("/fd/soniox/agent/speak", headers={"X-Agent-Auth": "tok-bob"}, json={"text": "  "})
+        assert r.status_code == 422
+        r = c.post("/fd/soniox/agent/speak", headers={"X-Agent-Auth": "tok-bob", "Origin": "http://x"},
+                   json={"text": "hi"})
+        assert r.status_code == 403
+        assert [c for c in soniox.requests if c["path"] == "/tts"] == []
 
     async def test_bad_usage_type_is_a_422(self, db, soniox, agents):
         await _save(BOB, KEY_BOB)
