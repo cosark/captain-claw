@@ -98,6 +98,35 @@ CREATE TABLE IF NOT EXISTS payment_connections (
     updated_at        REAL NOT NULL,
     PRIMARY KEY (owner_id, provider)
 );
+-- Purchases (Phase 3): Captain buys from an online shop with a one-time
+-- credential the user approved (Link Agent Wallet, a Revolut card made for the
+-- purchase) or through a checkout protocol (ACP, AP2).
+CREATE TABLE IF NOT EXISTS purchases (
+    id                  TEXT PRIMARY KEY,
+    owner_id            TEXT NOT NULL,
+    agent               TEXT NOT NULL DEFAULT '',
+    session_id          TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL,
+    source              TEXT NOT NULL,
+    merchant_name       TEXT NOT NULL DEFAULT '',
+    merchant_url        TEXT NOT NULL DEFAULT '',
+    description         TEXT NOT NULL DEFAULT '',
+    items               TEXT NOT NULL DEFAULT '[]',
+    amount_cents        INTEGER NOT NULL DEFAULT 0,
+    currency            TEXT NOT NULL DEFAULT 'EUR',
+    approval_url        TEXT NOT NULL DEFAULT '',
+    provider_state      TEXT NOT NULL DEFAULT '{}',
+    card_last4          TEXT NOT NULL DEFAULT '',
+    credential_released INTEGER NOT NULL DEFAULT 0,
+    result              TEXT NOT NULL DEFAULT '{}',
+    order_ref           TEXT NOT NULL DEFAULT '',
+    warnings            TEXT NOT NULL DEFAULT '[]',
+    automated           INTEGER NOT NULL DEFAULT 0,
+    created_at          REAL NOT NULL,
+    updated_at          REAL NOT NULL,
+    completed_at        REAL
+);
+CREATE INDEX IF NOT EXISTS idx_purchases_owner ON purchases(owner_id, created_at);
 -- Small per-owner preferences (Phase 2: the bank a pay-by-bank link opens).
 CREATE TABLE IF NOT EXISTS payment_prefs (
     owner_id   TEXT NOT NULL,
@@ -140,8 +169,25 @@ def _row(row: aiosqlite.Row | None) -> dict | None:
     return out
 
 
-def _dump(values: dict) -> dict:
-    return {k: (json.dumps(v, ensure_ascii=False) if k in _JSON_COLS else v) for k, v in values.items()}
+def _dump(values: dict, json_cols: dict = _JSON_COLS) -> dict:
+    return {k: (json.dumps(v, ensure_ascii=False) if k in json_cols else v) for k, v in values.items()}
+
+
+_PURCHASE_JSON = {"items": [], "provider_state": {}, "result": {}, "warnings": []}
+PURCHASE_LIVE = ("awaiting_approval", "approved", "paying", "needs_action")
+PURCHASE_DONE = ("ordered", "completed")
+PURCHASE_TERMINAL = PURCHASE_DONE + ("failed", "denied", "expired", "cancelled")
+
+
+def _purchase_row(row: aiosqlite.Row | None) -> dict | None:
+    if row is None:
+        return None
+    out = dict(row)
+    for col, default in _PURCHASE_JSON.items():
+        out[col] = _loads(out.get(col), type(default)())
+    out["automated"] = bool(out.get("automated"))
+    out["credential_released"] = bool(out.get("credential_released"))
+    return out
 
 
 class PaymentsStore:
@@ -279,7 +325,48 @@ class PaymentsStore:
         await db.execute("DELETE FROM payment_settings WHERE owner_id = ?", (owner_id,))
         await db.execute("DELETE FROM payment_connections WHERE owner_id = ?", (owner_id,))
         await db.execute("DELETE FROM payment_prefs WHERE owner_id = ?", (owner_id,))
+        await db.execute("DELETE FROM purchases WHERE owner_id = ?", (owner_id,))
         await db.commit()
+
+    # ── purchases (Phase 3) ──────────────────────────────────────────
+
+    async def create_purchase(self, row: dict) -> dict:
+        db = await self._ensure_db()
+        now = time.time()
+        values = _dump({**row, "created_at": now, "updated_at": now}, _PURCHASE_JSON)
+        await db.execute(f"INSERT INTO purchases ({', '.join(values)}) VALUES ({', '.join('?' for _ in values)})",
+                         tuple(values.values()))
+        await db.commit()
+        return await self.get_purchase(row["id"])
+
+    async def update_purchase(self, purchase_id: str, **changes: Any) -> dict | None:
+        db = await self._ensure_db()
+        values = _dump({**changes, "updated_at": time.time()}, _PURCHASE_JSON)
+        await db.execute(f"UPDATE purchases SET {', '.join(f'{k} = ?' for k in values)} WHERE id = ?",
+                         (*values.values(), purchase_id))
+        await db.commit()
+        return await self.get_purchase(purchase_id)
+
+    async def get_purchase(self, purchase_id: str) -> dict | None:
+        db = await self._ensure_db()
+        async with db.execute("SELECT * FROM purchases WHERE id = ?", (purchase_id,)) as cur:
+            return _purchase_row(await cur.fetchone())
+
+    async def list_purchases(self, owner_id: str, *, limit: int = 100) -> list[dict]:
+        db = await self._ensure_db()
+        async with db.execute("SELECT * FROM purchases WHERE owner_id = ? ORDER BY created_at DESC LIMIT ?",
+                              (owner_id, int(limit))) as cur:
+            return [_purchase_row(r) for r in await cur.fetchall()]
+
+    async def release_credential(self, purchase_id: str) -> bool:
+        """Mark the purchase's one-time credential released; False if it already was
+        (a credential leaves Flight Deck once, for one checkout)."""
+        db = await self._ensure_db()
+        cur = await db.execute(
+            "UPDATE purchases SET credential_released = 1, status = 'paying', updated_at = ?"
+            " WHERE id = ? AND credential_released = 0 AND status = 'approved'", (time.time(), purchase_id))
+        await db.commit()
+        return (cur.rowcount or 0) == 1
 
     # ── preferences ──────────────────────────────────────────────────
 

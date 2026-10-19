@@ -59,6 +59,15 @@ class PaymentsTool(Tool):
         "approve anything itself. action='mark' (id, status paid|skip|cancel): only when the user "
         "themselves says they paid or want to skip it. action='list' (status, query) / 'get' (id): "
         "what is prepared, paid or due.\n"
+        "SHOPPING (buying from an online shop): action='purchase' (source: 'link' = Stripe Link wallet, "
+        "'revolut_card' = a Revolut card made for this purchase; merchant_name, merchant_url = the shop's "
+        "https address, items [{name, quantity, unit_amount}], amount = the checkout's final total incl. "
+        "shipping, currency) asks the USER to approve this seller and amount — nothing can be paid before. "
+        "When get says APPROVED: fill the cart, shipping and contact details in the browser and stop at the "
+        "card form, then action='checkout_pay' (id, pay_button = the exact text of the shop's pay button): "
+        "it types the one-time card into the form and clicks pay in one step — you never see the card. "
+        "Don't screenshot or read the page between checkout_pay's fill and its result. If the bank asks the "
+        "user to confirm (3-D Secure), ask them, then action='checkout_check' (id).\n"
         "Rules: never ask for or accept card numbers, CVVs or bank logins. Never say anything was "
         "paid unless the user marked it paid — you can't pay. Tell the user every warning; you "
         "can't clear one, the user does that in Flight Deck → Payments."
@@ -68,7 +77,30 @@ class PaymentsTool(Tool):
     parameters = {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["prepare", "handoff", "mark", "list", "get"]},
+            "action": {"type": "string", "enum": ["prepare", "handoff", "mark", "list", "get",
+                                                  "purchase", "checkout_pay", "checkout_check"]},
+            "source": {"type": "string", "enum": ["link", "revolut_card", "acp", "ap2"],
+                       "description": "purchase: how it's paid (see the description)."},
+            "merchant_name": {"type": "string", "description": "purchase: the shop's name."},
+            "merchant_url": {"type": "string", "description": "purchase: the shop's https:// page for this order."},
+            "items": {"type": "array", "description": "purchase: what is bought.",
+                      "items": {"type": "object", "properties": {
+                          "name": {"type": "string"}, "quantity": {"type": "integer"},
+                          "unit_amount": {"type": "string"}, "url": {"type": "string"},
+                          "id": {"type": "string"}}}},
+            "credential_type": {"type": "string", "enum": ["card", "link_pay_token"],
+                                "description": "purchase with source link: 'link_pay_token' only on a Stripe "
+                                               "checkout showing a Link pay-token field."},
+            "merchant_account_id": {"type": "string",
+                                    "description": "purchase with link_pay_token: the acct_… on the checkout page."},
+            "protocol_endpoint": {"type": "string",
+                                  "description": "purchase with source acp / ap2: the merchant's endpoint."},
+            "pay_button": {"type": "string",
+                           "description": "checkout_pay: the exact visible text of the shop's pay button "
+                                          "(or a CSS selector)."},
+            "fields": {"type": "object",
+                       "description": "checkout_pay, only if the card fields aren't found: CSS selectors "
+                                      "{number, exp, exp_month, exp_year, cvc}."},
             "source": {"type": "string",
                        "description": "prepare: the invoice file — path or file name (PDF, PNG, JPG)."},
             "payee_name": {"type": "string", "description": "prepare: who is paid."},
@@ -115,10 +147,17 @@ class PaymentsTool(Tool):
                 return await self._list(kwargs)
             if action == "get":
                 return await self._get(kwargs)
+            if action == "purchase":
+                return await self._purchase(kwargs, runtime)
+            if action == "checkout_pay":
+                return await self._checkout_pay(kwargs, runtime)
+            if action == "checkout_check":
+                return await self._checkout_check(kwargs, runtime)
         except Exception as exc:  # noqa: BLE001 — a failed call is the tool's answer, not a crash
             log.warning("payments tool call failed", action=action, error=str(exc))
             return ToolResult(success=False, error=f"Flight Deck couldn't be reached: {exc}")
-        return ToolResult(success=False, error="Unknown action — use prepare, handoff, mark, list or get.")
+        return ToolResult(success=False, error=(
+            "Unknown action — use prepare, handoff, mark, list, get, purchase, checkout_pay or checkout_check."))
 
     # ── actions ───────────────────────────────────────────────────────
 
@@ -212,6 +251,14 @@ class PaymentsTool(Tool):
 
     async def _mark(self, kwargs: dict, runtime: dict) -> ToolResult:
         intent_id = str(kwargs.get("id") or "").strip()
+        if intent_id.startswith("pur_"):
+            if str(kwargs.get("status") or "").strip().lower() not in ("cancel", "cancelled", "skip"):
+                return ToolResult(success=False, error="A purchase can only be cancelled here (status cancel); "
+                                                       "it counts as paid only when its checkout confirms it.")
+            data, err = await payments_client.call("POST", f"/fd/payments/agent/purchases/{intent_id}/cancel", {})
+            if err:
+                return ToolResult(success=False, error=err)
+            return ToolResult(success=True, content=_describe_purchase(data.get("purchase") or {}))
         status = _MARK.get(str(kwargs.get("status") or "").strip().lower())
         if not intent_id or not status:
             return ToolResult(success=False, error="Give `id` and `status` (paid, skip or cancel).")
@@ -242,12 +289,99 @@ class PaymentsTool(Tool):
     async def _get(self, kwargs: dict) -> ToolResult:
         intent_id = str(kwargs.get("id") or "").strip()
         if not intent_id:
-            return ToolResult(success=False, error="Give `id` (pay_…).")
+            return ToolResult(success=False, error="Give `id` (pay_… or pur_…).")
+        if intent_id.startswith("pur_"):
+            data, err = await payments_client.call("GET", f"/fd/payments/agent/purchases/{intent_id}")
+            if err:
+                return ToolResult(success=False, error=err)
+            return ToolResult(success=True, content=_describe_purchase(data.get("purchase") or {}))
         data, err = await payments_client.call("GET", f"/fd/payments/agent/{intent_id}")
         if err:
             return ToolResult(success=False, error=err)
         return ToolResult(success=True, content=_describe(data.get("intent") or {}, next_step=False,
                                                           rails=data.get("rails") or []))
+
+    # ── purchases (Phase 3) ───────────────────────────────────────────
+
+    async def _purchase(self, kwargs: dict, runtime: dict) -> ToolResult:
+        keys = ("source", "merchant_name", "merchant_url", "description", "amount", "currency",
+                "credential_type", "merchant_account_id", "protocol_endpoint")
+        body: dict[str, Any] = {k: str(kwargs[k]).strip() for k in keys if kwargs.get(k) not in (None, "")}
+        items = kwargs.get("items") or []
+        body["items"] = [{k: (str(v) if k != "quantity" else int(v or 1)) for k, v in dict(i).items()
+                          if k in ("name", "quantity", "unit_amount", "url", "id") and v not in (None, "")}
+                         for i in items if isinstance(i, dict) and i.get("name")]
+        for value in [*body.values(), *(i.get("name", "") for i in body["items"])]:
+            if card_scrub.looks_like_card_data(str(value)):
+                return ToolResult(success=False, error="Refused: that looks like payment-card data. Captain "
+                                                       "never takes card numbers — the user approves the purchase.")
+        missing = [k for k in ("source", "merchant_name", "merchant_url", "amount") if not body.get(k)]
+        if missing:
+            return ToolResult(success=False, error=f"Give {', '.join(missing)}.")
+        body.update(session_id=str(runtime.get("_session_id") or ""), **{k: v for k, v in _turn_kind().items()
+                                                                          if k == "automated"})
+        data, err = await payments_client.call("POST", "/fd/payments/agent/purchases", body)
+        if err:
+            return ToolResult(success=False, error=err)
+        return ToolResult(success=True, content=_describe_purchase(data.get("purchase") or {}))
+
+    async def _checkout_pay(self, kwargs: dict, runtime: dict) -> ToolResult:
+        from captain_claw.payments import card_fill
+
+        purchase_id = str(kwargs.get("id") or "").strip()
+        pay_button = str(kwargs.get("pay_button") or "").strip()
+        if not purchase_id.startswith("pur_") or not pay_button:
+            return ToolResult(success=False, error="Give `id` (pur_…) and `pay_button` (the pay button's text).")
+        page = await _agent_page(runtime)
+        if page is None:
+            return ToolResult(success=False, error=(
+                "No checkout page is open. Open the shop's checkout in the browser tool (cart, shipping and "
+                "contact filled, stopped at the card form), then call checkout_pay again."))
+        cred, err = await payments_client.call("POST", f"/fd/payments/agent/purchases/{purchase_id}/credential", {})
+        if err:
+            return ToolResult(success=False, error=err)
+        card = None
+        token = ""
+        if cred.get("kind") == "card":
+            c = cred.get("card") or {}
+            card = card_fill.Card(number=str(c.get("number") or ""), exp_month=int(c.get("exp_month") or 0),
+                                  exp_year=int(c.get("exp_year") or 0), cvc=str(c.get("cvc") or ""),
+                                  name=str(c.get("name") or ""))
+        else:
+            token = str(cred.get("token") or "")
+        cred = {}
+        overrides = {k: str(v) for k, v in dict(kwargs.get("fields") or {}).items()
+                     if k in ("number", "exp", "exp_month", "exp_year", "cvc", "name") and v}
+        try:
+            result = await card_fill.fill_and_pay(page, card=card, link_pay_token=token, pay_button=pay_button,
+                                                  overrides=overrides)
+        finally:
+            card, token = None, ""            # the card lives only for the fill
+        data, err = await payments_client.call("POST", f"/fd/payments/agent/purchases/{purchase_id}/result",
+                                               result.as_dict() | {"filled": result.filled})
+        if err:
+            return ToolResult(success=False, error=f"The checkout said {result.outcome}, but recording it failed: {err}")
+        return ToolResult(success=True, content=_describe_checkout(result.as_dict(), data.get("purchase") or {}))
+
+    async def _checkout_check(self, kwargs: dict, runtime: dict) -> ToolResult:
+        from captain_claw.payments import card_fill
+
+        purchase_id = str(kwargs.get("id") or "").strip()
+        page = await _agent_page(runtime)
+        if not purchase_id.startswith("pur_") or page is None:
+            return ToolResult(success=False, error="Give `id` (pur_…) with the checkout page still open.")
+        outcome, url, title, excerpt = await card_fill.read_outcome(page)
+        if outcome in ("confirmed", "declined"):
+            data, err = await payments_client.call("POST", f"/fd/payments/agent/purchases/{purchase_id}/result",
+                                                   {"outcome": outcome, "url": url, "title": title, "excerpt": excerpt})
+            if err:
+                return ToolResult(success=False, error=err)
+            purchase = data.get("purchase") or {}
+        else:
+            data, err = await payments_client.call("GET", f"/fd/payments/agent/purchases/{purchase_id}")
+            purchase = data.get("purchase") or {} if not err else {}
+        return ToolResult(success=True, content=_describe_checkout(
+            {"outcome": outcome, "url": url, "title": title, "excerpt": excerpt, "filled": []}, purchase))
 
     # ── helpers ───────────────────────────────────────────────────────
 
@@ -272,6 +406,79 @@ class PaymentsTool(Tool):
                     pass
             paths.append(str(Path(target)))
         return paths
+
+
+async def _agent_page(runtime: dict):
+    """The agent's own browser page (the browser tool's session), or None."""
+    try:
+        from captain_claw.tools import browser as browser_tool
+    except Exception:  # noqa: BLE001 — no browser support installed
+        return None
+    key = str(runtime.get("_session_id") or "").strip() or "default"
+    session = browser_tool._BROWSER_SESSIONS.get(key)
+    if session is None or not session.is_alive:
+        return None
+    return await session.ensure_page()
+
+
+_PAID_WITH = {"link": "a one-time Link card", "revolut_card": "a Revolut card made for this purchase",
+              "acp": "the shop's ACP checkout", "ap2": "an AP2 checkout"}
+
+
+def _purchase_line(p: dict) -> str:
+    return f"purchase_intent: {p.get('id', '')} status: {p.get('status', '')}"
+
+
+def _describe_purchase(p: dict) -> str:
+    lines = [_purchase_line(p),
+             f"{p.get('merchant_name')} ({p.get('merchant_domain')}) · {p.get('amount_text')} · paid with "
+             f"{_PAID_WITH.get(p.get('source'), p.get('source'))}" + (" (TEST mode)" if p.get("test") else "")]
+    for w in p.get("warnings") or []:
+        lines.append(f"- note: {w.get('message')}")
+    status = p.get("status")
+    if status == "awaiting_approval":
+        if p.get("source") == "link":
+            lines.append(f"WAITING FOR THE USER — give them this link to approve it in Link: {p.get('approval_url')} "
+                         "(it works for 30 minutes). Then check with get.")
+        else:
+            lines.append("WAITING FOR THE USER — they approve it in Flight Deck → Payments "
+                         f"({p.get('review_path')}). You can't approve it. Then check with get.")
+    elif status == "approved":
+        lines.append("APPROVED — open the checkout in the browser (cart, shipping, contact filled; stop at the card "
+                     f"form), then payments checkout_pay id={p.get('id')} pay_button='<the pay button text>'.")
+    elif status == "needs_action":
+        action = p.get("next_action") or {}
+        lines.append("THE BANK WANTS THE USER TO CONFIRM (3-D Secure) — ask them to approve it in their bank or Link "
+                     "app" + (f" ({action.get('action_url')})" if action.get("action_url") else "")
+                     + ", then call checkout_check.")
+    elif status in ("ordered", "completed"):
+        lines.append(f"ORDERED{' and paid' if status == 'completed' else ''}"
+                     + (f" — order {p.get('order_ref')}" if p.get("order_ref") else "") + ".")
+    elif status in ("failed", "denied", "expired", "cancelled"):
+        lines.append(f"Not bought ({status}). Nothing was paid" + (" — the user denied it." if status == "denied" else "."))
+    return "\n".join(lines)
+
+
+def _describe_checkout(result: dict, purchase: dict) -> str:
+    outcome = result.get("outcome")
+    said = {"confirmed": "The shop confirmed the order.",
+            "declined": "The shop declined the card. Nothing was bought.",
+            "needs_action": "The bank wants the user to confirm the payment (3-D Secure).",
+            "not_filled": "The card form wasn't found, so nothing was entered or paid. Give `fields` selectors "
+                          "or check that the page is at the card step, then try again.",
+            "no_button": "The pay button wasn't found, so nothing was paid (the card was cleared from the form). "
+                         "Check the button's exact text and try again.",
+            "unknown": "The page didn't say clearly whether it worked — check it, then checkout_check."}.get(outcome, outcome)
+    lines = [_purchase_line(purchase) if purchase else "", said]
+    if result.get("filled"):
+        lines.append("Filled: " + ", ".join(result["filled"]) + " (values not shown).")
+    if result.get("title") or result.get("url"):
+        lines.append(f"Page now: {result.get('title') or ''} {result.get('url') or ''}".strip())
+    if result.get("excerpt"):
+        lines.append(f"It says: {result['excerpt'][:600]}")
+    if purchase:
+        lines.append(_describe_purchase(purchase).split("\n", 1)[-1])
+    return "\n".join(line for line in lines if line)
 
 
 def _user_text(runtime: dict) -> str:

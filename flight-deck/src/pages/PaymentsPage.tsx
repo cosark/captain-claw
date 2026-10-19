@@ -6,8 +6,11 @@ import { Loader2, Receipt } from 'lucide-react'
 import { PaymentCard } from '../components/payments/PaymentCard'
 import { RevolutPanel } from '../components/payments/RevolutPanel'
 import { BankLinkPanel } from '../components/payments/BankLinkPanel'
+import { LinkPanel } from '../components/payments/LinkPanel'
+import { PurchaseCard } from '../components/payments/PurchaseCard'
 import {
-  CLOSED, listPayments, setPaymentsCap, statusLabel, type Payment, type PaymentsConfig,
+  CLOSED, listPayments, listPurchases, PURCHASE_LABEL, setPaymentsCap, statusLabel,
+  type Payment, type PaymentsConfig, type Purchase,
 } from '../services/payments'
 
 const FILTERS: { id: string; label: string; status: string }[] = [
@@ -20,6 +23,37 @@ const FILTERS: { id: string; label: string; status: string }[] = [
 export function paymentIdFromPath(path = window.location.pathname): string {
   const m = /^\/payments\/(pay_[0-9a-f]{12})\/?$/.exec(path)
   return m ? m[1] : ''
+}
+
+/** /payments/purchases/<id> opens that purchase. */
+export function purchaseIdFromPath(path = window.location.pathname): string {
+  const m = /^\/payments\/purchases\/(pur_[0-9a-f]{12})\/?$/.exec(path)
+  return m ? m[1] : ''
+}
+
+function Purchases() {
+  const [rows, setRows] = useState<Purchase[] | null>(null)
+  const [selected, setSelected] = useState(purchaseIdFromPath())
+  useEffect(() => { listPurchases().then((r) => setRows(r.purchases)).catch(() => setRows([])) }, [])
+  if (!rows || (rows.length === 0 && !selected)) return null
+  return (
+    <div className="mb-6">
+      <h2 className="mb-2 text-sm font-semibold text-zinc-200">Purchases</h2>
+      {selected && <PurchaseCard key={selected} id={selected} />}
+      <div className="divide-y divide-zinc-800 rounded-lg border border-zinc-800">
+        {rows.map((p) => (
+          <button key={p.id} onClick={() => setSelected(p.id === selected ? '' : p.id)}
+            className={`flex w-full items-center justify-between gap-3 px-3 py-2 text-left hover:bg-zinc-900 ${p.id === selected ? 'bg-zinc-900' : ''}`}>
+            <div className="min-w-0">
+              <div className="truncate text-sm text-zinc-200">{p.merchant_name} · <span className="text-zinc-500">{p.merchant_domain}</span></div>
+              <div className="text-[11px] text-zinc-500">{PURCHASE_LABEL[p.status] ?? p.status}{p.test ? ' · test' : ''}</div>
+            </div>
+            <div className="shrink-0 text-sm font-medium text-zinc-300">{p.amount_text}</div>
+          </button>
+        ))}
+      </div>
+    </div>
+  )
 }
 
 function CapEditor({ config, onSaved }: { config: PaymentsConfig; onSaved: (c: PaymentsConfig) => void }) {
@@ -103,6 +137,8 @@ export function PaymentsPage() {
         {config && <div className="mb-4"><CapEditor config={config} onSaved={setConfig} /></div>}
         <BankLinkPanel />
         <RevolutPanel />
+        <LinkPanel />
+        <Purchases />
 
         <div className="mb-3 flex gap-1">
           {FILTERS.map((f) => (

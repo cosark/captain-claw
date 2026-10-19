@@ -870,7 +870,8 @@ def _callback_uri(request: Request) -> str:
 @router.get("/fd/payments/revolut/status")   # not /revolut: /fd/payments/{id} is declared first
 async def revolut_status(user: dict = Depends(get_current_user)):
     _require_on()
-    return _connection_view(await store().get_connection(user["id"], REVOLUT))
+    return {**_connection_view(await store().get_connection(user["id"], REVOLUT)),
+            "cards": bool(await store().get_pref(user["id"], "revolut_cards"))}
 
 
 @router.post("/fd/payments/revolut/key")

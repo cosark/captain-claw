@@ -66,7 +66,8 @@ import { SendContextModal } from './SendContextModal'
 import { FlowSelectorModal } from './FlowSelectorModal'
 import { PlanCard } from './PlanCard'
 import { PaymentCard } from '../payments/PaymentCard'
-import { paymentIntentOf } from '../../services/payments'
+import { PurchaseCard } from '../payments/PurchaseCard'
+import { paymentIntentOf, purchaseIntentOf } from '../../services/payments'
 import TraceTimeline from '../observability/TraceTimeline'
 import { uploadFileToAgent, formatSize } from '../../services/fileTransfer'
 import { AgentFilesPanel } from './AgentFilesPanel'
@@ -903,9 +904,11 @@ function ChatContent({
 
         {groups.map((grp, gi) => {
           // The live group is the last one (a payment card after it doesn't count).
-          const live = session.busy && groups.slice(gi + 1).every((g) => g.kind === 'payment')
+          const live = session.busy && groups.slice(gi + 1).every((g) => g.kind === 'payment' || g.kind === 'purchase')
           return grp.kind === 'payment' ? (
             <PaymentCard key={`pay-${grp.paymentId}`} id={grp.paymentId!} compact />
+          ) : grp.kind === 'purchase' ? (
+            <PurchaseCard key={`pur-${grp.paymentId}`} id={grp.paymentId!} compact />
           ) : grp.kind === 'activity' ? (
             <ActivityGroup
               key={`act-${grp.items[0].id}`}
@@ -2132,7 +2135,7 @@ function isActivityMessage(m: ChatMessage): boolean {
   return m.role === 'tool' || (m.role === 'system' && !!m.narration)
 }
 
-type ChatGroup = { kind: 'activity' | 'single' | 'payment'; items: ChatMessage[]; paymentId?: string }
+type ChatGroup = { kind: 'activity' | 'single' | 'payment' | 'purchase'; items: ChatMessage[]; paymentId?: string }
 
 function groupActivity(msgs: ChatMessage[]): ChatGroup[] {
   const groups: ChatGroup[] = []
@@ -2148,6 +2151,11 @@ function groupActivity(msgs: ChatMessage[]): ChatGroup[] {
       if (pid && !seenPayments.has(pid)) {
         seenPayments.add(pid)
         groups.push({ kind: 'payment', items: [m], paymentId: pid })
+      }
+      const purId = m.role === 'tool' ? purchaseIntentOf(m.tool_name, m.tool_output || m.content) : null
+      if (purId && !seenPayments.has(purId)) {
+        seenPayments.add(purId)
+        groups.push({ kind: 'purchase', items: [m], paymentId: purId })
       }
     } else {
       groups.push({ kind: 'single', items: [m] })

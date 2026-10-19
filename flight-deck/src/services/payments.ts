@@ -78,6 +78,8 @@ export interface RevolutConnection {
   account_label: string
   connected_at: number | null
   scope: string
+  /** Shopping: a Revolut card per purchase (Phase 3). */
+  cards?: boolean
 }
 
 export interface RevolutAccount { id: string; name: string; currency: string; balance: number; state: string }
@@ -227,4 +229,69 @@ export function statusLabel(s: PaymentStatus): string {
     user_paid: 'Paid', settled: 'Paid (bank-confirmed)', skipped: 'Skipped', cancelled: 'Cancelled',
     expired: 'Expired', failed: 'Not completed',
   }[s] ?? s
+}
+
+// ── Purchases (Phase 3): Captain buys from a shop with a one-time card ──
+
+export type PurchaseStatus =
+  | 'awaiting_approval' | 'approved' | 'paying' | 'needs_action'
+  | 'ordered' | 'completed' | 'failed' | 'denied' | 'expired' | 'cancelled'
+
+export interface Purchase {
+  id: string
+  status: PurchaseStatus
+  source: 'link' | 'revolut_card' | 'acp' | 'ap2'
+  merchant_name: string
+  merchant_url: string
+  merchant_domain: string
+  description: string
+  items: { name: string; quantity?: number; unit_amount?: string; url?: string }[]
+  amount_cents: number
+  currency: string
+  amount_text: string
+  approval_url: string
+  card_last4: string
+  order_ref: string
+  result: { outcome?: string; title?: string; url?: string; excerpt?: string }
+  warnings: { code: string; severity: string; message: string }[]
+  automated: boolean
+  next_action: { display_message?: string; action_url?: string | null }
+  test: boolean
+  created_at: number
+  completed_at: number | null
+}
+
+export interface LinkStatus {
+  configured: boolean
+  connected: boolean
+  test_mode: boolean
+  redirect_uri: string
+  user: { email: string; name: string } | null
+  error?: string
+}
+
+export const listPurchases = () => fdJson<{ purchases: Purchase[]; sources: string[] }>('/payments/purchases')
+export const getPurchase = (id: string) => fdJson<{ purchase: Purchase }>(`/payments/purchases/${encodeURIComponent(id)}`)
+export const approvePurchase = (id: string) =>
+  fdJson<{ purchase: Purchase }>(`/payments/purchases/${encodeURIComponent(id)}/approve`, { method: 'POST' })
+export const denyPurchase = (id: string) =>
+  fdJson<{ purchase: Purchase }>(`/payments/purchases/${encodeURIComponent(id)}/deny`, { method: 'POST' })
+export const getLink = () => fdJson<LinkStatus>('/payments/link/status')
+export const linkConnectUrl = () => fdJson<{ url: string }>('/payments/link/connect', { method: 'POST' })
+export const disconnectLink = () => fdJson<{ connected: false }>('/payments/link/connection', { method: 'DELETE' })
+export const setRevolutCards = (enabled: boolean) =>
+  fdJson<{ enabled: boolean; url?: string }>('/payments/revolut/cards', { method: 'POST', body: JSON.stringify({ enabled }) })
+
+/** A purchase id a `payments` tool row carries ("purchase_intent: pur_… status: …"). */
+const _PURCHASE_RE = /purchase_intent: (pur_[0-9a-f]{12}) status: (\w+)/
+export function purchaseIntentOf(toolName: string | undefined, output: string | undefined): string | null {
+  if (toolName !== 'payments' || !output) return null
+  const m = _PURCHASE_RE.exec(output)
+  return m ? m[1] : null
+}
+
+export const PURCHASE_LABEL: Record<PurchaseStatus, string> = {
+  awaiting_approval: 'Waiting for your approval', approved: 'Approved — Captain can pay',
+  paying: 'Paying…', needs_action: 'Your bank wants you to confirm', ordered: 'Ordered',
+  completed: 'Ordered and paid', failed: 'Not completed', denied: 'Denied', expired: 'Expired', cancelled: 'Cancelled',
 }

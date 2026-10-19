@@ -5,6 +5,7 @@ hidden unless the owner's Flight Deck has payments on."""
 from __future__ import annotations
 
 import asyncio
+import json
 import base64
 from pathlib import Path
 from types import SimpleNamespace
@@ -167,3 +168,68 @@ def test_ready_lists_every_rail_on_offer(fd):
     replies["/prepare"] = {"intent": INTENT, "rails": ["barcode", "revolut", "bank"]}
     out = _run(action="prepare", payee_name="HEP", iban="HR1210010051863000160", amount="1").content
     assert "rail='bank'" in out and "rail='revolut'" in out
+
+
+# ── Phase 3: purchases ──────────────────────────────────────────────
+
+_SHOP_PAGE = """<html><body><div id="form"><input autocomplete="cc-number" id="num"> <input autocomplete="cc-exp">
+<input autocomplete="cc-csc" id="cvc"></div>
+<button onclick="document.getElementById('out').textContent = document.getElementById('num').value.replace(/\\D/g,'')
+ === '4111111111117788' ? 'Thank you! Order number KB-77.' : 'Payment declined.'">Kupi</button><p id="out"></p></body></html>"""
+
+
+def test_purchase_refuses_card_data_and_sends_the_order(fd):
+    calls, replies = fd
+    r = _run(action="purchase", source="link", merchant_name="Shop", merchant_url="https://shop.example",
+             amount="10", items=[{"name": "4111 1111 1111 1111"}])
+    assert not r.success and calls == []
+    replies["/purchases"] = {"purchase": {"id": "pur_0123456789ab", "status": "awaiting_approval", "source": "link",
+                                          "merchant_name": "Shop", "merchant_domain": "shop.example",
+                                          "amount_text": "10.00 EUR", "approval_url": "https://app.link.com/a/1"}}
+    r = _run(action="purchase", source="link", merchant_name="Shop", merchant_url="https://shop.example",
+             amount="10", items=[{"name": "Book", "quantity": 2}])
+    assert r.success and "purchase_intent: pur_0123456789ab status: awaiting_approval" in r.content
+    assert "https://app.link.com/a/1" in r.content and calls[0][2]["items"] == [{"name": "Book", "quantity": 2}]
+
+
+def test_checkout_pay_never_shows_the_card(fd, monkeypatch):
+    playwright = pytest.importorskip("playwright.async_api")
+    from captain_claw.tools import browser as browser_tool
+
+    calls, replies = fd
+    replies["/credential"] = {"kind": "card", "card": {"number": "4111111111117788", "cvc": "321",
+                                                       "exp_month": 10, "exp_year": 2027, "name": ""}}
+    replies["/result"] = {"purchase": {"id": "pur_0123456789ab", "status": "ordered", "source": "revolut_card",
+                                       "merchant_name": "Knjižara", "merchant_domain": "knjizara.example",
+                                       "amount_text": "42.50 EUR", "order_ref": "KB-77"}}
+
+    async def go():
+        async with playwright.async_playwright() as p:
+            browser = await p.chromium.launch()
+            page = await browser.new_page()
+            await page.set_content(_SHOP_PAGE)
+
+            class Session:
+                is_alive = True
+
+                async def ensure_page(self):
+                    return page
+
+            monkeypatch.setitem(browser_tool._BROWSER_SESSIONS, "s1", Session())
+            try:
+                return await PaymentsTool().execute(action="checkout_pay", id="pur_0123456789ab",
+                                                    pay_button="Kupi", _session_id="s1")
+            finally:
+                await browser.close()
+
+    r = asyncio.run(go())
+    assert r.success, r.error
+    assert "4111111111117788" not in r.content and "321" not in r.content
+    assert "purchase_intent: pur_0123456789ab status: ordered" in r.content and "KB-77" in r.content
+    posted = next(body for _, path, body in calls if path.endswith("/result"))
+    assert posted["outcome"] == "confirmed" and "4111111111117788" not in json.dumps(posted)
+
+
+def test_checkout_pay_needs_an_open_page(fd):
+    r = _run(action="checkout_pay", id="pur_0123456789ab", pay_button="Pay", _session_id="nobody")
+    assert not r.success and "No checkout page is open" in r.error

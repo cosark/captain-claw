@@ -1772,3 +1772,25 @@ def test_a_made_up_payment_id_is_caught() -> None:
 def test_the_payment_corrective_never_asks_to_pay() -> None:
     text = fg.payment_corrective()
     assert not re.search(r"(?i)\b(?:pay|transfer|send)\s+(?:it|now|the\s+money)\b", text)
+
+
+# ── Purchase claims (Phase 3: Captain pays only for an approved, confirmed purchase) ──
+
+_PURCHASED = ToolStep("payments", "checkout_pay", {"id": "pur_0123456789ab"},
+                      "purchase_intent: pur_0123456789ab status: ordered\nThe checkout confirmed the order.")
+_PURCHASE_PENDING = ToolStep("payments", "purchase", {"id": "pur_0123456789ab"},
+                             "purchase_intent: pur_0123456789ab status: awaiting_approval")
+
+
+@pytest.mark.parametrize("reply", ["I ordered the shoes.", "I've placed the order.", "Naručio sam knjigu.",
+                                   "Your order is confirmed.", "I paid with the one-time card."])
+def test_a_purchase_claim_needs_a_confirmed_purchase(reply) -> None:
+    assert fg.judge_reply(reply, reply, _pay_facts(_PURCHASE_PENDING)).kinds == (fg.PAYMENT_CLAIM,)
+    assert fg.judge_reply(reply, reply, _pay_facts(_PURCHASED)).kinds == ()
+
+
+def test_a_confirmed_purchase_doesnt_make_a_bill_paid_by_captain_true_elsewhere() -> None:
+    # "I paid" is backed by the purchase; the bill's state still needs the ledger.
+    assert fg.judge_reply("I paid it.", "I paid it.", _pay_facts(_PURCHASED)).kinds == ()
+    assert fg.judge_reply("Once you approve, I'll place the order.", "Once you approve, I'll place the order.",
+                          _pay_facts(_PURCHASE_PENDING)).kinds == ()

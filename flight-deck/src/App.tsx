@@ -46,7 +46,7 @@ import { AgentFoldersPage } from './pages/AgentFoldersPage'
 import { SystemPage } from './pages/SystemPage'
 import { BrowserLLMPage } from './pages/BrowserLLMPage'
 import { BeingsPage } from './pages/BeingsPage'
-import { PaymentsPage, paymentIdFromPath } from './pages/PaymentsPage'
+import { PaymentsPage, paymentIdFromPath, purchaseIdFromPath } from './pages/PaymentsPage'
 import { PublicBeingPage } from './pages/PublicBeingPage'
 import { useUIStore } from './stores/uiStore'
 import { useAgentStore } from './stores/agentStore'
@@ -160,7 +160,7 @@ function AppContent() {
   const view = useUIStore((s) => s.view)
   // A payment's phone page links here (/payments/<id>) when it needs review.
   useEffect(() => {
-    if (window.location.pathname === '/payments' || paymentIdFromPath()) useUIStore.getState().setView('payments')
+    if (window.location.pathname === '/payments' || paymentIdFromPath() || purchaseIdFromPath()) useUIStore.getState().setView('payments')
   }, [])
   const layoutMode = useUIStore((s) => s.layoutMode)
   const kioskLocked = useAuthStore(selectKioskLocked)

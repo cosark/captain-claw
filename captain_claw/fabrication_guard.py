@@ -1611,10 +1611,25 @@ _PAY_USER_RE = re.compile(
     r"|\b(?:platio|platila|uplatio|uplatila|ozna[čc]io|ozna[čc]ila)\s+si\b"
 )
 _PAID_EVIDENCE_RE = re.compile(r"\bstatus: (?:user_paid|settled)\b")
+# A purchase Captain itself paid (Phase 3: one-time card, approved by the user)
+# that the checkout confirmed — the one case where "I paid / I ordered" is true.
+_PURCHASED_EVIDENCE_RE = re.compile(r"\bpurchase_intent: pur_[0-9a-f]{12} status: (?:ordered|completed)\b")
+# "I bought / ordered / placed the order", "kupio sam", "naručio sam".
+_PURCHASE_CLAIM_RE = re.compile(
+    r"(?i)\bI(?:'ve|\s+have|\s+just|\s+already)?\s+(?:just\s+|already\s+)?(?:bought|purchased|ordered"
+    r"|placed\s+(?:the|an|your)\s+order|checked\s+out)\b"
+    r"|\b(?:kupio|kupila|naru[čc]io|naru[čc]ila)\s+sam\b|\bsam\s+(?:kupio|kupila|naru[čc]io|naru[čc]ila)\b"
+    r"|\b(?:order|narud[žz]ba)\s+(?:is|was|has\s+been|je)\s+(?:now\s+)?(?:placed|confirmed|complete[d]?"
+    r"|zaprimljen\w*|potvr[đd]en\w*|poslan\w*)\b"
+)
 
 
 def _payment_evidence(steps: Iterable[ToolStep]) -> bool:
     return any(step.name in PAYMENT_TOOLS and _PAID_EVIDENCE_RE.search(step.content) for step in steps)
+
+
+def _purchase_evidence(steps: Iterable[ToolStep]) -> bool:
+    return any(step.name in PAYMENT_TOOLS and _PURCHASED_EVIDENCE_RE.search(step.content) for step in steps)
 
 
 def _payment_claim(reply: str, facts: TurnFacts) -> tuple[frozenset[int], bool]:
@@ -1622,10 +1637,12 @@ def _payment_claim(reply: str, facts: TurnFacts) -> tuple[frozenset[int], bool]:
     if not facts.payment_tools:
         return frozenset(), False
     text = str(reply or "")
-    evidence = _payment_evidence(facts.turn_steps) or _payment_evidence(facts.session_steps)
+    purchased = _purchase_evidence(facts.turn_steps) or _purchase_evidence(facts.session_steps)
+    evidence = purchased or _payment_evidence(facts.turn_steps) or _payment_evidence(facts.session_steps)
     lines: set[int] = set()
     false = False
-    for pattern, first_person in ((_PAY_I_CLAIM_RE, True), (_PAY_STATE_CLAIM_RE, False)):
+    for pattern, first_person in ((_PAY_I_CLAIM_RE, True), (_PAY_STATE_CLAIM_RE, False),
+                                  (_PURCHASE_CLAIM_RE, True)):
         for match in pattern.finditer(text):
             start, end = _line_bounds(text, match.start())
             line = text[start:end]
@@ -1635,7 +1652,9 @@ def _payment_claim(reply: str, facts: TurnFacts) -> tuple[frozenset[int], bool]:
                     or before.count('"') % 2 == 1 or before.count("“") > before.count("”")):
                 continue
             lines.add(text.count("\n", 0, start))
-            if first_person or not evidence:
+            # Captain pays only for a purchase the user approved and the
+            # checkout confirmed; a bill is paid only when the ledger says so.
+            if (first_person and not purchased) or not evidence:
                 false = True
     return frozenset(lines), false
 
@@ -1643,10 +1662,10 @@ def _payment_claim(reply: str, facts: TurnFacts) -> tuple[frozenset[int], bool]:
 def payment_corrective() -> str:
     """What the model is told about a reply that says something was paid
     when nothing it can see says so. It asks for a true reply."""
-    return ("Your reply says a payment was made or a bill is paid, but Captain can't make payments "
-            "and nothing shows this one as paid. Rewrite your reply so it is true: the payment is "
-            "prepared (with its barcode, if you handed it over) and the user approves it in their "
-            "bank app; it counts as paid only once the user says so or taps 'I paid'.")
+    return ("Your reply says a payment was made, an order placed or a bill paid, but nothing in this "
+            "conversation shows it. Captain pays only for a purchase the user approved and whose checkout "
+            "confirmed the order; a bill counts as paid only once the user says so or their bank confirms "
+            "it. Rewrite your reply so it is true: say what is prepared or waiting for the user's approval.")
 
 
 PAYMENT_BACKSTOP = ("Note: Captain did not make any payment — it can only prepare one for you to "

@@ -28,6 +28,9 @@ from captain_claw.logging import get_logger
 log = get_logger(__name__)
 
 SCOPE = "READ,WRITE"            # never PAY: Captain's token can't move money
+# Phase 3 (one card per purchase) also reads the card it made: Revolut allows
+# that scope only with an IP whitelist on the certificate. Still never PAY.
+SCOPE_CARDS = "READ,WRITE,READ_SENSITIVE_CARD_DATA"
 AUDIENCE = "https://revolut.com"
 ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 _API = {"production": "https://b2b.revolut.com/api/1.0", "sandbox": "https://sandbox-b2b.revolut.com/api/1.0"}
@@ -90,9 +93,9 @@ def client_assertion(conn: dict, *, lifetime: int = 300) -> str:
     return jwt.encode(claims, conn["private_key"], algorithm="RS256", headers={"typ": "JWT"})
 
 
-def consent_url(conn: dict, state: str = "") -> str:
+def consent_url(conn: dict, state: str = "", *, cards: bool = False) -> str:
     query = {"client_id": conn["client_id"], "redirect_uri": conn["redirect_uri"],
-             "response_type": "code", "scope": SCOPE}
+             "response_type": "code", "scope": SCOPE_CARDS if cards else SCOPE}
     if state:
         query["state"] = state
     return f"{_CONSENT[environment(conn.get('environment'))]}?{urllib.parse.urlencode(query, safe=',:/')}"
@@ -210,6 +213,43 @@ class RevolutClient:
             if exc.status == 404:
                 return None
             raise
+
+    # ── one card per purchase (Phase 3) ─────────────────────────────
+
+    async def team_members(self) -> list[dict]:
+        return await self.request("GET", "/team-members") or []
+
+    async def create_purchase_card(self, *, request_id: str, contact_id: str, account_id: str,
+                                   amount_cents: int, currency: str, label: str, purchase_id: str,
+                                   end_date: str) -> dict:
+        """A company virtual card good for this purchase only: one transaction up
+        to the amount, the amount in all, terminated by Revolut after *end_date*."""
+        amount = round(int(amount_cents) / 100, 2)
+        limit = {"amount": amount, "currency": currency.upper()}
+        body = {
+            "request_id": request_id, "virtual": True, "contact_ids": [contact_id], "label": label[:30],
+            "accounts": [account_id], "references": [{"name": "captain_purchase", "value": purchase_id}],
+            "spending_limits": {"single": limit, "all_time": limit},
+            "spending_period": {"end_date": end_date, "end_date_action": "terminate"},
+        }
+        return await self.request("POST", "/cards", json=body)
+
+    async def card_details(self, card_id: str) -> dict:
+        """{pan, cvv, expiry "MM/YYYY"} — needs READ_SENSITIVE_CARD_DATA."""
+        return await self.request("GET", f"/cards/{urllib.parse.quote(card_id)}/sensitive-details") or {}
+
+    async def terminate_card(self, card_id: str) -> None:
+        try:
+            await self.request("DELETE", f"/cards/{urllib.parse.quote(card_id)}")
+        except RevolutError as exc:
+            if exc.status not in (403, 404):
+                raise
+
+    async def card_payments(self, card_id: str, since_iso: str) -> list[dict]:
+        """This card's card payments since *since_iso* (Revolut has no card filter)."""
+        rows = await self.request("GET", "/transactions",
+                                  params={"from": since_iso, "type": "card_payment", "count": 1000}) or []
+        return [t for t in rows if (t.get("card") or {}).get("id") == card_id]
 
     async def delete_draft(self, draft_id: str) -> None:
         try:

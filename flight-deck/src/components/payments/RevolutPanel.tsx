@@ -9,7 +9,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Check, ChevronDown, ChevronRight, Copy, Landmark, Loader2 } from 'lucide-react'
 import {
   disconnectRevolut, getRevolut, makeRevolutKey, pasteRevolutCode, revolutAccounts, revolutConnectUrl,
-  setRevolutAccount, setRevolutClient, type RevolutAccount, type RevolutConnection,
+  setRevolutAccount, setRevolutCards, setRevolutClient, type RevolutAccount, type RevolutConnection,
 } from '../../services/payments'
 
 function CopyBlock({ label, value, mono = true }: { label: string; value: string; mono?: boolean }) {
@@ -146,6 +146,24 @@ export function RevolutPanel() {
                   Use code
                 </button>
               </div>
+            </div>
+          )}
+
+          {stage === 'connected' && (
+            <div className="space-y-1 rounded-md border border-zinc-800 p-2">
+              <label className="flex items-center gap-2 text-zinc-300">
+                <input type="checkbox" disabled={busy} checked={!!conn.cards} onChange={(e) => run(async () => {
+                  const r = await setRevolutCards(e.target.checked)
+                  setConn({ ...conn, cards: r.enabled })
+                  if (r.url) { window.open(r.url, '_blank', 'noopener'); setMsg('Approve the extra access in the Revolut tab (card details only — still no payments).') }
+                })} />
+                Shopping: make a Revolut card for each purchase
+              </label>
+              <p className="text-[11px] text-zinc-500">
+                Each card is good for one payment up to the approved amount and is closed after it. Revolut
+                shows card details only to an allow-listed IP: add this deck's public IP to the certificate's
+                IP whitelist in Revolut Business.
+              </p>
             </div>
           )}
 

@@ -1517,6 +1517,10 @@ app.include_router(public_file_shares.public_router)
 # Payments (bill pay by barcode, FD_PAYMENTS): agent + owner API and the
 # account-free /p/{token} phone page. Before spa_catch_all.
 payments_routes.configure(data_dir=DATA_DIR)
+# Purchases first: its /fd/payments/purchases… paths must win over
+# /fd/payments/{payment_id}.
+from captain_claw.flight_deck import purchases_routes  # noqa: E402 — Phase 3 purchases
+app.include_router(purchases_routes.router)
 app.include_router(payments_routes.router)
 app.include_router(payments_routes.public_router)
 app.include_router(agent_sharing_router)
