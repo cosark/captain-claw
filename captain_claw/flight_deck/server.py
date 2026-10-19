@@ -1533,9 +1533,12 @@ payments_routes.configure(data_dir=DATA_DIR)
 # /fd/payments/{payment_id}.
 from captain_claw.flight_deck import purchases_routes  # noqa: E402 — Phase 3 purchases
 from captain_claw.flight_deck import statements_routes  # noqa: E402 — Phase 4 bank statements
+from captain_claw.flight_deck import payment_reminders  # noqa: E402 — Phase 4c due-date reminders
 app.include_router(purchases_routes.router)
 app.include_router(statements_routes.router)
 app.include_router(statements_routes.public_router)
+app.include_router(payment_reminders.router)
+app.include_router(payment_reminders.public_router)
 app.include_router(payments_routes.router)
 app.include_router(payments_routes.public_router)
 app.include_router(agent_sharing_router)

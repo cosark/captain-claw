@@ -1,8 +1,8 @@
 # Payments, Phase 4: the bank statement closes the loop
 
 Status: **plan agreed** (2026-10-19): all six decisions at the end were taken
-as recommended. **4a and 4b are built** (see "As built" below); 4c and 4d
-are next.
+as recommended. **4a, 4b and 4c are built** (see "As built" below); 4d is
+next.
 It builds on Phases 0–2: the same ledger, the same Enable Banking application
 as pay-by-bank links, and the same Revolut Business connection.
 
@@ -53,6 +53,46 @@ the error shows cleanly on the panel.
     account), looked up once per sync.
   - **`FD_ENABLEBANKING_STATEMENTS_REDIRECT_URL`** overrides the callback URL
     the deck works out, like Phase 2's override.
+
+## As built: 4c (2026-10-19)
+
+Tested with pure stage tests and end-to-end tests (delivery captured). On a
+spare deck, the loop's first tick sent a digest for a bill due in two days.
+The card's reminder switch and the settings panel saved.
+
+- **Files:**
+  - `payments/reminders.py` (stages, words, settings), pure.
+  - `flight_deck/payment_reminders.py`: the digest; owner, agent and page
+    routes.
+  - `RemindersPanel.tsx`; a switch on `PaymentCard`; "Don't remind me about
+    this one" on the phone page.
+- **Where reminders go:**
+  - The agent's `prepare` sends the session's origin. The runtime sets it on
+    inbound messages, so the model can't choose it. It's stored as
+    `notify_origin`, but only for WhatsApp and Telegram; a channel or glasses
+    broadcast could reach other people.
+  - The digest goes to the owner's most recent such origin, through
+    `delivery_routes.deliver_to_origin`, which keeps the WhatsApp allowlist and
+    mute. Bills from mail triage or cron use it too.
+  - The bell always gets one entry per digest, without links.
+- **Links:** only the hash of a phone-page token is kept, so each reminder
+  mints a fresh `/p/` link for each payable bill, and the earlier link stops
+  working. Bills that need review get "needs your review in Flight Deck first".
+  A bill waiting as a Revolut draft is named as such, with no link.
+- **When:**
+  - Each loop tick checks every owner who has a bill with a due date.
+  - A digest goes out once a day (`reminders_sent_day`), after the owner's
+    time and outside `FD_SCHEDULER_QUIET_HOURS`.
+  - Stale bank statements (over 6 hours old) are read first.
+  - Stages per bill: before (default 3 days), due, then overdue the next day
+    and weekly until the bill expires. Missed days are skipped, not piled up.
+- **Routes:**
+  - `GET`/`PUT /fd/payments/reminders`.
+  - `PUT /fd/payments/{id}/reminders` (owner).
+  - `POST /fd/payments/agent/{id}/reminders`: the tool's `remind` action;
+    reminders aren't money.
+  - `POST /p/{token}/no-reminders`.
+  - `GET /fd/payments/agent/list?status=due`: due within a week, or overdue.
 
 ## As built: 4b (2026-10-19)
 

@@ -210,6 +210,8 @@ _MIGRATIONS = (
     ("payment_intents", "rail_nonce", "TEXT"),
     ("bank_sessions", "last_attempt_at", "REAL"),
     ("payment_intents", "statement", "TEXT NOT NULL DEFAULT '{}'"),
+    ("payment_intents", "notify_origin", "TEXT NOT NULL DEFAULT '{}'"),
+    ("payment_intents", "reminders", "TEXT NOT NULL DEFAULT '{}'"),
 )
 # Indexes on migrated columns, created after the migrations ran.
 _POST_MIGRATION_DDL = (
@@ -218,7 +220,7 @@ _POST_MIGRATION_DDL = (
 )
 
 _JSON_COLS = {"fields": {}, "provenance": {}, "warnings": [], "acks": {}, "barcodes": [], "rails_state": {},
-              "statement": {}}
+              "statement": {}, "notify_origin": {}, "reminders": {}}
 
 
 def _loads(raw: Any, default: Any) -> Any:
@@ -356,6 +358,25 @@ class PaymentsStore:
             ) as cur:
                 return _row(await cur.fetchone())
         return None
+
+    async def owners_with_due_bills(self) -> list[str]:
+        """Owners with a live bill that has a due date (Phase 4c reminders)."""
+        db = await self._ensure_db()
+        live = ", ".join("?" for _ in LIVE_STATES)
+        async with db.execute(
+            f"SELECT DISTINCT owner_id FROM payment_intents WHERE status IN ({live}) AND due_date != ''", LIVE_STATES,
+        ) as cur:
+            return [r[0] for r in await cur.fetchall()]
+
+    async def latest_origin(self, owner_id: str) -> dict:
+        """The chat the owner most recently prepared a bill from ({} if none)."""
+        db = await self._ensure_db()
+        async with db.execute(
+            "SELECT notify_origin FROM payment_intents WHERE owner_id = ? AND notify_origin NOT IN ('', '{}')"
+            " ORDER BY created_at DESC LIMIT 1", (owner_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return _loads(row[0], {}) if row else {}
 
     async def get_by_nonce(self, nonce: str) -> dict | None:
         """The payment a bank redirect's one-time state belongs to."""

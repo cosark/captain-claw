@@ -268,3 +268,20 @@ def test_statement_wording_and_no_transaction_details(fd):
         "booked_on": "", "pending_since": "2026-10-24", "suggestions": 1}}}
     r = _run(action="get", id="pay_0123456789ab")
     assert "pending since 24.10.2026." in r.content and "confirm or reject it in Flight Deck" in r.content
+
+
+def test_reminders_go_where_the_conversation_came_from_and_can_be_switched(fd):
+    calls, replies = fd
+    replies["/prepare"] = {"intent": INTENT, "existing": False}
+    agent = SimpleNamespace(_turn_user_text="plati",
+                            session=SimpleNamespace(metadata={"origin": {"kind": "whatsapp", "address": "385911234567"}}))
+    _run(action="prepare", payee_name="HEP", amount="84.20", iban="HR1210010051863000160", _agent=agent)
+    assert calls[-1][2]["origin"] == {"kind": "whatsapp", "address": "385911234567"}
+    _run(action="prepare", payee_name="HEP", amount="84.20", iban="HR1210010051863000160")
+    assert calls[-1][2]["origin"] == {}
+    replies["/reminders"] = {"intent": {**INTENT, "reminders": {"off": True}}}
+    r = _run(action="remind", id="pay_0123456789ab", reminders="off")
+    assert r.success and calls[-1][1].endswith("/pay_0123456789ab/reminders") and calls[-1][2] == {"on": False}
+    assert "reminders for HEP Elektra d.o.o. are off" in r.content
+    assert not _run(action="remind", id="pay_0123456789ab").success
+    assert "status='due'" in PaymentsTool.description

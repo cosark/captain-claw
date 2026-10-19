@@ -58,7 +58,10 @@ class PaymentsTool(Tool):
         "the user's Revolut Business as a DRAFT they send in the Revolut app — Captain can't send or "
         "approve anything itself. action='mark' (id, status paid|skip|cancel): only when the user "
         "themselves says they paid or want to skip it. action='list' (status, query) / 'get' (id): "
-        "what is prepared, paid or due.\n"
+        "what is prepared, paid or due — status='due' lists bills due within a week or overdue. "
+        "Flight Deck sends the user a daily reminder of due bills; if they say they paid one they were "
+        "reminded about, list status=due and mark that one. action='remind' (id, reminders on|off) "
+        "switches a bill's reminders when the user asks.\n"
         "SHOPPING (buying from an online shop): action='purchase' (source: 'link' = Stripe Link wallet, "
         "'revolut_card' = a Revolut card made for this purchase; merchant_name, merchant_url = the shop's "
         "https address, items [{name, quantity, unit_amount}], amount = the checkout's final total incl. "
@@ -83,8 +86,10 @@ class PaymentsTool(Tool):
     parameters = {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["prepare", "handoff", "mark", "list", "get",
+            "action": {"type": "string", "enum": ["prepare", "handoff", "mark", "list", "get", "remind",
                                                   "purchase", "checkout_pay", "checkout_check"]},
+            "reminders": {"type": "string", "enum": ["on", "off"],
+                          "description": "remind: switch this bill's due-date reminders on or off."},
             "source": {"type": "string",
                        "description": "prepare: the invoice file — path or file name (PDF, PNG, JPG). "
                                       "purchase: how it's paid — link, revolut_card, acp or ap2."},
@@ -132,7 +137,8 @@ class PaymentsTool(Tool):
                      "description": "handoff: 'barcode' (default); 'bank' — a link to approve it in the "
                                     "user's bank; 'revolut' — a draft in Revolut Business."},
             "status": {"type": "string",
-                       "description": "mark: paid | skip | cancel. list: filter, e.g. 'handed_off'."},
+                       "description": "mark: paid | skip | cancel. list: filter, e.g. 'handed_off', or "
+                                      "'due' for bills due within a week or overdue."},
             "query": {"type": "string", "description": "list: text to match in payee or description."},
         },
         "required": ["action"],
@@ -156,6 +162,8 @@ class PaymentsTool(Tool):
                 return await self._list(kwargs)
             if action == "get":
                 return await self._get(kwargs)
+            if action == "remind":
+                return await self._remind(kwargs)
             if action == "purchase":
                 return await self._purchase(kwargs, runtime)
             if action == "checkout_pay":
@@ -166,7 +174,8 @@ class PaymentsTool(Tool):
             log.warning("payments tool call failed", action=action, error=str(exc))
             return ToolResult(success=False, error=f"Flight Deck couldn't be reached: {exc}")
         return ToolResult(success=False, error=(
-            "Unknown action — use prepare, handoff, mark, list, get, purchase, checkout_pay or checkout_check."))
+            "Unknown action — use prepare, handoff, mark, list, get, remind, purchase, checkout_pay or "
+            "checkout_check."))
 
     # ── actions ───────────────────────────────────────────────────────
 
@@ -179,7 +188,7 @@ class PaymentsTool(Tool):
                     "or CVVs — payments are approved in the user's bank app."))
         body: dict[str, Any] = {
             "fields": fields, "user_text": _user_text(runtime), "session_id": str(runtime.get("_session_id") or ""),
-            "supersedes": str(kwargs.get("supersedes") or "").strip(),
+            "supersedes": str(kwargs.get("supersedes") or "").strip(), "origin": _session_origin(runtime),
             **_turn_kind(),
         }
         source = str(kwargs.get("source") or "").strip()
@@ -294,6 +303,19 @@ class PaymentsTool(Tool):
             out.append(f"• {p['id']} · {p['status']} · {p.get('payee_name') or '—'} · "
                        f"{p.get('amount_text')}{due}")
         return ToolResult(success=True, content="\n".join(out))
+
+    async def _remind(self, kwargs: dict) -> ToolResult:
+        intent_id = str(kwargs.get("id") or "").strip()
+        setting = str(kwargs.get("reminders") or "").strip().lower()
+        if not intent_id.startswith("pay_") or setting not in ("on", "off"):
+            return ToolResult(success=False, error="Give `id` (pay_…) and reminders='on' or 'off'.")
+        data, err = await payments_client.call("POST", f"/fd/payments/agent/{intent_id}/reminders",
+                                               {"on": setting == "on"})
+        if err:
+            return ToolResult(success=False, error=err)
+        intent = data.get("intent") or {}
+        return ToolResult(success=True, content=f"{_status_line(intent)}\nDue-date reminders for "
+                                                f"{intent.get('payee_name') or 'this bill'} are {setting}.")
 
     async def _get(self, kwargs: dict) -> ToolResult:
         intent_id = str(kwargs.get("id") or "").strip()
@@ -503,6 +525,18 @@ def _describe_checkout(result: dict, purchase: dict) -> str:
 def _user_text(runtime: dict) -> str:
     agent = runtime.get("_agent")
     return str(getattr(agent, "_turn_user_text", "") or "")[:4000]
+
+
+def _session_origin(runtime: dict) -> dict:
+    """Where this conversation came from (WhatsApp, Telegram…), so Flight Deck can
+    send due-date reminders there. Set by the runtime on inbound messages — the
+    model can't choose it."""
+    try:
+        from captain_claw.origin import get_session_origin
+
+        return get_session_origin(getattr(runtime.get("_agent"), "session", None)) or {}
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _turn_kind() -> dict:

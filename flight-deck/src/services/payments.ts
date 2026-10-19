@@ -60,7 +60,25 @@ export interface Payment {
     booked_on: string; account_label: string; match: string
     pending_since: string; pending_account: string; suggestions: number
   }
+  /** Due-date reminders (Phase 4c): switched off for this bill, and when each stage went out. */
+  reminders?: { off: boolean; sent: Record<string, string> }
 }
+
+export interface ReminderSettings {
+  enabled: boolean
+  days_before: number
+  time: string
+  overdue: boolean
+  chat: { kind: string; label: string } | null
+  quiet_hours: string
+}
+export const getReminders = () => fdJson<ReminderSettings>('/payments/reminders')
+export const setReminders = (s: Pick<ReminderSettings, 'enabled' | 'days_before' | 'time' | 'overdue'>) =>
+  fdJson<ReminderSettings>('/payments/reminders', { method: 'PUT', body: JSON.stringify(s) })
+export const setBillReminders = (id: string, on: boolean) =>
+  fdJson<{ intent: Payment }>(`/payments/${encodeURIComponent(id)}/reminders`, {
+    method: 'PUT', body: JSON.stringify({ on }),
+  })
 
 /** A payment on the statement that may be this bill — the owner says yes or no. */
 export interface StatementSuggestion {

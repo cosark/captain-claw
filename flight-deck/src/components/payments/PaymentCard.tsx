@@ -6,9 +6,10 @@
 // approves it there. A blocking warning hides the barcode until the owner
 // checks it here — the agent can't clear one.
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { AlertTriangle, Check, CheckCircle2, Copy, ExternalLink, Info, Landmark, Loader2, Receipt, X } from 'lucide-react'
+import { AlertTriangle, Bell, BellOff, Check, CheckCircle2, Copy, ExternalLink, Info, Landmark, Loader2, Receipt, X } from 'lucide-react'
 import {
-  ackWarnings, answerStatementMatch, CLOSED, getPayment, markPayment, PAID, payByBank, sendToRevolut, statusLabel, useBarcode,
+  ackWarnings, answerStatementMatch, CLOSED, getPayment, markPayment, PAID, payByBank, sendToRevolut, setBillReminders,
+  statusLabel, useBarcode,
   type Payment, type PaymentWarning, type StatementSuggestion,
 } from '../../services/payments'
 
@@ -212,6 +213,14 @@ export function PaymentCard({ id, compact = false, onChange }: {
         <div className="text-right">
           <div className={`text-xl font-bold ${paid ? 'text-emerald-400' : 'text-zinc-100'}`}>{p.amount_text}</div>
           {p.due_date && <div className="text-[11px] text-zinc-500">due {p.due_date}</div>}
+          {p.due_date && !closed && p.reminders && (
+            <button disabled={busy} onClick={() => act(() => setBillReminders(p.id, !!p.reminders?.off))}
+              title={p.reminders.off ? 'Due-date reminders are off for this bill' : 'Captain reminds you before it is due'}
+              className="mt-0.5 inline-flex items-center gap-1 text-[11px] text-zinc-500 hover:text-zinc-300">
+              {p.reminders.off ? <BellOff size={11} /> : <Bell size={11} />}
+              {p.reminders.off ? 'reminders off' : 'reminders on'}
+            </button>
+          )}
         </div>
       </div>
 

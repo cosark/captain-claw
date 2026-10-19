@@ -23,7 +23,7 @@ import os
 import re
 import secrets
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -232,6 +232,8 @@ def view(row: dict) -> dict:
         "revolut": _revolut_public((row.get("rails_state") or {}).get("revolut") or {}),
         "bank_link": _bank_public(row),
         "statement": _statement_public(row),
+        "reminders": {"off": bool((row.get("reminders") or {}).get("off")),
+                      "sent": {k: v for k, v in (row.get("reminders") or {}).items() if k in ("before", "due", "overdue")}},
     }
 
 
@@ -360,6 +362,19 @@ class PrepareRequest(BaseModel):
     automated: bool = False
     job_kind: str = ""
     supersedes: str = ""
+    origin: dict = {}            # the agent session's origin (set by the runtime, never by the model)
+
+
+REMINDER_KINDS = ("whatsapp", "telegram")
+
+
+def reminder_origin(raw: dict) -> dict:
+    """A chat reminders may go to: WhatsApp or Telegram only — a channel or glasses
+    broadcast could reach other people."""
+    from captain_claw.origin import normalize_origin
+
+    o = normalize_origin(raw) or {}
+    return o if o.get("kind") in REMINDER_KINDS and len(o.get("address", "")) <= 64 else {}
 
 
 class MarkRequest(BaseModel):
@@ -431,7 +446,7 @@ async def agent_prepare(req: PrepareRequest, request: Request):
         "source_name": os.path.basename(req.source_name)[:200], "source_sha256": sha,
         "source_kind": source_kind, "barcodes": checks.barcodes_for(fields),
         "supersedes": req.supersedes if _ID_RE.match(req.supersedes or "") else "",
-        "automated": 1 if req.automated else 0,
+        "automated": 1 if req.automated else 0, "notify_origin": reminder_origin(req.origin),
     })
     await s.add_event(intent_id, owner, f"agent:{slug}", "prepared",
                       {"automated": req.automated, "job_kind": req.job_kind[:60], "status": status})
@@ -548,8 +563,12 @@ async def agent_list(request: Request, status: str = "", q: str = "", limit: int
     _require_on()
     owner, _ = _agent_owner(request)
     await store().expire_stale()
-    statuses = tuple(x for x in status.split(",") if x) if status else ()
+    due_soon = status == "due"
+    statuses = LIVE_STATES if due_soon else tuple(x for x in status.split(",") if x) if status else ()
     rows = await _sync_rows(await store().list(owner, statuses=statuses, limit=max(1, min(limit, 100))))
+    if due_soon:
+        horizon = (date.today() + timedelta(days=7)).isoformat()
+        rows = sorted((r for r in rows if r.get("due_date") and r["due_date"] <= horizon), key=lambda r: r["due_date"])
     if q:
         needle = q.casefold()
         rows = [r for r in rows if needle in str(r["fields"].get("payee_name", "")).casefold()
@@ -1352,7 +1371,10 @@ def _render_page(row: dict, token: str) -> str:
               '<button class="btn primary" type="submit">I paid</button></form>'
               f'<form method="post" action="/p/{esc(token)}/skip">'
               '<button class="btn" type="submit">Skip this one</button></form></section>'
-              '<p class="muted small">Captain never moves money. You approve the payment in your bank app.</p>')
+            + ('' if (row.get("reminders") or {}).get("off") or not row.get("due_date") else
+               f'<section class="actions"><form method="post" action="/p/{esc(token)}/no-reminders">'
+               '<button class="btn" type="submit">Don\'t remind me about this one</button></form></section>')
+            + '<p class="muted small">Captain never moves money. You approve the payment in your bank app.</p>')
 
 
 @public_router.get("/p/{token}")
