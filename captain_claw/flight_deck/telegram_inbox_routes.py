@@ -184,6 +184,17 @@ async def _agent_owner(request: Request) -> str:
     return await _g._agent_owner(request, service="Telegram inbox")
 
 
+def _agent_slug(request: Request) -> str:
+    """The calling agent's slug on this deck (its cursor's key)."""
+    try:
+        from captain_claw.flight_deck.server import _find_agent_by_auth
+
+        matched, _owner, slug = _find_agent_by_auth(request.headers.get("X-Agent-Auth", ""))
+    except Exception:
+        return ""
+    return str(slug) if matched and slug else ""
+
+
 async def _require_on(db, owner: str) -> None:
     settings = await db.get_tg_inbox_settings(owner) or {}
     if not settings.get("enabled"):
@@ -244,4 +255,24 @@ async def agent_messages(body: MessagesBody, request: Request) -> dict[str, Any]
     items = await telegram_inbox.messages(
         db, owner, chat_id=chat["chat_id"] if chat else None, since=body.since,
         until=body.until, query=body.query, limit=max(1, min(body.limit, 200)))
+    # A chat's newest messages read (one chat, or the newest across all) count
+    # as seen for this agent's "what's new" line; a search or an older window
+    # doesn't — it skips messages.
+    if items and body.until is None and not body.query.strip():
+        await telegram_inbox.mark_read(db, owner, _agent_slug(request), items)
     return {"chat": chat, "messages": items}
+
+
+@router.post("/fd/telegram-inbox/agent/news")
+async def agent_news(request: Request) -> dict[str, Any]:
+    """What others wrote since this agent last looked — counts per chat, no
+    text — and the look itself moves the agent's cursor (an owner's own turn
+    calls it once)."""
+    if not _auth_enabled():
+        return {"connected": False}
+    owner = await _agent_owner(request)
+    db = get_db()
+    settings = await db.get_tg_inbox_settings(owner) or {}
+    if not settings.get("enabled") or await _unavailable_reason(db):
+        return {"connected": False}
+    return {"connected": True, **await telegram_inbox.news(db, owner, _agent_slug(request))}
