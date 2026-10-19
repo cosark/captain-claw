@@ -617,6 +617,9 @@ class Agent(
         channel: str | None = None,
         origin_detail: str | None = None,
     ) -> str:
+        from captain_claw.card_scrub import scrub_user_text
+
+        user_input = scrub_user_text(str(user_input or ""))   # no card data, ever
         user_input, _had_surface = self._absorb_surface_block(
             str(user_input or ""), surface=channel or self._hinted_channel())
         self._turn_user_text = user_input
@@ -651,6 +654,9 @@ class Agent(
     ) -> AsyncIterator[str]:
         # Not a ContextVar bind: this is an async generator (a set here would
         # leak into the caller between yields).
+        from captain_claw.card_scrub import scrub_user_text
+
+        user_input = scrub_user_text(str(user_input or ""))   # no card data, ever
         user_input, _had_surface = self._absorb_surface_block(
             str(user_input or ""), surface=channel or self._hinted_channel())
         self._turn_user_text = user_input

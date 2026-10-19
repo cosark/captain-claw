@@ -1,0 +1,31 @@
+{
+  "_about": "Shared by tests/test_card_scrub.py and flight-deck/scripts/card-scrub-check.mjs: the Python scrubber and its browser port must agree on every case. 'expect' lists the findings in order (kind, and last4 for card numbers); an empty list means the text must come through untouched.",
+  "cases": [
+    {"text": "my card is 4111 1111 1111 1111 exp 12/27 cvv 123", "expect": [{"kind": "pan", "last4": "1111"}, {"kind": "expiry"}, {"kind": "cvv"}],
+     "scrubbed": "my card is [card number removed · ends 1111] exp [expiry removed] cvv [CVV removed]"},
+    {"text": "5555555555554444", "expect": [{"kind": "pan", "last4": "4444"}]},
+    {"text": "Amex 3782 822463 10005 please", "expect": [{"kind": "pan", "last4": "0005"}]},
+    {"text": "Diners 3056 930902 5904", "expect": [{"kind": "pan", "last4": "5904"}]},
+    {"text": "Kartica 4111-1111-1111-1111, CVV: 987", "expect": [{"kind": "pan", "last4": "1111"}, {"kind": "cvv"}]},
+    {"text": "4111111111111111 123", "expect": [{"kind": "pan", "last4": "1111"}, {"kind": "cvv"}]},
+    {"text": "MC 2223 0000 4840 0011 vrijedi do 03/2029", "expect": [{"kind": "pan", "last4": "0011"}, {"kind": "expiry"}]},
+    {"text": "sigurnosni kod 456", "expect": [{"kind": "cvv"}]},
+    {"text": "Discover 6011111111111117\nnext line 123", "expect": [{"kind": "pan", "last4": "1117"}]},
+    {"text": "Maestro 6759 6498 2643 8453", "expect": [{"kind": "pan", "last4": "8453"}]},
+    {"text": "Old Visa 4222222222222", "expect": [{"kind": "pan", "last4": "2222"}]},
+
+    {"text": "IBAN HR1210010051863000160", "expect": []},
+    {"text": "IBAN: HR12 1001 0051 8630 0016 0", "expect": []},
+    {"text": "Pay to DE89 3704 0044 0532 0130 00 today", "expect": []},
+    {"text": "Model i poziv na broj: HR01 7269-68499637766-00019", "expect": []},
+    {"text": "OIB 12345678903", "expect": []},
+    {"text": "Call me on +385 91 234 5678", "expect": []},
+    {"text": "Order 1234567890123 shipped", "expect": []},
+    {"text": "Invoice dated 2026-10-19, due 12/27", "expect": []},
+    {"text": "4111 1111 1111 1112", "expect": []},
+    {"text": "Tracking 4000 1234 5678 9010", "expect": []},
+    {"text": "Total 1.234,55 EUR", "expect": []},
+    {"text": "What is a CVV, and why would anyone ask for it?", "expect": []},
+    {"text": "ref ABC4111111111111111", "expect": []}
+  ]
+}

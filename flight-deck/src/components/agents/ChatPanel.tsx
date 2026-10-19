@@ -65,6 +65,8 @@ import { PACKS_BUTTON } from '../../utils/contextPacks'
 import { SendContextModal } from './SendContextModal'
 import { FlowSelectorModal } from './FlowSelectorModal'
 import { PlanCard } from './PlanCard'
+import { PaymentCard } from '../payments/PaymentCard'
+import { paymentIntentOf } from '../../services/payments'
 import TraceTimeline from '../observability/TraceTimeline'
 import { uploadFileToAgent, formatSize } from '../../services/fileTransfer'
 import { AgentFilesPanel } from './AgentFilesPanel'
@@ -899,18 +901,22 @@ function ChatContent({
           </div>
         )}
 
-        {groups.map((grp, gi) =>
-          grp.kind === 'activity' ? (
+        {groups.map((grp, gi) => {
+          // The live group is the last one (a payment card after it doesn't count).
+          const live = session.busy && groups.slice(gi + 1).every((g) => g.kind === 'payment')
+          return grp.kind === 'payment' ? (
+            <PaymentCard key={`pay-${grp.paymentId}`} id={grp.paymentId!} compact />
+          ) : grp.kind === 'activity' ? (
             <ActivityGroup
               key={`act-${grp.items[0].id}`}
               items={grp.items}
-              live={gi === groups.length - 1 && session.busy}
-              liveTurnUsage={gi === groups.length - 1 && session.busy ? session.liveTurnUsage ?? null : null}
+              live={live}
+              liveTurnUsage={live ? session.liveTurnUsage ?? null : null}
             />
           ) : (
             <MessageBubble key={grp.items[0].id} message={grp.items[0]} sourceName={session.containerName} agentId={session.containerId} />
           )
-        )}
+        })}
 
         {/* Busy indicator */}
         {session.busy && (
@@ -2126,13 +2132,23 @@ function isActivityMessage(m: ChatMessage): boolean {
   return m.role === 'tool' || (m.role === 'system' && !!m.narration)
 }
 
-function groupActivity(msgs: ChatMessage[]): { kind: 'activity' | 'single'; items: ChatMessage[] }[] {
-  const groups: { kind: 'activity' | 'single'; items: ChatMessage[] }[] = []
+type ChatGroup = { kind: 'activity' | 'single' | 'payment'; items: ChatMessage[]; paymentId?: string }
+
+function groupActivity(msgs: ChatMessage[]): ChatGroup[] {
+  const groups: ChatGroup[] = []
+  const seenPayments = new Set<string>()
   for (const m of msgs) {
     if (isActivityMessage(m)) {
       const last = groups[groups.length - 1]
       if (last && last.kind === 'activity') last.items.push(m)
       else groups.push({ kind: 'activity', items: [m] })
+      // A payment the agent prepared gets its card right after the tool call
+      // (once per payment: the card shows the ledger's live state).
+      const pid = m.role === 'tool' ? paymentIntentOf(m.tool_name, m.tool_output || m.content) : null
+      if (pid && !seenPayments.has(pid)) {
+        seenPayments.add(pid)
+        groups.push({ kind: 'payment', items: [m], paymentId: pid })
+      }
     } else {
       groups.push({ kind: 'single', items: [m] })
     }

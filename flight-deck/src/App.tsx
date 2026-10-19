@@ -46,6 +46,7 @@ import { AgentFoldersPage } from './pages/AgentFoldersPage'
 import { SystemPage } from './pages/SystemPage'
 import { BrowserLLMPage } from './pages/BrowserLLMPage'
 import { BeingsPage } from './pages/BeingsPage'
+import { PaymentsPage, paymentIdFromPath } from './pages/PaymentsPage'
 import { PublicBeingPage } from './pages/PublicBeingPage'
 import { useUIStore } from './stores/uiStore'
 import { useAgentStore } from './stores/agentStore'
@@ -157,6 +158,10 @@ registerHydrator((settings) => {
 
 function AppContent() {
   const view = useUIStore((s) => s.view)
+  // A payment's phone page links here (/payments/<id>) when it needs review.
+  useEffect(() => {
+    if (window.location.pathname === '/payments' || paymentIdFromPath()) useUIStore.getState().setView('payments')
+  }, [])
   const layoutMode = useUIStore((s) => s.layoutMode)
   const kioskLocked = useAuthStore(selectKioskLocked)
   const chatOpen = useChatStore((s) => s.chatOpen)
@@ -342,6 +347,7 @@ function AppContent() {
       {view === 'council' && <CouncilPage />}
       {view === 'basna' && <BasnaPage />}
       {view === 'bat' && <BatPage />}
+      {view === 'payments' && <PaymentsPage />}
       {view === 'code' && <CodePage />}
       {view === 'dubina' && <DubinaPage />}
       {view === 'vfs' && <VFSPage />}

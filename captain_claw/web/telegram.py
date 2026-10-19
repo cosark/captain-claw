@@ -301,7 +301,9 @@ async def _handle_telegram_message(server: WebServer, message: TelegramMessage) 
         # Resolve per-user agent (creates on first use).
         user_agent = await _tg_get_or_create_agent(server, message)
 
-        text = message.text.strip()
+        # Card numbers / CVVs never go further (card_scrub).
+        from captain_claw.card_scrub import scrub_user_text
+        text = scrub_user_text(message.text.strip())
 
         # Download attached photo into the user's session media folder.
         image_path: str | None = None

@@ -63,6 +63,7 @@ MAIL_CLAIM = "false_mail_send"        # says an email went out; none did this tu
 CALENDAR_CLAIM = "false_calendar_change"  # says the calendar changed; it did not this turn
 NARRATED_LOOKUP = "narrated_lookup"   # no tool call, yet narrates lookups
 FABRICATED_ID = "fabricated_id"       # quotes a tool-style ID nothing showed
+PAYMENT_CLAIM = "false_payment"       # says something was paid; the ledger doesn't say so
 
 
 # ── Tool results ─────────────────────────────────────────────────────
@@ -1029,6 +1030,8 @@ _ID_SHAPES: tuple[tuple[str, re.Pattern[str]], ...] = (
     # "<16 hex>!<n>".
     ("onedrive", re.compile(
         _TOKEN_EDGE_L + r"(01[A-Z0-9]{32}|[0-9A-Fa-f]{16}!\d{1,9})" + _TOKEN_EDGE_R)),
+    # A payment Flight Deck prepared: pay_ + 12 hex.
+    ("payment", re.compile(_TOKEN_EDGE_L + r"(pay_[0-9a-f]{12})" + _TOKEN_EDGE_R)),
 )
 
 
@@ -1572,6 +1575,84 @@ def narrated_lookups(reply: str, pasted: bool = False) -> tuple[str, ...]:
     return tuple(dict.fromkeys(hits))
 
 
+# ── Payment claims ───────────────────────────────────────────────────
+#
+# Captain never moves money: the `payments` tool prepares a payment and hands
+# over a barcode; the user approves it in their bank app. So the agent saying
+# *it* paid is always false, and saying a bill *is* paid needs the ledger to
+# say so — a `payments` result showing ``status: user_paid`` (the user marked
+# it) or ``settled``. Judged only while the turn offers the payments tool.
+
+PAYMENT_TOOLS = frozenset({"payments"})
+
+# The agent says it paid: "I paid", "I've transferred", "I sent the money",
+# "platio sam", "račun sam platio", "izvršio sam plaćanje".
+_PAY_I_CLAIM_RE = re.compile(
+    r"(?i)\bI(?:'ve|\s+have|\s+just|\s+already)?\s+(?:just\s+|already\s+|now\s+)?"
+    r"(?:paid|transferred|wired|sent\s+(?:the\s+|your\s+)?(?:money|payment|funds|transfer))\b"
+    r"|\b(?:platio|platila|uplatio|uplatila|prebacio|prebacila)\s+sam\b"
+    r"|\bsam\s+(?:ve[ćc]\s+)?(?:platio|platila|uplatio|uplatila|prebacio|prebacila)\b"
+    r"|\bizvr[šs]i(?:o|la)\s+sam\s+(?:pla[ćc]anje|uplatu|transakciju|prijenos)\b"
+    r"|\bposla(?:o|la)\s+sam\s+(?:novac|uplatu|lovu)\b"
+)
+# A bill or payment said to be paid / done.
+_PAY_STATE_CLAIM_RE = re.compile(
+    r"(?i)\b(?:invoice|bill|payment|transfer)s?\s+(?:is|was|were|are|has\s+been|have\s+been)\s+"
+    r"(?:now\s+|already\s+|successfully\s+)?(?:paid|made|sent|completed|done|processed|settled)\b"
+    r"|\bpayment\s+(?:went\s+through|succeeded|is\s+successful|complete[d]?)\b"
+    r"|\b(?:ra[čc]un|uplatnica|pla[ćc]anje|uplata|transakcija|prijenos)\w*\s+(?:je\s+)?(?:sada\s+|ve[ćc]\s+)?"
+    r"(?:pla[ćc]en\w*|izvr[šs]en\w*|pro[šs]l\w*|obavljen\w*|upla[ćc]en\w*)\b"
+    r"|\bstatus\W{0,3}(?:paid|pla[ćc]eno|user_paid)\b"
+    r"|^[^\w\n]*(?:paid|pla[ćc]eno|upla[ćc]eno)[^\w\n]*$"
+)
+# The user paid (or marked it): "you paid", "you marked it paid", "platio si".
+_PAY_USER_RE = re.compile(
+    r"(?i)\byou(?:'ve|\s+have)?\s+(?:already\s+|just\s+)?(?:paid|marked)\b|\bmarked\s+(?:it\s+)?as\s+paid\b"
+    r"|\b(?:platio|platila|uplatio|uplatila|ozna[čc]io|ozna[čc]ila)\s+si\b"
+)
+_PAID_EVIDENCE_RE = re.compile(r"\bstatus: (?:user_paid|settled)\b")
+
+
+def _payment_evidence(steps: Iterable[ToolStep]) -> bool:
+    return any(step.name in PAYMENT_TOOLS and _PAID_EVIDENCE_RE.search(step.content) for step in steps)
+
+
+def _payment_claim(reply: str, facts: TurnFacts) -> tuple[frozenset[int], bool]:
+    """(lines that say something was paid, whether any of them is false)."""
+    if not facts.payment_tools:
+        return frozenset(), False
+    text = str(reply or "")
+    evidence = _payment_evidence(facts.turn_steps) or _payment_evidence(facts.session_steps)
+    lines: set[int] = set()
+    false = False
+    for pattern, first_person in ((_PAY_I_CLAIM_RE, True), (_PAY_STATE_CLAIM_RE, False)):
+        for match in pattern.finditer(text):
+            start, end = _line_bounds(text, match.start())
+            line = text[start:end]
+            before = text[start:match.start()]
+            if (_CLAIM_NEGATED_RE.search(before) or _is_question(text, match.end())
+                    or _ATTRIBUTED_RE.match(line) or _PAY_USER_RE.search(line)
+                    or before.count('"') % 2 == 1 or before.count("“") > before.count("”")):
+                continue
+            lines.add(text.count("\n", 0, start))
+            if first_person or not evidence:
+                false = True
+    return frozenset(lines), false
+
+
+def payment_corrective() -> str:
+    """What the model is told about a reply that says something was paid
+    when nothing it can see says so. It asks for a true reply."""
+    return ("Your reply says a payment was made or a bill is paid, but Captain can't make payments "
+            "and nothing shows this one as paid. Rewrite your reply so it is true: the payment is "
+            "prepared (with its barcode, if you handed it over) and the user approves it in their "
+            "bank app; it counts as paid only once the user says so or taps 'I paid'.")
+
+
+PAYMENT_BACKSTOP = ("Note: Captain did not make any payment — it can only prepare one for you to "
+                    "approve in your bank app.")
+
+
 # ── One decision for a reply ─────────────────────────────────────────
 
 
@@ -1608,6 +1689,8 @@ class TurnFacts:
     no_tool_call: bool = False
     # The tools this turn offers (the lookup corrective names the lookups).
     tools: frozenset[str] = frozenset()
+    # The payments tools this turn offers: none, no payment check.
+    payment_tools: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -1663,7 +1746,8 @@ def has_backstop(text: str) -> bool:
     """Whether *text* already carries a backstop line."""
     text = text or ""
     return (MAIL_BACKSTOP.rstrip(".") in text or CALENDAR_BACKSTOP.rstrip(".") in text
-            or LOOKUP_BACKSTOP in text or (_ID_BACKSTOP_TAIL in text and "Note: `" in text))
+            or LOOKUP_BACKSTOP in text or (_ID_BACKSTOP_TAIL in text and "Note: `" in text)
+            or PAYMENT_BACKSTOP in text)
 
 
 def _quote(text: str) -> str:
@@ -1862,12 +1946,13 @@ def judge_reply(raw: str, reply: str, facts: TurnFacts) -> Verdict:
     lines, mail_false, refused, earlier_send = _mail_claim(reply, request, facts)
     cal_lines, cal_false, cal_refused, earlier_change = _calendar_claim(reply, request, facts)
     lines |= cal_lines
+    _pay_lines, pay_false = _payment_claim(reply, facts)
     narrated = (narrated_lookups(reply, has_pasted_content(request))
                 if facts.no_tool_call and not _HOW_TO_RE.match(request) else ())
     fabricated = () if facts.known is None else fabricated_ids(raw, facts.known, request)
     kinds = tuple(kind for kind, on in (
-        (MAIL_CLAIM, mail_false), (CALENDAR_CLAIM, cal_false), (NARRATED_LOOKUP, bool(narrated)),
-        (FABRICATED_ID, bool(fabricated)),
+        (MAIL_CLAIM, mail_false), (CALENDAR_CLAIM, cal_false), (PAYMENT_CLAIM, pay_false),
+        (NARRATED_LOOKUP, bool(narrated)), (FABRICATED_ID, bool(fabricated)),
     ) if on)
     if not kinds:
         return Verdict(claim_lines=lines)
@@ -1887,6 +1972,11 @@ def judge_reply(raw: str, reply: str, facts: TurnFacts) -> Verdict:
             parts.append("Also: your reply says a calendar event was created or changed, but no "
                          "calendar change ran in this turn — don't claim one.")
         backstop.append(CALENDAR_BACKSTOP_REFUSED if cal_refused else CALENDAR_BACKSTOP)
+    if pay_false:
+        parts.append(payment_corrective() if not parts else
+                     "Also: your reply says a payment was made or a bill is paid — Captain can't "
+                     "pay, and nothing shows it paid. Don't claim it.")
+        backstop.append(PAYMENT_BACKSTOP)
     if narrated:
         parts.append(lookup_corrective(narrated, facts.tools) if not parts else
                      f"Also: your reply describes lookups ({_lookup_quotes(narrated)}) that never "

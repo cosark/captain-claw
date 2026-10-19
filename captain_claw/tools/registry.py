@@ -477,6 +477,7 @@ class ToolRegistry:
                     if not self._tool_metadata.get(t.name, {}).get("requires_google")
                     and not self._tool_metadata.get(t.name, {}).get("requires_microsoft")
                     and not self._tool_metadata.get(t.name, {}).get("requires_jev")
+                    and not self._tool_metadata.get(t.name, {}).get("requires_payments")
                 ]
         except Exception:
             pass
@@ -528,6 +529,17 @@ class ToolRegistry:
                     tools = [t for t in tools if not self._tool_metadata.get(t.name, {}).get("requires_jev")]
         except Exception:
             tools = [t for t in tools if not self._tool_metadata.get(t.name, {}).get("requires_jev")]
+
+        # Payments: shown only while the owner's Flight Deck has payments on
+        # (refreshed per turn by ``payments_client.refresh()``). Fails closed.
+        try:
+            if any(self._tool_metadata.get(t.name, {}).get("requires_payments") for t in tools):
+                from captain_claw import payments_client
+
+                if not payments_client.payments_usable():
+                    tools = [t for t in tools if not self._tool_metadata.get(t.name, {}).get("requires_payments")]
+        except Exception:
+            tools = [t for t in tools if not self._tool_metadata.get(t.name, {}).get("requires_payments")]
 
         # Soniox (the audio tool): shown only while a key is usable — the
         # owner's (or team's) in Flight Deck, refreshed per turn by
