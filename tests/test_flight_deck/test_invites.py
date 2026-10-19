@@ -382,3 +382,116 @@ def test_compose_invite_text_and_html():
     assert "25 October 2026" in text and "  Line two" in text
     assert 'href="https://deck.example.com/invite#abc"' in html_body
     assert "Agents for Acme" in html_body
+
+
+# ── Waitlist approval email ──
+# Approving an application (admin_routes.approve_waitlist) emails the
+# applicant from the approving admin's own account that they can sign in.
+
+async def _application(db, cohort: str = "CC Cohort 001"):
+    return await db.create_waitlist_entry(
+        email="applicant@example.com", display_name="Appy", password_hash=hash_password("their-pass"),
+        referrer_name="R", referrer_email="r@example.com", cohort=cohort)
+
+
+def _decoded(req: httpx.Request) -> str:
+    raw = json.loads(req.content)["raw"]
+    return base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode().replace("=\r\n", "")
+
+
+async def test_waitlist_lists_mail_options_and_the_sign_in_address(fd_db, monkeypatch):
+    _connect_google(monkeypatch)
+    async with _client(_app(fd_db.admin)) as c:
+        body = (await c.get("/fd/admin/waitlist")).json()
+    assert body["mail"]["google"] == {"available": True, "from": "boss@gmail.com", "reason": ""}
+    assert body["mail"]["microsoft"]["available"] is False
+    assert body["sign_in_url"] == "http://fd.test/"
+
+
+async def test_approve_without_email_says_where_to_sign_in(fd_db):
+    entry = await _application(fd_db.db)
+    async with _client(_app(fd_db.admin)) as c:
+        r = await c.post(f"/fd/admin/waitlist/{entry['id']}/approve", json={})
+        assert r.status_code == 200, r.text
+    assert r.json()["email"] == {"sent": False, "via": "none", "from": "", "error": "", "url": "http://fd.test/"}
+
+
+async def test_approve_emails_the_applicant_from_gmail(fd_db, monkeypatch):
+    _connect_google(monkeypatch)
+    seen = _mock_http(monkeypatch, lambda req: httpx.Response(200, json={"id": "m1"}))
+    entry = await _application(fd_db.db)
+    async with _client(_app(fd_db.admin)) as c:
+        r = await c.post(f"/fd/admin/waitlist/{entry['id']}/approve", json={"send_via": "google"})
+        assert r.status_code == 200, r.text
+        assert r.json()["email"] == {"sent": True, "via": "google", "from": "boss@gmail.com",
+                                     "error": "", "url": "http://fd.test/"}
+        # They sign in with the password they applied with.
+        r = await c.post("/fd/auth/login", json={"email": "applicant@example.com", "password": "their-pass"})
+        assert r.status_code == 200, r.text
+    [req] = seen
+    assert req.url.path == "/gmail/v1/users/me/messages/send"
+    message = _decoded(req)
+    assert "To: applicant@example.com" in message
+    assert "your Flight Deck account is ready" in message
+    assert "Boss approved your application for CC Cohort 001" in message
+    assert "http://fd.test/" in message
+
+
+async def test_approve_emails_from_outlook_at_the_public_address(fd_db, monkeypatch):
+    _connect_microsoft(monkeypatch)
+    monkeypatch.setenv("FD_PUBLIC_URL", "https://deck.example.com")
+    seen = _mock_http(monkeypatch, lambda req: httpx.Response(202))
+    entry = await _application(fd_db.db)
+    async with _client(_app(fd_db.admin)) as c:
+        r = await c.post(f"/fd/admin/waitlist/{entry['id']}/approve", json={"send_via": "microsoft"})
+    assert r.json()["email"]["sent"] is True
+    [req] = seen
+    payload = json.loads(req.content)
+    assert payload["message"]["toRecipients"] == [{"emailAddress": {"address": "applicant@example.com"}}]
+    assert 'href="https://deck.example.com/"' in payload["message"]["body"]["content"]
+
+
+async def test_a_failed_approval_email_keeps_the_approval(fd_db, monkeypatch):
+    _connect_google(monkeypatch)
+    _mock_http(monkeypatch, lambda req: httpx.Response(
+        403, json={"error": {"code": 403, "message": "Request had insufficient authentication scopes."}}))
+    entry = await _application(fd_db.db)
+    async with _client(_app(fd_db.admin)) as c:
+        r = await c.post(f"/fd/admin/waitlist/{entry['id']}/approve", json={"send_via": "google"})
+        assert r.status_code == 200, r.text
+        assert r.json()["email"]["sent"] is False
+        assert "insufficient authentication scopes" in r.json()["email"]["error"]
+        # Nothing connected for Outlook: the reason, and still approved.
+        other = await fd_db.db.create_waitlist_entry(
+            email="second@example.com", display_name="", password_hash=hash_password("x" * 8),
+            referrer_name="R", referrer_email="r@example.com", cohort="c")
+        r = await c.post(f"/fd/admin/waitlist/{other['id']}/approve", json={"send_via": "microsoft"})
+        assert r.status_code == 200 and "Connections → Microsoft" in r.json()["email"]["error"]
+    assert (await fd_db.db.get_waitlist_entry(entry["id"]))["status"] == "approved"
+    assert await fd_db.db.get_user_by_email("applicant@example.com")
+
+
+async def test_approve_refuses_an_unknown_send_via(fd_db):
+    entry = await _application(fd_db.db)
+    async with _client(_app(fd_db.admin)) as c:
+        r = await c.post(f"/fd/admin/waitlist/{entry['id']}/approve", json={"send_via": "pigeon"})
+        assert r.status_code == 400
+    assert (await fd_db.db.get_waitlist_entry(entry["id"]))["status"] == "pending"
+    assert not await fd_db.db.get_user_by_email("applicant@example.com")
+
+
+def test_compose_waitlist_approved_text_and_html():
+    subject, text, html_body = invite_routes.compose_waitlist_approved(
+        instance_name="Acme Deck", instance_description="Agents for <Acme>", approver="Boss",
+        applicant="Nova", email="nova@example.com", cohort="Cohort 7", url="https://deck.example.com/",
+    )
+    assert subject == "You're in — your Acme Deck account is ready"
+    assert "Hi Nova," in text and "Boss approved your application for Cohort 7 to join Acme Deck" in text
+    assert "https://deck.example.com/" in text and "nova@example.com" in text
+    assert 'href="https://deck.example.com/"' in html_body and "Agents for &lt;Acme&gt;" in html_body
+    # A cohort that is just the instance name isn't repeated.
+    _, text, _ = invite_routes.compose_waitlist_approved(
+        instance_name="Acme Deck", instance_description="", approver="Boss",
+        applicant="", email="nova@example.com", cohort="Acme Deck", url="https://deck.example.com/",
+    )
+    assert "Hi," in text and "Boss approved your application to join Acme Deck." in text
