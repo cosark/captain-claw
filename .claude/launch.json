@@ -5,7 +5,7 @@
       "name": "website",
       "runtimeExecutable": "/bin/bash",
       "runtimeArgs": [
-        "/Users/kstevica/captain-claw/website/start-preview.sh"
+        "/Users/kstevica/Dev/captain-claw.com/website/start-preview.sh"
       ],
       "port": 4321
     },
