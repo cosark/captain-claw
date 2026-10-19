@@ -175,6 +175,9 @@ _ECO_CORE_TOOLS: frozenset[str] = frozenset({
     # Jev-first: judgments come up in any task and any language, so the schema
     # is always sent; the registry still hides jev until the owner has a key.
     "jev",
+    # The owner's Telegram: "what's new?" comes in any language. Hidden by the
+    # registry unless the owner keeps a Telegram inbox.
+    "telegram_inbox",
 })
 
 # ── Nano-mode: barebone tool allowlist for tiny local models. ──
@@ -2155,6 +2158,12 @@ class AgentOrchestrationMixin:
                 try:
                     from captain_claw import soniox_client
                     await soniox_client.available()
+                except Exception:
+                    pass
+                # Telegram inbox (owner-only): does the owner keep one?
+                try:
+                    from captain_claw import telegram_inbox_client
+                    await telegram_inbox_client.refresh_connected()
                 except Exception:
                     pass
 

@@ -2,6 +2,8 @@
 // - the shared Telegram bot (/fd/telegram-shared for a user's own link,
 //   /fd/admin/telegram-shared for the token and the access requests) —
 //   captain_claw/flight_deck/telegram_shared_routes.py
+// - the Telegram inbox through that bot (/fd/telegram-inbox) —
+//   captain_claw/flight_deck/telegram_inbox_routes.py
 // - the team Jev key (/fd/jev/shared, /fd/jev/shared-key) — jev_routes.py
 // - the team Soniox key (/fd/soniox/shared, /shared-key, /import-env) — soniox_routes.py
 // - the deck's logo (/fd/admin/branding/logo) — branding_routes.py
@@ -109,17 +111,19 @@ export interface AdminTelegram {
     enabled: boolean
     // New requests are approved at once (not someone an admin turned down).
     auto_approve: boolean
+    // People may keep a Telegram inbox through the bot (read-only).
+    inbox: boolean
     bot_username: string
     bot_name: string
     token_hint: string
   }
-  status: { running: boolean; last_ok_at: string | null; error: string }
+  status: { running: boolean; last_ok_at: string | null; error: string; bot_flags?: BotFlags }
   links: AdminTelegramLink[]
 }
 
 export const getAdminTelegram = () => fdFetch<AdminTelegram>('/fd/admin/telegram-shared')
 
-export const saveAdminTelegram = (patch: { token?: string; enabled?: boolean; auto_approve?: boolean }) =>
+export const saveAdminTelegram = (patch: { token?: string; enabled?: boolean; auto_approve?: boolean; inbox?: boolean }) =>
   fdFetch<AdminTelegram>('/fd/admin/telegram-shared', {
     method: 'PUT',
     body: JSON.stringify(patch),
@@ -133,6 +137,74 @@ export const decideTelegramLink = (userId: string, decision: 'approve' | 'reject
     `/fd/admin/telegram-shared/links/${encodeURIComponent(userId)}/${decision}`,
     { method: 'POST' },
   )
+
+// What BotFather allows the bot (null: not checked yet): connecting to people's
+// accounts through Chat Automation (Business Mode), reading every group message
+// (privacy mode off).
+export interface BotFlags {
+  business: boolean | null
+  groups: boolean | null
+}
+
+// ── Telegram inbox ──
+
+export interface InboxGroup {
+  chat_id: string
+  kind: 'group'
+  title: string
+  active: boolean
+  messages: number
+  last_at: string | null
+}
+
+export interface TelegramInbox {
+  available: boolean
+  reason: string
+  bot_username: string
+  bot: BotFlags
+  // The user's Telegram account is linked to the team bot and approved.
+  linked: boolean
+  tg_username: string
+  enabled: boolean
+  collecting: boolean
+  consented_at: string | null
+  retention_days: number
+  retention_choices: number[]
+  // A live Chat Automation connection, and the rights the user granted it (unused).
+  connection: { connected_at: string | null; rights: string[] } | null
+  groups: InboxGroup[]
+  private_chats: number
+  stats: { messages: number; chats: number; oldest: string | null; newest: string | null }
+}
+
+export interface InboxMessage {
+  chat_id: string
+  chat: string
+  kind: string
+  message_id: number
+  at: string | null
+  outgoing: boolean
+  sender: string
+  text: string
+  media: string
+  forwarded_from: string
+  edited: boolean
+  deleted: boolean
+}
+
+export const getTelegramInbox = () => fdFetch<TelegramInbox>('/fd/telegram-inbox')
+
+export const setTelegramInbox = (patch: { enabled?: boolean; consent?: boolean; retention_days?: number }) =>
+  fdFetch<TelegramInbox>('/fd/telegram-inbox', { method: 'PUT', body: JSON.stringify(patch) })
+
+export const clearTelegramInbox = () =>
+  fdFetch<TelegramInbox>('/fd/telegram-inbox/messages', { method: 'DELETE' })
+
+export const removeInboxGroup = (chatId: string) =>
+  fdFetch<TelegramInbox>(`/fd/telegram-inbox/groups/${encodeURIComponent(chatId)}`, { method: 'DELETE' })
+
+export const getTelegramInboxRecent = (limit = 20) =>
+  fdFetch<{ messages: InboxMessage[] }>(`/fd/telegram-inbox/recent?limit=${limit}`)
 
 export const removeTelegramLink = (userId: string) =>
   fdFetch<AdminTelegram>(`/fd/admin/telegram-shared/links/${encodeURIComponent(userId)}`, {

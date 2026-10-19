@@ -192,6 +192,42 @@ export function SharedTelegramBotAdmin({ refreshTick = 0 }: { refreshTick?: numb
         </label>
       )}
 
+      {cfg?.configured && (
+        <label className="flex items-start justify-between gap-4 rounded-md border border-zinc-800 bg-zinc-950/50 px-3 py-2.5">
+          <div>
+            <div className="text-sm text-zinc-300">Telegram inbox</div>
+            <div className="text-xs text-zinc-500 mt-0.5">
+              Approved people may let their agents read their Telegram through this bot — the private
+              chats they connect in Telegram's Chat Automation and groups they add the bot to.
+              Read-only, each person's own consent, kept encrypted on this deck. Switching it off
+              stops collecting; what's kept expires with each person's own retention.
+            </div>
+            {cfg.inbox && data?.status.bot_flags && (
+              <div className="text-xs mt-1.5 space-y-0.5">
+                <div className={data.status.bot_flags.business ? 'text-emerald-500' : 'text-amber-500'}>
+                  {data.status.bot_flags.business === null ? 'Business Mode: not checked yet'
+                    : data.status.bot_flags.business ? 'Business Mode on — private chats can be connected'
+                    : 'Business Mode off — turn it on in @BotFather → Bot Settings → Business Mode, or private chats can\'t be connected'}
+                </div>
+                <div className={data.status.bot_flags.groups ? 'text-emerald-500' : 'text-amber-500'}>
+                  {data.status.bot_flags.groups === null ? 'Group privacy: not checked yet'
+                    : data.status.bot_flags.groups ? 'Group privacy off — the bot sees every group message'
+                    : 'Group privacy on — in groups the bot only sees commands. Turn it off in @BotFather → Bot Settings → Group Privacy (then re-add the bot), or make it a group admin'}
+                </div>
+              </div>
+            )}
+          </div>
+          <input
+            type="checkbox"
+            role="switch"
+            checked={cfg.inbox}
+            disabled={busy}
+            onChange={(e) => run(() => saveAdminTelegram({ inbox: e.target.checked }))}
+            className="mt-1 h-4 w-4 shrink-0 accent-violet-600"
+          />
+        </label>
+      )}
+
       {data?.status.error && cfg?.enabled && (
         <div className="flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
           <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5" />

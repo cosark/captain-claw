@@ -101,6 +101,8 @@ async def load_config(db) -> dict[str, Any]:
         # New requests are approved at once (Admin → Integrations); a person
         # an admin turned down still waits for an admin.
         "auto_approve": bool(cfg.get("auto_approve", False)),
+        # Users may keep a Telegram inbox through the bot (telegram_inbox.py).
+        "inbox": bool(cfg.get("inbox", True)),
         "bot_username": str(cfg.get("bot_username") or ""),
         "bot_name": str(cfg.get("bot_name") or ""),
         "bot_id": str(cfg.get("bot_id") or ""),
@@ -235,6 +237,12 @@ class _State:
     links_by_user: dict[str, dict] = field(default_factory=dict)
     boxes: dict[str, _Box] = field(default_factory=dict)
     notices: dict[tuple[str, str], float] = field(default_factory=dict)
+    inbox: bool = True
+    # What BotFather allows the bot (getMe): connecting to accounts through
+    # Chat Automation, and reading every group message (privacy mode off).
+    can_business: bool | None = None
+    reads_groups: bool | None = None
+    flags_at: float = 0.0
 
 
 _state = _State()
@@ -252,11 +260,36 @@ def status() -> dict[str, Any]:
         "running": _state.running,
         "last_ok_at": _state.last_ok_at,
         "error": _state.error,
+        "bot_flags": bot_flags(),
     }
 
 
 def bot_username() -> str:
     return _state.bot_username
+
+
+def inbox_allowed() -> bool:
+    return _state.inbox
+
+
+def bot_flags() -> dict[str, bool | None]:
+    return {"business": _state.can_business, "groups": _state.reads_groups}
+
+
+_FLAGS_EVERY = 600.0
+
+
+async def refresh_flags(force: bool = False) -> None:
+    """Re-read the bot's BotFather switches (getMe), at most every few minutes."""
+    token = _state.token
+    if not token or (not force and time.monotonic() - _state.flags_at < _FLAGS_EVERY):
+        return
+    _state.flags_at = time.monotonic()
+    data = await call(token, "getMe")
+    me = data.get("result") if data.get("ok") else None
+    if isinstance(me, dict):
+        _state.can_business = bool(me.get("can_connect_to_business"))
+        _state.reads_groups = bool(me.get("can_read_all_group_messages"))
 
 
 def agent_online(slug: str) -> bool | None:
@@ -302,6 +335,9 @@ async def start(db) -> None:
     cfg = await load_config(db)
     _state.token = cfg["token"] if cfg["enabled"] else ""
     _state.bot_username = cfg["bot_username"]
+    _state.inbox = cfg["inbox"]
+    _state.can_business = _state.reads_groups = None
+    _state.flags_at = 0.0
     _state.error = ""
     _state.last_ok_at = None
     await reload_links(db)
@@ -321,17 +357,35 @@ async def stop() -> None:
             pass
 
 
+_CHAT_UPDATES = ["message", "callback_query"]
+# The Telegram inbox's: Chat Automation (business) connections and their
+# messages, group edits, and the bot joining / leaving groups.
+_INBOX_UPDATES = [
+    "edited_message", "my_chat_member", "business_connection", "business_message",
+    "edited_business_message", "deleted_business_messages",
+]
+
+
 async def _poll_loop(db, token: str) -> None:
     offset: int | None = None
     backoff = 2.0
     _state.running = True
     log.info("Shared Telegram bot polling started")
+    updates = _CHAT_UPDATES + (_INBOX_UPDATES if _state.inbox else [])
     try:
         while True:
             try:
+                await refresh_flags()
+            except Exception:
+                pass
+            if _state.inbox:
+                from captain_claw.flight_deck import telegram_inbox
+
+                await telegram_inbox.maybe_purge(db)
+            try:
                 params: dict[str, Any] = {
                     "timeout": _POLL_TIMEOUT,
-                    "allowed_updates": json.dumps(["message", "callback_query"]),
+                    "allowed_updates": json.dumps(updates),
                 }
                 if offset is not None:
                     params["offset"] = offset
@@ -406,6 +460,13 @@ async def _notice(chat_id: Any, tg_user: str, kind: str, text: str) -> None:
 
 async def route_update(db, update: dict[str, Any]) -> str:
     """Deliver one update; returns what happened (for logs and tests)."""
+    # The Telegram inbox first: Chat Automation traffic, group messages and the
+    # bot's own group membership are its, and never reach an agent's chat.
+    from captain_claw.flight_deck import telegram_inbox
+
+    kept = await telegram_inbox.handle(db, update)
+    if kept is not None:
+        return kept
     msg = update.get("message")
     cbq = update.get("callback_query")
     if isinstance(msg, dict):

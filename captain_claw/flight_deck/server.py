@@ -1391,6 +1391,7 @@ from captain_claw.flight_deck.microsoft_oauth_routes import router as microsoft_
 from captain_claw.flight_deck.jev_routes import router as jev_router
 from captain_claw.flight_deck.soniox_routes import router as soniox_router
 from captain_claw.flight_deck.telegram_shared_routes import router as telegram_shared_router
+from captain_claw.flight_deck.telegram_inbox_routes import router as telegram_inbox_router
 from captain_claw.flight_deck.branding_routes import router as branding_router
 from captain_claw.flight_deck.invite_routes import admin_router as invite_admin_router
 from captain_claw.flight_deck.invite_routes import public_router as invite_public_router
@@ -1463,6 +1464,7 @@ app.include_router(microsoft_oauth_router)
 app.include_router(jev_router)
 app.include_router(soniox_router)
 app.include_router(telegram_shared_router)
+app.include_router(telegram_inbox_router)
 app.include_router(branding_router)
 app.include_router(invite_admin_router)
 app.include_router(invite_public_router)

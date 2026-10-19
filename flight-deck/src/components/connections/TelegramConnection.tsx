@@ -9,6 +9,7 @@ import {
   type MyTelegram,
   ADMIN_TAB_KEY,
 } from '../../services/sharedIntegrations'
+import TelegramInbox from './TelegramInbox'
 
 // The deck's shared Telegram bot (captain_claw/flight_deck/telegram_shared.py):
 // one bot an admin set up for everyone. A user picks which of their own agents
@@ -289,7 +290,7 @@ export default function TelegramConnection({ onStatus }: { onStatus?: (s: MyTele
                     onClick={() => {
                       const msg = active?.status === 'pending'
                         ? 'Withdraw your request for the team Telegram bot?'
-                        : 'Disconnect Telegram? The bot stops passing your messages on; asking again needs a new approval.'
+                        : 'Disconnect Telegram? The bot stops passing your messages on, your Telegram inbox (if on) is deleted, and asking again needs a new approval.'
                       if (confirm(msg)) run(disconnectTelegram)
                     }}
                     disabled={busy}
@@ -307,6 +308,8 @@ export default function TelegramConnection({ onStatus }: { onStatus?: (s: MyTele
                   <RefreshCw className={`h-3 w-3 ${loading ? 'animate-spin' : ''}`} />
                 </button>
               </div>
+
+              <TelegramInbox linkKey={`${link?.status ?? ''}:${link?.linked ? 1 : 0}`} />
             </>
           )}
 
