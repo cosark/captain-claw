@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react'
 import { Database, Table2, Loader2, AlertCircle, RefreshCw, Search } from 'lucide-react'
 import { useAuthStore, refreshAccessToken } from '../../stores/authStore'
-import { useAgentEndpoint } from './AgentFilesPanel'
+import { useAgentBack, useAgentEndpoint } from './AgentFilesPanel'
 import { DatastoreBrowser } from './DatastoreBrowser'
 import { CreatorBadge } from './CreatorBadge'
 import type { Creator } from '../../utils/sharedWorkspace'
@@ -69,6 +69,10 @@ export function AgentDatastorePanel({ containerId }: { containerId: string }) {
     }
   }
   useEffect(() => { loadTables() }, [host, port])
+  // Failed while the agent was away (restarting with Flight Deck): its chat
+  // getting through again means it's back.
+  const back = useAgentBack(containerId)
+  useEffect(() => { if (back && error) loadTables() }, [back])
 
   const shown = useMemo(() => {
     const q = search.trim().toLowerCase()
