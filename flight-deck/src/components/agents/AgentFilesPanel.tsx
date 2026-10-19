@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import {
   FileText, Loader2, AlertCircle, FolderOpen, RefreshCw, Download, Eye,
   Search, Image, FileCode, FileSpreadsheet, Film, Music, Archive,
@@ -20,6 +20,7 @@ import { usePinnedFilesStore } from '../../stores/pinnedFilesStore'
 import { useContainerStore } from '../../stores/containerStore'
 import { useProcessStore } from '../../stores/processStore'
 import { useLocalAgentStore } from '../../stores/localAgentStore'
+import { useChatStore } from '../../stores/chatStore'
 
 // File groups whose text content can be edited in place (mirrors FileBrowser).
 const EDITABLE_GROUPS = new Set(['markdown', 'code', 'data', 'text', 'html'])
@@ -55,6 +56,23 @@ export function useAgentEndpoint(containerId: string): AgentEndpoint | null {
     return { id: `proc-${proc.slug}`, name: proc.name, host: 'localhost', port: proc.web_port, auth: proc.web_auth }
   }
   return null
+}
+
+/** Goes up by one each time the agent's chat (any lane) gets through again
+ *  after being cut off — Flight Deck restarted it, or it moved port. A panel
+ *  left showing an error from while it was away reloads on it. */
+export function useAgentBack(containerId: string): number {
+  const live = useChatStore((s) => {
+    for (const x of s.sessions.values()) if (x.containerId === containerId && x.connected) return true
+    return false
+  })
+  const [back, setBack] = useState(0)
+  const wasLive = useRef(live)
+  useEffect(() => {
+    if (live && !wasLive.current) setBack((n) => n + 1)
+    wasLive.current = live
+  }, [live])
+  return back
 }
 
 function FileIcon({ file }: { file: AgentFile }) {
@@ -116,7 +134,11 @@ export function AgentFilesPanel({ containerId }: { containerId: string }) {
       setLoading(false)
     }
   }
-  useEffect(() => { loadFiles() }, [agentId])
+  useEffect(() => { loadFiles() }, [agentId, agent?.host, agent?.port])
+  // Failed while the agent was away (restarting with Flight Deck): its chat
+  // getting through again means it's back.
+  const back = useAgentBack(containerId)
+  useEffect(() => { if (back && error) loadFiles() }, [back])
 
   const processedFiles = useMemo(() => {
     let r = [...files]

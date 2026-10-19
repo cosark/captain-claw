@@ -1032,6 +1032,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     ws.on('fd_agent_endpoint', (data) => {
       const p = Number(data.port)
       if (p > 0) updateSession(key, { port: p })
+      // The agent list (files, datastore, cards) still has the old port until
+      // its next poll — fetch it now.
+      void useProcessStore.getState().fetchProcesses()
     })
 
     // Shared chats: Flight Deck closed the member socket for good. Say why
