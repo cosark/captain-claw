@@ -40,7 +40,7 @@
 #include <M5PM1.h>
 #endif
 
-#define FW_VERSION "0.10.0"
+#define FW_VERSION "0.10.1"
 
 // Home: the PaperColor's home screen even while there's an answer (C hold).
 // Link: the "settings on your phone" address.
@@ -80,6 +80,7 @@ static uint32_t buzzOffMs = 0;       // vibration motor runs until then (0 = off
 static bool deckReplay = false;      // asked the deck to send the last answer again
 static uint32_t deckReplayMs = 0;
 static bool quietSpeech = false;     // replayed speech comes without the cue
+static uint32_t closeAtMs = 0;       // the closing chime, a moment after the answer's last sound (0 = none)
 static uint32_t sideClickMs = 0;     // a side click on an answer, waiting for a second one (0 = none)
 static Mode sideClickMode = Mode::Idle;
 static bool sideClickWoke = false;   // that click only woke the screen
@@ -361,7 +362,7 @@ static String menuLabel(int row) {
       return String("Text size: ") + sizes[settings.textSize];
     }
     case MCharacter: return String("Character: ") + face::name(settings.character) + " »";
-    case MBeep: return String("Beep before speech: ") + (settings.cueBeep ? "on" : "off");
+    case MBeep: return String("Beeps around speech: ") + (settings.cueBeep ? "on" : "off");
     case MFlash:
       return String(board::kEpaper ? "Light" : "Flash") + " before speech: " + (settings.cueFlash ? "on" : "off");
     case MBuzz: return String("Buzz before speech: ") + (settings.cueBuzz ? "on" : "off");
@@ -415,7 +416,12 @@ static ui::Item menuItem(int row) {
       it.note = String(sizes[settings.textSize]) + " · change";
       break;
     case MCharacter: it.title = "Character"; it.badge = face::name(settings.character); it.note = "yellow = browse"; break;
-    case MBeep: it.title = "Beep before speech"; it.badge = onOff(settings.cueBeep); it.on = settings.cueBeep; break;
+    case MBeep:
+      it.title = "Beeps around speech";
+      it.badge = onOff(settings.cueBeep);
+      it.on = settings.cueBeep;
+      it.note = "a chime before it speaks, the reverse after";
+      break;
     case MFlash:
       it.title = board::kEpaper ? "Light before speech" : "Flash before speech";
       it.badge = onOff(settings.cueFlash);
@@ -1769,6 +1775,16 @@ void loop() {
   pollFlash();
   bool wasPlaying = audio::playing();
   audio::playPoll();
+  // The answer's sound played to its end: the cue again, the other way round
+  // — a moment later, so an agent-made sound that follows comes first.
+  if (audio::takeFinished() && settings.cueBeep && !quietSpeech) {
+    closeAtMs = millis() + 350;
+    if (!closeAtMs) closeAtMs = 1;
+  }
+  if (closeAtMs && (int32_t)(millis() - closeAtMs) >= 0) {
+    closeAtMs = 0;
+    if (!audio::playing() && !audio::micActive() && !prerollOn) audio::cueEnd();
+  }
   if (wasPlaying != audio::playing() && (mode == Mode::Reply || mode == Mode::Idle) && !flashing) redraw();
 
   if (!flashing && !screenOff) {

@@ -14,6 +14,7 @@ void setVolume(uint8_t volume);
 void setBoost(uint8_t db);
 void beep();  // short tone at the current volume (feedback for volume changes)
 void cue();   // two-tone "about to speak" chime
+void cueEnd(); // the same two tones the other way round: "done speaking"
 void click(); // a short tick for a button press (the paper changes slowly)
 
 // ── microphone ──
@@ -39,6 +40,9 @@ void playStop();                           // stop now (the clip is kept)
 void playPoll();                           // keep the speaker fed; call from loop()
 bool playing();                            // a stream is buffered or sounding
 bool sounding();                           // the speaker is actually outputting it
+// True once each time the answer's sound has played to its end by itself
+// (not stopped, not a replay): the moment for the closing chime.
+bool takeFinished();
 int outputLevel();                         // 0..100 loudness of what's sounding now
 
 // ── a line spoken aside (the e-paper's menu rows) ──

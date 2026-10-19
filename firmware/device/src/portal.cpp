@@ -119,7 +119,7 @@ static void handleRoot() {
   h += F("><label>Voice</label><select name=voice>");
   h += settings.femaleVoice ? F("<option value=male>Male</option><option value=female selected>Female</option>")
                             : F("<option value=male selected>Male</option><option value=female>Female</option>");
-  h += F("</select><label>Before speaking</label><select name=cue>");
+  h += F("</select><label>Around speech (a chime before, the reverse after)</label><select name=cue>");
   // The paper can't flash; its status lights do.
   struct { const char* v; const char* label; bool on; } cues[] = {
       {"both", board::kEpaper ? "Beep + light" : "Beep + flash", settings.cueBeep && settings.cueFlash},
