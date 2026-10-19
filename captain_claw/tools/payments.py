@@ -37,7 +37,7 @@ _FIELDS = ("payee_name", "payee_street", "payee_city", "payee_oib", "iban", "amo
 _MARK = {"paid": "user_paid", "user_paid": "user_paid", "skip": "skipped", "skipped": "skipped",
          "cancel": "cancelled", "cancelled": "cancelled"}
 _SOURCE_LABEL = {"barcode": "the invoice's own barcode", "document": "the invoice text",
-                 "model": "read by you only", "user": "the user"}
+                 "model": "read by you only", "user": "the user", "recurring": "the user's recurring bill"}
 
 
 class PaymentsTool(Tool):
@@ -61,7 +61,10 @@ class PaymentsTool(Tool):
         "what is prepared, paid or due — status='due' lists bills due within a week or overdue. "
         "Flight Deck sends the user a daily reminder of due bills; if they say they paid one they were "
         "reminded about, list status=due and mark that one. action='remind' (id, reminders on|off) "
-        "switches a bill's reminders when the user asks.\n"
+        "switches a bill's reminders when the user asks. action='recurring' lists the user's recurring bills "
+        "(Flight Deck prepares the fixed ones itself and watches for the others); with id (and cadence: "
+        "monthly | bimonthly | quarterly | yearly) it proposes that bill as recurring — the user confirms it "
+        "in Flight Deck → Payments.\n"
         "SHOPPING (buying from an online shop): action='purchase' (source: 'link' = Stripe Link wallet, "
         "'revolut_card' = a Revolut card made for this purchase; merchant_name, merchant_url = the shop's "
         "https address, items [{name, quantity, unit_amount}], amount = the checkout's final total incl. "
@@ -86,8 +89,10 @@ class PaymentsTool(Tool):
     parameters = {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["prepare", "handoff", "mark", "list", "get", "remind",
+            "action": {"type": "string", "enum": ["prepare", "handoff", "mark", "list", "get", "remind", "recurring",
                                                   "purchase", "checkout_pay", "checkout_check"]},
+            "cadence": {"type": "string", "enum": ["monthly", "bimonthly", "quarterly", "yearly"],
+                        "description": "recurring with id: how often this bill comes (default monthly)."},
             "reminders": {"type": "string", "enum": ["on", "off"],
                           "description": "remind: switch this bill's due-date reminders on or off."},
             "source": {"type": "string",
@@ -164,6 +169,8 @@ class PaymentsTool(Tool):
                 return await self._get(kwargs)
             if action == "remind":
                 return await self._remind(kwargs)
+            if action == "recurring":
+                return await self._recurring(kwargs)
             if action == "purchase":
                 return await self._purchase(kwargs, runtime)
             if action == "checkout_pay":
@@ -174,7 +181,7 @@ class PaymentsTool(Tool):
             log.warning("payments tool call failed", action=action, error=str(exc))
             return ToolResult(success=False, error=f"Flight Deck couldn't be reached: {exc}")
         return ToolResult(success=False, error=(
-            "Unknown action — use prepare, handoff, mark, list, get, remind, purchase, checkout_pay or "
+            "Unknown action — use prepare, handoff, mark, list, get, remind, recurring, purchase, checkout_pay or "
             "checkout_check."))
 
     # ── actions ───────────────────────────────────────────────────────
@@ -295,14 +302,49 @@ class PaymentsTool(Tool):
         if err:
             return ToolResult(success=False, error=err)
         rows = data.get("payments") or []
-        if not rows:
+        expected = data.get("expected") or []
+        if not rows and not expected:
             return ToolResult(success=True, content="No payments match.")
         out = []
         for p in rows:
             due = f" · due {p['due_date']}" if p.get("due_date") else ""
             out.append(f"• {p['id']} · {p['status']} · {p.get('payee_name') or '—'} · "
                        f"{p.get('amount_text')}{due}")
+        for e in expected:
+            out.append(f"• expected, no bill yet · {e.get('payee_name')} · {e.get('amount_text')} · around "
+                       f"{_hr_date(e.get('expected_on', ''))}" + (" · MISSING — it usually has come by now"
+                                                                  if e.get("status") == "missing" else ""))
         return ToolResult(success=True, content="\n".join(out))
+
+    async def _recurring(self, kwargs: dict) -> ToolResult:
+        intent_id = str(kwargs.get("id") or "").strip()
+        if intent_id:
+            if not intent_id.startswith("pay_"):
+                return ToolResult(success=False, error="Give the bill's `id` (pay_…).")
+            data, err = await payments_client.call("POST", f"/fd/payments/agent/{intent_id}/recurring",
+                                                   {"cadence": str(kwargs.get("cadence") or "monthly")})
+            if err:
+                return ToolResult(success=False, error=err)
+            bill = data.get("bill") or {}
+            if bill.get("status") == "active":
+                return ToolResult(success=True, content=f"{bill.get('payee_name')} is already tracked as a "
+                                                        f"{bill.get('cadence')} bill.")
+            return ToolResult(success=True, content=(
+                f"Proposed {bill.get('payee_name')} as a {bill.get('cadence')} bill. The user confirms it in Flight "
+                "Deck → Payments → Recurring bills; until then nothing is prepared or watched."))
+        data, err = await payments_client.call("GET", "/fd/payments/agent/recurring")
+        if err:
+            return ToolResult(success=False, error=err)
+        bills = data.get("bills") or []
+        if not bills:
+            return ToolResult(success=True, content="No recurring bills yet.")
+        lines = []
+        for b in bills:
+            what = ("Flight Deck prepares it" if b.get("prepares_itself") else "waits for the invoice") \
+                if b.get("status") == "active" else f"{b.get('status')} — the user confirms it in Flight Deck"
+            nxt = f" · next around {_hr_date(b['next_due'])}" if b.get("next_due") else ""
+            lines.append(f"• {b.get('payee_name')} · {b.get('cadence')} · {b.get('amount_text')}{nxt} · {what}")
+        return ToolResult(success=True, content="\n".join(lines))
 
     async def _remind(self, kwargs: dict) -> ToolResult:
         intent_id = str(kwargs.get("id") or "").strip()

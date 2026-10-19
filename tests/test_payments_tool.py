@@ -285,3 +285,23 @@ def test_reminders_go_where_the_conversation_came_from_and_can_be_switched(fd):
     assert "reminders for HEP Elektra d.o.o. are off" in r.content
     assert not _run(action="remind", id="pay_0123456789ab").success
     assert "status='due'" in PaymentsTool.description
+
+
+def test_recurring_bills_list_and_propose(fd):
+    calls, replies = fd
+    replies["/agent/recurring"] = {"bills": [
+        {"payee_name": "Stan d.o.o.", "status": "active", "cadence": "monthly", "amount_text": "650.00 EUR",
+         "next_due": "2026-11-01", "prepares_itself": True},
+        {"payee_name": "HEP", "status": "suggested", "cadence": "monthly", "amount_text": "79.00 EUR – 91.00 EUR",
+         "next_due": "", "prepares_itself": False}]}
+    r = _run(action="recurring")
+    assert "Stan d.o.o. · monthly · 650.00 EUR · next around 01.11.2026. · Flight Deck prepares it" in r.content
+    assert "HEP · monthly · 79.00 EUR – 91.00 EUR · suggested — the user confirms it in Flight Deck" in r.content
+    replies.clear()
+    replies["/pay_0123456789ab/recurring"] = {"bill": {"payee_name": "Gym", "status": "suggested", "cadence": "monthly"}}
+    r = _run(action="recurring", id="pay_0123456789ab", cadence="monthly")
+    assert calls[-1][2] == {"cadence": "monthly"} and "The user confirms it" in r.content
+    replies["/agent/list"] = {"payments": [], "expected": [
+        {"payee_name": "HEP", "expected_on": "2026-10-10", "amount_text": "~84 EUR", "status": "missing"}]}
+    r = _run(action="list", status="due")
+    assert "expected, no bill yet · HEP" in r.content and "MISSING" in r.content

@@ -201,6 +201,45 @@ CREATE TABLE IF NOT EXISTS statement_links (
     updated_at REAL NOT NULL,
     PRIMARY KEY (owner_id, fp, intent_id)
 );
+-- Phase 4d: bills that repeat. Only 'active' ones act (the owner confirmed them).
+CREATE TABLE IF NOT EXISTS recurring_bills (
+    id             TEXT PRIMARY KEY,
+    owner_id       TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    source         TEXT NOT NULL,
+    payee_name     TEXT NOT NULL DEFAULT '',
+    payee_key      TEXT NOT NULL DEFAULT '',
+    iban           TEXT NOT NULL,
+    model          TEXT NOT NULL DEFAULT '',
+    reference      TEXT NOT NULL DEFAULT '',
+    reference_kind TEXT NOT NULL,
+    amount_kind    TEXT NOT NULL,
+    amount_cents   INTEGER NOT NULL DEFAULT 0,
+    amount_min     INTEGER NOT NULL DEFAULT 0,
+    amount_max     INTEGER NOT NULL DEFAULT 0,
+    cadence        TEXT NOT NULL,
+    anchor_day     INTEGER NOT NULL,
+    last_paid      TEXT NOT NULL DEFAULT '',
+    next_due       TEXT NOT NULL DEFAULT '',
+    occurrences    INTEGER NOT NULL DEFAULT 0,
+    auto_prepare   INTEGER NOT NULL DEFAULT 1,
+    revolut_draft  INTEGER NOT NULL DEFAULT 0,
+    template       TEXT NOT NULL DEFAULT '{}',
+    created_at     REAL NOT NULL,
+    updated_at     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recurring_owner ON recurring_bills(owner_id, iban);
+CREATE TABLE IF NOT EXISTS recurring_periods (
+    recurring_id TEXT NOT NULL,
+    expected     TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    intent_id    TEXT NOT NULL DEFAULT '',
+    note         TEXT NOT NULL DEFAULT '',
+    nudged       INTEGER NOT NULL DEFAULT 0,
+    late         INTEGER NOT NULL DEFAULT 0,
+    updated_at   REAL NOT NULL,
+    PRIMARY KEY (recurring_id, expected)
+);
 """
 
 # Columns added after a table first shipped: (table, column, DDL).
@@ -212,6 +251,7 @@ _MIGRATIONS = (
     ("payment_intents", "statement", "TEXT NOT NULL DEFAULT '{}'"),
     ("payment_intents", "notify_origin", "TEXT NOT NULL DEFAULT '{}'"),
     ("payment_intents", "reminders", "TEXT NOT NULL DEFAULT '{}'"),
+    ("payment_intents", "recurring_id", "TEXT NOT NULL DEFAULT ''"),
 )
 # Indexes on migrated columns, created after the migrations ran.
 _POST_MIGRATION_DDL = (
@@ -359,6 +399,91 @@ class PaymentsStore:
                 return _row(await cur.fetchone())
         return None
 
+    async def payment_owners(self) -> list[str]:
+        """Everyone with bills, a statement connection or a recurring bill."""
+        db = await self._ensure_db()
+        async with db.execute(
+            "SELECT owner_id FROM payment_intents UNION SELECT owner_id FROM bank_sessions"
+            " UNION SELECT owner_id FROM recurring_bills",
+        ) as cur:
+            return [r[0] for r in await cur.fetchall()]
+
+    # ── recurring bills (Phase 4d) ───────────────────────────────────
+
+    @staticmethod
+    def _recurring_row(row: Any) -> dict | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["template"] = _loads(out.get("template"), {})
+        out["auto_prepare"] = bool(out.get("auto_prepare"))
+        out["revolut_draft"] = bool(out.get("revolut_draft"))
+        return out
+
+    async def create_recurring(self, row: dict) -> dict:
+        db = await self._ensure_db()
+        now = time.time()
+        values = {**row, "template": json.dumps(row.get("template") or {}, ensure_ascii=False),
+                  "created_at": now, "updated_at": now}
+        await db.execute(f"INSERT INTO recurring_bills ({', '.join(values)}) VALUES ({', '.join('?' for _ in values)})",
+                         tuple(values.values()))
+        await db.commit()
+        return await self.get_recurring(row["id"])
+
+    async def update_recurring(self, recurring_id: str, **changes: Any) -> dict | None:
+        db = await self._ensure_db()
+        values = {k: (json.dumps(v, ensure_ascii=False) if k == "template" else v)
+                  for k, v in {**changes, "updated_at": time.time()}.items()}
+        await db.execute(f"UPDATE recurring_bills SET {', '.join(f'{k} = ?' for k in values)} WHERE id = ?",
+                         (*values.values(), recurring_id))
+        await db.commit()
+        return await self.get_recurring(recurring_id)
+
+    async def get_recurring(self, recurring_id: str) -> dict | None:
+        db = await self._ensure_db()
+        async with db.execute("SELECT * FROM recurring_bills WHERE id = ?", (recurring_id,)) as cur:
+            return self._recurring_row(await cur.fetchone())
+
+    async def list_recurring(self, owner_id: str, statuses: tuple[str, ...] = ()) -> list[dict]:
+        db = await self._ensure_db()
+        q, args = "SELECT * FROM recurring_bills WHERE owner_id = ?", [owner_id]
+        if statuses:
+            q += f" AND status IN ({', '.join('?' for _ in statuses)})"
+            args += list(statuses)
+        async with db.execute(q + " ORDER BY payee_name", args) as cur:
+            return [self._recurring_row(r) for r in await cur.fetchall()]
+
+    async def delete_recurring(self, recurring_id: str) -> None:
+        db = await self._ensure_db()
+        await db.execute("DELETE FROM recurring_periods WHERE recurring_id = ?", (recurring_id,))
+        await db.execute("DELETE FROM recurring_bills WHERE id = ?", (recurring_id,))
+        await db.commit()
+
+    async def recurring_periods(self, recurring_id: str) -> list[dict]:
+        db = await self._ensure_db()
+        async with db.execute("SELECT * FROM recurring_periods WHERE recurring_id = ? ORDER BY expected",
+                              (recurring_id,)) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def save_period(self, recurring_id: str, expected: str, **values: Any) -> dict:
+        db = await self._ensure_db()
+        values = {**values, "updated_at": time.time()}
+        async with db.execute("SELECT 1 FROM recurring_periods WHERE recurring_id = ? AND expected = ?",
+                              (recurring_id, expected)) as cur:
+            exists = await cur.fetchone()
+        if exists:
+            await db.execute(f"UPDATE recurring_periods SET {', '.join(f'{k} = ?' for k in values)}"
+                             " WHERE recurring_id = ? AND expected = ?", (*values.values(), recurring_id, expected))
+        else:
+            values.setdefault("status", "expected")
+            cols = ["recurring_id", "expected", *values]
+            await db.execute(f"INSERT INTO recurring_periods ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+                             (recurring_id, expected, *values.values()))
+        await db.commit()
+        async with db.execute("SELECT * FROM recurring_periods WHERE recurring_id = ? AND expected = ?",
+                              (recurring_id, expected)) as cur:
+            return dict(await cur.fetchone())
+
     async def owners_with_due_bills(self) -> list[str]:
         """Owners with a live bill that has a due date (Phase 4c reminders)."""
         db = await self._ensure_db()
@@ -416,7 +541,9 @@ class PaymentsStore:
         await db.execute("DELETE FROM payment_connections WHERE owner_id = ?", (owner_id,))
         await db.execute("DELETE FROM payment_prefs WHERE owner_id = ?", (owner_id,))
         await db.execute("DELETE FROM purchases WHERE owner_id = ?", (owner_id,))
-        for table in ("bank_sessions", "bank_accounts", "bank_transactions", "statement_links"):
+        await db.execute("DELETE FROM recurring_periods WHERE recurring_id IN"
+                         " (SELECT id FROM recurring_bills WHERE owner_id = ?)", (owner_id,))
+        for table in ("bank_sessions", "bank_accounts", "bank_transactions", "statement_links", "recurring_bills"):
             await db.execute(f"DELETE FROM {table} WHERE owner_id = ?", (owner_id,))
         await db.commit()
 

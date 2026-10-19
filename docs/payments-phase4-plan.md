@@ -1,8 +1,8 @@
 # Payments, Phase 4: the bank statement closes the loop
 
 Status: **plan agreed** (2026-10-19): all six decisions at the end were taken
-as recommended. **4a, 4b and 4c are built** (see "As built" below); 4d is
-next.
+as recommended. **All of Phase 4 (4a–4d) is built** (see "As built" below).
+None of it has run against a real bank account yet.
 It builds on Phases 0–2: the same ledger, the same Enable Banking application
 as pay-by-bank links, and the same Revolut Business connection.
 
@@ -53,6 +53,57 @@ the error shows cleanly on the panel.
     account), looked up once per sync.
   - **`FD_ENABLEBANKING_STATEMENTS_REDIRECT_URL`** overrides the callback URL
     the deck works out, like Phase 2's override.
+
+## As built: 4d (2026-10-19)
+
+Tested with pure detection tests and end-to-end tests. On a spare deck, the
+loop suggested three bills (from paid bills and from statement rows); one was
+tracked from the panel, and "this repeats" was used on a card.
+
+- **Files:**
+  - `payments/recurring.py` (detect, next_due, window, amount_fits), pure.
+  - `flight_deck/recurring_bills.py`: detection, periods, prepare, link,
+    routes.
+  - `RecurringPanel.tsx`; "this repeats" on `PaymentCard`; a provenance
+    badge "from your recurring bill".
+- **Store:**
+  - `recurring_bills` (one per payee IBAN). `template` holds the payee
+    address and description from the latest bill.
+  - `recurring_periods`: keyed by the expected date, status `expected`,
+    `prepared`, `paid`, `covered`, `missing` or `skipped`, plus `nudged` and
+    `late`.
+  - Bills get a `recurring_id`.
+- **The loop** runs recurring bills each tick, before reminders. Detection
+  happens once a day per owner; periods move on every tick, idempotently.
+- **Detection:**
+  - Grouped by IBAN. A Captain bill and its statement row count as one
+    payment (same amount, within 5 days).
+  - Every recent interval must fit the cadence.
+  - Needed: 2 payments when Captain's history is involved, else 3 (2 for
+    yearly).
+  - Stopped patterns aren't suggested. A dismissed one is never suggested
+    again.
+- **Where it differs from the plan above:**
+  - **Prepared bills only from 5 days before to 2 days after the expected
+    date.** Never a bill for a long-gone due date: a period opened after its
+    day (just tracked, or the deck was off) is marked `late`, so it isn't
+    prepared and is never called missing.
+  - **A recurring period's earlier, paid bills to the same payee aren't
+    `possible_duplicate`s** (`_evaluate(recurring=True)`). A live, unpaid one
+    still is.
+  - **Covered by a statement row:** a direct debit or standing order
+    (`covered`, "paid outside Captain on …") ends the period. Nothing is
+    prepared or nudged.
+  - **The digest's "missing" lines** come from 4c's digest (once per period).
+    They also go out on days with no due bills.
+  - **The Revolut draft** is made only for a `ready` prepared bill, with
+    `schedule_for` = the due date (`create_draft(schedule_for=…)`); the owner
+    still approves it in Revolut.
+  - **"This repeats" on a card** tracks the payee at once (monthly; the panel
+    changes it). The agent's `recurring` action with an id only *proposes*
+    one.
+- **Limitation:** two recurring payments to the same IBAN (two children at one
+  kindergarten) look like one bill with a varying reference.
 
 ## As built: 4c (2026-10-19)
 

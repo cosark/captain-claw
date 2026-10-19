@@ -79,7 +79,7 @@ def test_one_digest_a_day_with_a_working_link(env):
     due = TODAY + timedelta(days=3)
     bill = _prepare(client, due)
     assert digest(at(TODAY, 8, 59))["sent"] is False                         # before the owner's time
-    assert digest(at(TODAY, 9, 30)) == {"sent": True, "bills": 1, "chat": "whatsapp"}
+    assert digest(at(TODAY, 9, 30)) == {"sent": True, "bills": 1, "missing": 0, "chat": "whatsapp"}
     [(origin, text)] = sent
     assert origin == WA and "HEP Elektra d.o.o. · 84.20 EUR — due in 3 days" in text
     link = next(line.strip() for line in text.splitlines() if "/p/" in line)

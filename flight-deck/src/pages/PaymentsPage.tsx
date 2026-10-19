@@ -8,6 +8,7 @@ import { RevolutPanel } from '../components/payments/RevolutPanel'
 import { BankLinkPanel } from '../components/payments/BankLinkPanel'
 import { StatementsPanel } from '../components/payments/StatementsPanel'
 import { RemindersPanel } from '../components/payments/RemindersPanel'
+import { RecurringPanel } from '../components/payments/RecurringPanel'
 import { LinkPanel } from '../components/payments/LinkPanel'
 import { ProtocolsPanel } from '../components/payments/ProtocolsPanel'
 import { PurchaseCard } from '../components/payments/PurchaseCard'
@@ -140,6 +141,7 @@ export function PaymentsPage() {
         )}
         {config && <div className="mb-4"><CapEditor config={config} onSaved={setConfig} /></div>}
         <RemindersPanel />
+        <RecurringPanel />
         <BankLinkPanel />
         <StatementsPanel />
         <RevolutPanel />

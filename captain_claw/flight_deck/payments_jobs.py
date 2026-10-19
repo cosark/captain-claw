@@ -3,8 +3,9 @@
 One loop for the work no request triggers: stale bills expire, bank statements
 are read on their daily slots (4a), bills are matched against them hourly so
 "not on the statement" ages (4b; every sync matches too), old unmatched
-statement rows are purged, and each owner gets their daily due-date digest
-(4c). Recurring bills (4d) come here next. Each step is idempotent, so a restart or a double tick repeats nothing;
+statement rows are purged, recurring bills move on — suggested, prepared,
+covered or missing (4d) — and each owner gets their daily due-date digest
+(4c), which comes last so a bill prepared this tick can be in it. Each step is idempotent, so a restart or a double tick repeats nothing;
 one failure is logged and never stops the loop.
 """
 
@@ -27,7 +28,7 @@ _last_match: dict[str, float] = {}
 async def tick(now: float | None = None) -> dict:
     from captain_claw.flight_deck import bank_statements, payments_routes, statements_routes
 
-    out = {"expired": 0, "synced": 0, "purged": 0, "matched": 0, "reminded": 0}
+    out = {"expired": 0, "synced": 0, "purged": 0, "matched": 0, "recurring": 0, "reminded": 0}
     if not payments_routes.enabled():
         return out
     out["expired"] = await payments_routes.store().expire_stale(now)
@@ -44,8 +45,9 @@ async def tick(now: float | None = None) -> dict:
         if _last_purge.get("statements") != today:
             out["purged"] = await statements_routes.purge(today)
             _last_purge["statements"] = today
-    from captain_claw.flight_deck import payment_reminders
+    from captain_claw.flight_deck import payment_reminders, recurring_bills
 
+    out["recurring"] = await recurring_bills.run_all(date.fromtimestamp(now) if now else None)
     out["reminded"] = await payment_reminders.run_all(now)
     return out
 

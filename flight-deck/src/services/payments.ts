@@ -62,7 +62,43 @@ export interface Payment {
   }
   /** Due-date reminders (Phase 4c): switched off for this bill, and when each stage went out. */
   reminders?: { off: boolean; sent: Record<string, string> }
+  /** The recurring bill this one belongs to (Phase 4d), if any. */
+  recurring_id?: string
 }
+
+export interface RecurringPeriod { expected: string; status: string; note: string; intent_id: string }
+export interface RecurringBill {
+  id: string
+  status: 'suggested' | 'active' | 'paused' | 'dismissed'
+  source: 'history' | 'statement' | 'user'
+  payee_name: string
+  iban_grouped: string
+  cadence: 'monthly' | 'bimonthly' | 'quarterly' | 'yearly'
+  anchor_day: number
+  amount_kind: 'fixed' | 'variable'
+  amount_text: string
+  reference_kind: 'fixed' | 'per_bill'
+  reference: string
+  can_prepare: boolean
+  auto_prepare: boolean
+  revolut_draft: boolean
+  next_due: string
+  last_paid: string
+  occurrences: number
+  periods: RecurringPeriod[]
+}
+export const listRecurring = () => fdJson<{ bills: RecurringBill[]; revolut: boolean }>('/payments/recurring')
+export const updateRecurring = (id: string, patch: Partial<Pick<RecurringBill,
+  'status' | 'auto_prepare' | 'revolut_draft' | 'cadence' | 'anchor_day' | 'reference_kind'>>) =>
+  fdJson<{ bill: RecurringBill }>(`/payments/recurring/${encodeURIComponent(id)}`, {
+    method: 'PUT', body: JSON.stringify(patch),
+  })
+export const deleteRecurring = (id: string) =>
+  fdJson<{ ok: true }>(`/payments/recurring/${encodeURIComponent(id)}`, { method: 'DELETE' })
+export const markRepeats = (paymentId: string, cadence = 'monthly') =>
+  fdJson<{ bill: RecurringBill }>(`/payments/${encodeURIComponent(paymentId)}/recurring`, {
+    method: 'POST', body: JSON.stringify({ cadence }),
+  })
 
 export interface ReminderSettings {
   enabled: boolean

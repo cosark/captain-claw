@@ -122,7 +122,10 @@ async def digest_owner(owner: str, now: float | None = None) -> dict:
         st = rem.stage(due, today, sent, days_before=cfg["days_before"], overdue=cfg["overdue"])
         if st:
             picked.append((due, st, row))
-    if not picked:
+    from captain_claw.flight_deck import recurring_bills
+
+    missing = await recurring_bills.missing_lines(owner)
+    if not picked and not missing:
         return out
     picked.sort(key=lambda x: (x[0], x[2]["id"]))
     base = await _link_base(owner)
@@ -139,15 +142,25 @@ async def digest_owner(owner: str, now: float | None = None) -> dict:
             note = await _fresh_link(row, base) if base else ""
         lines.append(f"• {head}" + (f"\n  {note}" if note else ""))
         bell.append(head + (f" — {note}" if note and not note.startswith("http") else ""))
+    for _, _, line in missing:
+        lines.append(f"• {line}")
+        bell.append(line)
     count = len(picked)
-    title = bell[0] if count == 1 else f"{count} bills to pay"
-    text = ("Bills to pay:\n" + "\n".join(lines)
-            + '\nPaid already? Tap "I paid" on its page, or tell Captain.')
+    if len(bell) == 1:
+        title = bell[0]
+    elif count and missing:
+        title = f"{count} bill{'s' if count > 1 else ''} to pay, {len(missing)} not come yet"
+    elif count:
+        title = f"{count} bills to pay"
+    else:
+        title = f"{len(missing)} bills haven't come yet"
+    text = ("Bills to pay:\n" if count else "Bills:\n") + "\n".join(lines) + (
+        '\nPaid already? Tap "I paid" on its page, or tell Captain.' if count else "")
     try:
         from captain_claw.flight_deck.auth import get_db
 
         await get_db().add_notification(owner, "payment", title[:200], "\n".join(bell)[:2000],
-                                        ref_type="payment", ref_id=picked[0][2]["id"])
+                                        ref_type="payment", ref_id=picked[0][2]["id"] if picked else "")
     except Exception as exc:  # noqa: BLE001
         log.warning("Reminder bell failed", error=str(exc))
     chat = ""
@@ -166,9 +179,10 @@ async def digest_owner(owner: str, now: float | None = None) -> dict:
         sent[st] = day
         await store().update(row["id"], reminders=sent)
         await store().add_event(row["id"], owner, "reminder", f"reminded_{st}", {"chat": chat or "bell"})
+    await recurring_bills.mark_nudged(missing)
     await store().set_pref(owner, SENT_PREF, day)
-    log.info("Payment reminder sent", bills=count, chat=chat or "bell")
-    return {"sent": True, "bills": count, "chat": chat}
+    log.info("Payment reminder sent", bills=count, missing=len(missing), chat=chat or "bell")
+    return {"sent": True, "bills": count, "missing": len(missing), "chat": chat}
 
 
 async def run_all(now: float | None = None) -> int:

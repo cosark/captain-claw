@@ -232,6 +232,7 @@ def view(row: dict) -> dict:
         "revolut": _revolut_public((row.get("rails_state") or {}).get("revolut") or {}),
         "bank_link": _bank_public(row),
         "statement": _statement_public(row),
+        "recurring_id": row.get("recurring_id", ""),
         "reminders": {"off": bool((row.get("reminders") or {}).get("off")),
                       "sent": {k: v for k, v in (row.get("reminders") or {}).items() if k in ("before", "due", "overdue")}},
     }
@@ -289,8 +290,9 @@ def render_barcodes(row: dict) -> list[dict]:
 
 
 async def _evaluate(owner: str, intent_id: str, fields: dict, provenance: dict, *,
-                    source_sha256: str = "", mismatches=(), not_in_document=()) -> list[dict]:
+                    source_sha256: str = "", mismatches=(), not_in_document=(), recurring: bool = False) -> list[dict]:
     from captain_claw.payments import checks, hub3
+    from captain_claw.payments import iban as iban_mod
 
     s = store()
     recent = await s.list(owner, since=time.time() - 120 * 86400, limit=500)
@@ -299,7 +301,10 @@ async def _evaluate(owner: str, intent_id: str, fields: dict, provenance: dict, 
                for r in recent if r["status"] in PAID_STATES]
     others = [{"id": r["id"], "status": r["status"], "iban": r["iban"], "amount_cents": r["amount_cents"],
                "reference": r["reference"], "source_sha256": r["source_sha256"],
-               "created_on": _iso_day(r.get("created_at"))} for r in recent]
+               "created_on": _iso_day(r.get("created_at"))} for r in recent
+              # A recurring bill's earlier, paid periods aren't duplicates of this one; a live bill still is.
+              if not (recurring and r["status"] in PAID_STATES
+                      and iban_mod.normalize(r["iban"]) == iban_mod.normalize(fields.get("iban", "")))]
     cap = await s.get_cap(owner)
     notes: list[str] = []
     if "hub3" in checks.barcodes_for(fields) and fields.get("iban") and fields.get("amount_cents"):
@@ -457,6 +462,9 @@ async def agent_prepare(req: PrepareRequest, request: Request):
     if req.automated:
         await _notify(owner, row)
     row = await _statement_check(owner, row)
+    from captain_claw.flight_deck import recurring_bills
+
+    row = await recurring_bills.link_new_bill(owner, row)
     log.info("Payment prepared", id=intent_id, owner=owner, status=status, source=source_kind)
     return {"intent": view(row), "existing": False, "rails": await _rails(owner)}
 
@@ -566,14 +574,18 @@ async def agent_list(request: Request, status: str = "", q: str = "", limit: int
     due_soon = status == "due"
     statuses = LIVE_STATES if due_soon else tuple(x for x in status.split(",") if x) if status else ()
     rows = await _sync_rows(await store().list(owner, statuses=statuses, limit=max(1, min(limit, 100))))
+    expected: list[dict] = []
     if due_soon:
+        from captain_claw.flight_deck import recurring_bills
+
         horizon = (date.today() + timedelta(days=7)).isoformat()
         rows = sorted((r for r in rows if r.get("due_date") and r["due_date"] <= horizon), key=lambda r: r["due_date"])
+        expected = await recurring_bills.expected_soon(owner, date.today())
     if q:
         needle = q.casefold()
         rows = [r for r in rows if needle in str(r["fields"].get("payee_name", "")).casefold()
                 or needle in str(r["fields"].get("description", "")).casefold()]
-    return {"payments": [view(r) for r in rows]}
+    return {"payments": [view(r) for r in rows], **({"expected": expected} if due_soon else {})}
 
 
 @router.get("/fd/payments/agent/{intent_id}")
@@ -806,7 +818,7 @@ def _draft_reference(fields: dict) -> str:
     return ref or fields.get("description", "") or fields.get("payee_name", "")
 
 
-async def _handoff_revolut(row: dict, owner: str, actor: str) -> dict:
+async def _handoff_revolut(row: dict, owner: str, actor: str, schedule_for: str = "") -> dict:
     """Put the payment into Revolut Business as a draft (gate already passed)."""
     from captain_claw.flight_deck import revolut_business as rb
     from captain_claw.payments import checks, iban as iban_mod
@@ -867,14 +879,15 @@ async def _handoff_revolut(row: dict, owner: str, actor: str) -> dict:
         draft_id = await client.create_draft(
             account_id=conn["account_id"], counterparty_id=counterparty["id"],
             counterparty_account_id=cp_account, amount_cents=int(fields.get("amount_cents") or 0),
-            reference=_draft_reference(fields), title=f"Captain · {name}")
+            reference=_draft_reference(fields), title=f"Captain · {name}", schedule_for=schedule_for)
     except rb.RevolutError as exc:
         raise HTTPException(502, f"Revolut Business refused it: {exc.message}")
     rv.update(draft_id=draft_id, counterparty_id=counterparty["id"], account_id=conn["account_id"],
               state="CREATED", created_at=time.time())
     row = await store().update(row["id"], status="handed_off", handoff_rail=REVOLUT, warnings=warnings,
                                rails_state={**(row.get("rails_state") or {}), REVOLUT: rv})
-    await store().add_event(row["id"], owner, actor, "revolut_draft", {"draft_id": draft_id})
+    await store().add_event(row["id"], owner, actor, "revolut_draft",
+                            {"draft_id": draft_id, **({"schedule_for": schedule_for} if schedule_for else {})})
     log.info("Revolut payment draft created", id=row["id"], owner=owner)
     return {"intent": view(row), "rail": REVOLUT, "existing": False}
 

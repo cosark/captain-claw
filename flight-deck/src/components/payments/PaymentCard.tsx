@@ -6,9 +6,10 @@
 // approves it there. A blocking warning hides the barcode until the owner
 // checks it here — the agent can't clear one.
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { AlertTriangle, Bell, BellOff, Check, CheckCircle2, Copy, ExternalLink, Info, Landmark, Loader2, Receipt, X } from 'lucide-react'
+import { AlertTriangle, Bell, BellOff, Check, CheckCircle2, Copy, ExternalLink, Info, Landmark, Loader2, Receipt, Repeat, X } from 'lucide-react'
 import {
-  ackWarnings, answerStatementMatch, CLOSED, getPayment, markPayment, PAID, payByBank, sendToRevolut, setBillReminders,
+  ackWarnings, answerStatementMatch, CLOSED, getPayment, markPayment, markRepeats, PAID, payByBank, sendToRevolut,
+  setBillReminders,
   statusLabel, useBarcode,
   type Payment, type PaymentWarning, type StatementSuggestion,
 } from '../../services/payments'
@@ -26,6 +27,7 @@ const SOURCE_BADGE: Record<string, { label: string; tone: string }> = {
   document: { label: 'from the invoice text', tone: 'text-emerald-400' },
   user: { label: 'from you', tone: 'text-emerald-400' },
   model: { label: 'read by AI — please check', tone: 'text-amber-400' },
+  recurring: { label: 'from your recurring bill', tone: 'text-emerald-400' },
 }
 
 function CopyButton({ value }: { value: string }) {
@@ -213,6 +215,18 @@ export function PaymentCard({ id, compact = false, onChange }: {
         <div className="text-right">
           <div className={`text-xl font-bold ${paid ? 'text-emerald-400' : 'text-zinc-100'}`}>{p.amount_text}</div>
           {p.due_date && <div className="text-[11px] text-zinc-500">due {p.due_date}</div>}
+          {p.recurring_id ? (
+            <div className="mt-0.5 inline-flex items-center gap-1 text-[11px] text-zinc-500"><Repeat size={11} /> recurring</div>
+          ) : p.iban && p.amount_cents > 0 && (
+            <button disabled={busy} title="Track this payee as a monthly bill (change how often on the Payments page)"
+              onClick={async () => {
+                setBusy(true)
+                try { await markRepeats(p.id); load() } catch (e) { setError(String((e as Error).message || e)) } finally { setBusy(false) }
+              }}
+              className="mt-0.5 inline-flex items-center gap-1 text-[11px] text-zinc-500 hover:text-zinc-300">
+              <Repeat size={11} /> this repeats
+            </button>
+          )}
           {p.due_date && !closed && p.reminders && (
             <button disabled={busy} onClick={() => act(() => setBillReminders(p.id, !!p.reminders?.off))}
               title={p.reminders.off ? 'Due-date reminders are off for this bill' : 'Captain reminds you before it is due'}

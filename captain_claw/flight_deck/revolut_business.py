@@ -209,13 +209,15 @@ class RevolutClient:
         return await self.request("POST", "/account-name-validation", json=body)
 
     async def create_draft(self, *, account_id: str, counterparty_id: str, counterparty_account_id: str,
-                           amount_cents: int, reference: str, title: str) -> str:
+                           amount_cents: int, reference: str, title: str, schedule_for: str = "") -> str:
         receiver = {"counterparty_id": counterparty_id}
         if counterparty_account_id:
             receiver["account_id"] = counterparty_account_id
         body = {"title": title[:100], "payments": [{
             "account_id": account_id, "receiver": receiver, "amount": round(amount_cents / 100, 2),
             "currency": "EUR", "reference": reference[:140]}]}
+        if schedule_for:
+            body["schedule_for"] = schedule_for          # a date: the draft is paid then, once approved
         data = await self.request("POST", "/payment-drafts", json=body)
         return str((data or {}).get("id") or "")
 
