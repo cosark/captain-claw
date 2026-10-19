@@ -6,11 +6,19 @@
 // approves it there. A blocking warning hides the barcode until the owner
 // checks it here — the agent can't clear one.
 import { useCallback, useEffect, useState } from 'react'
-import { AlertTriangle, Check, CheckCircle2, Copy, Info, Loader2, Receipt, X } from 'lucide-react'
+import { AlertTriangle, Check, CheckCircle2, Copy, Info, Landmark, Loader2, Receipt, X } from 'lucide-react'
 import {
-  ackWarnings, CLOSED, getPayment, markPayment, PAID, statusLabel, useBarcode,
+  ackWarnings, CLOSED, getPayment, markPayment, PAID, sendToRevolut, statusLabel, useBarcode,
   type Payment, type PaymentWarning,
 } from '../../services/payments'
+
+const REVOLUT_STATE: Record<string, string> = {
+  CREATED: 'Waiting in Revolut Business — send it from the Revolut app',
+  PENDING: 'Sent in Revolut — pending approval or processing',
+  COMPLETED: 'Completed in Revolut',
+  DECLINED: 'Declined by Revolut', FAILED: 'Failed in Revolut', REVERTED: 'Reverted by Revolut',
+  CANCELLED: 'Cancelled in Revolut', DELETED: 'Removed in Revolut',
+}
 
 const SOURCE_BADGE: Record<string, { label: string; tone: string }> = {
   barcode: { label: 'from the invoice barcode', tone: 'text-emerald-400' },
@@ -113,11 +121,13 @@ function Barcode({ p }: { p: Payment }) {
 
 export function PaymentCard({ id, compact = false }: { id: string; compact?: boolean }) {
   const [p, setP] = useState<Payment | null>(null)
+  const [rails, setRails] = useState<string[]>([])
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
   const load = useCallback(() => {
-    getPayment(id).then((r) => { setP(r.intent); setError('') }).catch((e) => setError(String(e.message || e)))
+    getPayment(id).then((r) => { setP(r.intent); setRails(r.rails || []); setError('') })
+      .catch((e) => setError(String(e.message || e)))
   }, [id])
   useEffect(() => { load() }, [load])
 
@@ -125,8 +135,10 @@ export function PaymentCard({ id, compact = false }: { id: string; compact?: boo
     setBusy(true)
     try {
       setP((await fn()).intent)
+      setError('')
     } catch (e) {
       setError(String((e as Error).message || e))
+      load()   // e.g. Verification of Payee just added a warning
     } finally {
       setBusy(false)
     }
@@ -145,6 +157,8 @@ export function PaymentCard({ id, compact = false }: { id: string; compact?: boo
   }
 
   const paid = PAID.includes(p.status)
+  const draft = p.revolut?.draft_id ? p.revolut : null
+  const inRevolut = !!draft && p.status === 'handed_off'
   const closed = CLOSED.includes(p.status)
   const payable = p.status === 'ready' || p.status === 'handed_off'
   const openBlocking = p.warnings.filter((w) => w.severity === 'blocking' && !w.acked)
@@ -169,7 +183,17 @@ export function PaymentCard({ id, compact = false }: { id: string; compact?: boo
 
       {paid && (
         <div className="mt-2 flex items-center gap-1.5 text-xs text-emerald-400">
-          <CheckCircle2 size={14} /> Marked as paid{p.paid_at ? ` on ${new Date(p.paid_at * 1000).toLocaleDateString()}` : ''}
+          <CheckCircle2 size={14} />
+          {p.status === 'settled' ? 'Paid — confirmed by the bank' : 'Marked as paid'}
+          {p.paid_at ? ` on ${new Date(p.paid_at * 1000).toLocaleDateString()}` : ''}
+        </div>
+      )}
+
+      {draft && (
+        <div className="mt-2 flex items-center gap-1.5 text-xs text-sky-300">
+          <Landmark size={14} />
+          {REVOLUT_STATE[draft.state || 'CREATED'] || draft.state}
+          {draft.reason ? ` (${draft.reason})` : ''}
         </div>
       )}
 
@@ -189,19 +213,31 @@ export function PaymentCard({ id, compact = false }: { id: string; compact?: boo
             <Field label="Model · poziv na broj" value={ref} copy={p.reference} source={p.provenance.reference} />
             <Field label="Description" value={p.description} />
           </div>
-          {payable && openBlocking.length === 0 && <Barcode p={p} />}
+          {payable && openBlocking.length === 0 && !inRevolut && <Barcode p={p} />}
         </div>
       )}
 
       {payable && (
-        <div className="mt-3 flex gap-2">
-          <button
-            disabled={busy}
-            onClick={() => act(() => markPayment(p.id, 'user_paid'))}
-            className="inline-flex items-center gap-1 rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
-          >
-            <Check size={13} /> I paid
-          </button>
+        <div className="mt-3 flex flex-wrap gap-2">
+          {rails.includes('revolut') && !inRevolut && openBlocking.length === 0 && (
+            <button
+              disabled={busy}
+              onClick={() => act(() => sendToRevolut(p.id))}
+              title="Creates a draft in Revolut Business — you send it from the Revolut app"
+              className="inline-flex items-center gap-1 rounded-md bg-sky-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-sky-600 disabled:opacity-50"
+            >
+              <Landmark size={13} /> Send to Revolut
+            </button>
+          )}
+          {!inRevolut && (
+            <button
+              disabled={busy}
+              onClick={() => act(() => markPayment(p.id, 'user_paid'))}
+              className="inline-flex items-center gap-1 rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
+            >
+              <Check size={13} /> I paid
+            </button>
+          )}
           <button
             disabled={busy}
             onClick={() => act(() => markPayment(p.id, 'skipped'))}

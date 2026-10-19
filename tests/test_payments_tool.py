@@ -123,3 +123,31 @@ def test_registry_hides_the_tool_unless_payments_are_on(monkeypatch):
     assert "payments" not in [t.name for t in registry._resolve_tools()]
     monkeypatch.setattr(payments_client, "payments_usable", lambda: True)
     assert "payments" in [t.name for t in registry._resolve_tools()]
+
+
+def test_handoff_to_revolut_says_it_is_a_draft(fd):
+    calls, replies = fd
+    replies["/handoff"] = {"rail": "revolut", "existing": False, "intent": {
+        **INTENT, "status": "handed_off", "handoff_rail": "revolut",
+        "revolut": {"draft_id": "draft-1", "state": "CREATED"}}}
+    r = _run(action="handoff", id="pay_0123456789ab", rail="revolut")
+    assert r.success and calls[0][2] == {"rail": "revolut"}
+    assert "draft" in r.content and "Nothing has been paid" in r.content and "Path:" not in r.content
+
+
+def test_ready_mentions_revolut_only_when_connected(fd):
+    _, replies = fd
+    replies["/prepare"] = {"intent": INTENT, "rails": ["barcode", "revolut"]}
+    assert "rail='revolut'" in _run(action="prepare", payee_name="HEP", iban="HR1210010051863000160",
+                                    amount="1").content
+    replies["/prepare"] = {"intent": INTENT, "rails": ["barcode"]}
+    assert "revolut" not in _run(action="prepare", payee_name="HEP", iban="HR1210010051863000160",
+                                 amount="1").content
+
+
+def test_a_settled_payment_says_bank_confirmed(fd):
+    _, replies = fd
+    replies["/pay_0123456789ab"] = {"intent": {**INTENT, "status": "settled",
+                                               "revolut": {"draft_id": "draft-1", "state": "COMPLETED"}}}
+    r = _run(action="get", id="pay_0123456789ab")
+    assert "status: settled" in r.content and "confirmed by the bank" in r.content

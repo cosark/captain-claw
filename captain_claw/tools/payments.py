@@ -53,7 +53,9 @@ class PaymentsTool(Tool):
         "description, due_date (YYYY-MM-DD). Flight Deck reads the invoice's own barcode when it has "
         "one and checks every field. To correct a prepared payment, prepare again with supersedes=<id>.\n"
         "action='handoff' (id): only when prepare says READY — makes the barcode the user scans plus "
-        "a link to a phone page. action='mark' (id, status paid|skip|cancel): only when the user "
+        "a link to a phone page; with rail='revolut' (when prepare lists it) it puts the payment into "
+        "the user's Revolut Business as a DRAFT they send in the Revolut app instead — Captain can't "
+        "send it. action='mark' (id, status paid|skip|cancel): only when the user "
         "themselves says they paid or want to skip it. action='list' (status, query) / 'get' (id): "
         "what is prepared, paid or due.\n"
         "Rules: never ask for or accept card numbers, CVVs or bank logins. Never say anything was "
@@ -84,6 +86,8 @@ class PaymentsTool(Tool):
             "supersedes": {"type": "string",
                            "description": "prepare: id of an earlier payment this one corrects."},
             "id": {"type": "string", "description": "handoff / mark / get: the payment id (pay_…)."},
+            "rail": {"type": "string", "enum": ["barcode", "revolut"],
+                     "description": "handoff: 'barcode' (default) or 'revolut' — a draft in Revolut Business."},
             "status": {"type": "string",
                        "description": "mark: paid | skip | cancel. list: filter, e.g. 'handed_off'."},
             "query": {"type": "string", "description": "list: text to match in payee or description."},
@@ -151,16 +155,29 @@ class PaymentsTool(Tool):
         intent = data.get("intent") or {}
         head = (f"This invoice was already prepared as {intent.get('id')} — nothing new was created."
                 if data.get("existing") else "")
-        return ToolResult(success=True, content=_describe(intent, head=head, next_step=True))
+        return ToolResult(success=True, content=_describe(intent, head=head, next_step=True,
+                                                          rails=data.get("rails") or []))
 
     async def _handoff(self, kwargs: dict, runtime: dict) -> ToolResult:
         intent_id = str(kwargs.get("id") or "").strip()
         if not intent_id:
             return ToolResult(success=False, error="Give `id` — the payment from prepare (pay_…).")
-        data, err = await payments_client.call("POST", f"/fd/payments/agent/{intent_id}/handoff", {})
+        rail = str(kwargs.get("rail") or "barcode").strip().lower()
+        data, err = await payments_client.call("POST", f"/fd/payments/agent/{intent_id}/handoff", {"rail": rail})
         if err:
             return ToolResult(success=False, error=err)
         intent = data.get("intent") or {}
+        if data.get("rail") == "revolut":
+            done = "already waiting" if data.get("existing") else "now waiting"
+            return ToolResult(success=True, content="\n".join([
+                _status_line(intent),
+                f"DONE — a payment draft is {done} in the user's Revolut Business. Nothing has been paid: "
+                "only the user can send it.",
+                f"Tell the user: {intent.get('payee_name')} · {intent.get('amount_text')} is in Revolut "
+                "Business as a draft — open the Revolut Business app, check it and send it there. Captain "
+                "will see when it completes. Do not say it is paid.",
+                *_warning_lines(intent),
+            ]))
         paths = await asyncio.to_thread(self._save_images, intent_id, data.get("images") or [], runtime)
         lines = [
             _status_line(intent),
@@ -215,7 +232,8 @@ class PaymentsTool(Tool):
         data, err = await payments_client.call("GET", f"/fd/payments/agent/{intent_id}")
         if err:
             return ToolResult(success=False, error=err)
-        return ToolResult(success=True, content=_describe(data.get("intent") or {}, next_step=False))
+        return ToolResult(success=True, content=_describe(data.get("intent") or {}, next_step=False,
+                                                          rails=data.get("rails") or []))
 
     # ── helpers ───────────────────────────────────────────────────────
 
@@ -261,7 +279,20 @@ def _status_line(intent: dict) -> str:
     return f"payment_intent: {intent.get('id', '')} status: {intent.get('status', '')}"
 
 
-def _describe(intent: dict, *, head: str = "", next_step: bool) -> str:
+def _warning_lines(intent: dict) -> list[str]:
+    warnings = intent.get("warnings") or []
+    if not warnings:
+        return []
+    lines = ["Warnings (tell the user every one):"]
+    for w in warnings:
+        tag = {"error": "must be fixed", "blocking": "the user must check it in Flight Deck",
+               "info": "note"}.get(w.get("severity"), w.get("severity"))
+        done = " — already checked by the user" if w.get("acked") else ""
+        lines.append(f"- [{tag}] {w.get('message')}{done}")
+    return lines
+
+
+def _describe(intent: dict, *, head: str = "", next_step: bool, rails: list[str] = ()) -> str:
     lines = [_status_line(intent)]
     if head:
         lines.append(head)
@@ -276,19 +307,20 @@ def _describe(intent: dict, *, head: str = "", next_step: bool) -> str:
     sources = sorted({_SOURCE_LABEL.get(v, v) for k, v in prov.items() if k in ("iban", "amount_cents", "reference")})
     if sources:
         lines.append("IBAN/amount/reference came from: " + ", ".join(sources))
-    warnings = intent.get("warnings") or []
-    if warnings:
-        lines.append("Warnings (tell the user every one):")
-        for w in warnings:
-            tag = {"error": "must be fixed", "blocking": "the user must check it in Flight Deck",
-                   "info": "note"}.get(w.get("severity"), w.get("severity"))
-            done = " — already checked by the user" if w.get("acked") else ""
-            lines.append(f"- [{tag}] {w.get('message')}{done}")
+    revolut = intent.get("revolut") or {}
+    if revolut.get("draft_id"):
+        lines.append(f"Revolut Business draft: {str(revolut.get('state') or 'CREATED').lower()}"
+                     + (f" ({revolut['reason']})" if revolut.get("reason") else ""))
+    if intent.get("status") == "settled":
+        lines.append("Paid — confirmed by the bank (Revolut).")
+    lines.extend(_warning_lines(intent))
     if not next_step:
         return "\n".join(lines)
     status = intent.get("status")
     if status == "ready":
-        lines.append(f"READY — next: payments handoff with id={intent.get('id')} to make the barcode.")
+        lines.append(f"READY — next: payments handoff with id={intent.get('id')} to make the barcode"
+                     + (", or rail='revolut' to put it into the user's Revolut Business as a draft "
+                        "(ask the user which they prefer)." if "revolut" in rails else "."))
     elif status == "needs_review":
         lines.append("NEEDS THE USER — tell them the warnings above and that they review and confirm "
                      f"them in Flight Deck → Payments ({intent.get('review_path')}). You can't clear a "

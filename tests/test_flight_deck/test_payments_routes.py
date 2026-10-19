@@ -72,7 +72,8 @@ def _codes(intent):
 def test_off_by_default(env, monkeypatch):
     client, *_ = env
     monkeypatch.delenv("FD_PAYMENTS")
-    assert client.get("/fd/payments/agent/status", headers=AGENT).json() == {"enabled": False, "deps_ok": True}
+    assert client.get("/fd/payments/agent/status", headers=AGENT).json() == {
+        "enabled": False, "deps_ok": True, "rails": []}
     assert _prepare(client, source_b64=_slip_png(), source_name="r.png").status_code == 404
     assert client.get("/fd/payments").status_code == 404
 

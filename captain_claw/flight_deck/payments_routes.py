@@ -46,7 +46,7 @@ PREPARES_PER_HOUR = 30
 PAGE_DAYS = 14
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
 _ID_RE = re.compile(r"^pay_[0-9a-f]{12}$")
-_DEPS = ("segno", "pdf417gen", "zxingcpp", "pypdfium2")
+_DEPS = ("segno", "pdf417gen", "zxingcpp", "pypdfium2", "cryptography")
 
 _data_dir: Path | None = None
 _store: PaymentsStore | None = None
@@ -228,7 +228,13 @@ def view(row: dict) -> dict:
         "paid_at": row.get("paid_at"), "paid_via": row.get("paid_via", ""),
         "page_active": bool(row.get("page_token_hash")) and float(row.get("page_expires_at") or 0) > now,
         "review_path": f"/payments/{row['id']}",
+        "handoff_rail": row.get("handoff_rail", ""),
+        "revolut": _revolut_public((row.get("rails_state") or {}).get("revolut") or {}),
     }
+
+
+def _revolut_public(rv: dict) -> dict:
+    return {k: rv[k] for k in ("draft_id", "state", "reason", "vop") if k in rv}
 
 
 def render_barcodes(row: dict) -> list[dict]:
@@ -294,6 +300,8 @@ async def _owned(intent_id: str, owner: str) -> dict:
 
 
 async def _set_status(row: dict, status: str, actor: str, *, via: str = "", detail: dict | None = None) -> dict:
+    if status in ("skipped", "cancelled"):
+        await _drop_revolut_draft(row)
     changes: dict = {"status": status}
     if status in PAID_STATES:
         changes.update(paid_at=time.time(), paid_via=via)
@@ -337,8 +345,9 @@ class MarkRequest(BaseModel):
 
 @router.get("/fd/payments/agent/status")
 async def agent_status(request: Request):
-    _agent_owner(request)
-    return {"enabled": enabled(), "deps_ok": deps_ok()}
+    owner, _ = _agent_owner(request)
+    return {"enabled": enabled(), "deps_ok": deps_ok(),
+            "rails": await _rails(owner) if enabled() else []}
 
 
 @router.post("/fd/payments/agent/prepare")
@@ -382,7 +391,7 @@ async def agent_prepare(req: PrepareRequest, request: Request):
                                      amount_cents=int(fields.get("amount_cents") or 0),
                                      reference=fields.get("reference", ""))
         if existing:
-            return {"intent": view(existing), "existing": True}
+            return {"intent": view(existing), "existing": True, "rails": await _rails(owner)}
 
     intent_id = f"pay_{secrets.token_hex(6)}"
     warnings = await _evaluate(owner, intent_id, fields, merged.provenance, source_sha256=sha,
@@ -408,7 +417,7 @@ async def agent_prepare(req: PrepareRequest, request: Request):
     if req.automated:
         await _notify(owner, row)
     log.info("Payment prepared", id=intent_id, owner=owner, status=status, source=source_kind)
-    return {"intent": view(row), "existing": False}
+    return {"intent": view(row), "existing": False, "rails": await _rails(owner)}
 
 
 async def _notify(owner: str, row: dict) -> None:
@@ -435,12 +444,12 @@ async def _link_base(request: Request, owner: str) -> tuple[str, bool]:
     return base, public_file_shares._private_host(host)
 
 
-@router.post("/fd/payments/agent/{intent_id}/handoff")
-async def agent_handoff(intent_id: str, request: Request):
-    _require_on()
-    _require_deps()
-    owner, slug = _agent_owner(request)
-    row = await _owned(intent_id, owner)
+class HandoffRequest(BaseModel):
+    rail: str = "barcode"        # barcode | revolut
+
+
+def _handoff_gate(row: dict) -> None:
+    """The same gate for every rail: complete, and no blocking warning open."""
     if row["status"] in TERMINAL_STATES:
         raise HTTPException(409, f"This payment is already {row['status'].replace('_', ' ')}")
     if row["status"] == "draft":
@@ -452,10 +461,22 @@ async def agent_handoff(intent_id: str, request: Request):
                  if w.get("severity") == "blocking" and w.get("code") not in (row.get("acks") or {})]
         raise HTTPException(409, "The user has to review this payment in Flight Deck first "
                             f"({row['id']}, Payments page): " + " ".join(open_))
+
+
+@router.post("/fd/payments/agent/{intent_id}/handoff")
+async def agent_handoff(intent_id: str, request: Request, req: HandoffRequest | None = None):
+    _require_on()
+    owner, slug = _agent_owner(request)
+    row = await _owned(intent_id, owner)
+    _handoff_gate(row)
+    if (req or HandoffRequest()).rail == "revolut":
+        return await _handoff_revolut(row, owner, f"agent:{slug}")
+    _require_deps()
     images = render_barcodes(row)
     token = secrets.token_urlsafe(24)
     row = await store().update(row["id"], status="handed_off", page_token_hash=_token_hash(token),
-                               page_expires_at=time.time() + PAGE_DAYS * 86400)
+                               page_expires_at=time.time() + PAGE_DAYS * 86400,
+                               handoff_rail=row.get("handoff_rail") or "barcode")
     await store().add_event(row["id"], owner, f"agent:{slug}", "handed_off",
                             {"barcodes": [i["kind"] for i in images]})
     base, local_only = await _link_base(request, owner)
@@ -489,7 +510,7 @@ async def agent_list(request: Request, status: str = "", q: str = "", limit: int
     owner, _ = _agent_owner(request)
     await store().expire_stale()
     statuses = tuple(x for x in status.split(",") if x) if status else ()
-    rows = await store().list(owner, statuses=statuses, limit=max(1, min(limit, 100)))
+    rows = await _sync_rows(await store().list(owner, statuses=statuses, limit=max(1, min(limit, 100))))
     if q:
         needle = q.casefold()
         rows = [r for r in rows if needle in str(r["fields"].get("payee_name", "")).casefold()
@@ -501,7 +522,8 @@ async def agent_list(request: Request, status: str = "", q: str = "", limit: int
 async def agent_get(intent_id: str, request: Request):
     _require_on()
     owner, _ = _agent_owner(request)
-    return {"intent": view(await _owned(intent_id, owner))}
+    row = await _sync_revolut(await _owned(intent_id, owner))
+    return {"intent": view(row), "rails": await _rails(owner)}
 
 
 # ── owner routes ──────────────────────────────────────────────────────
@@ -546,15 +568,15 @@ async def owner_list(status: str = "", user: dict = Depends(get_current_user)):
     _require_on()
     await store().expire_stale()
     statuses = tuple(x for x in status.split(",") if x) if status else ()
-    rows = await store().list(user["id"], statuses=statuses)
+    rows = await _sync_rows(await store().list(user["id"], statuses=statuses))
     return {"payments": [view(r) for r in rows], **(await _config(user["id"]))}
 
 
 @router.get("/fd/payments/{intent_id}")
 async def owner_get(intent_id: str, user: dict = Depends(get_current_user)):
     _require_on()
-    row = await _owned(intent_id, user["id"])
-    return {"intent": view(row), "events": await store().events(intent_id)}
+    row = await _sync_revolut(await _owned(intent_id, user["id"]))
+    return {"intent": view(row), "events": await store().events(intent_id), "rails": await _rails(user["id"])}
 
 
 @router.get("/fd/payments/{intent_id}/barcode/{kind}.png")
@@ -604,6 +626,383 @@ async def owner_mark(intent_id: str, req: OwnerMarkRequest, user: dict = Depends
         raise HTTPException(409, f"This payment is already {row['status'].replace('_', ' ')}")
     row = await _set_status(row, req.status, f"user:{user['id']}", via="card")
     return {"intent": view(row)}
+
+
+# ── Revolut Business payment drafts (Phase 1) ─────────────────────────
+#
+# docs/payments-phase1-plan.md. The token is scoped READ,WRITE: it creates
+# counterparties and drafts, never payments. The user sends the draft in the
+# Revolut Business app; the draft's state flows back here on every read.
+
+REVOLUT = "revolut"
+_CONNECT_TTL = 600
+_CONNECT_STATES: dict[str, tuple[str, float]] = {}    # state → (owner, expires)
+_SYNC_MAX = 10                                         # drafts re-read per list
+
+
+async def _revolut_conn(owner: str) -> dict | None:
+    conn = await store().get_connection(owner, REVOLUT)
+    return conn if conn and conn.get("refresh_token") else None
+
+
+async def _rails(owner: str) -> list[str]:
+    conn = await _revolut_conn(owner)
+    return ["barcode", REVOLUT] if conn and conn.get("account_id") else ["barcode"]
+
+
+def _client(conn: dict):
+    from captain_claw.flight_deck import revolut_business as rb
+
+    owner = conn["owner_id"]
+
+    async def save(tokens: dict) -> None:
+        await store().save_connection(owner, REVOLUT, **tokens)
+
+    return rb.RevolutClient(dict(conn), save)
+
+
+def _warn(row: dict, code: str, severity: str, message: str) -> list[dict]:
+    """The row's warnings with *code* (re)set."""
+    out = [w for w in row.get("warnings") or [] if w.get("code") != code]
+    out.append({"code": code, "severity": severity, "message": message})
+    return out
+
+
+async def _sync_revolut(row: dict) -> dict:
+    """Read the payment's Revolut draft and move the ledger on: COMPLETED →
+    settled, DECLINED/FAILED/REVERTED → failed, gone → cancelled."""
+    from captain_claw.flight_deck import revolut_business as rb
+
+    rv = dict((row.get("rails_state") or {}).get(REVOLUT) or {})
+    if row.get("status") != "handed_off" or not rv.get("draft_id"):
+        return row
+    conn = await _revolut_conn(row["owner_id"])
+    if not conn:
+        return row
+    try:
+        draft = await _client(conn).get_draft(rv["draft_id"])
+    except Exception as exc:  # the card shows the last known state
+        log.info("Revolut draft read failed", id=row["id"], error=str(exc))
+        return row
+    payment = ((draft or {}).get("payments") or [{}])[0]
+    state = str(payment.get("state") or ("" if draft else "DELETED")).upper()
+    reason = str(payment.get("reason") or payment.get("error_message") or "")
+    if state == rv.get("state") and state not in rb.DRAFT_STATES_DONE + rb.DRAFT_STATES_FAILED + rb.DRAFT_STATES_GONE:
+        return row
+    rv.update(state=state, reason=reason[:200], checked_at=time.time())
+    rails_state = {**(row.get("rails_state") or {}), REVOLUT: rv}
+    row = await store().update(row["id"], rails_state=rails_state)
+    if state in rb.DRAFT_STATES_DONE:
+        row = await _set_status(row, "settled", "revolut", via=REVOLUT, detail={"draft_id": rv["draft_id"]})
+    elif state in rb.DRAFT_STATES_FAILED:
+        row = await store().update(row["id"], warnings=_warn(
+            row, "revolut_failed", "info", f"Revolut didn't complete the payment ({state.lower()}"
+            + (f": {reason}" if reason else "") + "). Nothing was paid; prepare it again to retry."))
+        row = await _set_status(row, "failed", "revolut", via=REVOLUT, detail={"state": state, "reason": reason})
+    elif state in rb.DRAFT_STATES_GONE:
+        row = await _set_status(row, "cancelled", "revolut", via=REVOLUT, detail={"state": state})
+    return row
+
+
+async def _sync_rows(rows: list[dict]) -> list[dict]:
+    out, left = [], _SYNC_MAX
+    for row in rows:
+        if left and row.get("status") == "handed_off" and row.get("handoff_rail") == REVOLUT:
+            left -= 1
+            row = await _sync_revolut(row)
+        out.append(row)
+    return out
+
+
+async def _drop_revolut_draft(row: dict) -> None:
+    """A payment skipped or cancelled in Captain takes its unsent draft with it."""
+    rv = (row.get("rails_state") or {}).get(REVOLUT) or {}
+    if not rv.get("draft_id") or rv.get("state") not in ("CREATED", None, ""):
+        return
+    conn = await _revolut_conn(row["owner_id"])
+    if conn:
+        try:
+            await _client(conn).delete_draft(rv["draft_id"])
+        except Exception as exc:
+            log.warning("Revolut draft delete failed", id=row["id"], error=str(exc))
+
+
+def _draft_reference(fields: dict) -> str:
+    from captain_claw.payments import hr_ref
+
+    model, ref = fields.get("model", ""), fields.get("reference", "")
+    if ref and model and model != hr_ref.NO_REFERENCE_MODEL:
+        return f"{model} {ref}"
+    return ref or fields.get("description", "") or fields.get("payee_name", "")
+
+
+async def _handoff_revolut(row: dict, owner: str, actor: str) -> dict:
+    """Put the payment into Revolut Business as a draft (gate already passed)."""
+    from captain_claw.flight_deck import revolut_business as rb
+    from captain_claw.payments import checks, iban as iban_mod
+
+    conn = await _revolut_conn(owner)
+    if not conn:
+        raise HTTPException(409, "Revolut Business isn't connected — connect it on the Payments page.")
+    if not conn.get("account_id"):
+        raise HTTPException(409, "Pick the Revolut account to pay from on the Payments page first.")
+    fields = row["fields"]
+    account = iban_mod.normalize(fields.get("iban", ""))
+    if (fields.get("currency") or "EUR") != "EUR" or not iban_mod.is_sepa(account):
+        raise HTTPException(409, "Revolut drafts here are for EUR payments to SEPA IBANs.")
+    rv = dict((row.get("rails_state") or {}).get(REVOLUT) or {})
+    if rv.get("draft_id") and rv.get("state") in ("CREATED", "PENDING"):
+        return {"intent": view(row), "rail": REVOLUT, "existing": True}
+    client = _client(conn)
+    name = fields.get("payee_name", "")
+    warnings = list(row.get("warnings") or [])
+
+    try:
+        # Verification of Payee, once per payment: a payee name that doesn't
+        # match the IBAN's holder is the owner's call, not the agent's.
+        if "vop" not in rv:
+            try:
+                result = await client.validate_name(name=name, iban=account, individual=False)
+            except rb.RevolutError as exc:
+                result = {"result_code": "error", "message": exc.message}
+            code = str(result.get("result_code") or "error")
+            actual = str(result.get("company_name") or "")
+            rv["vop"] = {"result_code": code, "name": actual, "at": time.time()}
+            temp = {**row, "warnings": warnings}
+            if code in ("close_match", "not_matched"):
+                said = (f"the bank says the account holder is '{actual}'" if actual and code == "close_match"
+                        else "the bank says the name doesn't match the account")
+                warnings = _warn(temp, f"vop_{code}", "blocking", (
+                    f"Verification of Payee: you're paying '{name}', but {said}. Check the invoice "
+                    "and the payee before paying."))
+                acks = row.get("acks") or {}
+                row = await store().update(row["id"], warnings=warnings,
+                                           rails_state={**(row.get("rails_state") or {}), REVOLUT: rv},
+                                           status=checks.status_for(fields, warnings, set(acks)))
+                await store().add_event(row["id"], owner, actor, "vop", rv["vop"])
+                raise HTTPException(409, "Verification of Payee didn't confirm the payee's name — the "
+                                         f"user has to review it in Flight Deck first ({row['id']}).")
+            if code != "matched":
+                warnings = _warn(temp, "vop_unavailable", "info",
+                                 "The payee's name couldn't be checked against the IBAN (Verification of Payee).")
+
+        counterparty = await client.find_counterparty(account) or await client.create_counterparty(
+            name=name, iban=account, individual=False)
+        cp_account = next((a.get("id") for a in counterparty.get("accounts") or []
+                           if iban_mod.normalize(a.get("iban", "")) == account), "")
+        if fields.get("model") and account.startswith("HR"):
+            warnings = _warn({"warnings": warnings}, "reference_as_text", "info", (
+                "Revolut sends the model and poziv na broj as plain text, so the payee may take longer "
+                "to match this payment than one made from the barcode."))
+        draft_id = await client.create_draft(
+            account_id=conn["account_id"], counterparty_id=counterparty["id"],
+            counterparty_account_id=cp_account, amount_cents=int(fields.get("amount_cents") or 0),
+            reference=_draft_reference(fields), title=f"Captain · {name}")
+    except rb.RevolutError as exc:
+        raise HTTPException(502, f"Revolut Business refused it: {exc.message}")
+    rv.update(draft_id=draft_id, counterparty_id=counterparty["id"], account_id=conn["account_id"],
+              state="CREATED", created_at=time.time())
+    row = await store().update(row["id"], status="handed_off", handoff_rail=REVOLUT, warnings=warnings,
+                               rails_state={**(row.get("rails_state") or {}), REVOLUT: rv})
+    await store().add_event(row["id"], owner, actor, "revolut_draft", {"draft_id": draft_id})
+    log.info("Revolut payment draft created", id=row["id"], owner=owner)
+    return {"intent": view(row), "rail": REVOLUT, "existing": False}
+
+
+def _connection_view(conn: dict | None) -> dict:
+    conn = conn or {}
+    return {
+        "connected": bool(conn.get("refresh_token")), "environment": conn.get("environment") or "production",
+        "client_id": conn.get("client_id", ""), "redirect_uri": conn.get("redirect_uri", ""),
+        "has_key": bool(conn.get("private_key")), "certificate": conn.get("certificate", ""),
+        "account_id": conn.get("account_id", ""), "account_label": conn.get("account_label", ""),
+        "connected_at": conn.get("connected_at"), "scope": "READ,WRITE",
+    }
+
+
+class RevolutKeyRequest(BaseModel):
+    environment: str = "production"
+
+
+class RevolutClientRequest(BaseModel):
+    client_id: str
+    environment: str = "production"
+
+
+class RevolutCodeRequest(BaseModel):
+    code: str
+
+
+class RevolutAccountRequest(BaseModel):
+    account_id: str
+
+
+def _callback_uri(request: Request) -> str:
+    origin = (request.headers.get("origin") or str(request.base_url)).rstrip("/")
+    return f"{origin}/fd/payments/revolut/callback"
+
+
+@router.get("/fd/payments/revolut/status")   # not /revolut: /fd/payments/{id} is declared first
+async def revolut_status(user: dict = Depends(get_current_user)):
+    _require_on()
+    return _connection_view(await store().get_connection(user["id"], REVOLUT))
+
+
+@router.post("/fd/payments/revolut/key")
+async def revolut_key(req: RevolutKeyRequest, request: Request, user: dict = Depends(get_current_user)):
+    """A fresh key + certificate to upload in Revolut Business. A new key means
+    a new Client ID, so any earlier connection is dropped."""
+    from captain_claw.flight_deck import revolut_business as rb
+
+    _require_on()
+    key, cert = rb.generate_key_and_certificate()
+    conn = await store().save_connection(
+        user["id"], REVOLUT, environment=rb.environment(req.environment), private_key=key, certificate=cert,
+        redirect_uri=_callback_uri(request), client_id="", refresh_token="", access_token="",
+        access_expires_at=0, account_id="", account_label="", connected_at=None)
+    return _connection_view(conn)
+
+
+@router.put("/fd/payments/revolut/client")
+async def revolut_client_id(req: RevolutClientRequest, user: dict = Depends(get_current_user)):
+    from captain_claw.flight_deck import revolut_business as rb
+
+    _require_on()
+    conn = await store().get_connection(user["id"], REVOLUT)
+    if not conn or not conn.get("private_key"):
+        raise HTTPException(409, "Make a key first")
+    client_id = req.client_id.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{8,128}", client_id):
+        raise HTTPException(422, "That doesn't look like a Revolut Client ID")
+    conn = await store().save_connection(user["id"], REVOLUT, client_id=client_id,
+                                         environment=rb.environment(req.environment))
+    return _connection_view(conn)
+
+
+@router.post("/fd/payments/revolut/connect")
+async def revolut_connect(user: dict = Depends(get_current_user)):
+    """The Revolut consent URL (scope READ,WRITE — never PAY)."""
+    from captain_claw.flight_deck import revolut_business as rb
+
+    _require_on()
+    conn = await store().get_connection(user["id"], REVOLUT)
+    if not conn or not conn.get("private_key") or not conn.get("client_id"):
+        raise HTTPException(409, "Make a key and add the Client ID first")
+    now = time.time()
+    for state, (_owner, expires) in list(_CONNECT_STATES.items()):
+        if expires < now:
+            _CONNECT_STATES.pop(state, None)
+    state = secrets.token_urlsafe(16)
+    _CONNECT_STATES[state] = (user["id"], now + _CONNECT_TTL)
+    return {"url": rb.consent_url(conn, state)}
+
+
+async def _finish_connect(owner: str, code: str) -> dict:
+    from captain_claw.flight_deck import revolut_business as rb
+
+    conn = await store().get_connection(owner, REVOLUT)
+    if not conn or not conn.get("client_id"):
+        raise HTTPException(409, "Start the connection on the Payments page first")
+    try:
+        tokens = await rb.exchange_code(conn, code.strip())
+    except rb.RevolutError as exc:
+        raise HTTPException(502, f"Revolut refused the code: {exc.message}")
+    conn = await store().save_connection(owner, REVOLUT, connected_at=time.time(), **tokens)
+    # Pay from the first active EUR account until the owner picks another.
+    try:
+        accounts = await _client(conn).accounts()
+        eur = next((a for a in accounts if a.get("currency") == "EUR" and a.get("state") == "active"), None)
+        if eur and not conn.get("account_id"):
+            conn = await store().save_connection(owner, REVOLUT, account_id=eur["id"],
+                                                 account_label=str(eur.get("name") or "EUR account"))
+    except Exception as exc:
+        log.info("Revolut accounts read failed after connect", error=str(exc))
+    log.info("Revolut Business connected", owner=owner, environment=conn.get("environment"))
+    return _connection_view(conn)
+
+
+@router.post("/fd/payments/revolut/code")
+async def revolut_code(req: RevolutCodeRequest, user: dict = Depends(get_current_user)):
+    """Fallback: the code pasted by hand (valid 2 minutes)."""
+    _require_on()
+    return await _finish_connect(user["id"], req.code)
+
+
+@router.get("/fd/payments/revolut/accounts")
+async def revolut_accounts(user: dict = Depends(get_current_user)):
+    from captain_claw.flight_deck import revolut_business as rb
+
+    _require_on()
+    conn = await _revolut_conn(user["id"])
+    if not conn:
+        raise HTTPException(409, "Revolut Business isn't connected")
+    try:
+        accounts = await _client(conn).accounts()
+    except rb.RevolutError as exc:
+        raise HTTPException(502, f"Revolut: {exc.message}")
+    return {"accounts": [{k: a.get(k) for k in ("id", "name", "currency", "balance", "state")}
+                         for a in accounts if a.get("currency") == "EUR"]}
+
+
+@router.put("/fd/payments/revolut/account")
+async def revolut_account(req: RevolutAccountRequest, user: dict = Depends(get_current_user)):
+    _require_on()
+    accounts = (await revolut_accounts(user))["accounts"]
+    chosen = next((a for a in accounts if a["id"] == req.account_id), None)
+    if not chosen:
+        raise HTTPException(422, "That isn't one of your EUR accounts")
+    conn = await store().save_connection(user["id"], REVOLUT, account_id=chosen["id"],
+                                         account_label=str(chosen.get("name") or "EUR account"))
+    return _connection_view(conn)
+
+
+@router.delete("/fd/payments/revolut/connection")
+async def revolut_disconnect(user: dict = Depends(get_current_user)):
+    _require_on()
+    await store().delete_connection(user["id"], REVOLUT)
+    return _connection_view(None)
+
+
+@router.post("/fd/payments/{intent_id}/revolut")
+async def owner_send_to_revolut(intent_id: str, user: dict = Depends(get_current_user)):
+    _require_on()
+    row = await _owned(intent_id, user["id"])
+    _handoff_gate(row)
+    return await _handoff_revolut(row, user["id"], f"user:{user['id']}")
+
+
+@public_router.get("/fd/payments/revolut/callback")
+async def revolut_callback(code: str = "", state: str = "", error: str = ""):
+    """Revolut's redirect after consent. The one-time state names the owner;
+    without it, the only connect started in the last 10 minutes."""
+    def page(title: str, body: str, status: int = 200) -> HTMLResponse:
+        return HTMLResponse(
+            f'<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width">'
+            f'<title>{html.escape(title)}</title><body style="font:16px system-ui;max-width:520px;'
+            f'margin:40px auto;padding:0 16px"><h2>{html.escape(title)}</h2>{body}</body>',
+            status_code=status, headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+    if not enabled():
+        return page("Payments are off", "<p>Payments aren't turned on for this Flight Deck.</p>", 404)
+    if error or not code:
+        return page("Not connected", f"<p>Revolut didn't grant access{': ' + html.escape(error) if error else ''}."
+                    " Try again from the Payments page.</p>", 400)
+    now = time.time()
+    entry = _CONNECT_STATES.pop(state, None) if state else None
+    if entry is None and not state:
+        live = [(s, e) for s, e in _CONNECT_STATES.items() if e[1] > now]
+        if len(live) == 1:
+            entry = _CONNECT_STATES.pop(live[0][0])
+    if entry is None or entry[1] < now:
+        return page("Almost there", "<p>This Flight Deck couldn't tell whose connection this is. Copy "
+                    "this code into the Payments page within two minutes:</p>"
+                    f"<pre style='padding:8px;background:#eee;word-break:break-all'>{html.escape(code)}</pre>")
+    try:
+        await _finish_connect(entry[0], code)
+    except HTTPException as exc:
+        return page("Not connected", f"<p>{html.escape(str(exc.detail))}</p>", 502)
+    return page("Revolut Business connected", "<p>Captain can now put payments into Revolut Business as "
+                "drafts for you to send. It can't send them itself. You can close this tab.</p>")
 
 
 # ── the phone page: /p/{token} ────────────────────────────────────────

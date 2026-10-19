@@ -10,7 +10,7 @@ const FD_BASE = '/fd'
 
 export type PaymentStatus =
   | 'draft' | 'needs_review' | 'ready' | 'handed_off'
-  | 'user_paid' | 'settled' | 'skipped' | 'cancelled' | 'expired'
+  | 'user_paid' | 'settled' | 'skipped' | 'cancelled' | 'expired' | 'failed'
 
 export interface PaymentWarning {
   code: string
@@ -50,7 +50,25 @@ export interface Payment {
   paid_at: number | null
   paid_via: string
   page_active: boolean
+  handoff_rail: string
+  /** Revolut Business draft (Phase 1): its id, last state, reason, and the VoP check. */
+  revolut: { draft_id?: string; state?: string; reason?: string; vop?: { result_code: string; name: string } }
 }
+
+export interface RevolutConnection {
+  connected: boolean
+  environment: 'production' | 'sandbox'
+  client_id: string
+  redirect_uri: string
+  has_key: boolean
+  certificate: string
+  account_id: string
+  account_label: string
+  connected_at: number | null
+  scope: string
+}
+
+export interface RevolutAccount { id: string; name: string; currency: string; balance: number; state: string }
 
 export interface PaymentsConfig {
   enabled: boolean
@@ -97,7 +115,27 @@ export const listPayments = (status = '') =>
   fdJson<{ payments: Payment[] } & PaymentsConfig>(`/payments${status ? `?status=${encodeURIComponent(status)}` : ''}`)
 
 export const getPayment = (id: string) =>
-  fdJson<{ intent: Payment }>(`/payments/${encodeURIComponent(id)}`)
+  fdJson<{ intent: Payment; rails: string[] }>(`/payments/${encodeURIComponent(id)}`)
+
+export const sendToRevolut = (id: string) =>
+  fdJson<{ intent: Payment }>(`/payments/${encodeURIComponent(id)}/revolut`, { method: 'POST' })
+
+// Revolut Business connection (scope READ,WRITE: drafts only, never payments).
+export const getRevolut = () => fdJson<RevolutConnection>('/payments/revolut/status')
+export const makeRevolutKey = (environment: string) =>
+  fdJson<RevolutConnection>('/payments/revolut/key', { method: 'POST', body: JSON.stringify({ environment }) })
+export const setRevolutClient = (client_id: string, environment: string) =>
+  fdJson<RevolutConnection>('/payments/revolut/client', {
+    method: 'PUT', body: JSON.stringify({ client_id, environment }),
+  })
+export const revolutConnectUrl = () => fdJson<{ url: string }>('/payments/revolut/connect', { method: 'POST' })
+export const pasteRevolutCode = (code: string) =>
+  fdJson<RevolutConnection>('/payments/revolut/code', { method: 'POST', body: JSON.stringify({ code }) })
+export const revolutAccounts = () => fdJson<{ accounts: RevolutAccount[] }>('/payments/revolut/accounts')
+export const setRevolutAccount = (account_id: string) =>
+  fdJson<RevolutConnection>('/payments/revolut/account', { method: 'PUT', body: JSON.stringify({ account_id }) })
+export const disconnectRevolut = () =>
+  fdJson<RevolutConnection>('/payments/revolut/connection', { method: 'DELETE' })
 
 export const ackWarnings = (id: string, codes: string[]) =>
   fdJson<{ intent: Payment }>(`/payments/${encodeURIComponent(id)}/ack`, {
@@ -157,12 +195,12 @@ export function paymentIntentOf(toolName: string | undefined, output: string | u
 }
 
 export const PAID: PaymentStatus[] = ['user_paid', 'settled']
-export const CLOSED: PaymentStatus[] = ['user_paid', 'settled', 'skipped', 'cancelled', 'expired']
+export const CLOSED: PaymentStatus[] = ['user_paid', 'settled', 'skipped', 'cancelled', 'expired', 'failed']
 
 export function statusLabel(s: PaymentStatus): string {
   return {
     draft: 'Not ready', needs_review: 'Needs your review', ready: 'Ready', handed_off: 'Ready to pay',
     user_paid: 'Paid', settled: 'Paid (bank-confirmed)', skipped: 'Skipped', cancelled: 'Cancelled',
-    expired: 'Expired',
+    expired: 'Expired', failed: 'Not completed',
   }[s] ?? s
 }

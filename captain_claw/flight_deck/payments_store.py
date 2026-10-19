@@ -26,7 +26,7 @@ import aiosqlite
 
 LIVE_STATES = ("draft", "needs_review", "ready", "handed_off")
 PAID_STATES = ("user_paid", "settled")
-TERMINAL_STATES = PAID_STATES + ("skipped", "cancelled", "expired")
+TERMINAL_STATES = PAID_STATES + ("skipped", "cancelled", "expired", "failed")
 EXPIRE_AFTER_SECONDS = 30 * 86400
 
 _DDL = """
@@ -56,7 +56,9 @@ CREATE TABLE IF NOT EXISTS payment_intents (
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL,
     paid_at         REAL,
-    paid_via        TEXT NOT NULL DEFAULT ''
+    paid_via        TEXT NOT NULL DEFAULT '',
+    handoff_rail    TEXT NOT NULL DEFAULT '',
+    rails_state     TEXT NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS idx_payment_intents_owner ON payment_intents(owner_id, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_payment_intents_page
@@ -76,9 +78,34 @@ CREATE TABLE IF NOT EXISTS payment_settings (
     cap_cents  INTEGER NOT NULL,
     updated_at REAL NOT NULL
 );
+-- A bank connection (Phase 1: Revolut Business). Tokens are scoped READ,WRITE:
+-- they can create drafts, never pay.
+CREATE TABLE IF NOT EXISTS payment_connections (
+    owner_id          TEXT NOT NULL,
+    provider          TEXT NOT NULL,
+    environment       TEXT NOT NULL DEFAULT 'production',
+    client_id         TEXT NOT NULL DEFAULT '',
+    redirect_uri      TEXT NOT NULL DEFAULT '',
+    private_key       TEXT NOT NULL DEFAULT '',
+    certificate       TEXT NOT NULL DEFAULT '',
+    refresh_token     TEXT NOT NULL DEFAULT '',
+    access_token      TEXT NOT NULL DEFAULT '',
+    access_expires_at REAL NOT NULL DEFAULT 0,
+    account_id        TEXT NOT NULL DEFAULT '',
+    account_label     TEXT NOT NULL DEFAULT '',
+    connected_at      REAL,
+    updated_at        REAL NOT NULL,
+    PRIMARY KEY (owner_id, provider)
+);
 """
 
-_JSON_COLS = {"fields": {}, "provenance": {}, "warnings": [], "acks": {}, "barcodes": []}
+# Columns added after a table first shipped: (table, column, DDL).
+_MIGRATIONS = (
+    ("payment_intents", "handoff_rail", "TEXT NOT NULL DEFAULT ''"),
+    ("payment_intents", "rails_state", "TEXT NOT NULL DEFAULT '{}'"),
+)
+
+_JSON_COLS = {"fields": {}, "provenance": {}, "warnings": [], "acks": {}, "barcodes": [], "rails_state": {}}
 
 
 def _loads(raw: Any, default: Any) -> Any:
@@ -116,6 +143,11 @@ class PaymentsStore:
         await db.execute("PRAGMA journal_mode=WAL")
         await db.execute("PRAGMA synchronous=NORMAL")
         await db.executescript(_DDL)
+        for table, column, ddl in _MIGRATIONS:
+            try:
+                await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            except aiosqlite.OperationalError:
+                pass   # already there
         await db.commit()
         self._db = db
         return db
@@ -223,6 +255,38 @@ class PaymentsStore:
         await db.execute("DELETE FROM payment_intents WHERE owner_id = ?", (owner_id,))
         await db.execute("DELETE FROM payment_events WHERE owner_id = ?", (owner_id,))
         await db.execute("DELETE FROM payment_settings WHERE owner_id = ?", (owner_id,))
+        await db.execute("DELETE FROM payment_connections WHERE owner_id = ?", (owner_id,))
+        await db.commit()
+
+    # ── bank connections ─────────────────────────────────────────────
+
+    async def get_connection(self, owner_id: str, provider: str) -> dict | None:
+        db = await self._ensure_db()
+        async with db.execute(
+            "SELECT * FROM payment_connections WHERE owner_id = ? AND provider = ?", (owner_id, provider)
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+    async def save_connection(self, owner_id: str, provider: str, **values: Any) -> dict:
+        """Upsert *values* into the owner's connection for *provider*."""
+        db = await self._ensure_db()
+        values = {**values, "updated_at": time.time()}
+        cols = ["owner_id", "provider", *values]
+        marks = ", ".join("?" for _ in cols)
+        sets = ", ".join(f"{k} = excluded.{k}" for k in values)
+        await db.execute(
+            f"INSERT INTO payment_connections ({', '.join(cols)}) VALUES ({marks})"
+            f" ON CONFLICT(owner_id, provider) DO UPDATE SET {sets}",
+            (owner_id, provider, *values.values()),
+        )
+        await db.commit()
+        return await self.get_connection(owner_id, provider)
+
+    async def delete_connection(self, owner_id: str, provider: str) -> None:
+        db = await self._ensure_db()
+        await db.execute("DELETE FROM payment_connections WHERE owner_id = ? AND provider = ?",
+                         (owner_id, provider))
         await db.commit()
 
     # ── audit trail ──────────────────────────────────────────────────
