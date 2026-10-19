@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from captain_claw.flight_deck.auth import get_current_user, get_db, hash_password
@@ -246,27 +246,39 @@ async def delete_user(user_id: str, admin: dict = Depends(require_admin)):
 # ── Waitlist ──
 # Applications from the sign-up page while self-registration is closed
 # (auth_routes.join_waitlist). Approving creates the account with the
-# password the applicant chose; they then sign in as usual.
+# password the applicant chose and emails them, from the approving admin's
+# own Gmail or Outlook (invite_routes), that they can sign in.
 
 WAITLIST_STATUSES = ("pending", "approved", "rejected")
+WAITLIST_SEND_VIA = ("google", "microsoft", "none")
 
 
 class ApproveWaitlistRequest(BaseModel):
     kiosk: bool | None = None  # None = the deck's "new users start in kiosk"
+    send_via: str = "none"     # google | microsoft | none (no email)
 
 
 @router.get("/waitlist")
 async def list_waitlist(
+    request: Request,
     status: str = Query("pending"),
     admin: dict = Depends(require_admin),
 ):
-    """Waitlist applications, newest first (admin only). *status* is one of
-    pending | approved | rejected | all."""
+    """Waitlist applications, newest first (admin only), how this admin can
+    email an approval and the sign-in address that email carries. *status* is
+    one of pending | approved | rejected | all."""
+    from captain_claw.flight_deck.invite_routes import _link_base, mail_options
+
     if status != "all" and status not in WAITLIST_STATUSES:
         raise HTTPException(400, "status must be one of: pending, approved, rejected, all")
     db = get_db()
     entries = await db.list_waitlist(None if status == "all" else status)
-    return {"entries": entries, "pending": await db.count_waitlist("pending")}
+    return {
+        "entries": entries,
+        "pending": await db.count_waitlist("pending"),
+        "mail": await mail_options(db, admin["id"]),
+        "sign_in_url": f"{_link_base(request)}/",
+    }
 
 
 async def _pending_entry(db, entry_id: str) -> dict:
@@ -280,12 +292,20 @@ async def _pending_entry(db, entry_id: str) -> dict:
 
 @router.post("/waitlist/{entry_id}/approve")
 async def approve_waitlist(
-    entry_id: str, body: ApproveWaitlistRequest | None = None,
+    entry_id: str, request: Request, body: ApproveWaitlistRequest | None = None,
     admin: dict = Depends(require_admin),
 ):
-    """Create the applicant's account (role user) and mark them approved."""
+    """Create the applicant's account (role user), mark them approved and
+    email them when ``send_via`` names a provider. An email that fails
+    doesn't undo the approval — the response carries the error and the
+    sign-in address to pass on."""
     import sqlite3
 
+    from captain_claw.flight_deck.invite_routes import deliver_waitlist_approval
+
+    via = ((body.send_via if body else "") or "none").strip().lower()
+    if via not in WAITLIST_SEND_VIA:
+        raise HTTPException(400, "send_via must be one of: google, microsoft, none")
     db = get_db()
     entry = await _pending_entry(db, entry_id)
     if not entry.get("password_hash"):
@@ -302,10 +322,12 @@ async def approve_waitlist(
     except sqlite3.IntegrityError:  # another admin approved it a moment ago
         raise HTTPException(409, "An account with this email already exists")
     await db.decide_waitlist_entry(entry_id, "approved", admin["id"], user_id=user["id"])
+    email = await deliver_waitlist_approval(db, admin, entry, display, request, via)
     return {
         "ok": True,
         "user": {"id": user["id"], "email": user["email"], "display_name": display,
                  "role": "user", "kiosk": meta.get("kiosk") is True},
+        "email": email,
     }
 
 

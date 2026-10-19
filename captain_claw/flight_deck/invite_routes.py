@@ -27,6 +27,10 @@ opt-in on the deck's Microsoft client (Connections → Microsoft → Scopes). An
 email that fails leaves the invitation in place, and the admin gets the link
 to pass on themselves.
 
+Approving a waitlist application (admin_routes.approve_waitlist) emails the
+applicant the same way — from the approving admin's account — that their
+account is ready, with the deck's sign-in address.
+
 The accept routes live under /fd/auth so the refresh cookie (path=/fd/auth)
 they set is the one /fd/auth/refresh reads. Public, so limited per client
 network like the waitlist and device pairing.
@@ -267,6 +271,55 @@ def compose_invite(
     return subject, text, html_body
 
 
+def compose_waitlist_approved(
+    *, instance_name: str, instance_description: str, approver: str, applicant: str,
+    email: str, cohort: str, url: str,
+) -> tuple[str, str, str]:
+    """(subject, plain text, HTML) of the email telling a waitlist applicant
+    they're in. Their account already exists with the password they chose
+    when applying; a reply reaches the admin who approved them."""
+    subject = f"You're in — your {instance_name} account is ready"
+    joined = instance_name + (f" — {instance_description}" if instance_description else "")
+    # The cohort defaults to the instance name; only name it when it adds something.
+    for_cohort = f" for {cohort}" if cohort and cohort != instance_name else ""
+    greeting = f"Hi {applicant}," if applicant else "Hi,"
+
+    text = "\n".join([
+        greeting,
+        "",
+        f"{approver} approved your application{for_cohort} to join {joined}.",
+        "",
+        "Sign in with your email and the password you chose when you applied:",
+        url,
+        "",
+        f"Your email: {email}",
+        "",
+        "Forgot that password? Reply to this email and we'll sort it out.",
+    ])
+
+    e = html.escape
+    html_body = (
+        '<div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,'
+        'sans-serif;font-size:15px;line-height:1.5;color:#1a1a1a;max-width:520px">'
+        f'<p style="margin:0 0 16px">{e(greeting)}</p>'
+        f'<p style="margin:0 0 20px">{e(approver)} approved your application{e(for_cohort)} to join '
+        f'<strong>{e(instance_name)}</strong>'
+        + (f" — {e(instance_description)}" if instance_description else "")
+        + ".</p>"
+        '<p style="margin:0 0 12px">Sign in with your email and the password you chose when you applied.</p>'
+        '<p style="margin:0 0 24px"><a href="' + e(url, quote=True) + '" style="display:inline-block;'
+        'padding:11px 20px;border-radius:8px;background:#7c3aed;color:#ffffff;text-decoration:none;'
+        'font-weight:600">Sign in</a></p>'
+        f'<p style="margin:0 0 8px;color:#555;font-size:13px">Your email: {e(email)}</p>'
+        '<p style="margin:0 0 8px;color:#555;font-size:13px">If the button doesn\'t work, open this '
+        f'address: <a href="{e(url, quote=True)}" style="color:#7c3aed;word-break:break-all">{e(url)}</a></p>'
+        '<p style="margin:16px 0 0;color:#888;font-size:12px">Forgot that password? Reply to this '
+        "email and we'll sort it out.</p>"
+        "</div>"
+    )
+    return subject, text, html_body
+
+
 # ── Sending, from the admin's own account ──
 
 def _http() -> httpx.AsyncClient:
@@ -372,37 +425,74 @@ async def _send_microsoft(user_id: str, to: str, subject: str, html_body: str) -
         raise _MailError(f"Outlook refused the email ({resp.status_code}): {_api_error(resp)}")
 
 
-async def _deliver(db, admin: dict, invite: dict, url: str, via: str) -> dict[str, Any]:
-    """Email *invite* the way the admin chose. Never raises: the outcome is
-    ``sent``, ``via``, ``from`` and ``error``."""
+def _admin_name(admin: dict) -> str:
+    return admin.get("display_name") or admin.get("email") or "An administrator"
+
+
+async def send_from_admin(db, admin: dict, via: str, to: str, subject: str, text: str,
+                          html_body: str) -> dict[str, Any]:
+    """Email *to* from the admin's own account (*via* google | microsoft).
+    Never raises: the outcome is ``sent``, ``via``, ``from`` and ``error``."""
     out: dict[str, Any] = {"sent": False, "via": via, "from": "", "error": ""}
-    if via == "link":
-        return out
     options = (await mail_options(db, admin["id"]))[via]
     out["from"] = options["from"]
     if not options["available"]:
         out["error"] = options["reason"]
         return out
+    try:
+        if via == "google":
+            await _send_google(admin["id"], to, subject, text, html_body)
+        else:
+            await _send_microsoft(admin["id"], to, subject, html_body)
+    except _MailError as exc:
+        out["error"] = str(exc)
+        return out
+    out["sent"] = True
+    return out
+
+
+async def _deliver(db, admin: dict, invite: dict, url: str, via: str) -> dict[str, Any]:
+    """Email *invite* the way the admin chose. Never raises: the outcome is
+    ``sent``, ``via``, ``from`` and ``error``."""
+    if via == "link":
+        return {"sent": False, "via": via, "from": "", "error": ""}
     instance_name, description = await _branding(db)
     subject, text, html_body = compose_invite(
         instance_name=instance_name, instance_description=description,
-        inviter=(admin.get("display_name") or admin.get("email") or "An administrator"),
+        inviter=_admin_name(admin),
         invitee=invite.get("display_name") or "", email=invite["email"], url=url,
         expires_at=invite["expires_at"], note=invite.get("note") or "",
     )
-    try:
-        if via == "google":
-            await _send_google(admin["id"], invite["email"], subject, text, html_body)
-        else:
-            await _send_microsoft(admin["id"], invite["email"], subject, html_body)
-    except _MailError as exc:
-        out["error"] = str(exc)
-        log.warning("Invitation email failed", invite=invite["id"], via=via, error=str(exc)[:200])
+    out = await send_from_admin(db, admin, via, invite["email"], subject, text, html_body)
+    if not out["sent"]:
+        log.warning("Invitation email failed", invite=invite["id"], via=via, error=out["error"][:200])
         return out
-    await db.mark_invite_sent(invite["id"], via, options["from"])
-    out["sent"] = True
+    await db.mark_invite_sent(invite["id"], via, out["from"])
     log.info("Invitation emailed", invite=invite["id"], via=via)
     return out
+
+
+async def deliver_waitlist_approval(db, admin: dict, entry: dict, display_name: str,
+                                    request: Request, via: str) -> dict[str, Any]:
+    """Tell an approved waitlist applicant they can sign in, emailed the way
+    the admin chose (``none`` = no email). Never raises; the outcome carries
+    ``url``, the deck's sign-in address, for the admin to pass on when no
+    email went out."""
+    url = f"{_link_base(request)}/"
+    if via == "none":
+        return {"sent": False, "via": via, "from": "", "error": "", "url": url}
+    instance_name, description = await _branding(db)
+    subject, text, html_body = compose_waitlist_approved(
+        instance_name=instance_name, instance_description=description,
+        approver=_admin_name(admin), applicant=display_name, email=entry["email"],
+        cohort=entry.get("cohort") or "", url=url,
+    )
+    out = await send_from_admin(db, admin, via, entry["email"], subject, text, html_body)
+    if out["sent"]:
+        log.info("Waitlist approval emailed", entry=entry["id"], via=via)
+    else:
+        log.warning("Waitlist approval email failed", entry=entry["id"], via=via, error=out["error"][:200])
+    return {**out, "url": url}
 
 
 # ── Admin ──

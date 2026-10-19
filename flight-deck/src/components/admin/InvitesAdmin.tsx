@@ -9,15 +9,15 @@ import { useAuthStore } from '../../stores/authStore'
 // (captain_claw/flight_deck/invite_routes.py).
 
 type Via = 'google' | 'microsoft' | 'link'
-type Provider = Exclude<Via, 'link'>
+export type Provider = Exclude<Via, 'link'>
 
-interface MailOption {
+export interface MailOption {
   available: boolean
   from: string
   reason: string
 }
 
-type MailOptions = Record<Provider, MailOption>
+export type MailOptions = Record<Provider, MailOption>
 
 export interface Invite {
   id: string
@@ -50,8 +50,8 @@ interface InviteResult {
   email: EmailOutcome
 }
 
-const PROVIDER_LABEL: Record<Provider, string> = { google: 'Gmail', microsoft: 'Outlook' }
-const PROVIDERS: Provider[] = ['google', 'microsoft']
+export const PROVIDER_LABEL: Record<Provider, string> = { google: 'Gmail', microsoft: 'Outlook' }
+export const PROVIDERS: Provider[] = ['google', 'microsoft']
 
 function _headers(): Record<string, string> {
   const { token } = useAuthStore.getState()
@@ -81,7 +81,7 @@ function when(iso: string): string {
 }
 
 // A link the invitee can't open from elsewhere: the deck was reached on this machine.
-function localOnly(url: string): boolean {
+export function localOnly(url: string): boolean {
   try {
     const host = new URL(url).hostname
     return host === 'localhost' || host.endsWith('.localhost') || host === '127.0.0.1' || host === '[::1]'
