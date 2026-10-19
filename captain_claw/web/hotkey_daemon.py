@@ -449,10 +449,10 @@ async def _do_activation(
     use_realtime = False
     soniox_key = ""
     try:
-        from captain_claw.tools.stt import _HAS_AUDIO, _HAS_SONIOX, _resolve_stt_api_key
+        from captain_claw.tools.stt import _HAS_AUDIO, soniox_realtime_key
 
-        soniox_key = _resolve_stt_api_key("soniox")
-        use_realtime = _HAS_AUDIO and _HAS_SONIOX and bool(soniox_key)
+        soniox_key = await soniox_realtime_key() if _HAS_AUDIO else ""
+        use_realtime = bool(soniox_key)
     except ImportError:
         pass
 

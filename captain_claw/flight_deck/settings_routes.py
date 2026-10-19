@@ -33,7 +33,7 @@ PROVIDER_KEYS_SETTING = "fd:provider-keys"
 # script running as the user would get the raw key.
 _SERVER_OWNED_PREFIXES = (
     "google_oauth:", "microsoft_oauth:", "fd:tenant-profile", "fd:shared-agent-",
-    "jev:",
+    "jev:", "soniox:",
 )
 
 

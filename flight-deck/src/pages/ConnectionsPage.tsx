@@ -1,5 +1,5 @@
 import { useState, type ComponentType, type ReactNode } from 'react'
-import { Plug, Mail, LayoutGrid, Sparkles, MessageCircle, Database, Scale, Send } from 'lucide-react'
+import { Plug, Mail, LayoutGrid, Sparkles, MessageCircle, Database, Scale, Send, Mic } from 'lucide-react'
 import GoogleConnection from '../components/connections/GoogleConnection'
 import MicrosoftConnection from '../components/connections/MicrosoftConnection'
 import CodexConnection from '../components/connections/CodexConnection'
@@ -9,6 +9,7 @@ import MCPAgentAccess from '../components/connections/MCPAgentAccess'
 import TypesenseConnection from '../components/connections/TypesenseConnection'
 import WhatsAppNudgeConnection from '../components/connections/WhatsAppNudgeConnection'
 import JevConnection from '../components/connections/JevConnection'
+import SonioxConnection from '../components/connections/SonioxConnection'
 import TelegramConnection from '../components/connections/TelegramConnection'
 import type { MyTelegram } from '../services/sharedIntegrations'
 import { useGoogleAuthStore } from '../stores/googleAuthStore'
@@ -16,8 +17,9 @@ import { useMicrosoftAuthStore } from '../stores/microsoftAuthStore'
 import { useCodexAuthStore } from '../stores/codexAuthStore'
 import { useMCPStore } from '../stores/mcpStore'
 import { useJevStore } from '../stores/jevStore'
+import { useSonioxStore } from '../stores/sonioxStore'
 
-export type TabId = 'google' | 'microsoft' | 'telegram' | 'codex' | 'antigravity' | 'mcp' | 'jev' | 'whatsapp' | 'typesense'
+export type TabId = 'google' | 'microsoft' | 'telegram' | 'codex' | 'antigravity' | 'mcp' | 'jev' | 'soniox' | 'whatsapp' | 'typesense'
 
 interface TabDef {
   id: TabId
@@ -37,6 +39,8 @@ const TABS: TabDef[] = [
   { id: 'mcp', label: 'MCP Servers', icon: Plug },
   // The user's own Jev key (the deck's when sign-in is off) — kiosk users add theirs too.
   { id: 'jev', label: 'Jev', icon: Scale },
+  // Speech-to-text / voice — the user's own key (else the team's); kiosk users connect theirs too.
+  { id: 'soniox', label: 'Soniox', icon: Mic },
   { id: 'whatsapp', label: 'WhatsApp', icon: MessageCircle, deckOnly: true },
   { id: 'typesense', label: 'Deep memory', icon: Database, deckOnly: true },
 ]
@@ -54,13 +58,14 @@ function saveTab(id: TabId): void {
 
 // A small dot on the tab for the connections whose state is already loaded:
 // green connected, amber configured but not connected (Google / Microsoft) or
-// a Jev key saved but not verified.
+// a Jev / Soniox key saved but not verified.
 function useTabDots(telegram: MyTelegram | null): Partial<Record<TabId, 'on' | 'pending'>> {
   const google = useGoogleAuthStore((s) => s.status)
   const microsoft = useMicrosoftAuthStore((s) => s.status)
   const codex = useCodexAuthStore((s) => s.status)
   const mcpServers = useMCPStore((s) => s.servers.length)
   const jev = useJevStore((s) => s.status)
+  const soniox = useSonioxStore((s) => s.status)
   const dot = (st: { configured?: boolean; connected?: boolean } | null) =>
     st?.connected ? 'on' as const : st?.configured ? 'pending' as const : undefined
   return {
@@ -69,6 +74,7 @@ function useTabDots(telegram: MyTelegram | null): Partial<Record<TabId, 'on' | '
     codex: codex?.connected && !codex.stale ? 'on' : undefined,
     mcp: mcpServers > 0 ? 'on' : undefined,
     jev: jev?.key_set ? (jev.verified === false ? 'pending' : 'on') : undefined,
+    soniox: soniox?.key_set ? (soniox.verified === false ? 'pending' : 'on') : undefined,
     telegram: telegram?.link && telegram.link.status !== 'rejected'
       ? (telegram.link.status === 'approved' && telegram.link.linked ? 'on' : 'pending')
       : undefined,
@@ -76,8 +82,8 @@ function useTabDots(telegram: MyTelegram | null): Partial<Record<TabId, 'on' | '
 }
 
 // `kiosk` — the locked Simple layout's Connections dialog: a person's own
-// connections only (their Google / Microsoft account, their Jev key, the
-// deck's MCP servers).
+// connections only (their Google / Microsoft account, their Jev and Soniox
+// keys, the deck's MCP servers).
 // The ChatGPT subscription and the deep-memory server are deck setup, left to
 // the full view; WhatsApp nudges come from Autonomous Work, which the kiosk
 // doesn't expose.
@@ -171,6 +177,7 @@ export default function ConnectionsPage({ kiosk = false, initialTab }: { kiosk?:
         {panel('antigravity', <AntigravityConnection />)}
         {panel('mcp', <><MCPConnection /><MCPAgentAccess /></>)}
         {panel('jev', <JevConnection />)}
+        {panel('soniox', <SonioxConnection />)}
         {panel('whatsapp', <WhatsAppNudgeConnection />)}
         {panel('typesense', <TypesenseConnection />)}
       </div>

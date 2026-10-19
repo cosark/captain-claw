@@ -228,6 +228,8 @@ export interface MyInfo {
     microsoft?: { configured: boolean; connected: boolean }
     telegram?: { configured: boolean; status: string; linked: boolean; agent: string }
     jev?: { connected: boolean; source: string }
+    // source: 'own' | 'shared' (team key) | 'env' (the server's SONIOX_API_KEY)
+    soniox?: { connected: boolean; source: string }
   }
 }
 

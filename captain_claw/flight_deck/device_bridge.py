@@ -505,9 +505,14 @@ class _DeviceConn:
             await self.send_json({"type": "state", "state": "ready"})
             return
         await self.send_json({"type": "state", "state": "transcribing"})
-        from captain_claw.flight_deck.whatsapp_bridge import _transcribe_soniox
+        from captain_claw.flight_deck import soniox_routes
+        from captain_claw.flight_deck.whatsapp_bridge import _stt_language_hints
 
-        text, err = await _transcribe_soniox(wav_from_pcm(pcm, self.rec_rate), "audio/wav")
+        # The owner's Soniox key (their own, else the team's, else the deck's).
+        text, err = await soniox_routes.transcribe_text(
+            self.user_id or None, wav_from_pcm(pcm, self.rec_rate), "audio/wav",
+            language_hints=_stt_language_hints(), source="device",
+        )
         text = (text or "").strip()
         if not text:
             await self.send_json({"type": "error", "text": err or "Didn't catch that."})
@@ -614,7 +619,10 @@ class _DeviceConn:
                 pass
 
     async def _play_tts(self, text: str) -> None:
-        gen = gb.soniox_tts_pcm(text, language=self.lang, voice=self.voice)
+        from captain_claw.flight_deck.soniox_routes import key_for
+
+        gen = gb.soniox_tts_pcm(text, language=self.lang, voice=self.voice,
+                                api_key=await key_for(self.user_id or None))
         try:
             await self._stream_pcm(gen)
         except gb.SonioxTTSError as exc:

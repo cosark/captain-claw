@@ -1458,8 +1458,8 @@ async def glasses_tts(request: Request) -> Response:
     ``speechSynthesis``. Proxies to Soniox TTS and returns the raw audio
     bytes so the glasses view can play it via ``<audio>``.
 
-    Body: ``{text: str}``.  Configuration via env:
-      - ``SONIOX_API_KEY`` (required)
+    Body: ``{text: str}``. Needs the deck's Soniox key (the team key in Admin →
+    Integrations, else ``SONIOX_API_KEY``; see ``soniox_routes``). Optional env:
       - ``SONIOX_TTS_MODEL``    default ``tts-rt-v1``
       - ``SONIOX_TTS_VOICE``    default ``Adrian``
       - ``SONIOX_TTS_LANGUAGE`` default ``en``
@@ -1467,10 +1467,12 @@ async def glasses_tts(request: Request) -> Response:
     """
     _check_token(request)
 
-    api_key = os.environ.get("SONIOX_API_KEY", "").strip()
+    from captain_claw.flight_deck.soniox_routes import NOT_CONNECTED_DECK, key_for
+
+    api_key = await key_for(None)
     if not api_key:
         # 503 lets the client distinguish "TTS not configured" from real errors.
-        raise HTTPException(status_code=503, detail="SONIOX_API_KEY not set")
+        raise HTTPException(status_code=503, detail=NOT_CONNECTED_DECK)
 
     body = await request.json()
     text = str(body.get("text", "")).strip()
@@ -1544,17 +1546,21 @@ async def soniox_tts_pcm(
     """Synthesize *text* with Soniox realtime TTS and yield raw PCM chunks
     (``pcm_s16le``, mono, ``_STREAM_SAMPLE_RATE`` Hz) as they arrive.
 
-    Language/voice default to ``SONIOX_TTS_LANGUAGE`` / ``SONIOX_TTS_VOICE``.
-    Raises :class:`SonioxTTSError` on a Soniox error envelope; connection
+    *api_key* defaults to the deck's Soniox key (``soniox_routes.key_for``);
+    a surface with a person behind it passes that person's. Language/voice
+    default to ``SONIOX_TTS_LANGUAGE`` / ``SONIOX_TTS_VOICE``. Raises :class:`SonioxTTSError` on a Soniox error envelope; connection
     errors propagate as-is."""
     import base64
     import secrets as _secrets
 
     import websockets
 
-    api_key = api_key or os.environ.get("SONIOX_API_KEY", "").strip()
     if not api_key:
-        raise SonioxTTSError("SONIOX_API_KEY not set")
+        from captain_claw.flight_deck.soniox_routes import NOT_CONNECTED_DECK, key_for
+
+        api_key = await key_for(None)
+        if not api_key:
+            raise SonioxTTSError(NOT_CONNECTED_DECK)
     stream_id = "g_" + _secrets.token_hex(4)
     config = {
         "api_key": api_key,
@@ -1612,11 +1618,13 @@ async def glasses_tts_stream(ws: WebSocket) -> None:
         await ws.close(code=4401)
         return
 
-    api_key = os.environ.get("SONIOX_API_KEY", "").strip()
+    from captain_claw.flight_deck.soniox_routes import NOT_CONNECTED_DECK, key_for
+
+    api_key = await key_for(None)
     await ws.accept()
     if not api_key:
         await ws.send_text(json.dumps({
-            "type": "error", "code": 503, "message": "SONIOX_API_KEY not set",
+            "type": "error", "code": 503, "message": NOT_CONNECTED_DECK,
         }))
         await ws.close(code=1011)
         return

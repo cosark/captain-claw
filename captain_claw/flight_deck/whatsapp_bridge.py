@@ -77,7 +77,7 @@ Setup checklist (Cloud API "test number" tier — free, no business verification
                                                 # when agent isn't in FD's
                                                 # process/Docker registry)
 
-      # Optional MP3 voice reply via Soniox (needs SONIOX_API_KEY).
+      # Optional MP3 voice reply via Soniox (needs a Soniox key: Connections → Soniox).
       # WHATSAPP_AUDIO_REPLY=on
       # WHATSAPP_AUDIO_VOICE=Adrian            # default falls back to
       # WHATSAPP_AUDIO_LANGUAGE=en             # SONIOX_TTS_VOICE / *_LANGUAGE
@@ -2273,162 +2273,54 @@ def _format_contacts_as_text(contacts: list[dict[str, Any]]) -> str:
 
 
 # ── Soniox STT (async REST) ──────────────────────────────────────────
+#
+# The REST dance (upload → job → poll → transcript → delete) lives in
+# ``captain_claw.soniox_api``; whose key it uses is ``soniox_routes``'s call.
 
 
-# Soniox async transcription is a 3-step REST dance:
-#   1. POST /v1/files               — upload audio, get file_id
-#   2. POST /v1/transcriptions      — create job referencing file_id
-#   3. GET  /v1/transcriptions/{id} — poll until status=completed
-#   4. GET  /v1/transcriptions/{id}/transcript — fetch the text
-# Plus DELETEs on both file and transcription to keep the user's Soniox
-# storage clean. Source of the schema:
-#   https://github.com/soniox/soniox_examples/blob/master/speech_to_text/python/soniox_async.py
-_SONIOX_API_BASE = "https://api.soniox.com"
-_SONIOX_STT_MODEL = "stt-async-v4"
-_SONIOX_STT_POLL_MAX = 60  # 60 × 1 s = up to 60 s per WhatsApp voice note
+def _wa_owner() -> str:
+    """The person the WhatsApp bridge works for: the owner of its default agent
+    (``WHATSAPP_DEFAULT_AGENT_SLUG``), or "" — then the deck's Soniox key."""
+    from captain_claw.flight_deck.soniox_routes import owner_of_agent_slug
+
+    return owner_of_agent_slug(_env("WHATSAPP_DEFAULT_AGENT_SLUG"))
 
 
-def _soniox_http_reason(stage: str, status: int) -> str:
-    """A short, user-facing reason for a Soniox HTTP failure at a given stage."""
-    if status in (401, 403):
-        return f"Soniox rejected the request during {stage} (HTTP {status} — the SONIOX_API_KEY looks invalid)"
-    if status == 429:
-        return f"Soniox is rate-limiting {stage} (HTTP 429 — try again shortly)"
-    return f"Soniox {stage} failed (HTTP {status})"
+def _stt_language_hints() -> list[str]:
+    """``WHATSAPP_STT_LANGUAGES=en,es,hr`` biases the model toward several
+    languages; else one: ``WHATSAPP_AUDIO_LANGUAGE`` / ``SONIOX_TTS_LANGUAGE`` / en."""
+    raw_hints = _env("WHATSAPP_STT_LANGUAGES")
+    if raw_hints:
+        return [h.strip() for h in raw_hints.split(",") if h.strip()]
+    return [
+        _env("WHATSAPP_AUDIO_LANGUAGE")
+        or os.environ.get("SONIOX_TTS_LANGUAGE", "").strip()
+        or "en"
+    ]
 
 
 async def _transcribe_soniox(audio_bytes: bytes, mime_type: str = "audio/ogg") -> tuple[str, str]:
-    """Transcribe audio bytes via Soniox async REST.
+    """Transcribe audio bytes via Soniox with the key the bridge's person uses
+    (:func:`_wa_owner`; the deck's key when there is none).
 
     Returns ``(transcript, error_reason)``:
       * success              → ``(text, "")``
       * completed but silent → ``("", "no speech detected …")``
       * misconfig / failure  → ``("", "<short user-facing reason>")``
 
-    The previous version collapsed *every* failure mode (missing key, auth
-    error, upload/create/poll failure, job error, poll timeout, empty download,
-    genuinely-empty transcript) into a bare ``""`` with **no log line** — which
-    is exactly why a real incident surfaced only as "Soniox returned no text"
-    with nothing to diagnose. Now each failure is logged at WARNING with the
-    real HTTP status/body or job status, and reported back as a distinct reason.
-
-    Language hints default to ``WHATSAPP_AUDIO_LANGUAGE`` / ``SONIOX_TTS_LANGUAGE``
-    (single language). For multi-language users, set
-    ``WHATSAPP_STT_LANGUAGES=en,es,hr`` to bias the model.
+    Every failure is logged with Soniox's real answer and comes back as a
+    distinct reason (an earlier version collapsed them all into "" with no log
+    line, so an incident surfaced only as "Soniox returned no text").
     """
-    api_key = os.environ.get("SONIOX_API_KEY", "").strip()
-    if not api_key:
-        log.warning("soniox STT: SONIOX_API_KEY is not set in the FD process environment")
-        return "", "voice transcription isn't configured on the server (SONIOX_API_KEY missing)"
+    from captain_claw.flight_deck import soniox_routes
+
     if not audio_bytes:
         log.warning("soniox STT: nothing to transcribe — audio download returned 0 bytes")
         return "", "the voice note arrived empty (0 bytes downloaded)"
-
-    headers = {"Authorization": f"Bearer {api_key}"}
-
-    # Language hints: comma-sep override, else fall back to TTS language env.
-    raw_hints = _env("WHATSAPP_STT_LANGUAGES")
-    if raw_hints:
-        language_hints = [h.strip() for h in raw_hints.split(",") if h.strip()]
-    else:
-        lang = (
-            _env("WHATSAPP_AUDIO_LANGUAGE")
-            or os.environ.get("SONIOX_TTS_LANGUAGE", "").strip()
-            or "en"
-        )
-        language_hints = [lang]
-
-    file_id = ""
-    transcription_id = ""
-
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            try:
-                # 1. Upload file
-                up = await client.post(
-                    f"{_SONIOX_API_BASE}/v1/files",
-                    headers=headers,
-                    files={"file": ("audio", audio_bytes, mime_type or "audio/ogg")},
-                )
-                if up.status_code >= 400:
-                    log.warning("soniox STT upload failed: HTTP %s — %s", up.status_code, up.text[:300])
-                    return "", _soniox_http_reason("upload", up.status_code)
-                file_id = str((up.json() or {}).get("id") or "")
-                if not file_id:
-                    log.warning("soniox STT upload: response carried no file id — %s", up.text[:300])
-                    return "", "Soniox upload returned no file id"
-
-                # 2. Create transcription
-                cr = await client.post(
-                    f"{_SONIOX_API_BASE}/v1/transcriptions",
-                    headers={**headers, "Content-Type": "application/json"},
-                    json={
-                        "model": _SONIOX_STT_MODEL,
-                        "file_id": file_id,
-                        "language_hints": language_hints,
-                        "enable_language_identification": True,
-                    },
-                )
-                if cr.status_code >= 400:
-                    log.warning("soniox STT job create failed: HTTP %s — %s", cr.status_code, cr.text[:300])
-                    return "", _soniox_http_reason("job creation", cr.status_code)
-                transcription_id = str((cr.json() or {}).get("id") or "")
-                if not transcription_id:
-                    log.warning("soniox STT job create: response carried no id — %s", cr.text[:300])
-                    return "", "Soniox job creation returned no id"
-
-                # 3. Poll for completion (Soniox example uses 1 s interval)
-                status = ""
-                for _ in range(_SONIOX_STT_POLL_MAX):
-                    p = await client.get(
-                        f"{_SONIOX_API_BASE}/v1/transcriptions/{transcription_id}",
-                        headers=headers,
-                    )
-                    if p.status_code >= 400:
-                        log.warning("soniox STT status poll failed: HTTP %s — %s", p.status_code, p.text[:300])
-                        return "", _soniox_http_reason("status poll", p.status_code)
-                    pj = p.json() or {}
-                    status = str(pj.get("status") or "")
-                    if status == "completed":
-                        break
-                    if status == "error":
-                        err = str(pj.get("error_message") or pj.get("error") or "").strip()
-                        log.warning("soniox STT job errored: %s", err or "(no error_message)")
-                        return "", f"Soniox couldn't process the audio{(': ' + err) if err else ''}"
-                    await asyncio.sleep(1)
-                if status != "completed":
-                    log.warning("soniox STT timed out after %ss (last status=%r)", _SONIOX_STT_POLL_MAX, status)
-                    return "", f"Soniox timed out after {_SONIOX_STT_POLL_MAX}s"
-
-                # 4. Fetch the actual text
-                tr = await client.get(
-                    f"{_SONIOX_API_BASE}/v1/transcriptions/{transcription_id}/transcript",
-                    headers=headers,
-                )
-                if tr.status_code >= 400:
-                    log.warning("soniox STT transcript fetch failed: HTTP %s — %s", tr.status_code, tr.text[:300])
-                    return "", _soniox_http_reason("transcript fetch", tr.status_code)
-                transcript_text = str((tr.json() or {}).get("text") or "").strip()
-                if not transcript_text:
-                    log.info("soniox STT: job completed but transcript was empty (silence / no speech?)")
-                    return "", "no speech detected in the audio"
-                return transcript_text, ""
-            finally:
-                # Cleanup — fire-and-forget; runs on every exit path (incl. the
-                # early returns above) so we never leak Soniox files/jobs.
-                for path in (
-                    f"/v1/transcriptions/{transcription_id}" if transcription_id else "",
-                    f"/v1/files/{file_id}" if file_id else "",
-                ):
-                    if not path:
-                        continue
-                    try:
-                        await client.delete(f"{_SONIOX_API_BASE}{path}", headers=headers)
-                    except Exception:
-                        pass
-    except Exception as exc:
-        log.warning("soniox STT: unexpected error: %s", exc)
-        return "", f"transcription error ({type(exc).__name__})"
+    return await soniox_routes.transcribe_text(
+        _wa_owner() or None, audio_bytes, mime_type or "audio/ogg",
+        language_hints=_stt_language_hints(), source="whatsapp",
+    )
 
 
 def _rebind_waid(waid: str, new_channel: str) -> None:
@@ -2881,7 +2773,9 @@ async def _synth_audio_mp3(text: str) -> bytes | None:
     request fails. Errors don't surface to the user — audio reply is a
     nicety; if it can't happen, the text reply still goes through.
     """
-    api_key = os.environ.get("SONIOX_API_KEY", "").strip()
+    from captain_claw.flight_deck.soniox_routes import key_for
+
+    api_key = await key_for(_wa_owner() or None)
     if not api_key:
         return None
     text = (text or "").strip()

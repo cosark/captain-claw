@@ -112,6 +112,13 @@ async def _connections(db, uid: str) -> dict[str, Any]:
         out["jev"] = {"connected": bool(jev.get("key_set")), "source": jev.get("source") or ""}
     except Exception as exc:
         log.debug("info: jev status unavailable", error=type(exc).__name__)
+    try:
+        from captain_claw.flight_deck.soniox_routes import status_for_owner as soniox_status
+
+        soniox = await soniox_status(uid)
+        out["soniox"] = {"connected": bool(soniox.get("key_set")), "source": soniox.get("source") or ""}
+    except Exception as exc:
+        log.debug("info: soniox status unavailable", error=type(exc).__name__)
     return out
 
 

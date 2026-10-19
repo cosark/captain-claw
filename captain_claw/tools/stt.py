@@ -2,7 +2,7 @@
 
 Provider resolution order (first available wins):
   1. Explicit ``stt_provider`` in screen_capture config
-  2. Soniox  (``SONIOX_API_KEY``)
+  2. Soniox  (the owner's key, through Flight Deck; standalone ``SONIOX_API_KEY``)
   3. OpenAI Whisper (``OPENAI_API_KEY``)
   4. Gemini multimodal (``GEMINI_API_KEY``)
   5. Explicit ``model_type: "stt"`` from ``config.model.allowed``
@@ -160,12 +160,31 @@ def _resolve_stt_api_key(provider: str) -> str:
     return ""
 
 
+async def soniox_realtime_key() -> str:
+    """A key for one Soniox realtime (mic → WebSocket) session, or "" when
+    realtime isn't possible (no SDK, no key, Flight Deck refused). Under Flight
+    Deck it is a short-lived key minted with the owner's key."""
+    if not _HAS_SONIOX:
+        return ""
+    from captain_claw import soniox_client
+    from captain_claw.soniox_api import SonioxError
+
+    if not await soniox_client.available():
+        return ""
+    try:
+        return await soniox_client.realtime_key("transcribe_websocket")
+    except SonioxError as exc:
+        log.warning("soniox_realtime_key_unavailable", error=str(exc))
+        return ""
+
+
 async def transcribe_audio(wav_bytes: bytes) -> str:
     """Transcribe WAV audio to text using the best available provider.
 
     Resolution order:
       1. Explicit ``stt_provider`` in ``tools.screen_capture`` config
-      2. Soniox  (if ``SONIOX_API_KEY`` set and ``soniox`` package installed)
+      2. Soniox  (the owner's key in Flight Deck, or the agent's own
+         ``SONIOX_API_KEY`` — see :mod:`captain_claw.soniox_client`)
       3. OpenAI Whisper (if ``OPENAI_API_KEY`` set)
       4. Gemini multimodal (if ``GEMINI_API_KEY`` set)
       5. Explicit ``model_type: "stt"`` from ``config.model.allowed``
@@ -182,9 +201,10 @@ async def transcribe_audio(wav_bytes: bytes) -> str:
     # --- Auto-detect: try providers in order ---
 
     # 1. Soniox (preferred)
-    soniox_key = _resolve_stt_api_key("soniox")
-    if soniox_key and _HAS_SONIOX:
-        return await _transcribe_soniox(soniox_key, wav_bytes)
+    from captain_claw import soniox_client
+
+    if await soniox_client.available():
+        return await _transcribe_soniox(wav_bytes)
 
     # 2. OpenAI Whisper
     openai_key = _resolve_stt_api_key("openai")
@@ -202,7 +222,8 @@ async def transcribe_audio(wav_bytes: bytes) -> str:
             return await _transcribe_with_model(m, wav_bytes)
 
     raise RuntimeError(
-        "No STT provider available. Set one of: SONIOX_API_KEY, "
+        "No STT provider available. Connect Soniox in Flight Deck "
+        "(Connections → Soniox), or set one of: SONIOX_API_KEY, "
         "OPENAI_API_KEY, or GEMINI_API_KEY. Or configure stt_provider "
         "in tools.screen_capture settings."
     )
@@ -210,6 +231,15 @@ async def transcribe_audio(wav_bytes: bytes) -> str:
 
 async def _transcribe_with_provider(provider: str, wav_bytes: bytes) -> str:
     """Route to a specific STT provider by name."""
+    if provider == "soniox":
+        from captain_claw import soniox_client
+
+        if not await soniox_client.available():
+            raise RuntimeError(
+                "STT provider 'soniox' configured but Soniox isn't connected — "
+                "add a key in Flight Deck (Connections → Soniox) or set SONIOX_API_KEY."
+            )
+        return await _transcribe_soniox(wav_bytes)
     key = _resolve_stt_api_key(provider)
     if not key:
         raise RuntimeError(
@@ -217,14 +247,7 @@ async def _transcribe_with_provider(provider: str, wav_bytes: bytes) -> str:
             f"Set the appropriate environment variable."
         )
 
-    if provider == "soniox":
-        if not _HAS_SONIOX:
-            raise RuntimeError(
-                "Soniox configured but 'soniox' package not installed. "
-                "Install with: pip install soniox"
-            )
-        return await _transcribe_soniox(key, wav_bytes)
-    elif provider == "openai":
+    if provider == "openai":
         model = ""
         try:
             from captain_claw.config import get_config
@@ -256,9 +279,7 @@ async def _transcribe_with_model(model_cfg: Any, wav_bytes: bytes) -> str:
     elif provider in ("gemini", "google"):
         return await _transcribe_gemini(key or "", wav_bytes)
     elif provider == "soniox":
-        if not _HAS_SONIOX:
-            raise RuntimeError("Soniox package not installed.")
-        return await _transcribe_soniox(key or "", wav_bytes)
+        return await _transcribe_soniox(wav_bytes)
     else:
         raise RuntimeError(f"STT not supported for provider: {provider}")
 
@@ -364,51 +385,20 @@ def realtime_stt_sync(
 # ---------------------------------------------------------------------------
 
 
-async def _transcribe_soniox(api_key: str, wav_bytes: bytes) -> str:
-    """Transcribe using the Soniox async file-based API.
+async def _transcribe_soniox(wav_bytes: bytes) -> str:
+    """Transcribe a recording with Soniox's async file API — through Flight
+    Deck with the owner's key, or with the agent's own ``SONIOX_API_KEY``
+    (:mod:`captain_claw.soniox_client`)."""
+    from captain_claw import soniox_client
+    from captain_claw.soniox_api import SonioxError
 
-    Uses ``AsyncSonioxClient.stt.transcribe()`` which handles upload +
-    create + wait in one call.  The actual text is in a separate
-    ``TranscriptionTranscript`` object fetched via ``get_transcript()``.
-    """
-    from soniox import AsyncSonioxClient
-
-    client = AsyncSonioxClient(api_key=api_key)
-
-    wav_size_kb = len(wav_bytes) / 1024.0
-    log.info("soniox_transcribing", wav_size_kb=f"{wav_size_kb:.1f}")
-
-    transcription = await client.stt.transcribe(
-        file=wav_bytes,
-        filename="recording.wav",
-    )
-
-    log.info(
-        "soniox_job_done",
-        transcription_id=transcription.id,
-        status=str(getattr(transcription, "status", "unknown")),
-        audio_duration_ms=getattr(transcription, "audio_duration_ms", None),
-        error_message=getattr(transcription, "error_message", None),
-    )
-
-    # transcribe() may return before the job finishes (status="queued").
-    # Explicitly wait for completion before fetching the transcript.
-    status = str(getattr(transcription, "status", "")).lower()
-    if status != "completed":
-        log.info("soniox_waiting_for_completion", transcription_id=transcription.id)
-        transcription = await client.stt.wait(transcription.id)
-        log.info(
-            "soniox_wait_done",
-            status=str(getattr(transcription, "status", "unknown")),
-        )
-
-    # The Transcription object does NOT contain the text directly.
-    # The text lives in TranscriptionTranscript, fetched separately.
-    transcript = await client.stt.get_transcript(transcription.id)
-    text = str(getattr(transcript, "text", "") or "").strip()
-
-    log.info("soniox_transcription_complete", chars=len(text))
-    return text
+    log.info("soniox_transcribing", wav_size_kb=f"{len(wav_bytes) / 1024.0:.1f}")
+    try:
+        out = await soniox_client.transcribe(wav_bytes, filename="recording.wav", mime="audio/wav")
+    except SonioxError as exc:
+        raise RuntimeError(f"Soniox transcription failed: {exc}") from None
+    log.info("soniox_transcription_complete", chars=len(out.text))
+    return out.text
 
 
 async def _transcribe_openai_whisper(

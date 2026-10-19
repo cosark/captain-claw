@@ -43,10 +43,12 @@ async def handle_stt_ws(
     await ws.prepare(request)
 
     # Detect whether Soniox realtime is available.
-    from captain_claw.tools.stt import _HAS_SONIOX, _resolve_stt_api_key
+    # Under Flight Deck: a short-lived key for this one session, minted with
+    # the owner's Soniox key (which never reaches the agent).
+    from captain_claw.tools.stt import soniox_realtime_key
 
-    soniox_key = _resolve_stt_api_key("soniox")
-    use_realtime = bool(soniox_key and _HAS_SONIOX)
+    soniox_key = await soniox_realtime_key()
+    use_realtime = bool(soniox_key)
 
     await ws.send_json({"type": "stt_ready", "realtime": use_realtime})
     log.info("stt_ws_connected", realtime=use_realtime)
