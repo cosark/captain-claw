@@ -777,7 +777,7 @@ Speech-to-text transcription. Used internally by the hotkey daemon for voice com
 
 **Providers (in priority order):**
 
-1. **Soniox** (recommended) — Realtime streaming transcription. Set `SONIOX_API_KEY` env var. When used via the hotkey, audio streams directly from the microphone to Soniox over WebSocket — no audio files are saved.
+1. **Soniox** (recommended) — Realtime streaming transcription. Under Flight Deck, connect it in **Connections → Soniox** (or use the team key your admin shares); standalone, set `SONIOX_API_KEY`. When used via the hotkey, audio streams directly from the microphone to Soniox over WebSocket — no audio files are saved.
 2. **OpenAI Whisper** — File-upload transcription. Uses the configured OpenAI API key.
 3. **Gemini** — File-upload transcription via a Gemini model with audio understanding.
 
@@ -1163,7 +1163,7 @@ tools:
 
 | Provider | Setup | How it works |
 |---|---|---|
-| Soniox (recommended) | Set `SONIOX_API_KEY` env var | Realtime streaming — audio goes from mic to Soniox WebSocket, no files saved |
+| Soniox (recommended) | Flight Deck → Connections → Soniox (standalone: `SONIOX_API_KEY`) | Realtime streaming — audio goes from mic to Soniox WebSocket, no files saved |
 | OpenAI Whisper | Set `OPENAI_API_KEY` env var | Records WAV, uploads to Whisper API after key release |
 | Gemini | Set `GOOGLE_API_KEY` or `GEMINI_API_KEY` | Records WAV, transcribes via Gemini audio model |
 
@@ -5588,7 +5588,7 @@ captain-claw-fd
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `SONIOX_API_KEY` | _(unset)_ | Required for any TTS. Without it the glasses fall back to silent. |
+| `SONIOX_API_KEY` | _(unset)_ | Fallback only: the glasses speak with the deck's Soniox team key (Admin → Integrations), else this. Without either they fall back to silent. |
 | `SONIOX_TTS_MODEL` | `tts-rt-v1` | Soniox TTS model id |
 | `SONIOX_TTS_VOICE` | `Adrian` | Default voice; user can override per-session via the settings page |
 | `SONIOX_TTS_LANGUAGE` | `en` | Default language; user can override per-session via the settings page |
@@ -5615,7 +5615,7 @@ A pocket push-to-talk client for your agents on an **M5Stack StickS3**: hold the
 
 - **Server:** `WS /device/ws` on Flight Deck. The stick streams 16 kHz PCM while the button is held; replies come back as text, Soniox TTS audio (24 kHz PCM) and pictures fitted to the screen. Results the agent produces later (a cron job, a nudge) are shown too.
 - **Auth:** a personal access token (Flight Deck → Connections → *Agent access for Claude (MCP)* → Generate token) names the owner; a deck with auth off needs none.
-- **Deck requirements:** `SONIOX_API_KEY` (speech in, voice out). A deck reached through a domain needs that domain in `FD_ALLOWED_HOSTS` or `FD_PUBLIC_URL` (the [origin guard](#flight-deck-security-hardening--new-in-080) refuses unknown hosts).
+- **Deck requirements:** a Soniox key (speech in, voice out) — the device owner's own in Connections → Soniox, else the admin's team key, else `SONIOX_API_KEY`. A deck reached through a domain needs that domain in `FD_ALLOWED_HOSTS` or `FD_PUBLIC_URL` (the [origin guard](#flight-deck-security-hardening--new-in-080) refuses unknown hosts).
 - **Setup:** on first boot (or holding the front button while switching on) the stick opens a `Captain-StickS3-xxxx` hotspot; at `http://192.168.4.1` enter up to five Wi-Fi networks, the deck address (`ws://<host>:25080` or `wss://<deck domain>`), the token, and optionally an agent slug, reply language, volume and sleep minutes.
 - **Buttons:** front = hold to talk, tap to stop speaking or flip picture ↔ text; side = agents list, volume (25–100 %), speech **Boost** (+6 / +10 dB with a soft limiter), settings.
 - **Firmware:** PlatformIO in `firmware/sticks3/` — `uv tool install platformio`, then `cd firmware/sticks3 && pio run -t upload`. Details, serial logging and going back to stock firmware: [firmware/sticks3/README.md](firmware/sticks3/README.md).
@@ -6042,7 +6042,7 @@ workspace/saved/
 | `SENDGRID_API_KEY` | SendGrid API key |
 | `TYPESENSE_API_KEY` | Typesense API key (used by both tool and deep memory) |
 | `JEV_API_KEY` (or `TYPESAFE_API_KEY`) | Jev (TypeSafe AI) API key for the `jev` tool — standalone agents only; under Flight Deck add it in **Connections → Jev** |
-| `SONIOX_API_KEY` | Flight Deck: speech-to-text and TTS for WhatsApp voice notes, the glasses bridge, the HUD and the StickS3 device |
+| `SONIOX_API_KEY` | Flight Deck: last-fallback Soniox key (speech-to-text and TTS for WhatsApp voice notes, the glasses bridge, the HUD, the StickS3 device and agents). Prefer Connections → Soniox (per user) and Admin → Integrations → Soniox team key, where **Move server key here** imports this value. Agents no longer inherit it: they transcribe through Flight Deck with their owner's key. |
 | `WHATSAPP_REACTIONS` / `WHATSAPP_REACTION_TIMEOUT` | Flight Deck WhatsApp bridge: `off` disables emoji reactions (on by default); timeout in seconds (default 8) |
 | `CLAW_WRITE_GUARD` | `0` turns off the `write` tool's empty/placeholder refusal and read-back check (on by default since 0.8.0) |
 | `FD_JEV_BASE_URL` | Flight Deck: send every user's Jev calls to another Jev-compatible endpoint (a proxy in front of `https://api.typesafe.ai`, or a local stub); default `https://api.typesafe.ai` |

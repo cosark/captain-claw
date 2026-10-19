@@ -555,6 +555,9 @@ _FD_ONLY_ENV_VARS = (
     "FD_EVENTS_WEBHOOK_TOKEN",
     "GOOGLE_WORKSPACE_CLI_TOKEN",
     "GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE",
+    # The deck's Soniox key is a fallback FD itself uses (soniox_routes); an
+    # agent transcribes through FD with its owner's key instead of holding one.
+    "SONIOX_API_KEY",
 )
 
 
@@ -577,11 +580,10 @@ def _agent_base_env() -> dict[str, str]:
     return env
 
 
-# Keys Flight Deck shares with an agent that didn't set its own: SONIOX for
-# video/audio transcription, the WhatsApp Cloud API creds for the agent-side
-# send path (files and pictures back to a WhatsApp chat).
+# Keys Flight Deck shares with an agent that didn't set its own: the WhatsApp
+# Cloud API creds for the agent-side send path (files and pictures back to a
+# WhatsApp chat). Soniox is not one: agents ask FD (/fd/soniox/agent/*).
 _SHARED_FD_SECRETS = (
-    "SONIOX_API_KEY",
     "WHATSAPP_ACCESS_TOKEN", "WHATSAPP_PHONE_NUMBER_ID", "WHATSAPP_ALLOWED_WAIDS",
 )
 
@@ -1381,6 +1383,7 @@ from captain_claw.flight_deck.gmail_send_routes import router as gmail_send_rout
 from captain_claw.flight_deck.gmail_autoreply_routes import router as gmail_autoreply_router
 from captain_claw.flight_deck.microsoft_oauth_routes import router as microsoft_oauth_router
 from captain_claw.flight_deck.jev_routes import router as jev_router
+from captain_claw.flight_deck.soniox_routes import router as soniox_router
 from captain_claw.flight_deck.telegram_shared_routes import router as telegram_shared_router
 from captain_claw.flight_deck.branding_routes import router as branding_router
 from captain_claw.flight_deck.invite_routes import admin_router as invite_admin_router
@@ -1452,6 +1455,7 @@ app.include_router(gmail_send_router)
 app.include_router(gmail_autoreply_router)
 app.include_router(microsoft_oauth_router)
 app.include_router(jev_router)
+app.include_router(soniox_router)
 app.include_router(telegram_shared_router)
 app.include_router(branding_router)
 app.include_router(invite_admin_router)

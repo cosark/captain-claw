@@ -10,8 +10,9 @@ Pipeline (v1):
      coherent video description by the agent's own model.
 
 Frame vision is run with limited concurrency. Requires system ``ffmpeg`` +
-``ffprobe`` (same assumption the audio pipeline already makes). Soniox
-(``SONIOX_API_KEY``) is optional — without it, analysis is frames-only.
+``ffprobe`` (same assumption the audio pipeline already makes). Soniox (the
+owner's key in Flight Deck, or the agent's own ``SONIOX_API_KEY``) is optional —
+without it, analysis is frames-only.
 """
 
 from __future__ import annotations
@@ -34,8 +35,6 @@ _FRAME_CONCURRENCY = 4
 _PEER_FRAME_CONCURRENCY = 1  # a peer agent serves one request at a time → serialize
 _VISION_PEER_HINTS = ("vision", "image", "multimodal", "minimax", "llava", "qwen2.5vl", "vl")
 _VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v"}
-_SONIOX_API_BASE = "https://api.soniox.com"
-_SONIOX_STT_MODEL = "stt-async-v4"
 
 
 # ── subprocess helpers ────────────────────────────────────────────────
@@ -156,64 +155,24 @@ async def _transcribe_timestamped(
     audio_bytes: bytes, filename: str = "audio.ogg", mime: str = "audio/ogg",
 ) -> tuple[str, list[tuple[float, str]]]:
     """Return (full_text, [(start_seconds, token_text), ...]) or ('', [])."""
-    import os
+    from captain_claw import soniox_client
+    from captain_claw.soniox_api import SonioxError
 
-    import httpx
-
-    api_key = os.environ.get("SONIOX_API_KEY", "").strip()
-    if not api_key or not audio_bytes:
+    if not audio_bytes or not await soniox_client.available():
         return "", []
-    headers = {"Authorization": f"Bearer {api_key}"}
-    file_id = transcription_id = ""
     try:
-        async with httpx.AsyncClient(timeout=180.0) as client:
-            up = await client.post(
-                f"{_SONIOX_API_BASE}/v1/files", headers=headers,
-                files={"file": (filename, audio_bytes, mime)},
-            )
-            up.raise_for_status()
-            file_id = str((up.json() or {}).get("id") or "")
-            if not file_id:
-                return "", []
-            cr = await client.post(
-                f"{_SONIOX_API_BASE}/v1/transcriptions",
-                headers={**headers, "Content-Type": "application/json"},
-                json={"model": _SONIOX_STT_MODEL, "file_id": file_id,
-                      "enable_language_identification": True},
-            )
-            cr.raise_for_status()
-            transcription_id = str((cr.json() or {}).get("id") or "")
-            if not transcription_id:
-                return "", []
-            for _ in range(120):
-                p = await client.get(
-                    f"{_SONIOX_API_BASE}/v1/transcriptions/{transcription_id}", headers=headers)
-                p.raise_for_status()
-                st = str((p.json() or {}).get("status") or "")
-                if st in ("completed", "error"):
-                    break
-                await asyncio.sleep(1)
-            text, tokens = "", []
-            tr = await client.get(
-                f"{_SONIOX_API_BASE}/v1/transcriptions/{transcription_id}/transcript", headers=headers)
-            if tr.status_code == 200:
-                data = tr.json() or {}
-                text = str(data.get("text") or "").strip()
-                for tok in (data.get("tokens") or []):
-                    t = str(tok.get("text") or "")
-                    start_ms = tok.get("start_ms")
-                    if t and start_ms is not None:
-                        tokens.append((float(start_ms) / 1000.0, t))
-            # cleanup
-            for pth in (f"/v1/transcriptions/{transcription_id}", f"/v1/files/{file_id}"):
-                try:
-                    await client.delete(f"{_SONIOX_API_BASE}{pth}", headers=headers)
-                except Exception:
-                    pass
-            return text, tokens
-    except Exception as exc:
+        out = await soniox_client.transcribe(
+            audio_bytes, filename=filename, mime=mime, language_identification=True, poll_max=120,
+        )
+    except SonioxError as exc:
         log.warning("soniox timestamped transcription failed: %s", exc)
         return "", []
+    tokens = [
+        (float(tok["start_ms"]) / 1000.0, str(tok.get("text") or ""))
+        for tok in out.tokens
+        if tok.get("text") and tok.get("start_ms") is not None
+    ]
+    return out.text, tokens
 
 
 def _transcript_window(tokens: list[tuple[float, str]], center: float, half: float) -> str:
@@ -502,9 +461,10 @@ class VideoVisionTool(Tool):
         wa_id = _whatsapp_waid(kwargs)  # if set, mirror key updates to WhatsApp
 
         # ── Phase 1: audio → transcript → summary (fast; shown first) ──────
-        import os as _os
+        from captain_claw import soniox_client as _soniox
+
         has_audio_track = bool(audio)
-        has_soniox = bool(_os.environ.get("SONIOX_API_KEY", "").strip())
+        has_soniox = await _soniox.available()
         _emit_status(agent_obj, "🎙️ Transcribing audio…")
         await _send_whatsapp(wa_id, "🎙 Transcribing the video's audio…")
         full_text, tokens = await _transcribe_timestamped(audio, audio_name, audio_mime)
@@ -513,7 +473,7 @@ class VideoVisionTool(Tool):
             if not has_audio_track:
                 audio_note = "🎙 The video has no audio track."
             elif not has_soniox:
-                audio_note = "🎙 Audio is present, but transcription isn't configured (no SONIOX_API_KEY)."
+                audio_note = "🎙 Audio is present, but transcription isn't configured (connect Soniox in Flight Deck → Connections)."
             else:
                 audio_note = "🎙 No speech detected in the audio."
         if full_text:

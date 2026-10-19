@@ -254,6 +254,9 @@ export function KioskInfoDialog({ agents, onClose, onOpenProfile, onOpenConnecti
                   <ConnRow name="Jev" state={info.connections.jev ? (info.connections.jev.connected
                     ? { text: info.connections.jev.source === 'shared' ? 'Team key' : 'Connected', ok: true }
                     : { text: 'Not connected', ok: false }) : null} />
+                  <ConnRow name="Soniox (voice)" state={info.connections.soniox ? (info.connections.soniox.connected
+                    ? { text: info.connections.soniox.source === 'own' ? 'Connected' : 'Team key', ok: true }
+                    : { text: 'Not connected', ok: false }) : null} />
                 </ul>
                 <button
                   onClick={onOpenConnections}

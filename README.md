@@ -103,7 +103,7 @@ Hold the talk button, talk, release. Flight Deck transcribes it (Soniox), sends 
 - **Signed over-the-air updates** — `python tools/publish.py sticks3 --deck https://<deck> --token cc_pat_…` builds, signs (ECDSA P-256) and publishes; devices take the offer from Menu → *Software update* or by themselves on USB, and a build that can't reach the deck within 90 s rolls back.
 - **Setup from a hotspot** — scan the QR on screen, open `192.168.4.1`, enter up to five Wi-Fi networks, the deck address (`ws://<ip>:25080` or `wss://<domain>`) and an access token from Connections → *Agent access for Claude (MCP)*. No watch yet? `pio run -e preview` renders every screen on a Mac.
 
-The deck needs `SONIOX_API_KEY`; a deck behind a domain needs it in `FD_ALLOWED_HOSTS` or `FD_PUBLIC_URL`.
+The deck needs a Soniox key: your own in **Connections → Soniox**, or the team key an admin shares in **Admin → Integrations** (`SONIOX_API_KEY` in the environment still works as a fallback). A deck behind a domain needs it in `FD_ALLOWED_HOSTS` or `FD_PUBLIC_URL`.
 
 #### Flight Deck for a team, at a glance
 
@@ -622,7 +622,7 @@ First run starts onboarding automatically. For Ollama, no key needed — set `pr
 FD_AUTH_ENABLED=true FD_JWT_SECRET=$(openssl rand -hex 32) FD_PUBLIC_URL=https://deck.example.com flight-deck
 ```
 
-**Talk to it from your pocket** — flash an M5Stack StickS3 or StopWatch (the deck needs `SONIOX_API_KEY`):
+**Talk to it from your pocket** — flash an M5Stack StickS3 or StopWatch (the deck needs a Soniox key, in Connections → Soniox or as the admin's team key):
 
 ```bash
 uv tool install platformio

@@ -3,6 +3,7 @@
 //   /fd/admin/telegram-shared for the token and the access requests) —
 //   captain_claw/flight_deck/telegram_shared_routes.py
 // - the team Jev key (/fd/jev/shared, /fd/jev/shared-key) — jev_routes.py
+// - the team Soniox key (/fd/soniox/shared, /shared-key, /import-env) — soniox_routes.py
 // - the deck's logo (/fd/admin/branding/logo) — branding_routes.py
 //
 // None of these ever returns a token or key, only a hint of its last characters.
@@ -174,6 +175,38 @@ export const saveSharedJevKey = (api_key: string) =>
 
 export const removeSharedJevKey = () =>
   fdFetch<SharedJevKey>('/fd/jev/shared-key', { method: 'DELETE' })
+
+// ── Team Soniox key ──
+
+export interface SharedSonioxKey {
+  key_set: boolean
+  key_hint: string
+  verified: boolean | null
+  verify_error: 'refused' | 'unreachable' | null
+  verified_at: string | null
+  updated_at: string | null
+  models: string[]
+  available: boolean
+  // The server's environment still carries SONIOX_API_KEY (the old way).
+  env_key_set: boolean
+  env_key_hint: string
+  warning?: string
+}
+
+export const getSharedSonioxKey = () => fdFetch<SharedSonioxKey>('/fd/soniox/shared')
+
+export const saveSharedSonioxKey = (api_key: string) =>
+  fdFetch<SharedSonioxKey>('/fd/soniox/shared-key', {
+    method: 'PUT',
+    body: JSON.stringify({ api_key }),
+  })
+
+export const removeSharedSonioxKey = () =>
+  fdFetch<SharedSonioxKey>('/fd/soniox/shared-key', { method: 'DELETE' })
+
+/** Move the server's SONIOX_API_KEY into Flight Deck as the team key. */
+export const importSonioxEnvKey = () =>
+  fdFetch<SharedSonioxKey>('/fd/soniox/import-env', { method: 'POST' })
 
 // ── Google / Microsoft OAuth client (already one per deck, admin-managed) ──
 
