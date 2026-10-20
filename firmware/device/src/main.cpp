@@ -41,7 +41,7 @@
 #include <M5PM1.h>
 #endif
 
-#define FW_VERSION "0.11.1"
+#define FW_VERSION "0.11.2"
 
 // Home: the PaperColor's home screen even while there's an answer (C hold).
 // Link: the "settings on your phone" address.
@@ -746,7 +746,6 @@ static void chooseMenuRow() {
   if (menuSel == MBeep && settings.cueBeep) audio::cue();
   if (menuSel == MTalkSnd && settings.talkSounds) {  // what it sounds like
     audio::talkStart();
-    delay(250);
     audio::talkEnd();
   }
   sayRow();  // the new value
@@ -789,7 +788,7 @@ static void startTalking() {
   flashing = false;
   quietSpeech = false;
   ui::setQuestion("");
-  if (settings.talkSounds) audio::talkStart();  // played out before the mic listens
+  if (settings.talkSounds) audio::talkStart();  // the blip, then (0.25 s on) the mic listens
   audio::micStart();  // also stops any playback
   JsonDocument d;
   d["type"] = "rec_start";
