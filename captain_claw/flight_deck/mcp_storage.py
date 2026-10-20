@@ -18,9 +18,11 @@ Schema (one element per configured server)::
         "command":       "uvx",                           # stdio: executable to launch
         "args":          ["mcp-server-foo", "--flag"],    # stdio: argv after command
         "env":           {"PATH": "/usr/bin"},            # stdio: extra env vars
+        "auth":          "",                              # "" (none / client_credentials) or "oauth" (sign-in, DCR)
         "client_id":     "abc",                           # optional OAuth2 client_id (http only)
         "client_secret": "xyz",                           # optional OAuth2 client_secret (http only)
-        "token_endpoint": "/oauth/token",                 # optional, abs or rel (http only)
+        "token_endpoint": "/oauth/token",                 # optional, abs or rel (client_credentials only)
+        "scope":         "read write",                    # optional scope to ask for (oauth only)
         "headers":       {"X-Foo": "bar"},                # optional extra HTTP headers (http only)
         "enabled":       true,                            # disabled servers are skipped
         "allowed_agents": ["nano-man", "everyday"],       # empty list = all agents allowed
@@ -164,6 +166,9 @@ def _coerce_record(raw: Any) -> dict[str, Any] | None:
     if not isinstance(allowed, list):
         allowed = []
     allowed = [str(s).strip() for s in allowed if str(s).strip()]
+    # "oauth" = interactive sign-in (mcp_client_oauth); anything else keeps the
+    # original behaviour (client_credentials when client_id + token_endpoint).
+    auth = "oauth" if transport == "http" and str(raw.get("auth") or "").strip().lower() == "oauth" else ""
 
     return {
         "name": name,
@@ -172,6 +177,8 @@ def _coerce_record(raw: Any) -> dict[str, Any] | None:
         "command": command,
         "args": [str(a) for a in args],
         "env": {str(k): str(v) for k, v in env.items()},
+        "auth": auth,
+        "scope": str(raw.get("scope") or "").strip(),
         "client_id": str(raw.get("client_id") or ""),
         "client_secret": str(raw.get("client_secret") or ""),
         "token_endpoint": str(raw.get("token_endpoint") or ""),

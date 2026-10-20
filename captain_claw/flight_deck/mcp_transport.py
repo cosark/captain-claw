@@ -49,6 +49,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from captain_claw.flight_deck import mcp_client_oauth
 from captain_claw.logging import get_logger
 
 log = get_logger(__name__)
@@ -147,7 +148,10 @@ class HttpTransport(Transport):
 
     OAuth ``client_credentials`` flow (when ``token_endpoint`` /
     ``client_id`` are configured) is owned by this transport so callers
-    don't have to know whether auth applies.
+    don't have to know whether auth applies. A record with
+    ``auth: "oauth"`` instead sends the token of the interactive sign-in
+    (:mod:`mcp_client_oauth`), which refreshes it as needed — and once
+    more when the server answers 401, before the request is retried.
     """
 
     def __init__(self, record: dict[str, Any]) -> None:
@@ -192,6 +196,12 @@ class HttpTransport(Transport):
         return base + "/" + ep.lstrip("/")
 
     async def _ensure_token(self) -> str:
+        if mcp_client_oauth.is_oauth(self._record):
+            # Not cached here: the grant store refreshes and rotates it.
+            try:
+                return await mcp_client_oauth.access_token(self._record)
+            except mcp_client_oauth.MCPOAuthError as exc:
+                raise MCPTransportError(str(exc)) from exc
         if self._access_token:
             return self._access_token
         token_endpoint = self._resolve_token_endpoint()
@@ -231,6 +241,20 @@ class HttpTransport(Transport):
             raise MCPTransportError("OAuth response did not contain access_token")
         self._access_token = token
         return token
+
+    def _unauthorized_message(self, resp: httpx.Response) -> str:
+        if mcp_client_oauth.is_oauth(self._record):
+            return (
+                "MCP server rejected the sign-in (401) — sign in to this server "
+                "again on Connections → MCP servers"
+            )
+        challenge = resp.headers.get("www-authenticate", "")
+        if "bearer" in challenge.lower() and not self._record.get("client_id"):
+            return (
+                "MCP server requires authorization (401) — set its Auth to "
+                "'OAuth sign-in' and sign in"
+            )
+        return "MCP server rejected request (401); token cleared"
 
     async def _build_headers(self) -> dict[str, str]:
         headers: dict[str, str] = {
@@ -318,6 +342,18 @@ class HttpTransport(Transport):
         client = await self._http()
         headers = await self._build_headers()
         resp = await client.post(self.url, json=payload, headers=headers)
+        if resp.status_code == 401 and mcp_client_oauth.is_oauth(self._record):
+            # Revoked or expired ahead of its stated lifetime: refresh once
+            # and retry before giving up on the sign-in.
+            stale = headers.get("Authorization", "").removeprefix("Bearer ")
+            try:
+                fresh = await mcp_client_oauth.access_token(
+                    self._record, force_refresh=True, stale_token=stale,
+                )
+            except mcp_client_oauth.MCPOAuthError as exc:
+                raise MCPTransportError(str(exc)) from exc
+            headers["Authorization"] = f"Bearer {fresh}"
+            resp = await client.post(self.url, json=payload, headers=headers)
         self.last_status_code = resp.status_code
         sid = resp.headers.get("mcp-session-id") or resp.headers.get("Mcp-Session-Id")
         if sid and not self._session_id:
@@ -352,9 +388,7 @@ class HttpTransport(Transport):
             )
         if resp.status_code == 401:
             self._access_token = None
-            raise MCPTransportError(
-                "MCP server rejected request (401); token cleared"
-            )
+            raise MCPTransportError(self._unauthorized_message(resp))
         resp.raise_for_status()
         body = resp.json()
         if "error" in body:

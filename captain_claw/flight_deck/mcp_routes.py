@@ -14,6 +14,11 @@ Two audiences hit these endpoints:
    themselves; that gives FD a single chokepoint for OAuth,
    rate-limiting and observability.
 
+3. **The sign-in popup** (``/fd/mcp/oauth/*``) — for a server with
+   ``auth: "oauth"``, the browser leg of the MCP authorization flow:
+   discovery + Dynamic Client Registration + PKCE (see
+   :mod:`mcp_client_oauth`).
+
 Phase 1 keeps the schema flat: name + URL + optional OAuth client
 credentials + optional headers. Anything more (per-tenant scoping,
 ACLs, audit log) is intentionally deferred.
@@ -23,12 +28,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
+import time
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 
-from captain_claw.flight_deck import mcp_events, mcp_storage
+from captain_claw.flight_deck import google_oauth_routes as _g
+from captain_claw.flight_deck import mcp_client_oauth, mcp_events, mcp_storage
 from captain_claw.flight_deck.agent_identity import require_agent_caller
 from captain_claw.flight_deck.auth import get_current_user
 from captain_claw.flight_deck.mcp_manager import MCPServerError, get_manager
@@ -132,6 +146,8 @@ async def add_or_update_server(
         "command": command,
         "args": payload.get("args") or [],
         "env": payload.get("env") or {},
+        "auth": str(payload.get("auth") or ""),
+        "scope": str(payload.get("scope") or ""),
         "client_id": str(payload.get("client_id") or ""),
         "client_secret": incoming_secret,
         "token_endpoint": str(payload.get("token_endpoint") or ""),
@@ -141,6 +157,13 @@ async def add_or_update_server(
     }
     existed_before = existing is not None
     saved = await mcp_storage.upsert_server(record)
+    if existing is not None and (
+        not mcp_client_oauth.is_oauth(saved)
+        or existing.get("url") != saved.get("url")
+        or existing.get("client_id") != saved.get("client_id")
+    ):
+        # The sign-in was for another server, or another client — drop it.
+        await mcp_client_oauth.forget(name)
     # Drop any cached upstream session so the new config takes effect.
     # Awaited so a running stdio child gets terminated before we return —
     # otherwise the next call would race a brand-new state against the
@@ -167,6 +190,7 @@ async def remove_server(
     if not deleted:
         raise HTTPException(status_code=404, detail=f"No MCP server named '{name}'")
     await get_manager().forget_server(name)
+    await mcp_client_oauth.forget(name)
     mcp_events.publish_server_removed(name)
     return {"ok": True}
 
@@ -227,6 +251,8 @@ async def probe_transient(
         "command": command,
         "args": payload.get("args") or [],
         "env": payload.get("env") or {},
+        "auth": str(payload.get("auth") or ""),
+        "scope": str(payload.get("scope") or ""),
         "client_id": str(payload.get("client_id") or ""),
         "client_secret": incoming_secret,
         "token_endpoint": str(payload.get("token_endpoint") or ""),
@@ -235,6 +261,197 @@ async def probe_transient(
         "allowed_agents": payload.get("allowed_agents") or [],
     }
     return await get_manager().probe_record(record)
+
+
+# ── user-facing: OAuth sign-in to a remote server (DCR) ─────────────
+#
+# The protocol lives in mcp_client_oauth; these routes run its browser leg
+# exactly like the Google / Microsoft popups: an authenticated POST mints a
+# single-use ticket (also an HttpOnly SameSite=Strict cookie), /login takes it
+# only from that browser and sends the popup to the server's authorization
+# endpoint, and /callback completes only a state whose cookie this browser
+# holds. Every cookie lives under /fd/mcp/oauth.
+
+_OAUTH_MESSAGE_TYPE = "captain-claw-mcp-oauth"
+_OAUTH_COOKIE_PATH = "/fd/mcp/oauth"
+_OAUTH_STATE_COOKIE = "fd_mcp_oauth"
+_OAUTH_TICKET_COOKIE = "fd_mcp_ticket"
+_OAUTH_PENDING_TTL = 600
+_OAUTH_TICKET_TTL = 120
+
+_pending_oauth: dict[str, dict[str, Any]] = {}
+_oauth_tickets: dict[str, dict[str, Any]] = {}
+
+
+def _purge_stale_oauth() -> None:
+    now = time.time()
+    for store, ttl in ((_pending_oauth, _OAUTH_PENDING_TTL), (_oauth_tickets, _OAUTH_TICKET_TTL)):
+        for k in [k for k, v in store.items() if v.get("ts", 0) < now - ttl]:
+            store.pop(k, None)
+
+
+def _oauth_redirect_uri(request: Request) -> str:
+    """Registered with the server's authorization server at sign-in time, so
+    no admin has to copy it anywhere (unless the server lacks DCR)."""
+    public = _g._public_url()
+    if public:
+        return f"{public}/fd/mcp/oauth/callback"
+    host = request.headers.get("host") or request.url.netloc
+    return f"{request.url.scheme}://{host}/fd/mcp/oauth/callback"
+
+
+def _oauth_page(*, ok: bool, title: str, detail: str = "", status_code: int = 200) -> HTMLResponse:
+    return _g._callback_html(
+        ok=ok, title=title, detail=detail, status_code=status_code,
+        message_type=_OAUTH_MESSAGE_TYPE,
+    )
+
+
+def _oauth_server(name: str) -> dict[str, Any]:
+    record = mcp_storage.get_server(name)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"No MCP server named '{name}'")
+    if not mcp_client_oauth.is_oauth(record):
+        raise HTTPException(
+            status_code=400,
+            detail=f"MCP server '{name}' doesn't use OAuth sign-in — set its Auth to 'OAuth sign-in' first",
+        )
+    return record
+
+
+@router.post("/oauth/connect-ticket")
+async def oauth_connect_ticket(
+    request: Request,
+    payload: dict = Body(...),
+    user: dict = Depends(get_current_user),
+) -> JSONResponse:
+    """A single-use ticket that lets THIS browser start a sign-in to ``server``."""
+    name = str(payload.get("server") or "").strip()
+    _oauth_server(name)
+    _purge_stale_oauth()
+    label = str(user.get("email") or user.get("display_name") or user.get("id") or "")
+    ticket = secrets.token_urlsafe(32)
+    _oauth_tickets[ticket] = {"server": name, "by": label, "ts": time.time()}
+    resp = JSONResponse({"ticket": ticket}, headers={"Cache-Control": "no-store"})
+    resp.set_cookie(
+        key=_OAUTH_TICKET_COOKIE, value=ticket, max_age=_OAUTH_TICKET_TTL, httponly=True,
+        samesite="strict", path=_OAUTH_COOKIE_PATH, secure=_g._state_cookie_secure(request),
+    )
+    return resp
+
+
+@router.get("/oauth/login")
+async def oauth_login(request: Request) -> Response:
+    """Discover + register (DCR) as needed, then send the popup to the
+    server's authorization endpoint."""
+    ticket = request.query_params.get("ticket", "")
+    entry = _oauth_tickets.pop(ticket, None) if ticket else None
+    if (
+        not entry
+        or time.time() - float(entry.get("ts") or 0) > _OAUTH_TICKET_TTL
+        or not _g._same_secret(ticket, request.cookies.get(_OAUTH_TICKET_COOKIE, ""))
+    ):
+        return _oauth_page(
+            ok=False,
+            title="Sign-in link expired",
+            detail=(
+                "This link is expired, already used, or was opened outside the "
+                "Flight Deck tab that created it. Click Sign in again."
+            ),
+            status_code=401,
+        )
+    record = mcp_storage.get_server(str(entry["server"]))
+    if record is None or not mcp_client_oauth.is_oauth(record):
+        return _oauth_page(ok=False, title="MCP server not found", status_code=404)
+    _purge_stale_oauth()
+    state = secrets.token_urlsafe(32)
+    try:
+        url, pending = await mcp_client_oauth.begin_sign_in(
+            record, _oauth_redirect_uri(request), state,
+        )
+    except mcp_client_oauth.MCPOAuthError as exc:
+        return _oauth_page(ok=False, title=f"Can't sign in to {record['name']}", detail=str(exc))
+    browser = secrets.token_urlsafe(32)
+    _pending_oauth[state] = {**pending, "by": entry.get("by", ""), "browser": browser, "ts": time.time()}
+    resp = RedirectResponse(url, status_code=302)
+    secure = _g._state_cookie_secure(request)
+    resp.set_cookie(
+        key=_OAUTH_STATE_COOKIE, value=browser, max_age=_OAUTH_PENDING_TTL, httponly=True,
+        samesite="lax", path=_OAUTH_COOKIE_PATH, secure=secure,
+    )
+    resp.delete_cookie(
+        _OAUTH_TICKET_COOKIE, path=_OAUTH_COOKIE_PATH, secure=secure, httponly=True, samesite="strict",
+    )
+    return resp
+
+
+@router.get("/oauth/callback")
+async def oauth_callback(request: Request) -> HTMLResponse:
+    """The authorization server's redirect back: swap the code for tokens."""
+    resp = await _complete_oauth_callback(request)
+    resp.delete_cookie(
+        _OAUTH_STATE_COOKIE, path=_OAUTH_COOKIE_PATH, secure=_g._state_cookie_secure(request),
+        httponly=True, samesite="lax",
+    )
+    return resp
+
+
+async def _complete_oauth_callback(request: Request) -> HTMLResponse:
+    state = request.query_params.get("state", "")
+    pending = _pending_oauth.pop(state, None) if state else None
+    if pending and time.time() - float(pending.get("ts") or 0) > _OAUTH_PENDING_TTL:
+        pending = None
+
+    error = request.query_params.get("error")
+    if error:
+        desc = request.query_params.get("error_description", error)
+        return _oauth_page(ok=False, title="Sign-in error", detail=desc.splitlines()[0][:400])
+    code = request.query_params.get("code", "")
+    if not code or not state:
+        return _oauth_page(ok=False, title="Missing code or state")
+    if not pending:
+        return _oauth_page(ok=False, title="Invalid or expired state, please try again.")
+    if not _g._same_secret(str(pending.get("browser") or ""), request.cookies.get(_OAUTH_STATE_COOKIE, "")):
+        log.warning("MCP OAuth callback refused: state not started in this browser")
+        return _oauth_page(
+            ok=False,
+            title="Sign-in not started in this browser",
+            detail="Nothing was saved. Open Flight Deck in this browser and click Sign in again.",
+            status_code=400,
+        )
+    name = str(pending["server"])
+    record = mcp_storage.get_server(name)
+    if record is None or record.get("url") != pending.get("server_url") or not mcp_client_oauth.is_oauth(record):
+        return _oauth_page(ok=False, title="The MCP server changed during sign-in — nothing was saved.")
+    try:
+        await mcp_client_oauth.complete_sign_in(
+            pending, code,
+            connected_by=str(pending.get("by") or ""),
+            issuer=request.query_params.get("iss", ""),
+        )
+    except mcp_client_oauth.MCPOAuthError as exc:
+        log.warning("MCP OAuth token exchange failed", server=name, error=str(exc))
+        return _oauth_page(ok=False, title="Token exchange failed", detail=str(exc))
+    # New credentials: drop the cached session so the next call uses them,
+    # and tell agents to fetch the (now reachable) tool list.
+    await get_manager().forget_server(name)
+    mcp_events.publish_server_updated(name)
+    return _oauth_page(ok=True, title="Connected", detail=f"Flight Deck is signed in to {name}.")
+
+
+@router.post("/oauth/disconnect")
+async def oauth_disconnect(
+    payload: dict = Body(...),
+    _user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Sign Flight Deck out of ``server`` (revoking the token when the server
+    supports it)."""
+    name = str(payload.get("server") or "").strip()
+    record = _oauth_server(name)
+    await mcp_client_oauth.sign_out(record)
+    await get_manager().forget_server(name)
+    mcp_events.publish_server_updated(name)
+    return {"ok": True}
 
 
 # ── shared SSE helpers (used by both streaming routes below) ────────

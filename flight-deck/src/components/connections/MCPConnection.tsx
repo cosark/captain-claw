@@ -14,8 +14,11 @@ import {
   Pencil,
   Users,
   Globe,
+  LogIn,
+  LogOut,
 } from 'lucide-react'
 import {
+  openSignInPopup,
   useMCPStore,
   type MCPServer,
   type MCPServerInput,
@@ -26,6 +29,35 @@ import { useAuthStore } from '../../stores/authStore'
 import { AgentAllowlistPicker } from './AgentAllowlistPicker'
 
 const SECRET_PLACEHOLDER = '••••••••'
+
+// How an http server authenticates. 'client_credentials' and 'none' are both
+// stored as auth '' (client_credentials = client_id + token_endpoint set).
+type AuthChoice = 'none' | 'client_credentials' | 'oauth'
+
+const AUTH_LABELS: Record<AuthChoice, string> = {
+  none: 'None',
+  client_credentials: 'Client credentials',
+  oauth: 'OAuth sign-in',
+}
+
+function authChoiceOf(server?: MCPServer): AuthChoice {
+  if (!server) return 'none'
+  if (server.auth === 'oauth') return 'oauth'
+  return server.client_id ? 'client_credentials' : 'none'
+}
+
+function probeText(probe: MCPProbeResult): string {
+  if (probe.ok && probe.needs_sign_in) {
+    return `Sign-in ready — ${probe.issuer || 'the authorization server'} ${
+      probe.registration_supported
+        ? 'supports dynamic client registration'
+        : 'will use the client ID you entered'
+    }. Save, then sign in.`
+  }
+  if (!probe.ok) return `Probe failed: ${probe.error}`
+  const n = probe.tools_count ?? 0
+  return `Probe ok — ${n} tool${n === 1 ? '' : 's'}`
+}
 
 // A stdio server is a command FD spawns on its host, so the backend lets only
 // an admin add / edit / test / remove one. With auth off the single local user
@@ -39,6 +71,8 @@ function emptyForm(): MCPServerInput {
     name: '',
     transport: 'http',
     url: '',
+    auth: '',
+    scope: '',
     client_id: '',
     client_secret: '',
     token_endpoint: '',
@@ -56,6 +90,8 @@ function fromServer(server: MCPServer): MCPServerInput {
     name: server.name,
     transport: server.transport || 'http',
     url: server.url || '',
+    auth: server.auth || '',
+    scope: server.scope || '',
     client_id: server.client_id || '',
     client_secret: server.client_secret_set ? SECRET_PLACEHOLDER : '',
     token_endpoint: server.token_endpoint || '',
@@ -76,14 +112,20 @@ interface ServerRowProps {
 }
 
 function ServerRow({ server, onEdit, readOnly = false }: ServerRowProps) {
-  const { testing, lastTestResult, testServer, removeServer } = useMCPStore()
+  const { testing, lastTestResult, testServer, removeServer, signIn, signOut } = useMCPStore()
   const [confirming, setConfirming] = useState(false)
   const isTesting = !!testing[server.name]
   const result = lastTestResult[server.name]
   const transport: MCPTransport = server.transport || 'http'
   const allowed = server.allowed_agents || []
+  const isOAuth = transport === 'http' && server.auth === 'oauth'
+  const signedIn = isOAuth && !!server.oauth?.connected
 
-  const statusPill = server.initialized ? (
+  const statusPill = isOAuth && !signedIn ? (
+    <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full border bg-amber-500/15 text-amber-400 border-amber-500/30">
+      <AlertCircle className="h-3 w-3" /> Sign-in needed
+    </span>
+  ) : server.initialized ? (
     <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full border bg-emerald-500/15 text-emerald-500 border-emerald-500/30">
       <Check className="h-3 w-3" /> Connected
     </span>
@@ -119,7 +161,11 @@ function ServerRow({ server, onEdit, readOnly = false }: ServerRowProps) {
               )}
               {transport}
             </span>
-            {transport === 'http' && server.client_id && (
+            {isOAuth ? (
+              <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full border bg-blue-500/10 text-blue-400 border-blue-500/30">
+                OAuth sign-in
+              </span>
+            ) : transport === 'http' && server.client_id && (
               <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full border bg-blue-500/10 text-blue-400 border-blue-500/30">
                 OAuth2
               </span>
@@ -160,6 +206,12 @@ function ServerRow({ server, onEdit, readOnly = false }: ServerRowProps) {
               {(server.args && server.args.length > 0) ? ' ' + server.args.join(' ') : ''}
             </div>
           )}
+          {signedIn && (
+            <div className="text-xs text-emerald-400 mt-1 break-all">
+              Signed in{server.oauth?.connected_by ? ` by ${server.oauth.connected_by}` : ''}
+              {server.oauth?.issuer ? ` · ${server.oauth.issuer}` : ''}
+            </div>
+          )}
           {allowed.length > 0 && (
             <div className="text-[11px] text-zinc-500 mt-1 flex flex-wrap gap-1">
               {allowed.map((slug) => (
@@ -189,11 +241,7 @@ function ServerRow({ server, onEdit, readOnly = false }: ServerRowProps) {
                 (result.ok ? 'text-emerald-400' : 'text-red-400')
               }
             >
-              {result.ok
-                ? `Probe ok — ${result.tools_count ?? 0} tool${
-                    (result.tools_count ?? 0) === 1 ? '' : 's'
-                  }`
-                : `Probe failed: ${result.error}`}
+              {probeText(result)}
             </div>
           )}
         </div>
@@ -206,6 +254,33 @@ function ServerRow({ server, onEdit, readOnly = false }: ServerRowProps) {
           </span>
         ) : (
           <div className="flex items-center gap-1.5 flex-wrap shrink-0">
+            {isOAuth && (
+              <button
+                type="button"
+                onClick={() => signIn(server.name)}
+                className={
+                  'inline-flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs ' +
+                  (signedIn
+                    ? 'border border-zinc-700 hover:bg-zinc-800 text-zinc-200'
+                    : 'bg-violet-600 hover:bg-violet-500 text-white')
+                }
+                title="Sign Flight Deck in to this server in a popup (OAuth with dynamic client registration)"
+              >
+                <LogIn className="h-3.5 w-3.5" />
+                {signedIn ? 'Reconnect' : 'Sign in'}
+              </button>
+            )}
+            {signedIn && (
+              <button
+                type="button"
+                onClick={() => signOut(server.name)}
+                className="inline-flex items-center gap-1.5 rounded-md border border-zinc-700 hover:bg-zinc-800 px-2.5 py-1.5 text-xs text-zinc-200"
+                title="Forget this server's tokens (and revoke them, when the server supports it)"
+              >
+                <LogOut className="h-3.5 w-3.5" />
+                Sign out
+              </button>
+            )}
             <button
               type="button"
               onClick={onEdit}
@@ -277,10 +352,11 @@ interface ServerFormProps {
 }
 
 function ServerForm({ initial, onClose, allowStdio = true }: ServerFormProps) {
-  const { saving, saveServer, probeTransient } = useMCPStore()
+  const { saving, saveServer, probeTransient, signIn } = useMCPStore()
   const [form, setForm] = useState<MCPServerInput>(
     initial ? fromServer(initial) : emptyForm(),
   )
+  const [authChoice, setAuthChoice] = useState<AuthChoice>(authChoiceOf(initial))
   const [probing, setProbing] = useState(false)
   const [probe, setProbe] = useState<MCPProbeResult | null>(null)
 
@@ -320,11 +396,20 @@ function ServerForm({ initial, onClose, allowStdio = true }: ServerFormProps) {
     }
     if (transport === 'http') {
       payload.url = (form.url || '').trim()
-      payload.client_id = (form.client_id || '').trim()
-      // SECRET_PLACEHOLDER means "keep what was already stored".
-      payload.client_secret =
-        form.client_secret === SECRET_PLACEHOLDER ? '' : form.client_secret || ''
-      payload.token_endpoint = (form.token_endpoint || '').trim()
+      payload.auth = authChoice === 'oauth' ? 'oauth' : ''
+      payload.scope = authChoice === 'oauth' ? (form.scope || '').trim() : ''
+      if (authChoice === 'none') {
+        payload.client_id = ''
+        payload.client_secret = ''
+        payload.token_endpoint = ''
+      } else {
+        payload.client_id = (form.client_id || '').trim()
+        // SECRET_PLACEHOLDER means "keep what was already stored".
+        payload.client_secret =
+          form.client_secret === SECRET_PLACEHOLDER ? '' : form.client_secret || ''
+        payload.token_endpoint =
+          authChoice === 'client_credentials' ? (form.token_endpoint || '').trim() : ''
+      }
     } else {
       payload.command = (form.command || '').trim()
       payload.args = argsText.trim()
@@ -355,10 +440,21 @@ function ServerForm({ initial, onClose, allowStdio = true }: ServerFormProps) {
     }
   }
 
+  // An OAuth server nobody has signed in to yet is saved and signed in to in
+  // one click; the popup must open now, before any await, or it's blocked.
+  const signInOnSave =
+    transport === 'http' && authChoice === 'oauth' && !initial?.oauth?.connected
+
   async function onSave() {
     if (!valid) return
+    const popup = signInOnSave ? openSignInPopup() : null
     const saved = await saveServer(buildPayload())
-    if (saved) onClose()
+    if (!saved) {
+      popup?.close()
+      return
+    }
+    onClose()
+    if (signInOnSave) await signIn(saved.name, popup)
   }
 
   return (
@@ -432,34 +528,85 @@ function ServerForm({ initial, onClose, allowStdio = true }: ServerFormProps) {
                 className="w-full rounded-md bg-zinc-900 border border-zinc-800 px-2.5 py-1.5 text-sm text-zinc-100 focus:outline-none focus:border-violet-500"
               />
             </label>
-            <label className="text-xs text-zinc-400 space-y-1">
-              <span>Client ID</span>
-              <input
-                value={form.client_id || ''}
-                onChange={(e) => update('client_id', e.target.value)}
-                placeholder="optional, for OAuth2 client_credentials"
-                className="w-full rounded-md bg-zinc-900 border border-zinc-800 px-2.5 py-1.5 text-sm text-zinc-100 focus:outline-none focus:border-violet-500"
-              />
-            </label>
-            <label className="text-xs text-zinc-400 space-y-1">
-              <span>Client Secret</span>
-              <input
-                type="password"
-                value={form.client_secret || ''}
-                onChange={(e) => update('client_secret', e.target.value)}
-                placeholder={isEdit ? 'leave blank to keep existing' : 'optional'}
-                className="w-full rounded-md bg-zinc-900 border border-zinc-800 px-2.5 py-1.5 text-sm text-zinc-100 focus:outline-none focus:border-violet-500"
-              />
-            </label>
-            <label className="text-xs text-zinc-400 space-y-1 sm:col-span-2">
-              <span>Token endpoint</span>
-              <input
-                value={form.token_endpoint || ''}
-                onChange={(e) => update('token_endpoint', e.target.value)}
-                placeholder="absolute URL or path, e.g. /api/mcp/oauth/token"
-                className="w-full rounded-md bg-zinc-900 border border-zinc-800 px-2.5 py-1.5 text-sm text-zinc-100 focus:outline-none focus:border-violet-500"
-              />
-            </label>
+            <div className="text-xs text-zinc-400 space-y-1 sm:col-span-2">
+              <span>Auth</span>
+              <div className="flex">
+                <div className="inline-flex rounded-md border border-zinc-800 bg-zinc-900 p-0.5 flex-wrap">
+                  {(Object.keys(AUTH_LABELS) as AuthChoice[]).map((choice) => (
+                    <button
+                      key={choice}
+                      type="button"
+                      onClick={() => setAuthChoice(choice)}
+                      className={
+                        'rounded px-3 py-1 text-xs ' +
+                        (authChoice === choice
+                          ? 'bg-violet-600 text-white'
+                          : 'text-zinc-400 hover:text-zinc-200')
+                      }
+                    >
+                      {AUTH_LABELS[choice]}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+            {authChoice === 'oauth' && (
+              <>
+                <div className="text-[11px] text-zinc-500 sm:col-span-2">
+                  Flight Deck finds the server's authorization server and registers itself
+                  there (Dynamic Client Registration), then you sign in in a popup. Fill in a
+                  client ID only for a server without registration — register it with the
+                  redirect URI <span className="font-mono text-zinc-400">{window.location.origin}/fd/mcp/oauth/callback</span>.
+                </div>
+                <label className="text-xs text-zinc-400 space-y-1 sm:col-span-2">
+                  <span>Scopes</span>
+                  <input
+                    value={form.scope || ''}
+                    onChange={(e) => update('scope', e.target.value)}
+                    placeholder="optional — leave empty for the server's own"
+                    className="w-full rounded-md bg-zinc-900 border border-zinc-800 px-2.5 py-1.5 text-sm text-zinc-100 focus:outline-none focus:border-violet-500"
+                  />
+                </label>
+              </>
+            )}
+            {authChoice !== 'none' && (
+              <>
+                <label className="text-xs text-zinc-400 space-y-1">
+                  <span>Client ID</span>
+                  <input
+                    value={form.client_id || ''}
+                    onChange={(e) => update('client_id', e.target.value)}
+                    placeholder={
+                      authChoice === 'oauth'
+                        ? 'optional — empty registers automatically'
+                        : 'OAuth2 client_credentials client'
+                    }
+                    className="w-full rounded-md bg-zinc-900 border border-zinc-800 px-2.5 py-1.5 text-sm text-zinc-100 focus:outline-none focus:border-violet-500"
+                  />
+                </label>
+                <label className="text-xs text-zinc-400 space-y-1">
+                  <span>Client Secret</span>
+                  <input
+                    type="password"
+                    value={form.client_secret || ''}
+                    onChange={(e) => update('client_secret', e.target.value)}
+                    placeholder={isEdit ? 'leave blank to keep existing' : 'optional'}
+                    className="w-full rounded-md bg-zinc-900 border border-zinc-800 px-2.5 py-1.5 text-sm text-zinc-100 focus:outline-none focus:border-violet-500"
+                  />
+                </label>
+              </>
+            )}
+            {authChoice === 'client_credentials' && (
+              <label className="text-xs text-zinc-400 space-y-1 sm:col-span-2">
+                <span>Token endpoint</span>
+                <input
+                  value={form.token_endpoint || ''}
+                  onChange={(e) => update('token_endpoint', e.target.value)}
+                  placeholder="absolute URL or path, e.g. /api/mcp/oauth/token"
+                  className="w-full rounded-md bg-zinc-900 border border-zinc-800 px-2.5 py-1.5 text-sm text-zinc-100 focus:outline-none focus:border-violet-500"
+                />
+              </label>
+            )}
           </>
         ) : (
           <>
@@ -519,7 +666,7 @@ function ServerForm({ initial, onClose, allowStdio = true }: ServerFormProps) {
               : 'border-red-500/30 bg-red-500/10 text-red-300')
           }
         >
-          {probe.ok
+          {probe.ok && !probe.needs_sign_in
             ? `Probe ok — discovered ${probe.tools_count ?? 0} tool${
                 (probe.tools_count ?? 0) === 1 ? '' : 's'
               }${
@@ -529,7 +676,7 @@ function ServerForm({ initial, onClose, allowStdio = true }: ServerFormProps) {
                     }`
                   : ''
               }`
-            : `Probe failed: ${probe.error}`}
+            : probeText(probe)}
         </div>
       )}
 
@@ -555,12 +702,14 @@ function ServerForm({ initial, onClose, allowStdio = true }: ServerFormProps) {
         >
           {saving ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : signInOnSave ? (
+            <LogIn className="h-3.5 w-3.5" />
           ) : isEdit ? (
             <Check className="h-3.5 w-3.5" />
           ) : (
             <Plus className="h-3.5 w-3.5" />
           )}
-          {isEdit ? 'Save changes' : 'Save server'}
+          {signInOnSave ? 'Save & sign in' : isEdit ? 'Save changes' : 'Save server'}
         </button>
       </div>
     </div>
@@ -568,7 +717,7 @@ function ServerForm({ initial, onClose, allowStdio = true }: ServerFormProps) {
 }
 
 export default function MCPConnection() {
-  const { servers, loading, error, refresh } = useMCPStore()
+  const { servers, loading, error, notice, refresh, startMessageListener } = useMCPStore()
   const canManageStdio = useCanManageStdio()
   const [collapsed, setCollapsed] = useState(false)
   const [adding, setAdding] = useState(false)
@@ -577,6 +726,8 @@ export default function MCPConnection() {
   useEffect(() => {
     refresh()
   }, [refresh])
+
+  useEffect(() => startMessageListener(), [startMessageListener])
 
   const totalTools = servers.reduce(
     (sum, s) => sum + (s.tools_count || 0),
@@ -640,6 +791,12 @@ export default function MCPConnection() {
             <div className="flex items-start gap-2 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-500">
               <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
               <span className="break-all">{error}</span>
+            </div>
+          )}
+          {notice && !error && (
+            <div className="flex items-start gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-400">
+              <Check className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+              <span className="break-all">{notice}</span>
             </div>
           )}
 

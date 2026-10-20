@@ -29,7 +29,7 @@ import asyncio
 import time
 from typing import Any, Callable
 
-from captain_claw.flight_deck import mcp_events, mcp_storage
+from captain_claw.flight_deck import mcp_client_oauth, mcp_events, mcp_storage
 from captain_claw.flight_deck.mcp_transport import (
     HttpTransport,
     MCPTransportError,
@@ -276,6 +276,9 @@ class MCPManager:
         Always closes the transport before returning so a probe of a
         stdio record doesn't leak a child process.
         """
+        if mcp_client_oauth.is_oauth(record) and not mcp_client_oauth.public_status(record)["connected"]:
+            # Nothing to call with yet — check that sign-in can work instead.
+            return await _probe_sign_in(record)
         try:
             state = _ServerState(record)
         except Exception as exc:
@@ -312,6 +315,8 @@ class MCPManager:
             state = await self._state_for(name)
         except KeyError as exc:
             return {"ok": False, "error": str(exc)}
+        if mcp_client_oauth.is_oauth(state.record) and not mcp_client_oauth.public_status(state.record)["connected"]:
+            return await _probe_sign_in(state.record)
         # Force a clean run so an old cached failure doesn't poison the
         # test. For HTTP this resets the session/token; for stdio the
         # existing child stays (it's still healthy if it responded last
@@ -341,15 +346,43 @@ class MCPManager:
         out: list[dict[str, Any]] = []
         for rec in records:
             state = self._states.get(rec["name"])
-            out.append(
-                {
-                    **rec,
-                    "initialized": bool(state and state.initialized),
-                    "tools_count": len(state.tools) if state else 0,
-                    "last_error": state.last_error if state else None,
-                }
-            )
+            entry = {
+                **rec,
+                "initialized": bool(state and state.initialized),
+                "tools_count": len(state.tools) if state else 0,
+                "last_error": state.last_error if state else None,
+            }
+            if mcp_client_oauth.is_oauth(rec):
+                entry["oauth"] = mcp_client_oauth.public_status(rec)
+            out.append(entry)
         return out
+
+
+async def _probe_sign_in(record: dict[str, Any]) -> dict[str, Any]:
+    """Probe for an OAuth server nobody has signed in to: run discovery and
+    say whether Flight Deck can register itself there. Never raises."""
+    try:
+        found = await mcp_client_oauth.discover(
+            str(record.get("url") or ""), headers=record.get("headers") or {},
+        )
+    except mcp_client_oauth.MCPOAuthError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "error": f"discovery failed: {exc}"}
+    can_register = bool(found["registration_endpoint"]) or bool(record.get("client_id"))
+    return {
+        "ok": can_register,
+        "needs_sign_in": True,
+        "issuer": found["issuer"],
+        "registration_supported": bool(found["registration_endpoint"]),
+        "scope": found["scope"],
+        **({} if can_register else {
+            "error": (
+                f"{found['issuer']} has no dynamic client registration — enter a "
+                "client ID registered with it by hand"
+            ),
+        }),
+    }
 
 
 # ── module-level singleton ──────────────────────────────────────────
