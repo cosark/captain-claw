@@ -11,14 +11,18 @@ and what it has done:
 - its schedules: the deck's scheduled tasks for it and its own cron jobs;
 - its conversation topics and open intentions.
 
-The owner's fast tier writes the set (the File library's model): the 6 cards
-offered up front first, then the "More" list, 8 at a time, up to 16 — each
-step cached as it lands, in the agent's folder (``kiosk_skills.json``, gone
-with the agent). The set is rewritten when the agent's make-up changes (name,
-description, archetype, instructions, tools, accounts, scheduled tasks) or it
-is ``_TTL`` old, which is how new topics and experience reach it. Until then —
-and without a model, or with the day's allowance spent — cards are built
-straight from the schedules, intentions and topics.
+The owner's fast tier writes them (the File library's model). The 6 cards
+offered up front are written on their own and cached in the agent's folder
+(``kiosk_skills.json``, gone with the agent); they are rewritten when the
+agent's make-up changes (name, description, archetype, instructions, tools,
+accounts, scheduled tasks) or they are ``_TTL`` old, which is how new topics
+and experience reach them. Until then — and without a model, or with the
+day's allowance spent — cards are built straight from the schedules,
+intentions and topics.
+
+The "More" list (up to 16, written 8 at a time) is written only when the
+person asks for it — the More dialog asks when it opens and has none — and
+kept, with when it was written, until they ask again: never on its own.
 """
 
 from __future__ import annotations
@@ -57,7 +61,7 @@ ICONS = (
 SOURCES = ("archetype", "experience", "schedule", "topic", "intention")
 
 _TOP = 6                  # the cards offered up front (the composer's list)
-_MORE = 16                # and behind its "More"
+_MORE = 16                # and behind its "More", written only when asked for
 _MAX_SKILLS = _TOP + _MORE
 _VERSION = 2              # in the fingerprint: a new card set rewrites every cache
 _TTL = 12 * 3600          # a model-written set is rewritten after this
@@ -69,7 +73,7 @@ _RETRY_NUDGE = "Reply now with the JSON object only: no thinking aloud, no prose
 _AGENT_TIMEOUT = 5.0      # each read from the running agent
 _CACHE_FILE = "kiosk_skills.json"
 
-# One write per agent at a time.
+# One write per agent at a time — and one of its "More" list (key "<slug>:more").
 _RUNNING: dict[str, asyncio.Task] = {}
 
 
@@ -264,18 +268,20 @@ def basic_skills(make_up: dict, done: dict | None = None) -> list[dict]:
         "What can you do?", "A short tour of what I'm set up for, with examples",
         "What can you do for me? Give me a short list of concrete things you can do, with an example request for each.",
         "sparkles", "archetype"))
-    return _dedupe(cards)
+    return _dedupe(cards, _TOP)
 
 
-def _dedupe(cards: list[dict]) -> list[dict]:
-    seen: set[str] = set()
+def _dedupe(cards: list[dict], limit: int = _MAX_SKILLS, skip: list[dict] = ()) -> list[dict]:
+    """The cards with a title and a prompt, each title once and none of
+    *skip*'s, at most *limit*."""
+    seen = {c["title"].casefold() for c in skip}
     out: list[dict] = []
     for c in cards:
         key = c["title"].casefold()
         if c["title"] and c["prompt"] and key not in seen:
             seen.add(key)
             out.append(c)
-    return out[:_MAX_SKILLS]
+    return out[:limit]
 
 
 # ── Cards from the model ──────────────────────────────────────────────
@@ -402,12 +408,21 @@ def _cache_path(slug: str) -> Path:
     return _data_dir() / slug / _CACHE_FILE
 
 
+def _migrate(data: dict) -> dict:
+    """A set written before the "More" list was asked for apart (every card
+    in ``skills``): its extra cards become the More list."""
+    if "more" not in data and data.get("source") == "model" and len(data.get("skills") or []) > _TOP:
+        return {**data, "skills": data["skills"][:_TOP], "more": data["skills"][_TOP:],
+                "more_generated_at": data.get("generated_at")}
+    return data
+
+
 def read_cache(slug: str) -> dict | None:
     try:
         data = json.loads(_cache_path(slug).read_text())
     except (OSError, ValueError):
         return None
-    return data if isinstance(data, dict) and isinstance(data.get("skills"), list) else None
+    return _migrate(data) if isinstance(data, dict) else None
 
 
 def _write_cache(slug: str, payload: dict) -> None:
@@ -419,7 +434,18 @@ def _write_cache(slug: str, payload: dict) -> None:
     tmp.replace(path)
 
 
+def _update_cache(slug: str, **fields: Any) -> dict:
+    """Write *fields* over the cached set, keeping the rest: the cards up
+    front and the More list are written apart, maybe at the same time (no
+    await between the read and the write)."""
+    data = {**(read_cache(slug) or {}), **fields}
+    _write_cache(slug, data)
+    return data
+
+
 def is_fresh(cache: dict | None, fp: str, now: float | None = None) -> bool:
+    """Are the cards up front current? (The More list never goes stale on
+    its own: the person asks for a new one.)"""
     if not cache or cache.get("fingerprint") != fp:
         return False
     # A set built without the model, or a model set kept over a failed
@@ -454,18 +480,16 @@ async def _model_skills(tier: dict, make_up: dict, done: dict, owner_id: str,
 
 
 async def generate(slug: str, entry: dict, owner_id: str) -> dict:
-    """Write the agent's cards and cache them, in two passes: the cards up
-    front (cached at once, so they show while the rest are written), then the
-    "More" list. Without a tier, with the allowance spent or after bad
-    replies, the last model-written cards stay (tried again sooner); with
-    none, the cards built without the model."""
+    """Write the agent's cards up front and cache them; the More list stays as
+    it is. Without a tier, with the allowance spent or after bad replies, the
+    last model-written cards stay (tried again sooner); with none, the cards
+    built without the model."""
     from captain_claw.flight_deck.server import _process_is_alive
 
     make_up = await _make_up(slug, entry, owner_id)
     done = await _agent_reads(entry) if _process_is_alive(slug) else {}
     prev = read_cache(slug)
-    prev_model = prev if prev and prev.get("source") == "model" else None
-    payload: dict = {
+    fields: dict = {
         "fingerprint": fingerprint(make_up), "generated_at": time.time(),
         "skills": basic_skills(make_up, done), "source": "basic", "model": "", "error": "",
     }
@@ -477,65 +501,88 @@ async def generate(slug: str, entry: dict, owner_id: str) -> dict:
         error = "daily allowance spent"
     else:
         try:
-            top = await _model_skills(tier, make_up, done, owner_id)
-            payload.update(skills=top, source="model", model=str(tier.get("model") or ""))
+            fields.update(skills=await _model_skills(tier, make_up, done, owner_id), source="model",
+                          model=str(tier.get("model") or ""))
         except Exception as exc:
             log.info("agent skills: model write failed", agent=slug, error=str(exc))
             error = str(exc)[:300]
     if error:
-        payload["error"] = error
-        if prev_model:
-            payload.update(skills=prev_model["skills"], source="model", model=prev_model.get("model") or "")
-        _write_cache(slug, payload)
-        return payload
+        fields["error"] = error
+        if prev and prev.get("source") == "model":
+            fields.update(skills=prev["skills"], source="model", model=prev.get("model") or "")
+    return _update_cache(slug, **fields)
 
-    _write_cache(slug, payload)
-    cards = list(top)
-    while len(cards) < _MAX_SKILLS:
+
+async def generate_more(slug: str, entry: dict, owner_id: str) -> dict:
+    """Write the More list, asked for by the person: up to 16 cards, 8 at a
+    time, each batch told what is already offered and cached as it lands
+    (the new list replaces the old one with its first batch). Without a
+    tier, with the allowance spent or when nothing new comes, the earlier
+    list stays."""
+    from captain_claw.flight_deck.server import _process_is_alive
+
+    make_up = await _make_up(slug, entry, owner_id)
+    done = await _agent_reads(entry) if _process_is_alive(slug) else {}
+    top = (read_cache(slug) or {}).get("skills") or basic_skills(make_up, done)
+    tier = await _resolve_tier(owner_id)
+    error = ""
+    if not tier:
+        error = "no model tier set"
+    elif await _quota_spent(owner_id):
+        error = "daily allowance spent"
+    more: list[dict] = []
+    while not error and len(more) < _MORE:
         try:
-            batch = await _model_skills(tier, make_up, done, owner_id, offered=cards)
+            batch = await _model_skills(tier, make_up, done, owner_id, offered=top + more)
         except Exception as exc:
             log.info("agent skills: more cards failed", agent=slug, error=str(exc))
-            payload["error"] = str(exc)[:300]
-            if prev_model:  # the earlier "More" cards fill in, until the retry
-                cards = _dedupe(cards + prev_model["skills"][_TOP:])
+            error = str(exc)[:300]
             break
-        grown = _dedupe(cards + batch)
-        if len(grown) == len(cards):
+        grown = _dedupe(more + batch, _MORE, skip=top)
+        if len(grown) == len(more):
             break  # nothing new: the agent's range is covered
-        cards = grown
-        payload["skills"] = cards
-        _write_cache(slug, payload)
-    payload["skills"] = cards
-    _write_cache(slug, payload)
-    return payload
+        more = grown
+        _update_cache(slug, more=more, more_generated_at=time.time(), more_error="")
+    return _update_cache(slug, more_error=error)
 
 
-def _start(slug: str, entry: dict, owner_id: str) -> None:
-    task = _RUNNING.get(slug)
-    if task and not task.done():
+def _running(key: str) -> bool:
+    task = _RUNNING.get(key)
+    return bool(task and not task.done())
+
+
+def _start(slug: str, entry: dict, owner_id: str, more: bool = False) -> None:
+    """Write the cards up front — or, with *more*, the More list — in the
+    background, once at a time."""
+    key = f"{slug}:more" if more else slug
+    if _running(key):
         return
 
     async def run() -> None:
         try:
-            await generate(slug, entry, owner_id)
+            await (generate_more if more else generate)(slug, entry, owner_id)
         except Exception:
-            log.warning("agent skills: write failed", agent=slug, exc_info=True)
+            log.warning("agent skills: write failed", agent=slug, more=more, exc_info=True)
         finally:
-            _RUNNING.pop(slug, None)
+            _RUNNING.pop(key, None)
 
-    _RUNNING[slug] = asyncio.create_task(run())
+    _RUNNING[key] = asyncio.create_task(run())
 
 
 def _view(cache: dict | None, make_up: dict, slug: str) -> dict:
-    task = _RUNNING.get(slug)
     cache = cache or {}
+    top = cache.get("skills") or basic_skills(make_up)
     return {
-        "skills": cache.get("skills") or basic_skills(make_up),
+        "skills": top,
         "source": cache.get("source") or "basic",
         "model": cache.get("model") or "",
         "generated_at": cache.get("generated_at"),
-        "generating": bool(task and not task.done()),
+        "generating": _running(slug),
+        # Asked for apart; a card that became one up front shows there only.
+        "more": _dedupe(cache.get("more") or [], _MORE, skip=top),
+        "more_generated_at": cache.get("more_generated_at"),
+        "more_error": cache.get("more_error") or "",
+        "generating_more": _running(f"{slug}:more"),
     }
 
 
@@ -565,8 +612,18 @@ async def agent_skills(slug: str, user: dict = Depends(get_current_user)) -> dic
 
 @router.post("/{slug}/refresh")
 async def refresh_agent_skills(slug: str, user: dict = Depends(get_current_user)) -> dict:
-    """Write the agent's cards again now (in the background)."""
+    """Write the agent's cards up front again now (in the background)."""
     entry, owner_id = _owned(slug, user)
     make_up = await _make_up(slug, entry, owner_id)
     _start(slug, entry, owner_id)
+    return _view(read_cache(slug), make_up, slug)
+
+
+@router.post("/{slug}/more")
+async def more_agent_skills(slug: str, user: dict = Depends(get_current_user)) -> dict:
+    """Write the agent's More list now (in the background) — only ever on the
+    person's request."""
+    entry, owner_id = _owned(slug, user)
+    make_up = await _make_up(slug, entry, owner_id)
+    _start(slug, entry, owner_id, more=True)
     return _view(read_cache(slug), make_up, slug)

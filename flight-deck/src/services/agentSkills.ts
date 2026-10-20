@@ -24,13 +24,21 @@ export interface AgentSkill {
 }
 
 export interface AgentSkills {
+  /** The cards up front (kept fresh on their own). */
   skills: AgentSkill[]
   /** 'model' — written by the owner's fast tier; 'basic' — built from schedules and topics. */
   source: 'model' | 'basic'
   model: string
   generated_at: number | null
-  /** A new set is being written; ask again shortly. */
+  /** New cards up front are being written; ask again shortly. */
   generating: boolean
+  /** The "More" list — written only when asked for (`agentSkillsApi.more`). */
+  more: AgentSkill[]
+  /** When the More list was written (epoch seconds); null — never. */
+  more_generated_at: number | null
+  /** Why the last request for more came back with nothing. */
+  more_error: string
+  generating_more: boolean
 }
 
 export const SKILL_ICONS: Record<string, LucideIcon> = {
@@ -40,8 +48,8 @@ export const SKILL_ICONS: Record<string, LucideIcon> = {
   code: Code2, image: Image, wallet: Wallet,
 }
 
-/** The cards the composer's list offers; the rest are behind its "More"
- *  (Flight Deck writes up to 6 + 16). */
+/** The cards the composer's list offers; up to 16 more are written when the
+ *  "More" dialog asks for them. */
 export const SKILLS_UP_FRONT = 6
 
 /** The agent's process slug, for the agents that have cards (process agents). */
@@ -53,4 +61,7 @@ export const agentSkillsApi = {
   get: (slug: string) => api<AgentSkills>(`/fd/agent-skills/${encodeURIComponent(slug)}`),
   refresh: (slug: string) =>
     api<AgentSkills>(`/fd/agent-skills/${encodeURIComponent(slug)}/refresh`, { method: 'POST' }),
+  /** Write the More list now — only ever on the person's request. */
+  more: (slug: string) =>
+    api<AgentSkills>(`/fd/agent-skills/${encodeURIComponent(slug)}/more`, { method: 'POST' }),
 }

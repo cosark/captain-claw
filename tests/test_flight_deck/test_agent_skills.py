@@ -8,7 +8,10 @@
   (a model-written set lives longer than one built without it);
 * the owner reads their agent's cards; another user's agent is a 404;
 * a write caches the model's cards in the agent's folder, and falls back to
-  the cards built without it when the reply is no good.
+  the cards built without it when the reply is no good;
+* only the 6 up front are written on their own: the More list (16, 8 at a
+  time) only on request, kept with when it was written until asked again,
+  never touched by a rewrite of the cards up front.
 """
 
 from __future__ import annotations
@@ -175,7 +178,7 @@ def test_freshness():
 
 async def test_owner_reads_cards_others_get_404(deck, monkeypatch):
     started: list[str] = []
-    monkeypatch.setattr(skills, "_start", lambda slug, entry, owner: started.append(slug))
+    monkeypatch.setattr(skills, "_start", lambda slug, entry, owner, more=False: started.append(slug))
     _add_task("bob-agent", BOB)
     async with _client() as c:
         r = await c.get("/fd/agent-skills/bob-agent", headers=_auth(BOB))
@@ -212,7 +215,7 @@ async def test_write_caches_the_models_cards(deck, monkeypatch):
     monkeypatch.setattr(skills, "call_model", model)
     monkeypatch.setattr(skills, "_quota_spent", not_spent)
     started: list[str] = []
-    monkeypatch.setattr(skills, "_start", lambda slug, entry, owner: started.append(slug))
+    monkeypatch.setattr(skills, "_start", lambda slug, entry, owner, more=False: started.append(slug))
     entry = server._load_process_registry()["bob-agent"]
 
     payload = await skills.generate("bob-agent", entry, BOB)
@@ -281,45 +284,105 @@ def _cards(prefix: str, n: int) -> str:
                                    "prompt": f"Do {prefix} {i}.", "icon": "list"} for i in range(n)]})
 
 
-async def test_two_passes_up_front_then_more(deck, monkeypatch):
+async def test_automatic_write_is_the_cards_up_front_only(deck, monkeypatch):
     entry = server._load_process_registry()["bob-agent"]
-    seen_cache: list = []
-    sent = _patch_model(monkeypatch, [_cards("Top", 9), _cards("A", 10), _cards("B", 10)])
+    sent = _patch_model(monkeypatch, [_cards("Top", 9)])
     orig = skills.call_model
 
     async def watching(tier, system, user, owner, max_tokens=0, **kw):
-        if len(sent) == 1:  # the "More" pass: the cards up front are cached already
-            seen_cache.append(skills.read_cache("bob-agent"))
         assert kw.get("request_timeout") == skills._CALL_TIMEOUT
         return await orig(tier, system, user, owner, max_tokens)
 
     monkeypatch.setattr(skills, "call_model", watching)
     payload = await skills.generate("bob-agent", entry, BOB)
-    titles = [c["title"] for c in payload["skills"]]
-    assert titles[:6] == [f"Top {i}" for i in range(6)]          # capped at 6 up front
-    assert titles[6:] == [f"A {i}" for i in range(8)] + [f"B {i}" for i in range(8)]  # 8 at a time, 16 more
+    assert [c["title"] for c in payload["skills"]] == [f"Top {i}" for i in range(6)]  # capped at 6
+    assert len(sent) == 1 and "more" not in payload                # no More list on its own
+
+
+async def test_more_on_request_in_batches(deck, monkeypatch):
+    entry = server._load_process_registry()["bob-agent"]
+    sent = _patch_model(monkeypatch, [_cards("Top", 6), _cards("A", 10), _cards("B", 10)])
+    await skills.generate("bob-agent", entry, BOB)
+    seen_cache: list = []
+    orig = skills.call_model
+
+    async def watching(tier, system, user, owner, max_tokens=0, **kw):
+        if len(sent) == 2:  # the second batch: the first is cached already
+            seen_cache.append(skills.read_cache("bob-agent"))
+        return await orig(tier, system, user, owner, max_tokens)
+
+    monkeypatch.setattr(skills, "call_model", watching)
+    before = time.time()
+    payload = await skills.generate_more("bob-agent", entry, BOB)
+    more = [c["title"] for c in payload["more"]]
+    assert more == [f"A {i}" for i in range(8)] + [f"B {i}" for i in range(8)]  # 8 at a time, 16
+    assert [c["title"] for c in payload["skills"]] == [f"Top {i}" for i in range(6)]  # untouched
+    assert payload["more_generated_at"] >= before and payload["more_error"] == ""
     assert "Already offered:\n- Top 0: Top card 0" in sent[1]
-    assert "- A 7: A card 7" in sent[2]                          # the second batch knows the first
-    assert [c["title"] for c in seen_cache[0]["skills"]] == titles[:6]
+    assert "- A 7: A card 7" in sent[2]                           # the second batch knows the first
+    assert [c["title"] for c in seen_cache[0]["more"]] == more[:8]
 
 
-async def test_failed_more_pass_keeps_the_earlier_more_list(deck, monkeypatch):
+async def test_rewrite_up_front_keeps_the_more_list(deck, monkeypatch):
     entry = server._load_process_registry()["bob-agent"]
     _patch_model(monkeypatch, [_cards("Top", 6), _cards("A", 8), _cards("B", 8)])
     await skills.generate("bob-agent", entry, BOB)
-    _patch_model(monkeypatch, [_cards("New", 6), "no", "no"])
+    first = await skills.generate_more("bob-agent", entry, BOB)
+    _patch_model(monkeypatch, [_cards("New", 6)])
     payload = await skills.generate("bob-agent", entry, BOB)
-    titles = [c["title"] for c in payload["skills"]]
-    assert titles[:6] == [f"New {i}" for i in range(6)]
-    assert titles[6:] == [f"A {i}" for i in range(8)] + [f"B {i}" for i in range(8)]
-    assert payload["error"] and payload["source"] == "model"
+    assert [c["title"] for c in payload["skills"]] == [f"New {i}" for i in range(6)]
+    assert payload["more"] == first["more"] and payload["more_generated_at"] == first["more_generated_at"]
+
+
+async def test_failed_more_keeps_the_earlier_list(deck, monkeypatch):
+    entry = server._load_process_registry()["bob-agent"]
+    _patch_model(monkeypatch, [_cards("Top", 6), _cards("A", 8), _cards("B", 8)])
+    await skills.generate("bob-agent", entry, BOB)
+    first = await skills.generate_more("bob-agent", entry, BOB)
+    _patch_model(monkeypatch, ["no", "no"])
+    payload = await skills.generate_more("bob-agent", entry, BOB)
+    assert payload["more"] == first["more"] and payload["more_generated_at"] == first["more_generated_at"]
+    assert payload["more_error"]
 
 
 async def test_more_stops_when_nothing_new(deck, monkeypatch):
     entry = server._load_process_registry()["bob-agent"]
     sent = _patch_model(monkeypatch, [_cards("Top", 6), _cards("A", 3)])  # then A again: nothing new
-    payload = await skills.generate("bob-agent", entry, BOB)
-    assert len(payload["skills"]) == 9 and len(sent) == 3 and not payload["error"]
+    await skills.generate("bob-agent", entry, BOB)
+    payload = await skills.generate_more("bob-agent", entry, BOB)
+    assert len(payload["more"]) == 3 and len(sent) == 3 and not payload["more_error"]
+
+
+async def test_more_route_on_request_only(deck, monkeypatch):
+    started: list = []
+    monkeypatch.setattr(skills, "_start", lambda slug, entry, owner, more=False: started.append((slug, more)))
+    async with _client() as c:
+        r = await c.get("/fd/agent-skills/bob-agent", headers=_auth(BOB))
+        assert r.json()["more"] == [] and r.json()["more_generated_at"] is None
+        assert started == [("bob-agent", False)]                 # the cards up front only
+        r = await c.post("/fd/agent-skills/bob-agent/more", headers=_auth(BOB))
+        assert r.status_code == 200 and started[-1] == ("bob-agent", True)
+        r = await c.post("/fd/agent-skills/carol-agent/more", headers=_auth(BOB))
+        assert r.status_code == 404
+
+
+async def test_view_shows_a_card_once(deck, monkeypatch):
+    monkeypatch.setattr(skills, "_start", lambda *a, **k: None)
+    card = {"title": "Plan my week", "description": "", "prompt": "Plan my week.", "icon": "calendar",
+            "source": "archetype"}
+    other = {**card, "title": "Label my emails", "prompt": "Label my emails."}
+    skills._write_cache("bob-agent", {"skills": [card], "more": [card, other], "source": "model"})
+    async with _client() as c:
+        r = await c.get("/fd/agent-skills/bob-agent", headers=_auth(BOB))
+    assert [m["title"] for m in r.json()["more"]] == ["Label my emails"]
+
+
+def test_earlier_cache_migrates(deck):
+    many = [{"title": f"T {i}", "description": "", "prompt": f"Do {i}.", "icon": "list", "source": "archetype"}
+            for i in range(22)]
+    skills._write_cache("bob-agent", {"skills": many, "source": "model", "generated_at": 123.0})
+    cached = skills.read_cache("bob-agent")
+    assert len(cached["skills"]) == 6 and len(cached["more"]) == 16 and cached["more_generated_at"] == 123.0
 
 
 async def test_failed_rewrite_keeps_the_last_good_set(deck, monkeypatch):
