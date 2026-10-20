@@ -88,11 +88,11 @@ void talkStart() {
   if (micOn) return;
   playStop();
   if (!M5.Speaker.isEnabled()) M5.Speaker.begin();
-  M5.Speaker.tone(1760, 60, 1, true);  // A6
-  // Played out before the mic takes the codec (and so it isn't recorded).
-  uint32_t t0 = millis();
-  while (M5.Speaker.isPlaying(1) && millis() - t0 < 200) delay(2);
-  delay(10);
+  M5.Speaker.tone(1760, 70, 1, true);  // A6
+  // The blip first; the mic (which takes the codec, ending the speaker) only
+  // 0.25 s after it began. A fixed wait: right after tone() the speaker can
+  // still report nothing playing, and waiting on that ended the blip unheard.
+  delay(250);
 }
 
 void talkEnd() {
