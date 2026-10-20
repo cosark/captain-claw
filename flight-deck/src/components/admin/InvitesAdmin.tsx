@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useState } from 'react'
-import { Check, Copy, Link2, Loader2, Mail, MailPlus, RefreshCw, Send, Trash2, X } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Check, Copy, Link2, Loader2, Mail, MailPlus, RefreshCw, Send, Trash2, UserCheck, X } from 'lucide-react'
 import { useAuthStore } from '../../stores/authStore'
+import { matchesQuery } from './deckConfig'
+import { FilterSelect, FilterSummary, SearchBox, Segmented } from './ListFilters'
 
-// Admin → Users → Invite by email: a one-time link to <deck>/invite#<token>,
+// Users → Invitations: a one-time link to <deck>/invite#<token>,
 // emailed from the admin's own connected Google (Gmail) or Microsoft (Outlook)
 // account — or no email, and the admin passes the link on. The invitee
 // chooses their own password and the account is created then
@@ -35,6 +37,18 @@ export interface Invite {
   sent_via: '' | Provider
   sent_from: string
   sent_at: string
+  accepted_at: string  // blank until accepted
+}
+
+// Pending invitations split by whether their link still works.
+type StatusFilter = 'pending' | 'expired' | 'accepted' | 'all'
+type RoleFilter = 'all' | 'admin' | 'user'
+type SentFilter = 'any' | Provider | 'link'
+type SortKey = 'newest' | 'oldest'
+
+function inviteState(inv: Invite): Exclude<StatusFilter, 'all'> {
+  if (inv.status === 'accepted') return 'accepted'
+  return inv.expired ? 'expired' : 'pending'
 }
 
 interface EmailOutcome {
@@ -92,10 +106,12 @@ function firstAvailable(mail: MailOptions | null): Via {
   return PROVIDERS.find((p) => mail?.[p].available) ?? 'link'
 }
 
-export function InvitesAdmin({ refreshTick, kioskDefault, kioskNote }: {
+export function InvitesAdmin({ refreshTick, kioskDefault, kioskNote, onOpenCount }: {
   refreshTick: number
   kioskDefault: boolean
   kioskNote: string | null
+  // Invitations not yet accepted, expired ones included.
+  onOpenCount: (n: number) => void
 }) {
   const [invites, setInvites] = useState<Invite[] | null>(null)
   const [mail, setMail] = useState<MailOptions | null>(null)
@@ -104,17 +120,24 @@ export function InvitesAdmin({ refreshTick, kioskDefault, kioskNote }: {
   const [result, setResult] = useState<InviteResult | null>(null)
   const [busyId, setBusyId] = useState('')
   const [error, setError] = useState('')
+  const [status, setStatus] = useState<StatusFilter>('pending')
+  const [query, setQuery] = useState('')
+  const [role, setRole] = useState<RoleFilter>('all')
+  const [sent, setSent] = useState<SentFilter>('any')
+  const [sort, setSort] = useState<SortKey>('newest')
 
   const load = useCallback(async () => {
     try {
-      const data = await call<{ invites: Invite[]; mail: MailOptions; ttl_days: number }>('/fd/admin/invites')
+      const data = await call<{ invites: Invite[]; mail: MailOptions; ttl_days: number }>('/fd/admin/invites?status=all')
       setInvites(data.invites)
+      onOpenCount(data.invites.filter((i) => i.status === 'pending').length)
       setMail(data.mail)
       setTtlDays(data.ttl_days)
+      setError('')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
-  }, [])
+  }, [onOpenCount])
 
   useEffect(() => { load() }, [load, refreshTick])
 
@@ -134,7 +157,10 @@ export function InvitesAdmin({ refreshTick, kioskDefault, kioskNote }: {
   }
 
   const remove = async (inv: Invite) => {
-    if (!confirm(`Remove the invitation for ${inv.email}? Its link stops working.`)) return
+    const ask = inv.status === 'accepted'
+      ? `Remove the record of ${inv.email}'s accepted invitation? Their account stays.`
+      : `Remove the invitation for ${inv.email}? Its link stops working.`
+    if (!confirm(ask)) return
     setBusyId(inv.id); setError('')
     try {
       await call(`/fd/admin/invites/${inv.id}`, { method: 'DELETE' })
@@ -147,24 +173,80 @@ export function InvitesAdmin({ refreshTick, kioskDefault, kioskNote }: {
     }
   }
 
+  const counts = useMemo(() => {
+    const c = { pending: 0, expired: 0, accepted: 0, all: 0 }
+    for (const inv of invites ?? []) { c[inviteState(inv)] += 1; c.all += 1 }
+    return c
+  }, [invites])
+
+  const shown = useMemo(() => {
+    const list = (invites ?? []).filter((inv) => {
+      if (status !== 'all' && inviteState(inv) !== status) return false
+      if (!matchesQuery(query, inv.email, inv.display_name, inv.invited_by_name, inv.note)) return false
+      if (role !== 'all' && inv.role !== role) return false
+      if (sent === 'link' ? !!inv.sent_via : sent !== 'any' && inv.sent_via !== sent) return false
+      return true
+    })
+    return list.sort((a, b) => (sort === 'oldest'
+      ? a.created_at.localeCompare(b.created_at)
+      : b.created_at.localeCompare(a.created_at)))
+  }, [invites, status, query, role, sent, sort])
+
+  // The status switch is the view; these narrow it.
+  const filtered = query.trim() !== '' || role !== 'all' || sent !== 'any'
+  const clearFilters = () => { setQuery(''); setRole('all'); setSent('any') }
+  const inView = status === 'all' ? counts.all : counts[status]
+
   return (
     <div className="space-y-2">
-      {open ? (
+      <div className="flex flex-wrap items-center gap-2">
+        <SearchBox value={query} onChange={setQuery} placeholder="Search email, name, inviter or note" />
+        <button
+          onClick={() => { setOpen(true); setResult(null) }}
+          disabled={open}
+          className="flex items-center gap-1.5 rounded-md bg-violet-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-violet-500 disabled:opacity-50"
+        >
+          <MailPlus className="h-3.5 w-3.5" />
+          Invite by email
+        </button>
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <Segmented
+          label="Show"
+          value={status}
+          onChange={setStatus}
+          options={[
+            { value: 'pending', label: 'Pending', count: counts.pending },
+            { value: 'expired', label: 'Expired', count: counts.expired, warn: true },
+            { value: 'accepted', label: 'Accepted', count: counts.accepted },
+            { value: 'all', label: 'All', count: counts.all },
+          ]}
+        />
+        <FilterSelect label="Role" value={role} onChange={(v) => setRole(v as RoleFilter)} active={role !== 'all'}>
+          <option value="all">All roles</option>
+          <option value="admin">Admins</option>
+          <option value="user">Users</option>
+        </FilterSelect>
+        <FilterSelect label="Sent" value={sent} onChange={(v) => setSent(v as SentFilter)} active={sent !== 'any'}>
+          <option value="any">Any delivery</option>
+          {PROVIDERS.map((p) => <option key={p} value={p}>Emailed from {PROVIDER_LABEL[p]}</option>)}
+          <option value="link">Link only, not emailed</option>
+        </FilterSelect>
+        <span className="flex-1" />
+        <FilterSelect label="Sort" value={sort} onChange={(v) => setSort(v as SortKey)} active={false}>
+          <option value="newest">Newest first</option>
+          <option value="oldest">Oldest first</option>
+        </FilterSelect>
+      </div>
+
+      {open && (
         <InviteForm
           mail={mail}
           kioskDefault={kioskDefault}
           kioskNote={kioskNote}
           onCancel={() => setOpen(false)}
-          onDone={(r) => { setResult(r); setOpen(false); load() }}
+          onDone={(r) => { setResult(r); setOpen(false); setStatus('pending'); load() }}
         />
-      ) : (
-        <button
-          onClick={() => { setOpen(true); setResult(null) }}
-          className="flex w-full items-center justify-center gap-2 rounded-lg bg-violet-600 px-3 py-2.5 text-sm font-medium text-white hover:bg-violet-500 transition-colors"
-        >
-          <MailPlus className="h-4 w-4" />
-          Invite by email
-        </button>
       )}
 
       {result && <ResultBanner result={result} ttlDays={ttlDays} onClose={() => setResult(null)} />}
@@ -173,71 +255,123 @@ export function InvitesAdmin({ refreshTick, kioskDefault, kioskNote }: {
         <div className="rounded-md border border-red-900/50 bg-red-950/20 px-4 py-2 text-sm text-red-400">{error}</div>
       )}
 
-      {invites && invites.length > 0 && (
+      {invites === null && !error && (
+        <div className="flex justify-center py-6">
+          <Loader2 className="h-5 w-5 animate-spin text-zinc-500" />
+        </div>
+      )}
+
+      {invites && filtered && (
+        <FilterSummary shown={shown.length} total={inView} noun="invitations" onClear={clearFilters} />
+      )}
+
+      {shown.length > 0 && (
         <div className="rounded-lg border border-zinc-800 bg-zinc-900/30">
-          <div className="border-b border-zinc-800 px-4 py-2 text-xs font-medium text-zinc-400">
-            Pending invitations · {invites.length}
-          </div>
-          {invites.map((inv) => (
-            <div key={inv.id} className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-zinc-800/60 px-4 py-2.5 last:border-b-0">
-              <div className="min-w-0 flex-1 space-y-0.5">
-                <div className="flex flex-wrap items-center gap-2">
-                  <Mail className="h-3.5 w-3.5 shrink-0 text-zinc-500" />
-                  <span className="truncate text-sm text-zinc-100">{inv.display_name || inv.email}</span>
-                  {inv.display_name && <span className="truncate text-xs text-zinc-400">{inv.email}</span>}
-                  {inv.role === 'admin' && (
-                    <span className="rounded bg-amber-950/60 px-1.5 py-0.5 text-[10px] font-medium text-amber-400">admin</span>
-                  )}
-                  {inv.kiosk === true && (
-                    <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] font-medium text-zinc-300">kiosk</span>
-                  )}
-                  {inv.expired ? (
-                    <span className="rounded bg-red-950/60 px-1.5 py-0.5 text-[10px] font-medium text-red-400">Expired</span>
-                  ) : (
-                    <span className="text-[11px] text-zinc-500">until {shortDate(inv.expires_at)}</span>
-                  )}
-                </div>
-                <div className="text-[11px] text-zinc-500" title={when(inv.created_at)}>
-                  Invited{inv.invited_by_name ? ` by ${inv.invited_by_name}` : ''}
-                  {inv.sent_via
-                    ? <> · emailed from {inv.sent_from || PROVIDER_LABEL[inv.sent_via]} {shortDate(inv.sent_at)}</>
-                    : <> · link only, not emailed</>}
-                </div>
-              </div>
-              <div className="flex flex-wrap items-center gap-1.5">
-                {busyId === inv.id && <Loader2 className="h-3.5 w-3.5 animate-spin text-zinc-500" />}
-                {PROVIDERS.filter((p) => mail?.[p].available).map((p) => (
-                  <button
-                    key={p}
-                    onClick={() => resend(inv, p)}
-                    disabled={!!busyId}
-                    title={`A new link, emailed from ${mail?.[p].from || PROVIDER_LABEL[p]} — the old link stops working`}
-                    className="flex items-center gap-1 rounded-md bg-zinc-800 px-2.5 py-1 text-xs text-zinc-200 hover:bg-zinc-700 disabled:opacity-50"
-                  >
-                    <Send className="h-3 w-3" /> Resend via {PROVIDER_LABEL[p]}
-                  </button>
-                ))}
-                <button
-                  onClick={() => resend(inv, 'link')}
-                  disabled={!!busyId}
-                  title="A new link to copy and pass on yourself — the old link stops working"
-                  className="flex items-center gap-1 rounded-md bg-zinc-800 px-2.5 py-1 text-xs text-zinc-200 hover:bg-zinc-700 disabled:opacity-50"
-                >
-                  <Link2 className="h-3 w-3" /> New link
-                </button>
-                <button
-                  onClick={() => remove(inv)}
-                  disabled={!!busyId}
-                  title="Remove invitation"
-                  className="rounded-md p-1.5 text-zinc-500 hover:bg-zinc-800 hover:text-red-400 disabled:opacity-50"
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                </button>
-              </div>
-            </div>
+          {shown.map((inv) => (
+            <InviteRow
+              key={inv.id}
+              inv={inv}
+              mail={mail}
+              busy={busyId === inv.id}
+              disabled={!!busyId}
+              onResend={(via) => resend(inv, via)}
+              onRemove={() => remove(inv)}
+            />
           ))}
         </div>
       )}
+
+      {invites && shown.length === 0 && (
+        <p className="text-center text-sm text-zinc-500 py-8">
+          {filtered
+            ? 'No invitations match these filters.'
+            : status === 'pending'
+              ? counts.expired > 0
+                ? `No invitations waiting — ${counts.expired} expired (see Expired).`
+                : 'No invitations waiting to be accepted.'
+              : status === 'expired' ? 'No expired invitations.'
+                : status === 'accepted' ? 'No accepted invitations yet.'
+                  : 'No invitations yet.'}
+        </p>
+      )}
+    </div>
+  )
+}
+
+function InviteRow({ inv, mail, busy, disabled, onResend, onRemove }: {
+  inv: Invite
+  mail: MailOptions | null
+  busy: boolean
+  disabled: boolean
+  onResend: (via: Via) => void
+  onRemove: () => void
+}) {
+  const accepted = inv.status === 'accepted'
+  return (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-zinc-800/60 px-4 py-2.5 last:border-b-0">
+      <div className="min-w-0 flex-1 space-y-0.5">
+        <div className="flex flex-wrap items-center gap-2">
+          {accepted
+            ? <UserCheck className="h-3.5 w-3.5 shrink-0 text-emerald-500" />
+            : <Mail className="h-3.5 w-3.5 shrink-0 text-zinc-500" />}
+          <span className="truncate text-sm text-zinc-100">{inv.display_name || inv.email}</span>
+          {inv.display_name && <span className="truncate text-xs text-zinc-400">{inv.email}</span>}
+          {inv.role === 'admin' && (
+            <span className="rounded bg-amber-950/60 px-1.5 py-0.5 text-[10px] font-medium text-amber-400">admin</span>
+          )}
+          {inv.kiosk === true && (
+            <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] font-medium text-zinc-300">kiosk</span>
+          )}
+          {accepted ? (
+            <span className="rounded bg-emerald-950/60 px-1.5 py-0.5 text-[10px] font-medium text-emerald-400"
+              title={inv.accepted_at ? when(inv.accepted_at) : undefined}>
+              Accepted{inv.accepted_at ? ` ${shortDate(inv.accepted_at)}` : ''}
+            </span>
+          ) : inv.expired ? (
+            <span className="rounded bg-red-950/60 px-1.5 py-0.5 text-[10px] font-medium text-red-400">Expired</span>
+          ) : (
+            <span className="text-[11px] text-zinc-500">until {shortDate(inv.expires_at)}</span>
+          )}
+        </div>
+        <div className="text-[11px] text-zinc-500" title={when(inv.created_at)}>
+          Invited{inv.invited_by_name ? ` by ${inv.invited_by_name}` : ''} {shortDate(inv.created_at)}
+          {inv.sent_via
+            ? <> · emailed from {inv.sent_from || PROVIDER_LABEL[inv.sent_via]} {shortDate(inv.sent_at)}</>
+            : <> · link only, not emailed</>}
+        </div>
+      </div>
+      <div className="flex flex-wrap items-center gap-1.5">
+        {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-zinc-500" />}
+        {!accepted && PROVIDERS.filter((p) => mail?.[p].available).map((p) => (
+          <button
+            key={p}
+            onClick={() => onResend(p)}
+            disabled={disabled}
+            title={`A new link, emailed from ${mail?.[p].from || PROVIDER_LABEL[p]} — the old link stops working`}
+            className="flex items-center gap-1 rounded-md bg-zinc-800 px-2.5 py-1 text-xs text-zinc-200 hover:bg-zinc-700 disabled:opacity-50"
+          >
+            <Send className="h-3 w-3" /> Resend via {PROVIDER_LABEL[p]}
+          </button>
+        ))}
+        {!accepted && (
+          <button
+            onClick={() => onResend('link')}
+            disabled={disabled}
+            title="A new link to copy and pass on yourself — the old link stops working"
+            className="flex items-center gap-1 rounded-md bg-zinc-800 px-2.5 py-1 text-xs text-zinc-200 hover:bg-zinc-700 disabled:opacity-50"
+          >
+            <Link2 className="h-3 w-3" /> New link
+          </button>
+        )}
+        <button
+          onClick={onRemove}
+          disabled={disabled}
+          title={accepted ? 'Remove from the list (their account stays)' : 'Remove invitation'}
+          className="rounded-md p-1.5 text-zinc-500 hover:bg-zinc-800 hover:text-red-400 disabled:opacity-50"
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+        </button>
+      </div>
     </div>
   )
 }

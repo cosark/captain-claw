@@ -7,7 +7,7 @@ export const MIN_PASSWORD_LENGTH = 6
 
 // The signed-in user changes their own password (Profile page and the kiosk's
 // Profile dialog). Needs the current one; optionally ends their other sessions.
-// An admin resets someone else's from Admin → Users instead.
+// An admin resets someone else's from the Users page instead.
 export function ChangePasswordCard() {
   const email = useAuthStore((s) => s.user?.email ?? '')
   const [current, setCurrent] = useState('')

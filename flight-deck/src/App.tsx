@@ -21,6 +21,7 @@ import { LoginPage } from './pages/LoginPage'
 import { ChoosePasswordPage } from './pages/ChoosePasswordPage'
 import { AcceptInvitePage, INVITE_PATH } from './pages/AcceptInvitePage'
 import { AdminPage } from './pages/AdminPage'
+import { UsersPage } from './pages/UsersPage'
 import { CouncilPage } from './pages/CouncilPage'
 import { BasnaPage } from './pages/BasnaPage'
 import { BatPage } from './pages/BatPage'
@@ -344,6 +345,7 @@ function AppContent() {
       {view === 'forge' && <ForgePage />}
       {view === 'library' && <LibraryPage />}
       {view === 'admin' && <AdminPage />}
+      {view === 'users' && <UsersPage />}
       {view === 'council' && <CouncilPage />}
       {view === 'basna' && <BasnaPage />}
       {view === 'bat' && <BatPage />}

@@ -234,7 +234,7 @@ export async function joinWaitlist(application: WaitlistApplication): Promise<st
   return typeof data.cohort === 'string' ? data.cohort : ''
 }
 
-// ── Invitations (Admin → Users → Invite by email) ──
+// ── Invitations (Users → Invitations → Invite by email) ──
 // The link in the email is <deck>/invite#<token>; the invitee chooses their
 // password and the account is created then (captain_claw/flight_deck/invite_routes.py).
 

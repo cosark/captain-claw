@@ -10,7 +10,7 @@ import {
 import { AuthCard, AuthError, AuthField, AuthShell } from '../components/auth/AuthShell'
 import { MIN_PASSWORD_LENGTH } from '../components/profile/ChangePasswordCard'
 
-// <deck>/invite#<token>: the link in an invitation email (Admin → Users →
+// <deck>/invite#<token>: the link in an invitation email (Users → Invitations →
 // Invite by email). The invitee chooses their password here and the account
 // is created then — they're signed in straight away. The token rides in the
 // fragment, so it never reaches a server log.

@@ -159,6 +159,8 @@ async def test_rejected_can_apply_again(fd_db):
         all_ = (await c.get("/fd/admin/waitlist", params={"status": "all"})).json()
     assert [e["status"] for e in all_["entries"]] == ["pending", "rejected"]
     assert all_["pending"] == 1
+    # Every status counted, whichever one is listed (the Users page's tabs).
+    assert all_["counts"] == {"pending": 1, "approved": 0, "rejected": 1}
     assert await fd_db.get_user_by_email("newbie@example.com") is None
 
 

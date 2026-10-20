@@ -264,18 +264,21 @@ async def list_waitlist(
     status: str = Query("pending"),
     admin: dict = Depends(require_admin),
 ):
-    """Waitlist applications, newest first (admin only), how this admin can
-    email an approval and the sign-in address that email carries. *status* is
-    one of pending | approved | rejected | all."""
+    """Waitlist applications, newest first (admin only), how many there are
+    of each status, how this admin can email an approval and the sign-in
+    address that email carries. *status* is one of pending | approved |
+    rejected | all."""
     from captain_claw.flight_deck.invite_routes import _link_base, mail_options
 
     if status != "all" and status not in WAITLIST_STATUSES:
         raise HTTPException(400, "status must be one of: pending, approved, rejected, all")
     db = get_db()
     entries = await db.list_waitlist(None if status == "all" else status)
+    counts = {s: await db.count_waitlist(s) for s in WAITLIST_STATUSES}
     return {
         "entries": entries,
-        "pending": await db.count_waitlist("pending"),
+        "pending": counts["pending"],
+        "counts": counts,
         "mail": await mail_options(db, admin["id"]),
         "sign_in_url": f"{_link_base(request)}/",
     }

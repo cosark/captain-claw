@@ -1,9 +1,11 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Check, Copy, X, Trash2, Loader2, ClipboardList, RefreshCw } from 'lucide-react'
 import { useAuthStore } from '../../stores/authStore'
 import { localOnly, PROVIDER_LABEL, PROVIDERS, type MailOptions, type Provider } from './InvitesAdmin'
+import { matchesQuery } from './deckConfig'
+import { FilterSelect, FilterSummary, SearchBox, Segmented } from './ListFilters'
 
-// Admin → Waitlist: people who applied from the sign-up page while
+// Users → Waitlist: people who applied from the sign-up page while
 // self-registration is closed, each naming who recommended them. Approving
 // creates the account with the password they chose and emails them, from the
 // admin's own Gmail or Outlook, that they can sign in
@@ -21,7 +23,9 @@ export interface WaitlistEntry {
   decided_at: string
 }
 
-type Filter = 'pending' | 'all'
+type Status = WaitlistEntry['status']
+type StatusFilter = Status | 'all'
+type SortKey = 'newest' | 'oldest'
 type Via = Provider | 'none'
 
 interface ApproveResult {
@@ -46,9 +50,13 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json()
 }
 
-export async function fetchWaitlist(
-  status: Filter = 'pending',
-): Promise<{ entries: WaitlistEntry[]; pending: number; mail: MailOptions; sign_in_url: string }> {
+export async function fetchWaitlist(status: StatusFilter = 'pending'): Promise<{
+  entries: WaitlistEntry[]
+  pending: number
+  counts: Record<Status, number>
+  mail: MailOptions
+  sign_in_url: string
+}> {
   return call(`/fd/admin/waitlist?status=${status}`)
 }
 
@@ -67,8 +75,12 @@ export function WaitlistAdmin({ refreshTick, onPendingCount, onApproved, note }:
   onApproved: () => void
   note: string | null
 }) {
-  const [filter, setFilter] = useState<Filter>('pending')
+  const [filter, setFilter] = useState<StatusFilter>('pending')
   const [entries, setEntries] = useState<WaitlistEntry[] | null>(null)
+  const [counts, setCounts] = useState<Record<Status, number> | null>(null)
+  const [query, setQuery] = useState('')
+  const [cohort, setCohort] = useState('all')
+  const [sort, setSort] = useState<SortKey>('newest')
   const [busyId, setBusyId] = useState('')
   const [error, setError] = useState('')
   const [mail, setMail] = useState<MailOptions | null>(null)
@@ -80,6 +92,7 @@ export function WaitlistAdmin({ refreshTick, onPendingCount, onApproved, note }:
     try {
       const data = await fetchWaitlist(filter)
       setEntries(data.entries)
+      setCounts(data.counts)
       onPendingCount(data.pending)
       setMail(data.mail)
       setSignInUrl(data.sign_in_url)
@@ -126,38 +139,66 @@ export function WaitlistAdmin({ refreshTick, onPendingCount, onApproved, note }:
     act(e, () => call(`/fd/admin/waitlist/${e.id}`, { method: 'DELETE' }))
   }
 
+  // Waitlist names applicants joined under, for the cohort filter.
+  const cohorts = useMemo(
+    () => [...new Set((entries ?? []).map((e) => e.cohort).filter(Boolean))].sort(),
+    [entries],
+  )
+  // The menu shows only with two or more; a pick it no longer offers is dropped.
+  useEffect(() => {
+    if (entries && cohort !== 'all' && (cohorts.length < 2 || !cohorts.includes(cohort))) setCohort('all')
+  }, [entries, cohorts, cohort])
+
+  const shown = useMemo(() => {
+    const list = (entries ?? []).filter((e) => (
+      matchesQuery(query, e.display_name, e.email, e.referrer_name, e.referrer_email, e.cohort)
+      && (cohort === 'all' || e.cohort === cohort)
+    ))
+    return list.sort((a, b) => (sort === 'oldest'
+      ? a.created_at.localeCompare(b.created_at)
+      : b.created_at.localeCompare(a.created_at)))
+  }, [entries, query, cohort, sort])
+
+  const filtered = query.trim() !== '' || cohort !== 'all'
+  const clearFilters = () => { setQuery(''); setCohort('all') }
+
   return (
-    <div className="space-y-3">
+    <div className="space-y-2">
+      <SearchBox value={query} onChange={setQuery} placeholder="Search applicant, email or who recommended them" />
+      <div className="flex flex-wrap items-center gap-2">
+        <Segmented
+          label="Show"
+          value={filter}
+          onChange={setFilter}
+          options={[
+            { value: 'pending', label: 'Waiting', count: counts?.pending },
+            { value: 'approved', label: 'Approved', count: counts?.approved },
+            { value: 'rejected', label: 'Rejected', count: counts?.rejected },
+            { value: 'all', label: 'All', count: counts ? counts.pending + counts.approved + counts.rejected : undefined },
+          ]}
+        />
+        {cohorts.length > 1 && (
+          <FilterSelect label="Waitlist" value={cohort} onChange={setCohort} active={cohort !== 'all'}>
+            <option value="all">Every waitlist</option>
+            {cohorts.map((c) => <option key={c} value={c}>{c}</option>)}
+          </FilterSelect>
+        )}
+        <span className="flex-1" />
+        <FilterSelect label="Sort" value={sort} onChange={(v) => setSort(v as SortKey)} active={false}>
+          <option value="newest">Newest first</option>
+          <option value="oldest">Oldest first</option>
+        </FilterSelect>
+      </div>
+
       <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-4 space-y-3">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="min-w-0 flex-1">
-            <h3 className="flex items-center gap-2 text-sm font-semibold text-zinc-200">
-              <ClipboardList className="h-4 w-4 text-violet-400" />
-              Waitlist
-            </h3>
-            <p className="text-xs text-zinc-500 mt-0.5">
-              People who applied while registration is closed, with who recommended them. Approving creates
-              their account with the password they chose, so they can sign in right away, and emails them
-              that they're in; the deck's kiosk default applies.
-            </p>
-          </div>
-          <div className="inline-flex rounded-md border border-zinc-700 p-0.5" role="radiogroup" aria-label="Show">
-            {(['pending', 'all'] as Filter[]).map((f) => (
-              <button
-                key={f}
-                type="button"
-                role="radio"
-                aria-checked={filter === f}
-                onClick={() => setFilter(f)}
-                className={`rounded px-3 py-1 text-xs font-medium transition-colors ${
-                  filter === f ? 'bg-violet-600 text-white' : 'text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200'
-                }`}
-              >
-                {f === 'pending' ? 'Waiting' : 'All'}
-              </button>
-            ))}
-          </div>
-        </div>
+        <p className="flex gap-2 text-xs text-zinc-500">
+          <ClipboardList className="h-4 w-4 shrink-0 text-violet-400" />
+          <span>
+            People who applied while registration is closed, with who recommended them. Approving creates
+            their account with the password they chose, so they can sign in right away, and emails them
+            that they're in; the deck's kiosk default applies.
+          </span>
+        </p>
         <div className="flex flex-wrap items-center gap-2">
           <label htmlFor="waitlist-via" className="text-xs text-zinc-500">When I approve someone, email them</label>
           <select
@@ -204,7 +245,11 @@ export function WaitlistAdmin({ refreshTick, onPendingCount, onApproved, note }:
         </div>
       )}
 
-      {entries?.map((e) => (
+      {entries && filtered && (
+        <FilterSummary shown={shown.length} total={entries.length} noun="applications" onClear={clearFilters} />
+      )}
+
+      {shown.map((e) => (
         <div
           key={e.id}
           className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border border-zinc-800 bg-zinc-900/50 px-4 py-3"
@@ -271,9 +316,13 @@ export function WaitlistAdmin({ refreshTick, onPendingCount, onApproved, note }:
         </div>
       ))}
 
-      {entries?.length === 0 && (
+      {entries && shown.length === 0 && (
         <p className="text-center text-sm text-zinc-500 py-8">
-          {filter === 'pending' ? 'Nobody is waiting for approval.' : 'No applications yet.'}
+          {filtered ? 'No applications match these filters.'
+            : filter === 'pending' ? 'Nobody is waiting for approval.'
+              : filter === 'approved' ? 'Nobody has been approved yet.'
+                : filter === 'rejected' ? 'No rejected applications.'
+                  : 'No applications yet.'}
         </p>
       )}
     </div>

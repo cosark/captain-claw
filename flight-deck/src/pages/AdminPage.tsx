@@ -1,118 +1,50 @@
 import { useEffect, useState, useCallback } from 'react'
 import {
   Shield,
-  Users,
-  UserPlus,
   BarChart3,
   RefreshCw,
-  Trash2,
-  ChevronDown,
-  ChevronRight,
-  Crown,
   Loader2,
   Settings2,
   Key,
   Save,
   Check,
-  Bot,
   Plug,
   MessageSquare,
-  KeyRound,
   ClipboardList,
+  UserCog,
 } from 'lucide-react'
 import { useAuthStore } from '../stores/authStore'
-import { useUIStore } from '../stores/uiStore'
-import { MIN_PASSWORD_LENGTH } from '../components/profile/ChangePasswordCard'
-import { UserAgentsDialog } from '../components/agents/UserAgentsDialog'
 import { DeckProfileDefaults } from '../components/profile/DeckProfileDefaults'
 import { SharedTelegramBotAdmin } from '../components/admin/SharedTelegramBotAdmin'
 import { SharedCredentialsAdmin } from '../components/admin/SharedCredentialsAdmin'
-import { WaitlistAdmin, fetchWaitlist } from '../components/admin/WaitlistAdmin'
 import { BrandingAdmin } from '../components/admin/BrandingAdmin'
-import { InvitesAdmin } from '../components/admin/InvitesAdmin'
+import {
+  adminHeaders, CONFIG_DEFAULTS, fetchConfig, fetchPlans, openUsersTab, saveConfig, waitlistName,
+  type KioskMode, type PlanLimits, type SystemConfig,
+} from '../components/admin/deckConfig'
 import { ADMIN_TAB_KEY } from '../services/sharedIntegrations'
 
-type AdminTab = 'users' | 'waitlist' | 'usage' | 'plans' | 'settings' | 'integrations'
+// Users, invitations and the waitlist have a page of their own (UsersPage).
+type AdminTab = 'usage' | 'plans' | 'settings' | 'integrations'
 
 // Other pages may open Admin on a given tab (Connections → Telegram sends an
-// admin to Integrations, see ADMIN_TAB_KEY); otherwise it opens on Users.
+// admin to Integrations, see ADMIN_TAB_KEY); otherwise it opens on Usage.
 function takeRequestedTab(): AdminTab {
   try {
     const t = sessionStorage.getItem(ADMIN_TAB_KEY)
     sessionStorage.removeItem(ADMIN_TAB_KEY)
-    if (t === 'waitlist' || t === 'usage' || t === 'plans' || t === 'settings' || t === 'integrations') return t
+    if (t === 'plans' || t === 'settings' || t === 'integrations') return t
   } catch { /* storage blocked */ }
-  return 'users'
+  return 'usage'
 }
 
 // ── Types ──
 
-interface UserInfo {
-  id: string
-  email: string
-  display_name: string
-  role: string
-  created_at: string
-  updated_at: string
-  metadata: string
-}
-
-// Kiosk (simple-chat) lock for the deck: nobody, every non-admin, or the users
-// marked in the Users tab. Admins are never locked.
-type KioskMode = 'off' | 'all' | 'selected'
-
-interface SystemConfig {
-  docker_spawn_enabled: boolean
-  kiosk_mode: KioskMode
-  kiosk_new_users: boolean
-  // The mode is the `--simple-chat` default — no admin has picked one yet.
-  kiosk_mode_from_env?: boolean
-  // While self-registration is closed, sign-up takes waitlist applications.
-  waitlist_enabled: boolean
-  // Blank: applicants join under the instance name (waitlistName).
-  waitlist_cohort: string
-  // Branding: the panels' title and the sign-in page (the logo: BrandingCard).
-  instance_name: string
-  instance_description: string
-}
-
-const CONFIG_DEFAULTS: SystemConfig = {
-  docker_spawn_enabled: true, kiosk_mode: 'off', kiosk_new_users: false,
-  waitlist_enabled: true, waitlist_cohort: '',
-  instance_name: 'Flight Deck', instance_description: 'Agent Management Console',
-}
-
 const KIOSK_MODES: { value: KioskMode; label: string; hint: string }[] = [
   { value: 'off', label: 'Off', hint: 'Everyone gets the normal layout.' },
   { value: 'all', label: 'Everyone', hint: 'Every non-admin is locked to simple chat.' },
-  { value: 'selected', label: 'Selected users', hint: 'Only the users marked in the Users tab are locked.' },
+  { value: 'selected', label: 'Selected users', hint: 'Only the users marked on the Users page are locked.' },
 ]
-
-// What applicants join: the waitlist name an admin set, else the instance name.
-function waitlistName(cfg: SystemConfig): string {
-  return cfg.waitlist_cohort || cfg.instance_name || 'Flight Deck'
-}
-
-function userKioskFlag(user: UserInfo): boolean {
-  try { return JSON.parse(user.metadata || '{}').kiosk === true } catch { return false }
-}
-
-// An admin set their password and they haven't chosen their own yet.
-function userMustChangePassword(user: UserInfo): boolean {
-  try { return JSON.parse(user.metadata || '{}').must_change_password === true } catch { return false }
-}
-
-// What the server resolves as the user's lock (auth_routes._user_payload).
-function kioskEffective(role: string, flag: boolean, mode: KioskMode): boolean {
-  if (role === 'admin') return false
-  return mode === 'all' || (mode === 'selected' && flag)
-}
-
-function kioskModeNote(mode: KioskMode): string | null {
-  if (mode === 'all') return 'Kiosk mode is on for everyone (Settings), so this user is locked either way.'
-  if (mode === 'off') return 'Kiosk mode is off (Settings); this takes effect under "Selected users".'
-  return null
-}
 
 interface UsageLog {
   id: number
@@ -120,15 +52,6 @@ interface UsageLog {
   event_type: string
   detail: string
   created_at: string
-}
-
-interface PlanLimits {
-  max_agents: number
-  max_storage_mb: number
-  requests_per_minute: number
-  spawns_per_hour: number
-  messages_per_day: number  // 0 = unlimited
-  tokens_per_day: number    // 0 = unlimited
 }
 
 interface CostUserRow {
@@ -151,68 +74,12 @@ interface CostRollup {
 }
 
 // ── API helpers ──
-
-function _headers(): Record<string, string> {
-  const { token } = useAuthStore.getState()
-  return {
-    'Content-Type': 'application/json',
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
-  }
-}
-
-async function fetchUsers(limit = 100, offset = 0): Promise<{ users: UserInfo[]; total: number }> {
-  const res = await fetch(`/fd/admin/users?limit=${limit}&offset=${offset}`, {
-    headers: _headers(), credentials: 'include',
-  })
-  if (!res.ok) throw new Error('Failed to fetch users')
-  return res.json()
-}
-
-async function createUser(payload: {
-  email: string
-  password: string
-  display_name?: string
-  role?: string
-  kiosk?: boolean
-  must_change_password?: boolean
-}): Promise<void> {
-  const res = await fetch('/fd/admin/users', {
-    method: 'POST', headers: _headers(), credentials: 'include',
-    body: JSON.stringify(payload),
-  })
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}))
-    throw new Error(data.detail || 'Failed to create user')
-  }
-}
-
-async function updateUser(userId: string, patch: Record<string, unknown>): Promise<void> {
-  const res = await fetch(`/fd/admin/users/${userId}`, {
-    method: 'PUT', headers: _headers(), credentials: 'include',
-    body: JSON.stringify(patch),
-  })
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}))
-    throw new Error(typeof data.detail === 'string' ? data.detail : 'Failed to update user')
-  }
-}
-
-async function deleteUser(userId: string): Promise<void> {
-  const res = await fetch(`/fd/admin/users/${userId}`, {
-    method: 'DELETE', headers: _headers(), credentials: 'include',
-  })
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}))
-    throw new Error(data.detail || 'Failed to delete user')
-  }
-}
-
 async function fetchUsageSummary(userId?: string, since?: string): Promise<Record<string, number>> {
   const params = new URLSearchParams()
   if (userId) params.set('user_id', userId)
   if (since) params.set('since', since)
   const res = await fetch(`/fd/admin/usage/summary?${params}`, {
-    headers: _headers(), credentials: 'include',
+    headers: adminHeaders(), credentials: 'include',
   })
   if (!res.ok) throw new Error('Failed to fetch usage')
   const data = await res.json()
@@ -225,7 +92,7 @@ async function fetchUsageLogs(userId?: string, eventType?: string, limit = 50): 
   if (eventType) params.set('event_type', eventType)
   params.set('limit', String(limit))
   const res = await fetch(`/fd/admin/usage?${params}`, {
-    headers: _headers(), credentials: 'include',
+    headers: adminHeaders(), credentials: 'include',
   })
   if (!res.ok) throw new Error('Failed to fetch usage logs')
   const data = await res.json()
@@ -237,34 +104,14 @@ async function fetchCostRollup(since?: string, until?: string): Promise<CostRoll
   if (since) params.set('since', since)
   if (until) params.set('until', until)
   const qs = params.toString() ? `?${params}` : ''
-  const res = await fetch(`/fd/admin/costs${qs}`, { headers: _headers(), credentials: 'include' })
+  const res = await fetch(`/fd/admin/costs${qs}`, { headers: adminHeaders(), credentials: 'include' })
   if (!res.ok) throw new Error('Failed to fetch cost rollup')
   return res.json()
 }
 
-async function fetchConfig(): Promise<SystemConfig> {
-  const res = await fetch('/fd/admin/config', {
-    headers: _headers(), credentials: 'include',
-  })
-  if (!res.ok) return { ...CONFIG_DEFAULTS }
-  return { ...CONFIG_DEFAULTS, ...(await res.json()) }
-}
-
-async function saveConfig(cfg: Partial<SystemConfig>): Promise<SystemConfig> {
-  const res = await fetch('/fd/admin/config', {
-    method: 'PUT', headers: _headers(), credentials: 'include',
-    body: JSON.stringify(cfg),
-  })
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    throw new Error(typeof body.detail === 'string' ? body.detail : 'Failed to save config')
-  }
-  return { ...CONFIG_DEFAULTS, ...(await res.json()) }
-}
-
 async function fetchProviderKeys(): Promise<Record<string, string>> {
   const res = await fetch('/fd/admin/provider-keys', {
-    headers: _headers(), credentials: 'include',
+    headers: adminHeaders(), credentials: 'include',
   })
   if (!res.ok) return {}
   const data = await res.json()
@@ -273,7 +120,7 @@ async function fetchProviderKeys(): Promise<Record<string, string>> {
 
 async function saveProviderKeysApi(keys: Record<string, string>): Promise<Record<string, string>> {
   const res = await fetch('/fd/admin/provider-keys', {
-    method: 'PUT', headers: _headers(), credentials: 'include',
+    method: 'PUT', headers: adminHeaders(), credentials: 'include',
     body: JSON.stringify({ keys }),
   })
   if (!res.ok) throw new Error('Failed to save provider keys')
@@ -290,248 +137,15 @@ const LLM_PROVIDERS = [
   { value: 'litert', label: 'LiteRT (local Gemma)' },
 ] as const
 
-async function fetchPlans(): Promise<Record<string, PlanLimits>> {
-  const res = await fetch('/fd/admin/plans', {
-    headers: _headers(), credentials: 'include',
-  })
-  if (!res.ok) throw new Error('Failed to fetch plans')
-  const data = await res.json()
-  return data.plans
-}
-
-// What each user spent today against their plan's daily allowances.
-interface DayUsage { messages: number; tokens: number }
-
-async function fetchUsageToday(): Promise<Record<string, DayUsage>> {
-  const res = await fetch('/fd/admin/usage/today', { headers: _headers(), credentials: 'include' })
-  if (!res.ok) throw new Error("Failed to fetch today's usage")
-  return (await res.json()).usage
-}
-
-async function resetUsageToday(userId: string): Promise<void> {
-  const res = await fetch(`/fd/admin/users/${userId}/usage/today`, {
-    method: 'DELETE', headers: _headers(), credentials: 'include',
-  })
-  if (!res.ok) throw new Error("Failed to reset today's usage")
-}
-
-function fmtTok(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`
-  if (n >= 1_000) return `${Math.round(n / 1_000)}k`
-  return String(n)
-}
-
-const perDay = (n: number | undefined, fmt: (n: number) => string = String) => (n ? fmt(n) : 'unlimited')
-
-/** A user's limits as Flight Deck applies them: their plan's, with any
- *  per-user override from their metadata on top. */
-function effectiveLimits(plan: PlanLimits | undefined, metadata: string): { limits?: PlanLimits; custom: Set<string> } {
-  if (!plan) return { custom: new Set() }
-  let meta: Record<string, unknown> = {}
-  try { meta = JSON.parse(metadata || '{}') } catch { /* plan limits only */ }
-  const limits = { ...plan }
-  const custom = new Set<string>()
-  for (const key of Object.keys(plan) as (keyof PlanLimits)[]) {
-    if (typeof meta[key] === 'number') { limits[key] = meta[key] as number; custom.add(key) }
-  }
-  return { limits, custom }
-}
-
 async function updatePlan(plan: string, limits: Partial<PlanLimits>): Promise<void> {
   const res = await fetch(`/fd/admin/plans/${plan}`, {
-    method: 'PUT', headers: _headers(), credentials: 'include',
+    method: 'PUT', headers: adminHeaders(), credentials: 'include',
     body: JSON.stringify(limits),
   })
   if (!res.ok) throw new Error('Failed to update plan')
 }
 
 // ── Components ──
-
-function CreateUserForm({ onCreated, config }: { onCreated: () => void; config: SystemConfig }) {
-  const [open, setOpen] = useState(false)
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
-  const [displayName, setDisplayName] = useState('')
-  const [role, setRole] = useState('user')
-  // Starts at the deck's "new users start in kiosk mode".
-  const [kiosk, setKiosk] = useState(config.kiosk_new_users)
-  // You know the password you type here: they pick their own at first sign-in.
-  const [mustChange, setMustChange] = useState(true)
-  const [saving, setSaving] = useState(false)
-  const [err, setErr] = useState('')
-
-  const reset = () => {
-    setEmail(''); setPassword(''); setDisplayName(''); setRole('user')
-    setKiosk(config.kiosk_new_users); setMustChange(true); setErr('')
-  }
-  useEffect(() => { setKiosk(config.kiosk_new_users) }, [config.kiosk_new_users])
-
-  const valid = email.trim().includes('@') && password.length >= 6
-
-  const handleCreate = async () => {
-    if (!valid) return
-    setSaving(true); setErr('')
-    try {
-      await createUser({
-        email: email.trim(),
-        password,
-        display_name: displayName.trim() || undefined,
-        role,
-        must_change_password: mustChange,
-        ...(role === 'admin' ? {} : { kiosk }),
-      })
-      reset()
-      setOpen(false)
-      onCreated()
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Failed to create user')
-    }
-    setSaving(false)
-  }
-
-  if (!open) {
-    return (
-      <button
-        onClick={() => setOpen(true)}
-        className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-zinc-700 px-3 py-2.5 text-sm text-zinc-400 hover:border-violet-500/50 hover:text-zinc-200 transition-colors"
-      >
-        <UserPlus className="h-4 w-4" />
-        Add user
-      </button>
-    )
-  }
-
-  return (
-    <div className="rounded-lg border border-violet-800/40 bg-zinc-900/50 p-4 space-y-3">
-      <div className="flex items-center gap-2">
-        <UserPlus className="h-4 w-4 text-violet-400" />
-        <h3 className="text-sm font-semibold text-zinc-200">New user</h3>
-      </div>
-      <div className="grid grid-cols-2 gap-3">
-        <div className="col-span-2">
-          <label className="block text-xs font-medium text-zinc-500 mb-1">Email</label>
-          <input
-            type="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            placeholder="teammate@example.com"
-            autoComplete="off"
-            className="w-full rounded-md border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-sm text-zinc-200 focus:border-violet-500/50 focus:outline-none"
-          />
-        </div>
-        <div>
-          <label className="block text-xs font-medium text-zinc-500 mb-1">Password</label>
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="At least 6 characters"
-            autoComplete="new-password"
-            className="w-full rounded-md border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-sm text-zinc-200 focus:border-violet-500/50 focus:outline-none"
-          />
-          {password && password.length < 6 && (
-            <p className="mt-1 text-[11px] text-amber-500/80">At least 6 characters.</p>
-          )}
-        </div>
-        <div>
-          <label className="block text-xs font-medium text-zinc-500 mb-1">Role</label>
-          <select
-            value={role}
-            onChange={(e) => setRole(e.target.value)}
-            className="w-full rounded-md border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-sm text-zinc-200 focus:border-violet-500/50 focus:outline-none"
-          >
-            <option value="user">user</option>
-            <option value="admin">admin</option>
-          </select>
-        </div>
-        <div className="col-span-2">
-          <label className="block text-xs font-medium text-zinc-500 mb-1">
-            Display name <span className="text-zinc-600">(optional)</span>
-          </label>
-          <input
-            type="text"
-            value={displayName}
-            onChange={(e) => setDisplayName(e.target.value)}
-            placeholder="Defaults to the email name"
-            className="w-full rounded-md border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-sm text-zinc-200 focus:border-violet-500/50 focus:outline-none"
-          />
-        </div>
-        <div className="col-span-2">
-          <MustChangeCheckbox
-            checked={mustChange}
-            onChange={setMustChange}
-            label="They choose their own password at first sign-in"
-            note="Turn off for a shared account that everyone signs in with (a kiosk)."
-          />
-        </div>
-        {role !== 'admin' && (
-          <div className="col-span-2">
-            <KioskCheckbox checked={kiosk} onChange={setKiosk} note={kioskModeNote(config.kiosk_mode)} />
-          </div>
-        )}
-      </div>
-      {err && <p className="text-xs text-red-400">{err}</p>}
-      <div className="flex items-center gap-2 pt-1">
-        <button
-          onClick={handleCreate}
-          disabled={saving || !valid}
-          className="rounded-md bg-violet-600 px-3 py-1.5 text-xs text-white hover:bg-violet-500 disabled:opacity-50"
-        >
-          {saving ? 'Creating…' : 'Create user'}
-        </button>
-        <button
-          onClick={() => { reset(); setOpen(false) }}
-          className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-400 hover:bg-zinc-800"
-        >
-          Cancel
-        </button>
-      </div>
-    </div>
-  )
-}
-
-function KioskCheckbox({ checked, onChange, note }: {
-  checked: boolean
-  onChange: (v: boolean) => void
-  note: string | null
-}) {
-  return (
-    <div>
-      <label className="flex items-center gap-2 text-sm text-zinc-300 cursor-pointer">
-        <input
-          type="checkbox"
-          checked={checked}
-          onChange={(e) => onChange(e.target.checked)}
-          className="h-3.5 w-3.5 rounded border-zinc-600 bg-zinc-950 accent-violet-600"
-        />
-        Kiosk mode <span className="text-xs text-zinc-500">— simple chat only</span>
-      </label>
-      {note && <p className="mt-1 ml-5 text-[11px] text-zinc-500">{note}</p>}
-    </div>
-  )
-}
-
-function MustChangeCheckbox({ checked, onChange, label, note }: {
-  checked: boolean
-  onChange: (v: boolean) => void
-  label: string
-  note?: string
-}) {
-  return (
-    <div>
-      <label className="flex items-center gap-2 text-sm text-zinc-300 cursor-pointer">
-        <input
-          type="checkbox"
-          checked={checked}
-          onChange={(e) => onChange(e.target.checked)}
-          className="h-3.5 w-3.5 rounded border-zinc-600 bg-zinc-950 accent-violet-600"
-        />
-        {label}
-      </label>
-      {note && <p className="mt-1 ml-5 text-[11px] text-zinc-500">{note}</p>}
-    </div>
-  )
-}
 
 function Switch({ on, onToggle, disabled = false, label }: {
   on: boolean
@@ -555,333 +169,6 @@ function Switch({ on, onToggle, disabled = false, label }: {
         on ? 'translate-x-5' : 'translate-x-0'
       }`} />
     </button>
-  )
-}
-
-function UserRow({
-  user, plans, usage, onUpdate, onDelete, currentUserId, kioskMode,
-}: {
-  user: UserInfo
-  plans: Record<string, PlanLimits>
-  usage?: DayUsage
-  onUpdate: () => void
-  onDelete: (id: string) => void
-  currentUserId: string
-  kioskMode: KioskMode
-}) {
-  const [expanded, setExpanded] = useState(false)
-  const [plan, setPlan] = useState(() => {
-    try {
-      const p = JSON.parse(user.metadata || '{}').plan || 'free'
-      return p === 'pro' ? 'premium' : p  // "pro" is "premium" now
-    } catch { return 'free' }
-  })
-  const [role, setRole] = useState(user.role)
-  const [kiosk, setKiosk] = useState(() => userKioskFlag(user))
-  const [saving, setSaving] = useState(false)
-  const [saveError, setSaveError] = useState('')
-  const [agentsOpen, setAgentsOpen] = useState(false)
-  const [resetting, setResetting] = useState(false)
-  const isSelf = user.id === currentUserId
-  const { limits, custom } = effectiveLimits(plans[plan], user.metadata)
-  const mark = (key: string) => (custom.has(key) ? ' (custom)' : '')
-  const spent = user.role !== 'admin' && !!limits && !!usage && (
-    (limits.messages_per_day > 0 && usage.messages >= limits.messages_per_day)
-    || (limits.tokens_per_day > 0 && usage.tokens >= limits.tokens_per_day))
-
-  const handleResetUsage = async () => {
-    setResetting(true); setSaveError('')
-    try {
-      await resetUsageToday(user.id)
-      onUpdate()
-    } catch (e) {
-      setSaveError(e instanceof Error ? e.message : "Failed to reset today's usage")
-    }
-    setResetting(false)
-  }
-
-  const handleSave = async () => {
-    setSaving(true); setSaveError('')
-    try {
-      await updateUser(user.id, { plan, role, kiosk })
-      onUpdate()
-    } catch (e) {
-      setSaveError(e instanceof Error ? e.message : 'Failed to update user')
-    }
-    setSaving(false)
-  }
-
-  return (
-    <div className="border border-zinc-800 rounded-lg overflow-hidden">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-3 px-4 py-3 hover:bg-zinc-800/50 transition-colors text-left"
-      >
-        {expanded ? <ChevronDown className="h-4 w-4 text-zinc-500 shrink-0" /> : <ChevronRight className="h-4 w-4 text-zinc-500 shrink-0" />}
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
-            <span className="text-sm font-medium text-zinc-200 truncate">{user.display_name || user.email}</span>
-            {user.role === 'admin' && <Crown className="h-3.5 w-3.5 text-amber-400" />}
-            {isSelf && <span className="text-xs text-zinc-500">(you)</span>}
-          </div>
-          <div className="text-xs text-zinc-500">{user.email}</div>
-        </div>
-        {userMustChangePassword(user) && (
-          <span
-            title="An admin set this password; they choose their own at their next sign-in"
-            className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-700 dark:text-amber-300"
-          >
-            <KeyRound className="h-3 w-3" />
-            temporary password
-          </span>
-        )}
-        {kioskEffective(user.role, userKioskFlag(user), kioskMode) && (
-          <span
-            title="Locked to the simple chat layout (kiosk mode)"
-            className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-violet-500/15 text-violet-300"
-          >
-            <MessageSquare className="h-3 w-3" />
-            kiosk
-          </span>
-        )}
-        {usage && (usage.messages > 0 || usage.tokens > 0) && (
-          <span
-            title={spent ? "Today's allowance is spent" : 'Used today'}
-            className={`hidden sm:inline text-xs px-2 py-0.5 rounded-full ${spent ? 'bg-red-500/15 text-red-700 dark:text-red-300' : 'bg-zinc-800 text-zinc-500'}`}
-          >
-            {usage.messages} msg · {fmtTok(usage.tokens)} tok today
-          </span>
-        )}
-        <span className="text-xs px-2 py-0.5 rounded-full bg-zinc-800 text-zinc-400 capitalize">{plan}</span>
-      </button>
-
-      {expanded && (
-        <div className="border-t border-zinc-800 px-4 py-3 bg-zinc-900/50 space-y-3">
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs font-medium text-zinc-500 mb-1">Plan</label>
-              <select
-                value={plan}
-                onChange={(e) => setPlan(e.target.value)}
-                className="w-full rounded-md border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-sm text-zinc-200 focus:border-violet-500/50 focus:outline-none"
-              >
-                {Object.keys(plans).map((p) => (
-                  <option key={p} value={p}>{p}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs font-medium text-zinc-500 mb-1">Role</label>
-              <select
-                value={role}
-                onChange={(e) => setRole(e.target.value)}
-                disabled={isSelf}
-                className="w-full rounded-md border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-sm text-zinc-200 focus:border-violet-500/50 focus:outline-none disabled:opacity-50"
-              >
-                <option value="user">user</option>
-                <option value="admin">admin</option>
-              </select>
-            </div>
-          </div>
-
-          {role === 'admin' ? (
-            <p className="text-[11px] text-zinc-500">Admins are never held to kiosk mode.</p>
-          ) : (
-            <KioskCheckbox checked={kiosk} onChange={setKiosk} note={kioskModeNote(kioskMode)} />
-          )}
-
-          {limits && (
-            <div className="text-xs text-zinc-500 grid grid-cols-2 gap-1">
-              <span>Max agents: {limits.max_agents}{mark('max_agents')}</span>
-              <span>Storage: {limits.max_storage_mb} MB{mark('max_storage_mb')}</span>
-              <span>Requests/min: {limits.requests_per_minute}{mark('requests_per_minute')}</span>
-              <span>Spawns/hour: {limits.spawns_per_hour}{mark('spawns_per_hour')}</span>
-              <span>Messages/day: {perDay(limits.messages_per_day)}{mark('messages_per_day')}</span>
-              <span>Tokens/day: {perDay(limits.tokens_per_day, fmtTok)}{mark('tokens_per_day')}</span>
-            </div>
-          )}
-
-          <div className="flex flex-wrap items-center gap-2 text-xs">
-            <span className={spent ? 'text-red-700 dark:text-red-300' : 'text-zinc-400'}>
-              Today: {usage?.messages ?? 0} message{(usage?.messages ?? 0) === 1 ? '' : 's'} · {fmtTok(usage?.tokens ?? 0)} tokens
-              {spent && ' — limit reached'}
-              {user.role === 'admin' && ' (admins have no daily limits)'}
-            </span>
-            {usage && (usage.messages > 0 || usage.tokens > 0) && (
-              <button
-                onClick={handleResetUsage}
-                disabled={resetting}
-                title="Give this user today's messages and tokens back"
-                className="rounded-md border border-zinc-700 px-2 py-0.5 text-[11px] text-zinc-300 hover:border-violet-500/40 hover:text-zinc-100 disabled:opacity-50"
-              >
-                {resetting ? 'Resetting…' : 'Reset today'}
-              </button>
-            )}
-          </div>
-
-          <div className="text-xs text-zinc-600">
-            Joined: {new Date(user.created_at).toLocaleDateString()}
-          </div>
-          {saveError && <p className="text-xs text-red-400">{saveError}</p>}
-
-          <div className="flex items-center gap-2 pt-1">
-            <button
-              onClick={handleSave}
-              disabled={saving}
-              className="rounded-md bg-violet-600 px-3 py-1.5 text-xs text-white hover:bg-violet-500 disabled:opacity-50"
-            >
-              {saving ? 'Saving...' : 'Save Changes'}
-            </button>
-            <button
-              onClick={() => setAgentsOpen(true)}
-              title="Create, start, stop, configure and remove this user's agents"
-              className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-300 hover:border-violet-500/40 hover:text-zinc-100"
-            >
-              <Bot className="h-3 w-3 inline mr-1" />
-              Agents
-            </button>
-            {!isSelf && (
-              <button
-                onClick={() => { if (confirm(`Delete user ${user.email}? This cannot be undone.`)) onDelete(user.id) }}
-                className="rounded-md border border-red-900/50 px-3 py-1.5 text-xs text-red-400 hover:bg-red-950/50"
-              >
-                <Trash2 className="h-3 w-3 inline mr-1" />
-                Delete
-              </button>
-            )}
-          </div>
-
-          <SetPasswordSection userId={user.id} email={user.email} isSelf={isSelf} onSet={onUpdate} />
-        </div>
-      )}
-      {agentsOpen && (
-        <UserAgentsDialog
-          userId={user.id}
-          userLabel={user.display_name || user.email}
-          onClose={() => setAgentsOpen(false)}
-        />
-      )}
-    </div>
-  )
-}
-
-// Admin sets someone's password (they forgot it, or it leaked) — no current
-// password needed. Its own action, apart from Save Changes. Their own: Profile.
-function SetPasswordSection({ userId, email, isSelf, onSet }: {
-  userId: string
-  email: string
-  isSelf: boolean
-  onSet: () => void
-}) {
-  const setView = useUIStore((s) => s.setView)
-  const [password, setPassword] = useState('')
-  const [confirm, setConfirm] = useState('')
-  const [signOut, setSignOut] = useState(true)
-  const [mustChange, setMustChange] = useState(true)
-  const [saving, setSaving] = useState(false)
-  const [notice, setNotice] = useState('')
-  const [err, setErr] = useState('')
-
-  if (isSelf) {
-    return (
-      <div className="border-t border-zinc-800 pt-3 text-xs text-zinc-500">
-        <KeyRound className="h-3 w-3 inline mr-1" />
-        Change your own password on your{' '}
-        <button onClick={() => setView('profile')} className="text-violet-400 underline underline-offset-2 hover:no-underline">
-          Profile
-        </button>.
-      </div>
-    )
-  }
-
-  const tooShort = password.length > 0 && password.length < MIN_PASSWORD_LENGTH
-  const mismatch = confirm.length > 0 && confirm !== password
-  const valid = password.length >= MIN_PASSWORD_LENGTH && confirm === password
-
-  const handleSet = async () => {
-    if (!valid) return
-    setSaving(true); setErr(''); setNotice('')
-    try {
-      await updateUser(userId, { password, sign_out: signOut, must_change_password: mustChange })
-      setPassword(''); setConfirm('')
-      setNotice([
-        'Password set.',
-        signOut && 'They were signed out everywhere.',
-        mustChange && 'They choose their own at their next sign-in.',
-      ].filter(Boolean).join(' '))
-      onSet()
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : 'Failed to set password')
-    }
-    setSaving(false)
-  }
-
-  const input = 'w-full rounded-md border border-zinc-700 bg-zinc-950 px-2.5 py-1.5 text-sm text-zinc-200 focus:border-violet-500/50 focus:outline-none'
-
-  return (
-    <div className="border-t border-zinc-800 pt-3 space-y-2">
-      <div className="flex items-center gap-1.5 text-xs font-medium text-zinc-400">
-        <KeyRound className="h-3.5 w-3.5" />
-        Set password
-      </div>
-      {/* For password managers: the account this password is for. */}
-      <input type="text" autoComplete="username" value={email} readOnly hidden />
-      <div className="grid grid-cols-2 gap-3">
-        <div>
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => { setPassword(e.target.value); setNotice('') }}
-            placeholder="New password"
-            autoComplete="new-password"
-            aria-label="New password"
-            className={input}
-          />
-          {tooShort && <p className="mt-1 text-[11px] text-amber-500/80">At least {MIN_PASSWORD_LENGTH} characters.</p>}
-        </div>
-        <div>
-          <input
-            type="password"
-            value={confirm}
-            onChange={(e) => { setConfirm(e.target.value); setNotice('') }}
-            placeholder="Confirm new password"
-            autoComplete="new-password"
-            aria-label="Confirm new password"
-            className={input}
-          />
-          {mismatch && <p className="mt-1 text-[11px] text-amber-500/80">Doesn't match.</p>}
-        </div>
-      </div>
-      <div className="flex flex-wrap items-center gap-3">
-        <button
-          onClick={handleSet}
-          disabled={saving || !valid}
-          className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-200 hover:border-violet-500/50 hover:bg-zinc-800 disabled:opacity-50"
-        >
-          {saving ? 'Setting…' : 'Set password'}
-        </button>
-        <label className="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={signOut}
-            onChange={(e) => setSignOut(e.target.checked)}
-            className="h-3.5 w-3.5 rounded border-zinc-600 bg-zinc-950 accent-violet-600"
-          />
-          Sign them out everywhere
-        </label>
-        <label className="flex items-center gap-2 text-xs text-zinc-400 cursor-pointer">
-          <input
-            type="checkbox"
-            checked={mustChange}
-            onChange={(e) => setMustChange(e.target.checked)}
-            className="h-3.5 w-3.5 rounded border-zinc-600 bg-zinc-950 accent-violet-600"
-          />
-          They choose their own at next sign-in
-        </label>
-      </div>
-      {notice && <p className="text-xs text-emerald-400">{notice}</p>}
-      {err && <p className="text-xs text-red-400">{err}</p>}
-    </div>
   )
 }
 
@@ -951,10 +238,7 @@ function PlanCard({
 export function AdminPage() {
   const currentUser = useAuthStore((s) => s.user)
   const [tab, setTab] = useState<AdminTab>(takeRequestedTab)
-  const [users, setUsers] = useState<UserInfo[]>([])
-  const [totalUsers, setTotalUsers] = useState(0)
   const [plans, setPlans] = useState<Record<string, PlanLimits>>({})
-  const [usageToday, setUsageToday] = useState<Record<string, DayUsage>>({})
   const [config, setConfig] = useState<SystemConfig>({ ...CONFIG_DEFAULTS })
   const [providerKeys, setProviderKeys] = useState<Record<string, string>>({})
   const [providerKeysDraft, setProviderKeysDraft] = useState<Record<string, string>>({})
@@ -966,28 +250,20 @@ export function AdminPage() {
   const [error, setError] = useState('')
   // Bumped by Refresh: the Integrations cards load on their own and reload on it.
   const [refreshTick, setRefreshTick] = useState(0)
-  const [waitlistPending, setWaitlistPending] = useState(0)
   const [cohortDraft, setCohortDraft] = useState('')
   const signUpMode = useAuthStore((s) => s.signUp.mode)
 
-  const loadUsers = useCallback(async () => {
+  const loadSettings = useCallback(async () => {
     try {
-      const [usersData, plansData, cfgData, keys, waitlist, today] = await Promise.all([
-        fetchUsers(), fetchPlans(), fetchConfig(), fetchProviderKeys(), fetchWaitlist().catch(() => null),
-        fetchUsageToday().catch(() => ({})),
-      ])
-      setUsers(usersData.users)
-      setUsageToday(today)
-      setTotalUsers(usersData.total)
+      const [plansData, cfgData, keys] = await Promise.all([fetchPlans(), fetchConfig(), fetchProviderKeys()])
       setPlans(plansData)
       setConfig(cfgData)
       setCohortDraft(cfgData.waitlist_cohort)
-      if (waitlist) setWaitlistPending(waitlist.pending)
       setProviderKeys(keys)
       setProviderKeysDraft(keys)
       setError('')
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load users')
+      setError(e instanceof Error ? e.message : 'Failed to load settings')
     }
   }, [])
 
@@ -1007,22 +283,13 @@ export function AdminPage() {
 
   useEffect(() => {
     setLoading(true)
-    Promise.all([loadUsers(), loadUsage()]).finally(() => setLoading(false))
-  }, [loadUsers, loadUsage])
-
-  const handleDelete = async (userId: string) => {
-    try {
-      await deleteUser(userId)
-      loadUsers()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to delete user')
-    }
-  }
+    Promise.all([loadSettings(), loadUsage()]).finally(() => setLoading(false))
+  }, [loadSettings, loadUsage])
 
   const refresh = () => {
     setRefreshTick((t) => t + 1)
     setLoading(true)
-    Promise.all([loadUsers(), loadUsage()]).finally(() => setLoading(false))
+    Promise.all([loadSettings(), loadUsage()]).finally(() => setLoading(false))
   }
 
   if (!currentUser || currentUser.role !== 'admin') {
@@ -1037,19 +304,29 @@ export function AdminPage() {
     <div className="h-full overflow-y-auto">
       <div className="max-w-4xl mx-auto p-6 space-y-6">
         {/* Header */}
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-3">
           <div className="flex items-center gap-3">
             <Shield className="h-5 w-5 text-violet-400" />
             <h1 className="text-lg font-semibold text-zinc-100">Admin Panel</h1>
           </div>
-          <button
-            onClick={refresh}
-            disabled={loading}
-            className="flex items-center gap-1.5 rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-400 hover:bg-zinc-800"
-          >
-            <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
-            Refresh
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => openUsersTab('users')}
+              title="Users, invitations and the waitlist"
+              className="flex items-center gap-1.5 rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+            >
+              <UserCog className="h-3.5 w-3.5" />
+              Users
+            </button>
+            <button
+              onClick={refresh}
+              disabled={loading}
+              className="flex items-center gap-1.5 rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-400 hover:bg-zinc-800"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
+              Refresh
+            </button>
+          </div>
         </div>
 
         {error && (
@@ -1059,34 +336,7 @@ export function AdminPage() {
         )}
 
         {/* Tabs */}
-        <div className="flex gap-1 border-b border-zinc-800">
-          <button
-            onClick={() => setTab('users')}
-            className={`flex items-center gap-2 px-4 py-2.5 text-sm border-b-2 transition-colors ${
-              tab === 'users'
-                ? 'border-violet-500 text-zinc-100'
-                : 'border-transparent text-zinc-500 hover:text-zinc-300'
-            }`}
-          >
-            <Users className="h-4 w-4" />
-            Users ({totalUsers})
-          </button>
-          <button
-            onClick={() => setTab('waitlist')}
-            className={`flex items-center gap-2 px-4 py-2.5 text-sm border-b-2 transition-colors ${
-              tab === 'waitlist'
-                ? 'border-violet-500 text-zinc-100'
-                : 'border-transparent text-zinc-500 hover:text-zinc-300'
-            }`}
-          >
-            <ClipboardList className="h-4 w-4" />
-            Waitlist
-            {waitlistPending > 0 && (
-              <span className="rounded-full bg-violet-600 px-1.5 py-0.5 text-[10px] font-semibold leading-none text-white">
-                {waitlistPending}
-              </span>
-            )}
-          </button>
+        <div className="flex gap-1 overflow-x-auto border-b border-zinc-800">
           <button
             onClick={() => setTab('usage')}
             className={`flex items-center gap-2 px-4 py-2.5 text-sm border-b-2 transition-colors ${
@@ -1137,49 +387,6 @@ export function AdminPage() {
           <div className="flex justify-center py-8">
             <Loader2 className="h-6 w-6 animate-spin text-zinc-500" />
           </div>
-        )}
-
-        {/* Users tab */}
-        {!loading && tab === 'users' && (
-          <div className="space-y-2">
-            <InvitesAdmin
-              refreshTick={refreshTick}
-              kioskDefault={config.kiosk_new_users}
-              kioskNote={kioskModeNote(config.kiosk_mode)}
-            />
-            <CreateUserForm onCreated={loadUsers} config={config} />
-            {users.map((u) => (
-              <UserRow
-                key={u.id}
-                user={u}
-                plans={plans}
-                usage={usageToday[u.id]}
-                onUpdate={loadUsers}
-                onDelete={handleDelete}
-                currentUserId={currentUser.id}
-                kioskMode={config.kiosk_mode}
-              />
-            ))}
-            {users.length === 0 && (
-              <p className="text-center text-sm text-zinc-500 py-8">No users found</p>
-            )}
-          </div>
-        )}
-
-        {/* Waitlist tab: loads on its own, like the Integrations cards. */}
-        {tab === 'waitlist' && (
-          <WaitlistAdmin
-            refreshTick={refreshTick}
-            onPendingCount={setWaitlistPending}
-            onApproved={loadUsers}
-            note={
-              signUpMode === 'register'
-                ? 'Self-registration is open (FD_REGISTRATION_OPEN), so the sign-up page creates accounts directly and takes no applications.'
-                : !config.waitlist_enabled
-                  ? 'The waitlist is off (Settings), so the sign-up page takes no new applications.'
-                  : null
-            }
-          />
         )}
 
         {/* Usage tab */}
@@ -1387,8 +594,11 @@ export function AdminPage() {
                 </h3>
                 <p className="text-xs text-zinc-500 mt-0.5">
                   While registration is closed, the sign-up page takes applications instead: name, email, a
-                  password, and the name and email of whoever recommended them. You approve them in the
-                  Waitlist tab.
+                  password, and the name and email of whoever recommended them. You approve them on the
+                  Users page, under{' '}
+                  <button onClick={() => openUsersTab('waitlist')} className="text-violet-400 underline underline-offset-2 hover:no-underline">
+                    Waitlist
+                  </button>.
                   {signUpMode === 'register' && ' Self-registration is open on this deck (FD_REGISTRATION_OPEN), so the waitlist isn\'t shown.'}
                 </p>
               </div>
@@ -1397,7 +607,7 @@ export function AdminPage() {
                   <div className="text-sm text-zinc-300">Take waitlist applications</div>
                   <div className="text-xs text-zinc-500 mt-0.5">
                     Off: the sign-in page says sign-up is closed and that an administrator creates accounts
-                    (Users → Add user). Applications already in stay listed.
+                    (Users → Add user, or Invitations). Applications already in stay listed.
                   </div>
                 </div>
                 <Switch
@@ -1523,7 +733,7 @@ export function AdminPage() {
                 limits={limits}
                 onSave={async (plan, newLimits) => {
                   await updatePlan(plan, newLimits)
-                  await loadUsers()
+                  await loadSettings()
                 }}
               />
             ))}

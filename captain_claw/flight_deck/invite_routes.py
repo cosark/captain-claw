@@ -1,7 +1,7 @@
 """Member invitations — an admin invites someone by email; they choose their
 own password.
 
-Admin → Users → Invite: the admin names the email (plus a name, the role, the
+Users → Invitations: the admin names the email (plus a name, the role, the
 kiosk flag and an optional note) and how to send it — from their OWN connected
 Google (Gmail) or Microsoft (Outlook) account, or no email at all (they copy
 the link and pass it on). The email carries a one-time link to
