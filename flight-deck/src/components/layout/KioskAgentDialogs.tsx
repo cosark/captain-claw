@@ -20,9 +20,10 @@ import {
 } from 'lucide-react'
 import { IntentionsPanel } from '../agents/IntentionsPanel'
 import { TopicsPanel } from '../agents/TopicsPanel'
-import { MODES } from '../common/CognitiveModeSelector'
-import { KNOWN_PROVIDERS, VISION_OPTIONS, parseModelFromYaml } from '../common/ModelSelector'
 import { getAgentConfig, getAgentMode, setAgentMode, setAgentModel, setAgentVision } from '../../services/docker'
+import { LLM_PROVIDERS } from '../../services/tierConfig'
+import { VISION_OPTIONS, parseModelFromYaml } from '../../services/agentModel'
+import { MODES } from '../../services/cognitiveModes'
 import { useChatStore } from '../../stores/chatStore'
 import { useContainerStore } from '../../stores/containerStore'
 import { useNotificationStore } from '../../stores/notificationStore'
@@ -417,8 +418,9 @@ export function KioskAgentSettingsDialog({ agent, restarting, onRestart, onClose
 
   const textOnly = SIGN_IN_PROVIDERS.has(model.provider)
   const current = MODES.find((m) => m.id === mode) ?? MODES[0]
+  const providerLabel = LLM_PROVIDERS.find((p) => p.value === provider)?.label || provider || 'the new provider'
   const keyHint = switched
-    ? `The key for ${provider || 'the new provider'}. Leave it empty to use your team's key, if your deck has one.`
+    ? `The key for ${providerLabel}. Leave it empty to use your team's key, if your deck has one.`
     : 'Leave it empty to keep the key it uses now.'
 
   return (
@@ -436,12 +438,22 @@ export function KioskAgentSettingsDialog({ agent, restarting, onRestart, onClose
                 The AI model it runs on, and the key that pays for it. Applies once the agent restarts.
               </p>
               <div className="grid grid-cols-1 gap-2 wide:grid-cols-[2fr_3fr]">
-                <TextField label="Provider" value={draft.provider} onChange={pickProvider} placeholder="openai" list={`kiosk-providers-${key}`} />
+                <label className="block min-w-0">
+                  <span className="mb-1 block text-[11px] font-medium text-zinc-400">Provider</span>
+                  <select
+                    value={draft.provider}
+                    onChange={(e) => pickProvider(e.target.value)}
+                    className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-2.5 py-2 text-sm text-zinc-200 focus:border-violet-500/60 focus:outline-none"
+                  >
+                    {/* What it runs on now, even if it isn't one of the list. */}
+                    {!LLM_PROVIDERS.some((p) => p.value === model.provider) && (
+                      <option value={model.provider}>{model.provider || '— choose —'}</option>
+                    )}
+                    {LLM_PROVIDERS.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
+                  </select>
+                </label>
                 <TextField label="Model" value={draft.model} onChange={(v) => setDraft((d) => ({ ...d, model: v }))} placeholder="e.g. gpt-4.1-mini" />
               </div>
-              <datalist id={`kiosk-providers-${key}`}>
-                {KNOWN_PROVIDERS.map((p) => <option key={p} value={p} />)}
-              </datalist>
               {signIn ? (
                 <p className="mt-2 text-[11px] text-zinc-500">Local Google sign-in — no API key or endpoint.</p>
               ) : (
@@ -584,14 +596,13 @@ export function KioskAgentSettingsDialog({ agent, restarting, onRestart, onClose
   )
 }
 
-function TextField({ label, value, onChange, placeholder, hint, type = 'text', list }: {
+function TextField({ label, value, onChange, placeholder, hint, type = 'text' }: {
   label: string
   value: string
   onChange: (v: string) => void
   placeholder?: string
   hint?: string
   type?: 'text' | 'password'
-  list?: string
 }) {
   return (
     <label className="block min-w-0">
@@ -601,7 +612,6 @@ function TextField({ label, value, onChange, placeholder, hint, type = 'text', l
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
-        list={list}
         spellCheck={false}
         autoComplete={type === 'password' ? 'new-password' : 'off'}
         className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 placeholder-zinc-600 focus:border-violet-500/60 focus:outline-none"

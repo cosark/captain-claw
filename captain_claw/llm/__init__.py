@@ -783,6 +783,18 @@ def _reasoning_content_fallback(reasoning: str) -> str:
     return "" if result == _REASONING_BACKFILL_PLACEHOLDER else result
 
 
+# Every provider create_provider can build (normalized names).
+SUPPORTED_PROVIDERS = frozenset({
+    "ollama", "openai", "anthropic", "claude-cli", "gemini", "antigravity-cli",
+    "xai", "openrouter", "litert", "browser",
+})
+
+
+def is_supported_provider(provider: str) -> bool:
+    """Can an agent run on ``provider`` (or an alias of one)?"""
+    return _normalize_provider_name(provider) in SUPPORTED_PROVIDERS
+
+
 def _normalize_provider_name(provider: str) -> str:
     """Normalize provider aliases."""
     key = (provider or "").strip().lower()

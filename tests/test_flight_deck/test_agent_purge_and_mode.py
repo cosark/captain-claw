@@ -287,3 +287,34 @@ async def test_the_mode_reaches_every_config_copy_too(deck):
         assert data["model"]["model"] == "a"
     cc = server.DATA_DIR / "bob-agent" / "data" / "home-config-parent" / ".captain-claw"
     assert (cc / "cognitive_mode.txt").read_text() == "dorian"
+
+
+# ── only providers the agent can run on ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_an_unsupported_provider_is_refused_and_nothing_written(deck):
+    _with_all_copies("bob-agent", {"provider": "ollama", "model": "ornith:9b"})
+    before = [path.read_text() for path in _copies("bob-agent")]
+    async with _client() as c:
+        r = await c.put("/fd/agent-model/process/bob-agent", headers=_hdr(BOB),
+                        json={"provider": "groq", "model": "llama"})
+        assert r.status_code == 400 and "groq" in r.text
+        assert [path.read_text() for path in _copies("bob-agent")] == before
+        # An alias of a supported one is fine.
+        r = await c.put("/fd/agent-model/process/bob-agent", headers=_hdr(BOB),
+                        json={"provider": "claude", "model": "claude-sonnet-5-5"})
+        assert r.status_code == 200
+
+
+def test_every_provider_flight_deck_offers_is_one_an_agent_runs_on():
+    import re
+
+    from captain_claw.llm import is_supported_provider
+
+    src = (Path(__file__).resolve().parents[2] / "flight-deck" / "src" / "services" / "tierConfig.ts").read_text()
+    block = src[src.index("export const LLM_PROVIDERS"):]
+    block = block[:block.index("] as const")]
+    offered = re.findall(r"value: '([^']+)'", block)
+    assert len(offered) >= 8
+    assert [p for p in offered if not is_supported_provider(p)] == []

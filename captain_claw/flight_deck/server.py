@@ -3823,6 +3823,12 @@ async def update_agent_model(
         raise HTTPException(400, "Nothing to update: give a provider and model, or vision")
     if changes_model and not (body.provider.strip() and body.model.strip()):
         raise HTTPException(400, "Give both a provider and a model")
+    if changes_model:
+        from captain_claw.llm import SUPPORTED_PROVIDERS, is_supported_provider
+
+        if not is_supported_provider(body.provider):
+            raise HTTPException(400, f"Unknown provider '{body.provider.strip()}'. "
+                                f"Use one of: {', '.join(sorted(SUPPORTED_PROVIDERS))}")
     user_id = getattr(request.state, "user_id", "")
     agent_dir = _resolve_agent_dir(identifier, kind, user_id)
     provider, model_name = body.provider.strip(), body.model.strip()

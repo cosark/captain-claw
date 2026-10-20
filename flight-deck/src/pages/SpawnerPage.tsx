@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { Server, Plus, Trash2, Save, FolderOpen, Copy, X, FileDown, ClipboardCopy, ChevronDown, ChevronRight, Rocket, Cpu, Menu, Key, Check, Gift, Loader2, ExternalLink } from 'lucide-react'
 import { useAuthStore } from '../stores/authStore'
-import { OUTPUT_CTX_OPTIONS } from '../services/tierConfig'
+import { LLM_PROVIDERS, OUTPUT_CTX_OPTIONS } from '../services/tierConfig'
 import { CtxSelect } from '../components/common/CtxSelect'
 import { useIsMobile } from '../hooks/useMediaQuery'
 import { useConnectionStore } from '../stores/connectionStore'
@@ -77,18 +77,6 @@ interface SavedPreset {
 
 const PRESETS_KEY = 'fd:agent-presets'
 const PROVIDER_KEYS_SETTING = 'fd:provider-keys'
-
-const LLM_PROVIDERS = [
-  { value: 'anthropic', label: 'Anthropic' },
-  { value: 'ollama', label: 'Ollama' },
-  { value: 'openai', label: 'OpenAI' },
-  { value: 'gemini', label: 'Gemini (API)' },
-  { value: 'antigravity-cli', label: 'Google (Antigravity subscription, text only)' },
-  { value: 'openrouter', label: 'OpenRouter' },
-  { value: 'xai', label: 'xAI' },
-  { value: 'litert', label: 'LiteRT (local Gemma)' },
-  { value: 'browser', label: 'Browser tab (Local inference)' },
-] as const
 
 type ProviderKeys = Record<string, string>
 

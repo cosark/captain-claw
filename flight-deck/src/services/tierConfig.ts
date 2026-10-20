@@ -114,6 +114,20 @@ interface SetsBlob { sets: TierSet[]; activeSetId: string }
 
 export const PROVIDERS = ['anthropic', 'openai', 'ollama', 'gemini', 'antigravity-cli', 'xai', 'openrouter', 'litert', 'browser']
 
+/** The providers an agent can run on (the agent runtime's create_provider),
+ *  named for people — every picker that sets an agent's provider offers these. */
+export const LLM_PROVIDERS = [
+  { value: 'anthropic', label: 'Anthropic' },
+  { value: 'ollama', label: 'Ollama' },
+  { value: 'openai', label: 'OpenAI' },
+  { value: 'gemini', label: 'Gemini (API)' },
+  { value: 'antigravity-cli', label: 'Google (Antigravity subscription, text only)' },
+  { value: 'openrouter', label: 'OpenRouter' },
+  { value: 'xai', label: 'xAI' },
+  { value: 'litert', label: 'LiteRT (local Gemma)' },
+  { value: 'browser', label: 'Browser tab (Local inference)' },
+] as const
+
 // Fixed context-size menus — every panel that edits input/output context
 // uses these (no freeform token counts). Powers of two where natural,
 // decimal for the model-family sizes (100k, 160k).

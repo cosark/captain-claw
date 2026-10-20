@@ -1,71 +1,13 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Cpu, Check, Loader2, Pencil, KeyRound, Eye } from 'lucide-react'
 import { useAuthStore, refreshAccessToken } from '../../stores/authStore'
+import { LLM_PROVIDERS } from '../../services/tierConfig'
+import { VISION_OPTIONS, parseModelFromYaml } from '../../services/agentModel'
 
 interface ModelSelectorProps {
   kind: 'docker' | 'process'
   identifier: string  // container id or process slug
   onModelChange?: (provider: string, model: string) => void
-}
-
-export interface ModelInfo {
-  provider: string
-  model: string
-  api_key: string
-  base_url: string
-  // Does the model see images itself (model.vision): 'auto' | 'on' | 'off'
-  vision: string
-}
-
-export const VISION_OPTIONS = [
-  { value: 'auto', label: 'Auto — known multimodal models' },
-  { value: 'on', label: 'On — the model sees images itself' },
-  { value: 'off', label: 'Off — a vision model describes them' },
-]
-
-export const KNOWN_PROVIDERS = [
-  'ollama', 'anthropic', 'openai', 'gemini', 'groq', 'mistral',
-  'deepseek', 'openrouter', 'xai', 'together', 'cerebras', 'sambanova', 'fireworks',
-  'litert', 'antigravity-cli',
-]
-
-export function parseModelFromYaml(yaml: string): ModelInfo {
-  const info: ModelInfo = { provider: '', model: '', api_key: '', base_url: '', vision: 'auto' }
-  // Simple YAML parser for the model section
-  const lines = yaml.split('\n')
-  let inModel = false
-  for (const line of lines) {
-    const trimmed = line.trimStart()
-    // Entering/leaving the top-level model section — judged on the raw line:
-    // its keys are indented, the next section's key is not.
-    if (/^model\s*:/.test(line)) {
-      inModel = true
-      continue
-    }
-    if (inModel && trimmed.length > 0 && !/^[\s#]/.test(line)) {
-      inModel = false
-    }
-    if (!inModel) continue
-
-    const providerMatch = trimmed.match(/^\s*provider\s*:\s*["']?([^"'\s#]+)/)
-    if (providerMatch) info.provider = providerMatch[1]
-
-    const modelMatch = trimmed.match(/^\s*model\s*:\s*["']?([^"'\s#]+)/)
-    if (modelMatch) info.model = modelMatch[1]
-
-    const keyMatch = trimmed.match(/^\s*api_key\s*:\s*["']?([^"'#]*)/)
-    if (keyMatch) info.api_key = keyMatch[1].trim()
-
-    const urlMatch = trimmed.match(/^\s*base_url\s*:\s*["']?([^"'\s#]*)/)
-    if (urlMatch) info.base_url = urlMatch[1]
-
-    const visionMatch = trimmed.match(/^vision\s*:\s*["']?([^"'\s#]+)/)
-    if (visionMatch) {
-      const v = visionMatch[1].toLowerCase()
-      info.vision = ['true', 'on', 'yes'].includes(v) ? 'on' : ['false', 'off', 'no'].includes(v) ? 'off' : 'auto'
-    }
-  }
-  return info
 }
 
 async function fdFetch<T>(path: string, init?: RequestInit): Promise<T> {
@@ -232,7 +174,7 @@ export function ModelSelector({ kind, identifier, onModelChange }: ModelSelector
             className="w-full rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-200 placeholder-zinc-600 focus:border-violet-500/50 focus:outline-none"
           />
           <datalist id="model-providers">
-            {KNOWN_PROVIDERS.map(p => <option key={p} value={p} />)}
+            {LLM_PROVIDERS.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
           </datalist>
         </div>
 
