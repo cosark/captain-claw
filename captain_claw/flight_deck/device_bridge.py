@@ -31,6 +31,13 @@ Device → Flight Deck
   text  {"type":"agents"} / {"type":"select","agent":"<slug>"}
   text  {"type":"prefs","voice":"male|female|<name>","speak":bool}   change voice / speaking live
   text  {"type":"ping","t":<device ms>}          echoed back (round-trip time)
+  text  {"type":"notes_begin","count":n}         offline voice notes (recorded while the deck was
+  text  {"type":"note_start","id","rate","seconds","recorded","epoch"}   out of reach), then bin PCM,
+  text  {"type":"note_end","id"} … {"type":"notes_end","ctx":{…}}        → transcribed into ONE agent
+                                                 turn marked as offline notes → {"type":"notes_done",
+                                                 "ids":[…]} (the device deletes those) or
+                                                 {"type":"notes_failed","text":…}; notes_cancel drops
+                                                 a batch cut short
   text  {"type":"say","text":"…"}                speak a short line aside (an e-paper's menu row):
                                                  audio_start with "aside":true; never over an
                                                  answer, never kept for a replay
@@ -119,6 +126,20 @@ AUDIO_FILE_MAX_S = 300
 MAX_JPEG_BYTES = 14000           # the device's WebSocket library takes ≤15 KB frames
 MAX_CHUNKED_JPEG_BYTES = 120_000  # a picture sent in parts (img=chunks)
 MAX_SAY_CHARS = 120              # a spoken menu row, not a reply
+MAX_NOTES_PER_BATCH = 20         # offline voice notes taken in one upload
+MAX_NOTE_SECONDS = 120
+
+# Offline voice notes already handed to the agent, per device channel: a
+# batch sent again (its notes_done lost with the link) is acknowledged, not
+# delivered twice.
+_delivered_notes: dict[str, list[str]] = {}
+_notes_locks: dict[str, asyncio.Lock] = {}
+
+OFFLINE_NOTES_CONTEXT = (
+    "Offline voice notes: the user recorded these on the device while it had no connection to you, "
+    "each at the time shown. They weren't waiting for an answer then. Handle them now, in order — do "
+    "what each one asks, or keep it as a note when it is one — and answer once, briefly."
+)
 
 # The last answer's sounds per device channel, for a replay — kept here, not
 # on the connection, so it survives a reconnect (a dropped link cuts an
@@ -321,6 +342,23 @@ def device_context_line(ctx: Any, hw: str = "") -> str:
     return f"Device readings{' (' + model + ')' if model else ''} as it sent this: " + "; ".join(parts) + "."
 
 
+def offline_notes_message(notes: list[dict]) -> str:
+    """Transcribed offline voice notes as one message, oldest first: each
+    numbered, with when it was recorded and how long it was."""
+    lines = []
+    for i, note in enumerate(notes, 1):
+        when = _ctx_text(note.get("recorded"), 40) or "time unknown"
+        secs = int(_num(note.get("seconds"), 0, 3600) or 0)
+        lines.append(f"{i}. ({when}, {secs // 60}:{secs % 60:02d}) {str(note.get('text', '')).strip()}")
+    head = ("Voice notes I recorded while you were out of reach:" if len(notes) > 1
+            else "A voice note I recorded while you were out of reach:")
+    return head + "\n" + "\n".join(lines)
+
+
+def _note_id(value: Any) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]", "", str(value or ""))[:40]
+
+
 def _int_param(value: str, default: int, lo: int, hi: int) -> int:
     try:
         return max(lo, min(hi, int(value)))
@@ -428,6 +466,9 @@ class _DeviceConn:
         self._audio_task: asyncio.Task | None = None
         self._audio_worker: asyncio.Task | None = None
         self._say_task: asyncio.Task | None = None
+        # Offline voice notes arriving: the one now (note_start … note_end), the batch so far.
+        self.note: dict | None = None
+        self.notes: list[dict] = []
         self._bg: set[asyncio.Task] = set()
 
     # ── over-the-air updates ──
@@ -565,23 +606,26 @@ class _DeviceConn:
             screen = f"{w}×{h} pixel"
         return _DEVICE_SYSTEM_CONTEXT.replace("{screen}", screen)
 
-    async def send_to_agent(self, text: str, ctx: Any = None) -> None:
+    async def send_to_agent(self, text: str, ctx: Any = None, extra_notes: list[str] | None = None) -> bool:
+        """The words to the agent as a device turn, with the device's
+        readings (and any *extra_notes*) as context lines; False when it
+        didn't go (the device has been told why)."""
         ch = self.ch
         if ch is None:
             await self.send_json({"type": "error", "text": "No agent bound."})
-            return
+            return False
         for _ in range(50):  # the first send after binding waits for the link
             if ch.agent_ws is not None:
                 break
             await asyncio.sleep(0.1)
         if ch.agent_ws is None:
             await self.send_json({"type": "error", "text": "Agent isn't reachable."})
-            return
+            return False
         allowed, quota = await usage_quota.admit_message(self.user_id, text)
         if not allowed:
             await self.send_json({"type": "error", "text": usage_quota.short_limit_text(quota)})
             await self.send_json({"type": "state", "state": "ready"})
-            return
+            return False
         async with ch.send_lock:
             content = text if ch.context_sent else self.system_context() + text
             payload = {
@@ -589,17 +633,89 @@ class _DeviceConn:
                 "client_msg_id": "dev_" + secrets.token_hex(6),
             }
             readings = device_context_line(ctx, self.hw)
-            if readings:
-                payload["context_notes"] = [readings]
+            notes = ([readings] if readings else []) + list(extra_notes or [])
+            if notes:
+                payload["context_notes"] = notes
             try:
                 await ch.agent_ws.send(json.dumps(payload))
                 ch.context_sent = True
             except Exception as exc:
                 await self.send_json({"type": "error", "text": f"Send failed: {exc}"})
-                return
+                return False
         self.pending = True
         self._last_activity = ""
-        await self.send_json({"type": "state", "state": "thinking"})
+        try:
+            await self.send_json({"type": "state", "state": "thinking"})
+        except Exception:
+            pass  # the device went away: the agent has the turn all the same
+        return True
+
+    async def _note_text(self, note: dict) -> tuple[str, str]:
+        """(text, why it failed): ("", "") is a note with nothing said in it."""
+        from captain_claw.flight_deck import soniox_routes
+        from captain_claw.flight_deck.whatsapp_bridge import _stt_language_hints
+
+        try:
+            out = await soniox_routes.transcribe_for(
+                self.user_id or None, wav_from_pcm(bytes(note["pcm"]), note["rate"]), mime="audio/wav",
+                filename="note.wav", language_hints=_stt_language_hints(), source="device",
+            )
+        except (soniox_routes.SonioxNotConnected, soniox_routes.SonioxError) as exc:
+            return "", str(exc) or "transcription failed"
+        return (out.text or "").strip(), ""
+
+    async def deliver_notes(self, batch: list[dict], ctx: Any = None) -> None:
+        """Offline voice notes → one turn for the agent, marked as recorded
+        offline. notes_done names the notes the device may delete: the ones
+        the agent got, the silent ones, and any delivered before (a batch sent
+        again). A note that couldn't be transcribed stays on the device."""
+        lock = _notes_locks.setdefault(self.channel_id, asyncio.Lock())
+        async with lock:  # one batch at a time per device, even across reconnects
+            delivered = _delivered_notes.setdefault(self.channel_id, [])
+            fresh = [n for n in batch if n["id"] not in delivered]
+            if fresh and await usage_quota.spent(self.user_id) is not None:
+                await self.send_json({"type": "notes_failed", "text": "Over today's limit."})
+                return  # don't transcribe what can't be sent
+            done = [n["id"] for n in batch if n["id"] in delivered]
+            heard: list[dict] = []
+            failed = ""
+            for note in fresh:
+                if len(note["pcm"]) < MIN_REC_SECONDS * 2 * note["rate"]:
+                    done.append(note["id"])  # nothing in it
+                    continue
+                text, err = await self._note_text(note)
+                if text:
+                    heard.append({**note, "text": text})
+                elif err:
+                    failed = err  # kept on the device for a later try
+                else:
+                    done.append(note["id"])  # nothing said
+            if heard:
+                # Shielded: once the agent has the turn, the ids are kept as
+                # delivered even if this connection is torn down meanwhile.
+                sent = await asyncio.shield(self._send_notes_turn(heard, ctx, delivered))
+                if not sent:
+                    await self.send_json({"type": "notes_failed", "text": "The agent didn't get them."})
+                    return
+                done += [n["id"] for n in heard]
+            delivered.extend(i for i in done if i not in delivered)
+            del delivered[:-200]
+            await self.send_json({"type": "notes_done", "ids": done, "heard": len(heard)})
+            if failed:
+                await self.send_json({"type": "notes_failed", "text": f"Couldn't transcribe some: {failed}"[:200]})
+
+    async def _send_notes_turn(self, heard: list[dict], ctx: Any, delivered: list[str]) -> bool:
+        said = " · ".join("“" + n["text"] + "”" for n in heard)
+        shown = said if len(heard) == 1 else f"{len(heard)} offline notes: {said}"
+        try:
+            await self.send_json({"type": "transcript",
+                                  "text": screen_text(shown[:300], has_dj=self.round_screen or self.paper)})
+        except Exception:
+            pass  # the device is gone; the agent can still have them
+        if not await self.send_to_agent(offline_notes_message(heard), ctx, extra_notes=[OFFLINE_NOTES_CONTEXT]):
+            return False
+        delivered.extend(n["id"] for n in heard if n["id"] not in delivered)
+        return True
 
     async def finish_recording(self, ctx: Any = None) -> None:
         pcm = bytes(self.rec)
@@ -869,6 +985,9 @@ async def device_ws(ws: WebSocket) -> None:
                 if conn.recording:
                     if len(conn.rec) + len(data) <= MAX_REC_SECONDS * 2 * conn.rec_rate:
                         conn.rec.extend(data)
+                elif conn.note is not None:
+                    if len(conn.note["pcm"]) + len(data) <= MAX_NOTE_SECONDS * 2 * conn.note["rate"]:
+                        conn.note["pcm"].extend(data)
                 continue
             try:
                 obj = json.loads(msg.get("text") or "")
@@ -898,6 +1017,28 @@ async def device_ws(ws: WebSocket) -> None:
                 await conn.replay()
             elif mtype == "say":
                 await conn.say(str(obj.get("text", "")))
+            elif mtype in ("notes_begin", "notes_cancel"):
+                conn.notes, conn.note = [], None
+            elif mtype == "note_start":
+                conn.note = None
+                if len(conn.notes) < MAX_NOTES_PER_BATCH and _note_id(obj.get("id")):
+                    conn.note = {
+                        "id": _note_id(obj.get("id")),
+                        "rate": _int_param(str(obj.get("rate", 16000)), 16000, 8000, 48000),
+                        "seconds": obj.get("seconds"),
+                        "recorded": str(obj.get("recorded", "") or "")[:40],
+                        "pcm": bytearray(),
+                    }
+            elif mtype == "note_end":
+                if conn.note is not None and conn.note["id"] == _note_id(obj.get("id")):
+                    conn.notes.append(conn.note)
+                conn.note = None
+            elif mtype == "notes_end":
+                batch, conn.notes, conn.note = conn.notes, [], None
+                if batch:
+                    conn._spawn(conn.deliver_notes(batch, obj.get("ctx")))
+                else:
+                    await conn.send_json({"type": "notes_done", "ids": [], "heard": 0})
             elif mtype == "agents":
                 items = [{"slug": a.get("slug"), "name": a.get("name")} for a in _running_agents(conn.user_id)]
                 await conn.send_json({"type": "agents", "items": items,

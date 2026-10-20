@@ -34,6 +34,10 @@ constexpr bool kEpaper = false;
 constexpr bool kHasMotor = true;
 constexpr bool kHasLeds = false;
 constexpr bool kHasClimate = false;
+// Voice notes recorded offline are kept (no TF slot: in internal flash) and
+// sent when the deck is back (notes.cpp).
+constexpr bool kOfflineNotes = true;
+constexpr bool kHasSdCard = false;
 constexpr bool kLoudPeakRestarts = false;  // not seen (yet) on the StopWatch
 // Pictures bigger than one WebSocket frame arrive in parts (0x03 … 0x02).
 constexpr bool kChunkedImages = true;
@@ -57,6 +61,8 @@ constexpr bool kEpaper = true;
 constexpr bool kHasMotor = false;
 constexpr bool kHasLeds = true;
 constexpr bool kHasClimate = true;
+constexpr bool kOfflineNotes = true;
+constexpr bool kHasSdCard = true;   // TF slot (SPI, shared with the panel); flash when there's no card
 constexpr bool kLoudPeakRestarts = false;
 constexpr bool kChunkedImages = true;
 
@@ -77,6 +83,8 @@ constexpr bool kEpaper = false;
 constexpr bool kHasMotor = false;
 constexpr bool kHasLeds = false;
 constexpr bool kHasClimate = false;
+constexpr bool kOfflineNotes = false;
+constexpr bool kHasSdCard = false;
 constexpr bool kLoudPeakRestarts = true;   // M5Stack's note: >75% volume on battery
 constexpr bool kChunkedImages = false;
 
