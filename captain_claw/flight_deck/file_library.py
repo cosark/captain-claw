@@ -467,7 +467,8 @@ async def _resolve_tier(user_id: str) -> dict | None:
     return cfg if isinstance(cfg, dict) and cfg.get("model") else None
 
 
-def _parse_reply(content: str) -> dict:
+def reply_json(content: str) -> dict:
+    """The JSON object a model replied with (fenced or not), or raise."""
     text = (content or "").strip()
     if text.startswith("```"):
         text = "\n".join(l for l in text.split("\n") if not l.strip().startswith("```"))
@@ -477,19 +478,53 @@ def _parse_reply(content: str) -> dict:
     data = json.loads(m.group(0))
     if not isinstance(data, dict):
         raise ValueError("the model did not answer with a JSON object")
-    category = str(data.get("category") or "").strip().lower()
-    tags_raw = data.get("tags") if isinstance(data.get("tags"), list) else []
+    return data
+
+
+def clean_tags(raw: Any, limit: int = 5) -> list[str]:
     tags: list[str] = []
-    for t in tags_raw:
+    for t in raw if isinstance(raw, list) else []:
         t = " ".join(str(t).lower().split())[:32]
         if t and t not in tags:
             tags.append(t)
+    return tags[:limit]
+
+
+def _parse_reply(content: str) -> dict:
+    data = reply_json(content)
+    category = str(data.get("category") or "").strip().lower()
     return {
         "title": " ".join(str(data.get("title") or "").split())[:120],
         "summary": " ".join(str(data.get("summary") or "").split())[:600],
         "category": category if category in _CATEGORY_IDS else "other",
-        "tags": tags[:5],
+        "tags": clean_tags(data.get("tags")),
     }
+
+
+async def call_model(tier: dict, system: str, user: str, owner_id: str,
+                     max_tokens: int = _MAX_TOKENS) -> tuple[str, int]:
+    """One call to *tier*'s model: (reply text, tokens spent). The tokens
+    count toward the owner's daily allowance."""
+    from captain_claw.flight_deck.basna_routes import tier_api_key
+    from captain_claw.llm import Message, create_provider
+    provider = create_provider(
+        provider=tier.get("provider", "anthropic"), model=tier.get("model", ""),
+        base_url=tier.get("base_url") or None, api_key=tier_api_key(tier),
+        temperature=0.2, max_tokens=max_tokens)
+    resp = await provider.complete(
+        messages=[Message(role="system", content=system), Message(role="user", content=user)],
+        temperature=0.2, max_tokens=max_tokens)
+    usage = dict(getattr(resp, "usage", None) or {})
+    tokens = int(usage.get("total_tokens") or 0) or (
+        int(usage.get("prompt_tokens") or 0) + int(usage.get("completion_tokens") or 0))
+    if owner_id and _auth_enabled() and tokens:
+        try:
+            from captain_claw.flight_deck import usage_quota
+            from captain_claw.flight_deck.auth import get_db
+            await usage_quota.record_tokens(get_db(), owner_id, tokens)
+        except Exception:
+            log.debug("library: token report failed", exc_info=True)
+    return resp.content or "", tokens
 
 
 async def summarize_row(row: dict, tier: dict, owner_id: str) -> dict:
@@ -509,30 +544,12 @@ async def summarize_row(row: dict, tier: dict, owner_id: str) -> dict:
     if not text:
         return _metadata_only(row, why_not)
 
-    from captain_claw.flight_deck.basna_routes import tier_api_key
-    from captain_claw.llm import Message, create_provider
     body = text if len(text) <= _LLM_CHARS else text[:_LLM_CHARS] + "\n\n[… truncated]"
     user_msg = (f"File: {row['rel_path']}\nAgent: {row.get('agent_name') or row['agent_slug']}\n"
                 f"Size: {row['size']} bytes\n\n---\n{body}")
-    provider = create_provider(
-        provider=tier.get("provider", "anthropic"), model=tier.get("model", ""),
-        base_url=tier.get("base_url") or None, api_key=tier_api_key(tier),
-        temperature=0.2, max_tokens=_MAX_TOKENS)
-    resp = await provider.complete(
-        messages=[Message(role="system", content=_SYSTEM % ", ".join(c for c, _ in CATEGORIES)),
-                  Message(role="user", content=user_msg)],
-        temperature=0.2, max_tokens=_MAX_TOKENS)
-    usage = dict(getattr(resp, "usage", None) or {})
-    tokens = int(usage.get("total_tokens") or 0) or (
-        int(usage.get("prompt_tokens") or 0) + int(usage.get("completion_tokens") or 0))
-    if owner_id and _auth_enabled() and tokens:
-        try:
-            from captain_claw.flight_deck import usage_quota
-            from captain_claw.flight_deck.auth import get_db
-            await usage_quota.record_tokens(get_db(), owner_id, tokens)
-        except Exception:
-            log.debug("file library: token report failed", exc_info=True)
-    parsed = _parse_reply(resp.content or "")
+    content, tokens = await call_model(
+        tier, _SYSTEM % ", ".join(c for c, _ in CATEGORIES), user_msg, owner_id)
+    parsed = _parse_reply(content)
     return {
         "status": "done",
         "title": parsed["title"] or _humanize(row["filename"]),

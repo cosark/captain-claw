@@ -31,12 +31,12 @@ import { formatSize, getFileTypeGroup, isViewable } from '../../services/fileTra
 import { fmtRelative, fmtWhen } from '../../services/schedulerApi'
 import {
   fileLibraryApi,
-  type Facet,
   type LibraryItem,
   type LibraryPage,
   type LibrarySort,
   type LibraryState,
 } from '../../services/fileLibraryApi'
+import { FacetGroup, Highlight, ScanStatus, libraryIconBtn } from './libraryParts'
 
 // ── File library ────────────────────────────────────────────────────
 //
@@ -94,7 +94,7 @@ const SORTS: { id: LibrarySort; label: string }[] = [
   { id: 'agent', label: 'By agent' },
 ]
 
-const iconBtn = 'rounded-lg p-2 text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-200 disabled:opacity-50'
+const iconBtn = libraryIconBtn
 
 function categoryOf(item: LibraryItem): string {
   return item.category || 'pending'
@@ -275,7 +275,7 @@ export function FileLibrary({ phone = false, initialAgent, onClose, onOpenAgent 
         <h2 className="truncate text-base font-semibold text-zinc-100">File library</h2>
         {!phone && <p className="truncate text-xs text-zinc-500">Every file your agents made — summarised, sorted and searchable.</p>}
       </div>
-      {!phone && <ScanStatus state={state} />}
+      {!phone && <ScanStatus state={state} noun="file" />}
       <button onClick={rescan} disabled={running} className={iconBtn} title="Look for new files" aria-label="Look for new files">
         <RotateCw className={`h-4 w-4 ${running ? 'animate-spin' : ''}`} />
       </button>
@@ -381,7 +381,7 @@ export function FileLibrary({ phone = false, initialAgent, onClose, onOpenAgent 
     return (
       <div className="relative flex h-full flex-col bg-zinc-950">
         {header}
-        <div className="border-b border-zinc-800 px-3 py-2"><ScanStatus state={state} /></div>
+        <div className="border-b border-zinc-800 px-3 py-2"><ScanStatus state={state} noun="file" /></div>
         {toolbar}
         <div className="min-h-0 flex-1">{list}</div>
         {selected && <div className="absolute inset-0 z-10 flex flex-col bg-zinc-950">{detail}</div>}
@@ -433,47 +433,6 @@ export function FileLibrary({ phone = false, initialAgent, onClose, onOpenAgent 
   )
 }
 
-// ── Scan progress ──
-
-function ScanStatus({ state }: { state: LibraryState | null }) {
-  if (!state) return null
-  const { job, counts } = state
-  if (job.running) {
-    const pct = job.total ? Math.round(((job.done + job.failed) / job.total) * 100) : 0
-    return (
-      <div className="flex min-w-0 items-center gap-2 text-xs text-zinc-400" title={job.current ? `Reading ${job.current}` : undefined}>
-        <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-violet-500 dark:text-violet-400" />
-        {job.phase === 'summarizing' ? (
-          <>
-            <span className="shrink-0">Summarising {Math.min(job.done + job.failed + 1, job.total)} of {job.total}</span>
-            <span className="h-1.5 w-20 shrink-0 overflow-hidden rounded-full bg-zinc-800">
-              <span className="block h-full rounded-full bg-violet-500 transition-all" style={{ width: `${pct}%` }} />
-            </span>
-          </>
-        ) : <span>Looking for new files…</span>}
-      </div>
-    )
-  }
-  if (job.message) {
-    return (
-      <div className="flex min-w-0 items-center gap-1.5 text-xs text-amber-700 dark:text-amber-400" title={job.message}>
-        <AlertTriangle className="h-3.5 w-3.5 shrink-0" /><span className="truncate">{job.message}</span>
-      </div>
-    )
-  }
-  return (
-    <div className="flex min-w-0 items-center gap-1.5 text-xs text-zinc-500">
-      <Sparkles className="h-3.5 w-3.5 shrink-0 text-violet-500 dark:text-violet-400" />
-      <span className="truncate">
-        {counts.total === 0 ? 'No files yet'
-          : counts.pending ? `${counts.pending} file${counts.pending === 1 ? '' : 's'} waiting for a summary`
-            : `Up to date · ${counts.total} file${counts.total === 1 ? '' : 's'}`}
-        {job.finished_at && !counts.pending ? ` · checked ${fmtRelative(job.finished_at)}` : ''}
-      </span>
-    </div>
-  )
-}
-
 // ── Filters ──
 
 function Filters({ facets, agent, category, kind, onAgent, onCategory, onKind }: {
@@ -486,6 +445,7 @@ function Filters({ facets, agent, category, kind, onAgent, onCategory, onKind }:
     <div className="flex flex-col gap-4 px-2 py-3">
       <FacetGroup
         title="Categories" allLabel="All files" facets={facets.categories} value={category} onChange={onCategory}
+        labelOf={(id) => CATEGORY_LABEL[id] || id}
         dot={(id) => <span className={`h-2 w-2 shrink-0 rounded-full ${CATEGORY_DOT[id] || CATEGORY_DOT.other}`} />}
       />
       <FacetGroup title="Agents" allLabel="All agents" facets={facets.agents} value={agent} onChange={onAgent} />
@@ -495,37 +455,6 @@ function Filters({ facets, agent, category, kind, onAgent, onCategory, onKind }:
           dot={(id) => { const Icon = KIND_ICON[id] || File; return <Icon className={`h-3.5 w-3.5 shrink-0 ${KIND_TONE[id] || 'text-zinc-500'}`} /> }}
         />
       )}
-    </div>
-  )
-}
-
-function FacetGroup({ title, allLabel, facets, value, onChange, dot }: {
-  title: string; allLabel: string; facets: Facet[]; value: string
-  onChange: (v: string) => void; dot?: (id: string) => ReactNode
-}) {
-  const all = facets.reduce((n, f) => n + f.count, 0)
-  // A filter whose value no longer has files still shows, so it can be cleared.
-  const rows = value && !facets.some((f) => f.id === value) ? [...facets, { id: value, label: CATEGORY_LABEL[value] || value, count: 0 }] : facets
-  const row = (id: string, label: string, count: number, icon?: ReactNode) => (
-    <li key={id || '_all'}>
-      <button
-        onClick={() => onChange(id === value ? '' : id)}
-        className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[13px] transition-colors ${
-          value === id ? 'bg-zinc-800 font-medium text-zinc-100' : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200'}`}
-      >
-        {icon}
-        <span className="min-w-0 flex-1 truncate">{label}</span>
-        <span className="shrink-0 text-[11px] tabular-nums text-zinc-500">{count}</span>
-      </button>
-    </li>
-  )
-  return (
-    <div>
-      <div className="px-2.5 pb-1 text-[11px] font-medium uppercase tracking-wider text-zinc-500">{title}</div>
-      <ul className="flex flex-col gap-0.5">
-        {row('', allLabel, all)}
-        {rows.map((f) => row(f.id, f.label, f.count, dot?.(f.id)))}
-      </ul>
     </div>
   )
 }
@@ -669,19 +598,6 @@ function ResultRow({ item, terms, active, onClick }: {
         )}
       </span>
     </button>
-  )
-}
-
-function Highlight({ text, terms }: { text: string; terms: string[] }) {
-  if (!terms.length || !text) return <>{text}</>
-  const re = new RegExp(`(${terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'gi')
-  const parts = text.split(re)
-  return (
-    <>
-      {parts.map((p, i) => (i % 2 === 1
-        ? <mark key={i} className="rounded-sm bg-amber-400/30 px-0.5 text-inherit">{p}</mark>
-        : <span key={i}>{p}</span>))}
-    </>
   )
 }
 

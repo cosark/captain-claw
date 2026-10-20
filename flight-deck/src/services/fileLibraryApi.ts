@@ -74,7 +74,8 @@ export interface LibraryQuery {
   offset?: number
 }
 
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
+/** JSON from a Flight Deck route, with the FD token; a refusal's `detail` as the error. */
+export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const jwt = useAuthStore.getState().token
   const r = await fetch(path, {
     ...init,
