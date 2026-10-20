@@ -174,7 +174,9 @@ def fake(monkeypatch: pytest.MonkeyPatch) -> FakeDCRServer:
 
 
 async def _save_oauth_server(**extra: Any) -> dict[str, Any]:
-    return await mcp_storage.upsert_server({"name": "remote", "url": MCP_URL, "auth": "oauth", **extra})
+    return await mcp_storage.upsert_server({
+        "name": "remote", "url": MCP_URL, "auth": "oauth", "owner_id": USER["id"], **extra,
+    })
 
 
 async def _sign_in(fake: FakeDCRServer, record: dict[str, Any]) -> dict[str, Any]:
@@ -412,6 +414,7 @@ def test_routes_popup_flow_end_to_end(fake: FakeDCRServer) -> None:
     server = client.get("/fd/mcp/servers").json()["servers"][0]
     assert server["oauth"]["connected"] is True
     assert server["oauth"]["connected_by"] == USER["email"]
+    assert mcp_client_oauth.signer(mcp_storage.get_server("remote")) == (USER["id"], USER["email"])
 
     resp = client.post("/fd/mcp/servers/remote/test")
     assert resp.json()["ok"] is True and resp.json()["tools_count"] == 1

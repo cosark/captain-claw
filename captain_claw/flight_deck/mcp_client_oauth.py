@@ -24,8 +24,9 @@ connectors such as Linear, Notion, Atlassian or Cloudflare, another deck's
    ahead of expiry, and once more after a 401 — one refresh per server at a
    time, because refresh tokens commonly rotate (single use).
 
-The grant belongs to the SERVER, like the rest of its config: whoever signs in
-connects that account for every agent the server's allowlist admits.
+The grant belongs to the SERVER record, and a record is private to the user
+who added it (see :mod:`mcp_storage`): only that user signs in, and only their
+agents use the account — unless an admin made the server deck-wide.
 
 Grants live beside the servers file (``<servers>.oauth.json``, mode 0600), not
 in the record, so a token refresh never looks like a config change to the
@@ -164,9 +165,16 @@ async def forget(name: str) -> None:
     await _update(name, lambda _g: None)
 
 
+def signer(record: dict[str, Any]) -> tuple[str, str]:
+    """``(user_id, label)`` of whoever signed ``record``'s server in. Grants
+    made before ``connected_by_id`` existed have only the label (an email)."""
+    grant = _grant_for(record) or {}
+    return str(grant.get("connected_by_id") or ""), str(grant.get("connected_by") or "")
+
+
 _TOKEN_FIELDS = (
     "access_token", "refresh_token", "token_type", "expires_at", "scope",
-    "connected_at", "connected_by", "client",
+    "connected_at", "connected_by", "connected_by_id", "client",
 )
 
 
@@ -613,7 +621,8 @@ async def _token_request(
 
 
 async def complete_sign_in(
-    pending: dict[str, Any], code: str, *, connected_by: str, issuer: str = "",
+    pending: dict[str, Any], code: str, *, connected_by: str, connected_by_id: str = "",
+    issuer: str = "",
 ) -> dict[str, Any]:
     """Swap the callback's code for tokens and store the grant."""
     discovered = pending["discovered"]
@@ -645,6 +654,7 @@ async def complete_sign_in(
             "client": pending["client"],
             "connected_at": time.time(),
             "connected_by": connected_by,
+            "connected_by_id": connected_by_id,
         })
         return base
 

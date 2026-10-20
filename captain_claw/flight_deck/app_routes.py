@@ -11,7 +11,7 @@ from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 
-from captain_claw.flight_deck import app_manifest_authoring, app_manifests
+from captain_claw.flight_deck import app_manifest_authoring, app_manifests, mcp_storage
 from captain_claw.flight_deck.auth import get_current_user
 
 
@@ -42,7 +42,7 @@ async def get_app(
 @router.post("/generate")
 async def generate_app(
     payload: dict = Body(...),
-    _user: dict = Depends(get_current_user),
+    user: dict = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Generate (or revise) a manifest from a natural-language description.
 
@@ -70,6 +70,11 @@ async def generate_app(
     mcp_server = payload.get("mcp_server")
     if mcp_server is not None and not isinstance(mcp_server, str):
         raise HTTPException(status_code=400, detail="mcp_server must be a string")
+    if mcp_server:
+        # Its tool catalogue goes into the prompt: only a server this user may use.
+        record = mcp_storage.get_server(mcp_server)
+        if record is not None and not mcp_storage.user_may_use(record, user):
+            raise HTTPException(status_code=404, detail=f"No MCP server named '{mcp_server}'")
 
     agent_target: app_manifest_authoring.AgentTarget | None = None
     raw_agent = payload.get("agent")

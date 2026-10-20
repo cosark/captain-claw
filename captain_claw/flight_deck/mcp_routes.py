@@ -2,17 +2,22 @@
 
 Two audiences hit these endpoints:
 
-1. **Admin UI** (``/fd/mcp/servers``, ``/fd/mcp/servers/<name>``,
+1. **Connections UI** (``/fd/mcp/servers``, ``/fd/mcp/servers/<name>``,
    ``/fd/mcp/servers/<name>/test``) — gated by the normal Flight Deck
-   user auth. Returns secrets in masked form only. Anything touching a
-   stdio server (a command FD spawns on its host) is admin-only.
+   user auth. Returns secrets in masked form only. A server is private
+   to the user who added it (``mcp_storage``): others never see it, and
+   a name they can't see answers 404 (or 409 when they try to reuse it).
+   Deck-wide servers are an admin's opt-in and only admins change them.
+   Anything touching a stdio server (a command FD spawns on its host) is
+   admin-only.
 
 2. **Captain-claw agents** (``/fd/mcp/<server>/tools``,
    ``/fd/mcp/<server>/call``) — gated like the Codex token endpoint:
    loopback / shared secret AND the agent's own ``X-Agent-Auth`` token.
    Agents proxy here instead of dialing the upstream MCP server
    themselves; that gives FD a single chokepoint for OAuth,
-   rate-limiting and observability.
+   rate-limiting and observability. An agent reaches only its owner's
+   servers and the deck-wide ones, then the server's allowlist.
 
 3. **The sign-in popup** (``/fd/mcp/oauth/*``) — for a server with
    ``auth: "oauth"``, the browser leg of the MCP authorization flow:
@@ -43,7 +48,7 @@ from fastapi.responses import (
 
 from captain_claw.flight_deck import google_oauth_routes as _g
 from captain_claw.flight_deck import mcp_client_oauth, mcp_events, mcp_storage
-from captain_claw.flight_deck.agent_identity import require_agent_caller
+from captain_claw.flight_deck.agent_identity import AgentCaller, require_agent_caller
 from captain_claw.flight_deck.auth import get_current_user
 from captain_claw.flight_deck.mcp_manager import MCPServerError, get_manager
 from captain_claw.logging import get_logger
@@ -56,19 +61,93 @@ router = APIRouter(prefix="/fd/mcp", tags=["mcp"])
 # ── agent auth (same gate as codex_oauth_routes) ────────────────────
 
 
-def _authorize_agent_call(request: Request) -> str:
+def _authorize_agent_call(request: Request) -> AgentCaller:
     """Gate the proxy endpoints captain-claw agents call: one of THIS deck's
     agents, identified by its ``X-Agent-Auth`` token on top of the loopback /
     ``X-Agent-Secret`` transport gate (see :mod:`agent_identity`) — a web page
     in the user's browser is on loopback too, and must not drive the fleet's
     MCP connections.
 
-    Returns the calling agent's slug as FD recorded it at spawn — not the
-    self-declared ``X-Agent-Slug`` — for per-agent ACL filtering downstream.
-    An empty slug (an agent FD knows but has no slug for) is only allowed
-    servers with no allowlist configured.
+    Returns the calling agent's slug and owner as FD recorded them at spawn —
+    not the self-declared ``X-Agent-Slug`` — for :func:`_agent_may_use`. An
+    empty slug (an agent FD knows but has no slug for) is only allowed servers
+    with no allowlist configured; an empty owner only deck-wide servers.
     """
-    return require_agent_caller(request, what="the MCP proxy").slug
+    return require_agent_caller(request, what="the MCP proxy")
+
+
+def _agent_may_use(record: dict[str, Any] | None, caller: AgentCaller) -> bool:
+    return record is not None and mcp_storage.agent_may_use(record, caller.slug, caller.owner)
+
+
+# ── ownership gates (see mcp_storage: a server is private to its owner) ──
+
+
+def _no_such_server(name: str) -> HTTPException:
+    # Same answer for "doesn't exist" and "someone else's", so a private
+    # server's existence never leaks.
+    return HTTPException(status_code=404, detail=f"No MCP server named '{name}'")
+
+
+def _visible(record: dict[str, Any], user: dict) -> bool:
+    return mcp_storage.user_may_use(record, user) or mcp_storage.user_may_manage(record, user)
+
+
+def _usable_server(name: str, user: dict) -> dict[str, Any]:
+    """The record, when ``user`` may call its tools."""
+    record = mcp_storage.get_server(name)
+    if record is None or not _visible(record, user):
+        raise _no_such_server(name)
+    if not mcp_storage.user_may_use(record, user):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Nobody owns MCP server '{name}' any more, so it can't be used — "
+                "remove it and add it again"
+            ),
+        )
+    return record
+
+
+def _managed_server(name: str, user: dict) -> dict[str, Any]:
+    """The record, when ``user`` may change it."""
+    record = mcp_storage.get_server(name)
+    if record is None or not _visible(record, user):
+        raise _no_such_server(name)
+    if not mcp_storage.user_may_manage(record, user):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Only an admin can change the deck-wide MCP server '{name}'",
+        )
+    return record
+
+
+async def migrate_legacy_ownership(db: Any) -> None:
+    """FD startup: give pre-ownership servers an owner (``mcp_storage``).
+    An OAuth server goes to whoever signed it in — by the user id newer
+    grants carry, else by the email older ones recorded — and stays private
+    and unusable when that user can't be found. Never raises."""
+
+    async def _signer(record: dict[str, Any]) -> str:
+        user_id, label = mcp_client_oauth.signer(record)
+        if user_id or db is None or "@" not in label:
+            return user_id
+        user = await db.get_user_by_email(label)
+        return str((user or {}).get("id") or "")
+
+    try:
+        changed = await mcp_storage.migrate_legacy_ownership(_signer)
+    except Exception as exc:
+        log.warning("MCP ownership migration failed", error=str(exc))
+        return
+    for name in changed:
+        rec = mcp_storage.get_server(name) or {}
+        log.info(
+            "MCP server ownership set",
+            server=name,
+            deck_wide=bool(rec.get("deck_wide")),
+            owner=rec.get("owner_id") or "(none — unusable until re-added)",
+        )
 
 
 # ── stdio gate ──────────────────────────────────────────────────────
@@ -77,8 +156,8 @@ def _authorize_agent_call(request: Request) -> str:
 def _require_stdio_admin(user: dict) -> None:
     """A stdio server is a command FD spawns on its own host, so only an admin
     may add one, switch a server to it, edit / remove / test one, or probe an
-    ad-hoc stdio config. HTTP servers stay open to every signed-in user (the
-    kiosk Connections dialog). An auth-off deck has one trusted user and
+    ad-hoc stdio config. Any signed-in user may add HTTP servers of their own
+    (the kiosk Connections dialog). An auth-off deck has one trusted user and
     ``get_current_user`` hands it a synthetic admin, so it passes unchanged."""
     if (user or {}).get("role") != "admin":
         raise HTTPException(
@@ -98,11 +177,20 @@ def _is_stdio(record: dict | None) -> bool:
 
 
 @router.get("/servers")
-async def list_servers(_user: dict = Depends(get_current_user)) -> dict[str, Any]:
-    """Return every configured server with secrets masked, plus runtime
-    status (initialised? tool count? last error?)."""
-    manager = get_manager()
-    return {"servers": manager.status_snapshot()}
+async def list_servers(user: dict = Depends(get_current_user)) -> dict[str, Any]:
+    """The servers this user may see — their own, the deck-wide ones (and,
+    for an admin, ownerless ones to clean up) — with secrets masked, runtime
+    status, and what the user may do with each."""
+    out = []
+    for entry in get_manager().status_snapshot():
+        if not _visible(entry, user):
+            continue
+        out.append({
+            **entry,
+            "can_use": mcp_storage.user_may_use(entry, user),
+            "can_manage": mcp_storage.user_may_manage(entry, user),
+        })
+    return {"servers": out}
 
 
 @router.post("/servers")
@@ -119,11 +207,23 @@ async def add_or_update_server(
     if not name:
         raise HTTPException(status_code=400, detail="name is required")
     existing = mcp_storage.get_server(name)
+    if existing is not None and not mcp_storage.user_may_manage(existing, user):
+        if _visible(existing, user):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Only an admin can change the deck-wide MCP server '{name}'",
+            )
+        # Names are deck-wide keys; say it's taken, never whose it is.
+        raise HTTPException(
+            status_code=409,
+            detail=f"An MCP server named '{name}' already exists — pick another name",
+        )
     # Creating a stdio server, switching one to stdio, or touching an existing
     # stdio server in any way (command/args/env, enabled, or overwriting it
     # with an http config) is admin-only.
     if transport == "stdio" or _is_stdio(existing):
         _require_stdio_admin(user)
+    owner_id, deck_wide = _ownership(payload, existing, user)
     if transport == "http" and not url:
         raise HTTPException(status_code=400, detail="url is required for http transport")
     if transport == "stdio" and not command:
@@ -154,6 +254,8 @@ async def add_or_update_server(
         "headers": payload.get("headers") or {},
         "enabled": bool(payload.get("enabled", True)),
         "allowed_agents": payload.get("allowed_agents") or [],
+        "owner_id": owner_id,
+        "deck_wide": deck_wide,
     }
     existed_before = existing is not None
     saved = await mcp_storage.upsert_server(record)
@@ -179,12 +281,35 @@ async def add_or_update_server(
     return {"ok": True, "server": mcp_storage._public_view(saved)}
 
 
+def _ownership(payload: dict, existing: dict[str, Any] | None, user: dict) -> tuple[str, bool]:
+    """``(owner_id, deck_wide)`` for a save: a new server belongs to its
+    creator; an existing one keeps its owner. Only an admin may make a server
+    deck-wide or take that back."""
+    is_admin = user.get("role") == "admin"
+    requested = payload.get("deck_wide")
+    if existing is None:
+        owner_id = str(user.get("id") or "")
+        deck_wide = bool(requested)
+    else:
+        owner_id = str(existing.get("owner_id") or "")
+        deck_wide = bool(existing.get("deck_wide")) if requested is None else bool(requested)
+    if deck_wide != bool((existing or {}).get("deck_wide")) and not is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="Only an admin can share an MCP server with everyone on this deck",
+        )
+    if not deck_wide and not owner_id:
+        # An admin taking a legacy deck-wide server private keeps it.
+        owner_id = str(user.get("id") or "")
+    return owner_id, deck_wide
+
+
 @router.delete("/servers/{name}")
 async def remove_server(
     name: str,
     user: dict = Depends(get_current_user),
 ) -> dict[str, Any]:
-    if _is_stdio(mcp_storage.get_server(name)):
+    if _is_stdio(_managed_server(name, user)):
         _require_stdio_admin(user)
     deleted = await mcp_storage.delete_server(name)
     if not deleted:
@@ -201,9 +326,7 @@ async def test_server(
     user: dict = Depends(get_current_user),
 ) -> dict[str, Any]:
     """Probe a configured server: re-init, list tools, surface any error."""
-    record = mcp_storage.get_server(name)
-    if record is None:
-        raise HTTPException(status_code=404, detail=f"No MCP server named '{name}'")
+    record = _usable_server(name, user)
     if _is_stdio(record):
         _require_stdio_admin(user)
     return await get_manager().test_server(name)
@@ -235,17 +358,26 @@ async def probe_transient(
         raise HTTPException(
             status_code=400, detail="command is required for stdio transport"
         )
-    name = str(payload.get("name") or "_probe").strip() or "_probe"
+    name = str(payload.get("name") or "").strip()
+    existing = mcp_storage.get_server(name) if name else None
+    if existing is not None and not mcp_storage.user_may_manage(existing, user):
+        raise HTTPException(
+            status_code=409,
+            detail=f"An MCP server named '{name}' already exists — pick another name",
+        )
+    # Only the server's own manager re-tests with its stored secret / sign-in;
+    # anyone else probes under a throwaway name that matches no grant.
+    reuse = existing is not None and mcp_storage.user_may_use(existing, user)
 
     incoming_secret = str(payload.get("client_secret") or "")
     looks_masked = incoming_secret and set(incoming_secret) <= {"•", "*"}
-    if (looks_masked or not incoming_secret) and name and name != "_probe":
-        existing = mcp_storage.get_server(name)
-        if existing is not None:
-            incoming_secret = existing.get("client_secret", "")
+    if looks_masked:
+        incoming_secret = ""
+    if not incoming_secret and reuse:
+        incoming_secret = existing.get("client_secret", "")
 
     record = {
-        "name": name,
+        "name": name if reuse else f"_probe-{secrets.token_hex(6)}",
         "transport": transport,
         "url": url,
         "command": command,
@@ -307,10 +439,8 @@ def _oauth_page(*, ok: bool, title: str, detail: str = "", status_code: int = 20
     )
 
 
-def _oauth_server(name: str) -> dict[str, Any]:
-    record = mcp_storage.get_server(name)
-    if record is None:
-        raise HTTPException(status_code=404, detail=f"No MCP server named '{name}'")
+def _oauth_server(name: str, user: dict) -> dict[str, Any]:
+    record = _managed_server(name, user)
     if not mcp_client_oauth.is_oauth(record):
         raise HTTPException(
             status_code=400,
@@ -327,11 +457,14 @@ async def oauth_connect_ticket(
 ) -> JSONResponse:
     """A single-use ticket that lets THIS browser start a sign-in to ``server``."""
     name = str(payload.get("server") or "").strip()
-    _oauth_server(name)
+    _oauth_server(name, user)
     _purge_stale_oauth()
     label = str(user.get("email") or user.get("display_name") or user.get("id") or "")
     ticket = secrets.token_urlsafe(32)
-    _oauth_tickets[ticket] = {"server": name, "by": label, "ts": time.time()}
+    _oauth_tickets[ticket] = {
+        "server": name, "by": label, "ts": time.time(),
+        "by_user": {"id": str(user.get("id") or ""), "role": user.get("role") or ""},
+    }
     resp = JSONResponse({"ticket": ticket}, headers={"Cache-Control": "no-store"})
     resp.set_cookie(
         key=_OAUTH_TICKET_COOKIE, value=ticket, max_age=_OAUTH_TICKET_TTL, httponly=True,
@@ -361,7 +494,12 @@ async def oauth_login(request: Request) -> Response:
             status_code=401,
         )
     record = mcp_storage.get_server(str(entry["server"]))
-    if record is None or not mcp_client_oauth.is_oauth(record):
+    signer = entry.get("by_user") or {}
+    if (
+        record is None
+        or not mcp_client_oauth.is_oauth(record)
+        or not mcp_storage.user_may_manage(record, signer)
+    ):
         return _oauth_page(ok=False, title="MCP server not found", status_code=404)
     _purge_stale_oauth()
     state = secrets.token_urlsafe(32)
@@ -372,7 +510,9 @@ async def oauth_login(request: Request) -> Response:
     except mcp_client_oauth.MCPOAuthError as exc:
         return _oauth_page(ok=False, title=f"Can't sign in to {record['name']}", detail=str(exc))
     browser = secrets.token_urlsafe(32)
-    _pending_oauth[state] = {**pending, "by": entry.get("by", ""), "browser": browser, "ts": time.time()}
+    _pending_oauth[state] = {
+        **pending, "by": entry.get("by", ""), "by_user": signer, "browser": browser, "ts": time.time(),
+    }
     resp = RedirectResponse(url, status_code=302)
     secure = _g._state_cookie_secure(request)
     resp.set_cookie(
@@ -421,12 +561,19 @@ async def _complete_oauth_callback(request: Request) -> HTMLResponse:
         )
     name = str(pending["server"])
     record = mcp_storage.get_server(name)
-    if record is None or record.get("url") != pending.get("server_url") or not mcp_client_oauth.is_oauth(record):
+    signer = pending.get("by_user") or {}
+    if (
+        record is None
+        or record.get("url") != pending.get("server_url")
+        or not mcp_client_oauth.is_oauth(record)
+        or not mcp_storage.user_may_manage(record, signer)
+    ):
         return _oauth_page(ok=False, title="The MCP server changed during sign-in — nothing was saved.")
     try:
         await mcp_client_oauth.complete_sign_in(
             pending, code,
             connected_by=str(pending.get("by") or ""),
+            connected_by_id=str(signer.get("id") or ""),
             issuer=request.query_params.get("iss", ""),
         )
     except mcp_client_oauth.MCPOAuthError as exc:
@@ -447,7 +594,7 @@ async def oauth_disconnect(
     """Sign Flight Deck out of ``server`` (revoking the token when the server
     supports it)."""
     name = str(payload.get("server") or "").strip()
-    record = _oauth_server(name)
+    record = _oauth_server(name, _user)
     await mcp_client_oauth.sign_out(record)
     await get_manager().forget_server(name)
     mcp_events.publish_server_updated(name)
@@ -484,13 +631,13 @@ async def agent_list_servers(request: Request) -> dict[str, Any]:
     upstream call routes through this proxy. Use ``/fd/mcp/<name>/tools``
     for per-server discovery.
     """
-    agent_slug = _authorize_agent_call(request)
+    caller = _authorize_agent_call(request)
     records = mcp_storage.load_servers()
     out: list[dict[str, Any]] = []
     for rec in records:
         if not rec.get("enabled", True):
             continue
-        if not mcp_storage.is_agent_allowed(rec, agent_slug):
+        if not _agent_may_use(rec, caller):
             continue
         out.append({"name": rec["name"]})
     return {"servers": out}
@@ -505,11 +652,9 @@ async def proxy_tools_list(
     """Return the cached ``tools/list`` for ``name``. Agents hit this
     instead of running their own MCP discovery, so OAuth + session is
     single-flighted across the fleet."""
-    agent_slug = _authorize_agent_call(request)
+    caller = _authorize_agent_call(request)
     record = mcp_storage.get_server(name)
-    if record is None:
-        raise HTTPException(status_code=404, detail=f"No MCP server named '{name}'")
-    if not mcp_storage.is_agent_allowed(record, agent_slug):
+    if not _agent_may_use(record, caller):
         # Match the 404 shape of "not configured" so disallowed servers
         # are indistinguishable from non-existent ones — don't leak the
         # existence of restricted servers to agents that can't use them.
@@ -527,11 +672,9 @@ async def proxy_tool_call(
     request: Request,
     payload: dict = Body(...),
 ) -> dict[str, Any]:
-    agent_slug = _authorize_agent_call(request)
+    caller = _authorize_agent_call(request)
     record = mcp_storage.get_server(name)
-    if record is None:
-        raise HTTPException(status_code=404, detail=f"No MCP server named '{name}'")
-    if not mcp_storage.is_agent_allowed(record, agent_slug):
+    if not _agent_may_use(record, caller):
         raise HTTPException(status_code=404, detail=f"No MCP server named '{name}'")
     tool_name = str(payload.get("tool") or payload.get("name") or "").strip()
     if not tool_name:
@@ -553,14 +696,13 @@ async def proxy_tool_call(
 async def user_tools_list(
     name: str,
     refresh: bool = False,
-    _user: dict = Depends(get_current_user),
+    user: dict = Depends(get_current_user),
 ) -> dict[str, Any]:
     """User-authed counterpart of ``/{name}/tools``. Used by the
     Flight-Deck app runtime so the browser can introspect a server
-    without holding an agent shared secret."""
-    record = mcp_storage.get_server(name)
-    if record is None:
-        raise HTTPException(status_code=404, detail=f"No MCP server named '{name}'")
+    without holding an agent shared secret — the user's own servers and
+    the deck-wide ones only."""
+    _usable_server(name, user)
     try:
         tools = await get_manager().list_tools(name, force_refresh=refresh)
     except MCPServerError as exc:
@@ -572,14 +714,13 @@ async def user_tools_list(
 async def user_tool_call(
     name: str,
     payload: dict = Body(...),
-    _user: dict = Depends(get_current_user),
+    user: dict = Depends(get_current_user),
 ) -> dict[str, Any]:
     """User-authed counterpart of ``/{name}/call``. Lets the app
     runtime in the browser invoke MCP tools as the logged-in user
-    (no agent slug, no shared secret)."""
-    record = mcp_storage.get_server(name)
-    if record is None:
-        raise HTTPException(status_code=404, detail=f"No MCP server named '{name}'")
+    (no agent slug, no shared secret) — on their own servers and the
+    deck-wide ones only."""
+    _usable_server(name, user)
     tool_name = str(payload.get("tool") or payload.get("name") or "").strip()
     if not tool_name:
         raise HTTPException(status_code=400, detail="payload.tool is required")
@@ -618,11 +759,9 @@ async def proxy_tool_call_stream(
     surface "tool is running, 30%…" indicators while the model
     waits.
     """
-    agent_slug = _authorize_agent_call(request)
+    caller = _authorize_agent_call(request)
     record = mcp_storage.get_server(name)
-    if record is None:
-        raise HTTPException(status_code=404, detail=f"No MCP server named '{name}'")
-    if not mcp_storage.is_agent_allowed(record, agent_slug):
+    if not _agent_may_use(record, caller):
         raise HTTPException(status_code=404, detail=f"No MCP server named '{name}'")
     tool_name = str(payload.get("tool") or payload.get("name") or "").strip()
     if not tool_name:
@@ -715,7 +854,7 @@ async def agent_event_stream(request: Request) -> StreamingResponse:
 
     Events are only delivered if the calling agent is allowed to use
     the affected server (see
-    :func:`mcp_storage.is_agent_allowed`). That keeps restricted-server
+    :func:`mcp_storage.agent_may_use`). That keeps restricted-server
     existence opaque to disallowed agents — same rule as the rest of
     the agent-facing surface.
 
@@ -723,7 +862,7 @@ async def agent_event_stream(request: Request) -> StreamingResponse:
     survives proxies / NATs that drop idle TCP. The client should
     treat ``ping`` as a no-op.
     """
-    agent_slug = _authorize_agent_call(request)
+    caller = _authorize_agent_call(request)
     bus = mcp_events.get_event_bus()
     queue = await bus.subscribe()
 
@@ -731,7 +870,7 @@ async def agent_event_stream(request: Request) -> StreamingResponse:
         try:
             # Send an initial hello so the client knows the connection
             # is live before any real event arrives.
-            yield _sse_format({"type": "hello", "agent": agent_slug})
+            yield _sse_format({"type": "hello", "agent": caller.slug})
             while True:
                 if await request.is_disconnected():
                     break
@@ -750,9 +889,7 @@ async def agent_event_stream(request: Request) -> StreamingResponse:
                 server_name = event.get("server")
                 if server_name:
                     record = mcp_storage.get_server(str(server_name))
-                    if record is not None and not mcp_storage.is_agent_allowed(
-                        record, agent_slug
-                    ):
+                    if record is not None and not _agent_may_use(record, caller):
                         continue
                     # ``server_removed`` fires *after* deletion, so
                     # ``record is None`` is normal there — forward

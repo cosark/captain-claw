@@ -840,6 +840,11 @@ async def lifespan(app: FastAPI):
     print(f"Flight Deck: {origin_guard.describe_policy()}")
     # Initialize database for auth & settings — always, see _init_fd_db.
     _fd_db = await _init_fd_db()
+    # MCP servers saved before they had owners: settle that before serving,
+    # so an OAuth sign-in never answers another user's agent in between.
+    from captain_claw.flight_deck.mcp_routes import migrate_legacy_ownership
+
+    await migrate_legacy_ownership(_fd_db)
     # Bring every agent's owner-profile files in line with the DB (an auth-mode
     # switch, edits made while FD was down) — in the background, best-effort.
     app.state.tenant_profile_reconcile = asyncio.create_task(tenant_profile.reconcile(_fd_db))

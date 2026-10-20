@@ -22,6 +22,11 @@ export interface MCPServer {
   transport?: MCPTransport
   enabled: boolean
   allowed_agents?: string[]
+  // Private to the user who added it unless an admin made it deck-wide.
+  owner_id?: string
+  deck_wide?: boolean
+  can_use?: boolean     // this user may call its tools
+  can_manage?: boolean  // this user may edit / sign in / remove it
   headers: Record<string, string>
   added_at?: number
   initialized?: boolean
@@ -59,6 +64,7 @@ export interface MCPServerInput {
   transport?: MCPTransport
   enabled?: boolean
   allowed_agents?: string[]
+  deck_wide?: boolean  // admin only; omit to keep the server's current setting
   headers?: Record<string, string>
   // HTTP
   url?: string

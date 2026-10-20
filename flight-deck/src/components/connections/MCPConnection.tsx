@@ -66,6 +66,16 @@ function useCanManageStdio(): boolean {
   return useAuthStore((s) => s.authEnabled === false || s.user?.role === 'admin')
 }
 
+// Only an admin on an auth-enabled deck can share a server with every user;
+// with auth off there is one user and nothing to share.
+function useCanShareDeckWide(): boolean {
+  return useAuthStore((s) => s.authEnabled === true && s.user?.role === 'admin')
+}
+
+function useOwnershipShown(): boolean {
+  return useAuthStore((s) => s.authEnabled === true)
+}
+
 function emptyForm(): MCPServerInput {
   return {
     name: '',
@@ -79,6 +89,7 @@ function emptyForm(): MCPServerInput {
     headers: {},
     enabled: true,
     allowed_agents: [],
+    deck_wide: false,
     command: '',
     args: [],
     env: {},
@@ -98,6 +109,7 @@ function fromServer(server: MCPServer): MCPServerInput {
     headers: server.headers || {},
     enabled: server.enabled !== false,
     allowed_agents: server.allowed_agents || [],
+    deck_wide: !!server.deck_wide,
     command: server.command || '',
     args: server.args || [],
     env: server.env || {},
@@ -107,7 +119,8 @@ function fromServer(server: MCPServer): MCPServerInput {
 interface ServerRowProps {
   server: MCPServer
   onEdit: () => void
-  // stdio server seen by a non-admin: shown, but not editable/testable/removable.
+  // Shown, but not editable/testable/removable: a stdio server seen by a
+  // non-admin, or a deck-wide server seen by a non-admin.
   readOnly?: boolean
 }
 
@@ -120,6 +133,11 @@ function ServerRow({ server, onEdit, readOnly = false }: ServerRowProps) {
   const allowed = server.allowed_agents || []
   const isOAuth = transport === 'http' && server.auth === 'oauth'
   const signedIn = isOAuth && !!server.oauth?.connected
+  const ownershipShown = useOwnershipShown()
+  const deckWide = !!server.deck_wide
+  // An admin sees an ownerless private server (an OAuth sign-in whose user
+  // is gone) only to remove it: nothing can call it.
+  const orphaned = server.can_use === false
 
   const statusPill = isOAuth && !signedIn ? (
     <span className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full border bg-amber-500/15 text-amber-400 border-amber-500/30">
@@ -175,6 +193,23 @@ function ServerRow({ server, onEdit, readOnly = false }: ServerRowProps) {
                 Disabled
               </span>
             )}
+            {ownershipShown && (
+              <span
+                className={
+                  'inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full border ' +
+                  (deckWide
+                    ? 'bg-amber-500/10 text-amber-400 border-amber-500/30'
+                    : 'bg-zinc-500/10 text-zinc-300 border-zinc-500/30')
+                }
+                title={
+                  deckWide
+                    ? "Shared by an admin: every user's agents may use this server"
+                    : 'Private: only your agents can use it, and only you see it'
+                }
+              >
+                {deckWide ? 'Deck-wide' : 'Private'}
+              </span>
+            )}
             <span
               className={
                 'inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full border ' +
@@ -184,13 +219,15 @@ function ServerRow({ server, onEdit, readOnly = false }: ServerRowProps) {
               }
               title={
                 allowed.length === 0
-                  ? 'Every agent in the fleet may use this server'
+                  ? ownershipShown && !deckWide
+                    ? 'Every one of your agents may use this server'
+                    : 'Every agent in the fleet may use this server'
                   : `Allowed: ${allowed.join(', ')}`
               }
             >
               <Users className="h-3 w-3" />
               {allowed.length === 0
-                ? 'All agents'
+                ? ownershipShown && !deckWide ? 'All your agents' : 'All agents'
                 : `${allowed.length} agent${allowed.length === 1 ? '' : 's'}`}
             </span>
           </div>
@@ -206,7 +243,13 @@ function ServerRow({ server, onEdit, readOnly = false }: ServerRowProps) {
               {(server.args && server.args.length > 0) ? ' ' + server.args.join(' ') : ''}
             </div>
           )}
-          {signedIn && (
+          {orphaned && (
+            <div className="text-xs text-red-400 mt-1">
+              Nobody owns this server any more, so no agent can use it — remove it, and
+              have its user add it again.
+            </div>
+          )}
+          {signedIn && !orphaned && (
             <div className="text-xs text-emerald-400 mt-1 break-all">
               Signed in{server.oauth?.connected_by ? ` by ${server.oauth.connected_by}` : ''}
               {server.oauth?.issuer ? ` · ${server.oauth.issuer}` : ''}
@@ -248,13 +291,17 @@ function ServerRow({ server, onEdit, readOnly = false }: ServerRowProps) {
         {readOnly ? (
           <span
             className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full border bg-zinc-500/10 text-zinc-400 border-zinc-500/30 shrink-0"
-            title="stdio servers run a command on the Flight Deck host — only an admin can change them"
+            title={
+              deckWide
+                ? 'An admin shared this server with the whole deck — only an admin can change it'
+                : 'stdio servers run a command on the Flight Deck host — only an admin can change them'
+            }
           >
             Admin-managed
           </span>
         ) : (
           <div className="flex items-center gap-1.5 flex-wrap shrink-0">
-            {isOAuth && (
+            {isOAuth && !orphaned && (
               <button
                 type="button"
                 onClick={() => signIn(server.name)}
@@ -290,20 +337,22 @@ function ServerRow({ server, onEdit, readOnly = false }: ServerRowProps) {
               <Pencil className="h-3.5 w-3.5" />
               Edit
             </button>
-            <button
-              type="button"
-              onClick={() => testServer(server.name)}
-              disabled={isTesting}
-              className="inline-flex items-center gap-1.5 rounded-md border border-zinc-700 hover:bg-zinc-800 px-2.5 py-1.5 text-xs text-zinc-200 disabled:opacity-50"
-              title="Run an end-to-end probe (initialize + list tools)"
-            >
-              {isTesting ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <RefreshCw className="h-3.5 w-3.5" />
-              )}
-              Test
-            </button>
+            {!orphaned && (
+              <button
+                type="button"
+                onClick={() => testServer(server.name)}
+                disabled={isTesting}
+                className="inline-flex items-center gap-1.5 rounded-md border border-zinc-700 hover:bg-zinc-800 px-2.5 py-1.5 text-xs text-zinc-200 disabled:opacity-50"
+                title="Run an end-to-end probe (initialize + list tools)"
+              >
+                {isTesting ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw className="h-3.5 w-3.5" />
+                )}
+                Test
+              </button>
+            )}
             {confirming ? (
               <>
                 <button
@@ -357,6 +406,7 @@ function ServerForm({ initial, onClose, allowStdio = true }: ServerFormProps) {
     initial ? fromServer(initial) : emptyForm(),
   )
   const [authChoice, setAuthChoice] = useState<AuthChoice>(authChoiceOf(initial))
+  const canShareDeckWide = useCanShareDeckWide()
   const [probing, setProbing] = useState(false)
   const [probe, setProbe] = useState<MCPProbeResult | null>(null)
 
@@ -394,6 +444,8 @@ function ServerForm({ initial, onClose, allowStdio = true }: ServerFormProps) {
       allowed_agents: (form.allowed_agents || []).map((s) => s.trim()).filter(Boolean),
       headers: form.headers || {},
     }
+    // Non-admins leave it out: the server keeps its setting (private).
+    if (canShareDeckWide) payload.deck_wide = !!form.deck_wide
     if (transport === 'http') {
       payload.url = (form.url || '').trim()
       payload.auth = authChoice === 'oauth' ? 'oauth' : ''
@@ -651,6 +703,26 @@ function ServerForm({ initial, onClose, allowStdio = true }: ServerFormProps) {
         <span>Enabled (agents will load tools from this server)</span>
       </label>
 
+      {canShareDeckWide && (
+        <label className="flex items-start gap-2 text-xs text-zinc-400">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={!!form.deck_wide}
+            onChange={(e) => update('deck_wide', e.target.checked)}
+          />
+          <span>
+            Share with everyone on this deck — every user's agents may use it (subject to the
+            allowed agents below), and only admins can change it. Off: only your agents.
+            {form.deck_wide && authChoice === 'oauth' && (
+              <span className="block text-amber-400 mt-0.5">
+                Every user's agents will act as the account signed in here.
+              </span>
+            )}
+          </span>
+        </label>
+      )}
+
       <AgentAllowlistPicker
         value={form.allowed_agents || []}
         onChange={(next) => update('allowed_agents', next)}
@@ -808,7 +880,8 @@ export default function MCPConnection() {
 
           <div className="space-y-2">
             {servers.map((srv) => {
-              const readOnly = srv.transport === 'stdio' && !canManageStdio
+              const readOnly =
+                srv.can_manage === false || (srv.transport === 'stdio' && !canManageStdio)
               return editingName === srv.name && !readOnly ? (
                 <ServerForm
                   key={srv.name}

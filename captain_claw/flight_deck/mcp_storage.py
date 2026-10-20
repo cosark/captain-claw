@@ -5,9 +5,15 @@ per-instance — see :func:`_storage_path` — so a host running several
 Flight Decks does not leak one deck's MCP servers into another; only the
 legacy ``~/.captain-claw-fd/mcp_servers.json`` fallback is shared, used
 when no isolation env (``CAPTAIN_CLAW_FD_MCP_PATH`` / ``CAPTAIN_CLAW_FD_HOME``
-/ ``FD_DATA_DIR``) is set. Anything fancier (SQLite, encryption-at-rest,
-per-tenant scoping within one deck) is deferred until we have a clearer
-picture of what users actually want.
+/ ``FD_DATA_DIR``) is set. Anything fancier (SQLite, encryption-at-rest)
+is deferred until we have a clearer picture of what users actually want.
+
+Within one deck a server is **private to the user who added it** — only
+that user's agents may use it, and only that user sees, calls or manages
+it — unless an admin made it ``deck_wide`` (every user's agents, subject to
+``allowed_agents``; only admins manage it). See :func:`agent_may_use`,
+:func:`user_may_use` and :func:`user_may_manage`. With Flight Deck auth off
+there is one trusted user and ownership is not enforced.
 
 Schema (one element per configured server)::
 
@@ -26,6 +32,8 @@ Schema (one element per configured server)::
         "headers":       {"X-Foo": "bar"},                # optional extra HTTP headers (http only)
         "enabled":       true,                            # disabled servers are skipped
         "allowed_agents": ["nano-man", "everyday"],       # empty list = all agents allowed
+        "owner_id":      "user-uuid",                     # who added it ("" = nobody, see below)
+        "deck_wide":     false,                           # admin opt-in: every user's agents
         "added_at":      1715000000.0                     # unix seconds
     }
 
@@ -53,6 +61,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from captain_claw.flight_deck.auth import _fd_auth_enabled
 from captain_claw.logging import get_logger
 
 log = get_logger(__name__)
@@ -169,6 +178,14 @@ def _coerce_record(raw: Any) -> dict[str, Any] | None:
     # "oauth" = interactive sign-in (mcp_client_oauth); anything else keeps the
     # original behaviour (client_credentials when client_id + token_endpoint).
     auth = "oauth" if transport == "http" and str(raw.get("auth") or "").strip().lower() == "oauth" else ""
+    # Records saved before servers had owners carry no ``owner_id`` key: they
+    # were deck-wide, and stay so (migrate_legacy_ownership persists that) —
+    # except an OAuth sign-in, which is one person's account: private, and
+    # unusable until the migration finds who signed in (fail closed).
+    if "owner_id" in raw:
+        deck_wide = bool(raw.get("deck_wide", False))
+    else:
+        deck_wide = auth != "oauth"
 
     return {
         "name": name,
@@ -185,6 +202,8 @@ def _coerce_record(raw: Any) -> dict[str, Any] | None:
         "headers": {str(k): str(v) for k, v in headers.items()},
         "enabled": bool(raw.get("enabled", True)),
         "allowed_agents": allowed,
+        "owner_id": str(raw.get("owner_id") or "").strip(),
+        "deck_wide": deck_wide,
         "added_at": float(raw.get("added_at") or 0.0),
     }
 
@@ -268,6 +287,79 @@ def is_agent_allowed(record: dict[str, Any], agent_slug: str) -> bool:
     if not agent_slug:
         return False
     return agent_slug in allowed
+
+
+def _is_admin(user: dict[str, Any] | None) -> bool:
+    return (user or {}).get("role") == "admin"
+
+
+def agent_may_use(record: dict[str, Any], agent_slug: str, agent_owner: str) -> bool:
+    """May the agent (slug + the owner FD recorded at spawn) use ``record``?
+    A private server admits only its owner's agents; then the allowlist."""
+    if not is_agent_allowed(record, agent_slug):
+        return False
+    if not _fd_auth_enabled() or record.get("deck_wide"):
+        return True
+    owner = str(record.get("owner_id") or "")
+    return bool(owner) and agent_owner == owner
+
+
+def user_may_use(record: dict[str, Any], user: dict[str, Any] | None) -> bool:
+    """May this signed-in user see ``record`` and call its tools?"""
+    if not _fd_auth_enabled() or record.get("deck_wide"):
+        return True
+    owner = str(record.get("owner_id") or "")
+    return bool(owner) and str((user or {}).get("id") or "") == owner
+
+
+def user_may_manage(record: dict[str, Any], user: dict[str, Any] | None) -> bool:
+    """May this user edit, sign in / out, test or remove ``record``? A
+    deck-wide server is the admins'; a private one its owner's; an ownerless
+    private one (an OAuth server whose signer couldn't be found) the admins',
+    so they can clean it up — they still can't call it."""
+    if not _fd_auth_enabled():
+        return True
+    if record.get("deck_wide"):
+        return _is_admin(user)
+    owner = str(record.get("owner_id") or "")
+    if owner:
+        return str((user or {}).get("id") or "") == owner
+    return _is_admin(user)
+
+
+async def migrate_legacy_ownership(oauth_signer) -> list[str]:
+    """Give every pre-ownership record an explicit owner / deck_wide.
+
+    Non-OAuth records stay deck-wide (that is how they behaved). An OAuth
+    record becomes private to whoever signed it in: ``oauth_signer(record)``
+    returns that user's id, or "" when unknown — the record then stays
+    private and ownerless (no agent can use it; an admin can remove it).
+    Returns the names it changed.
+    """
+    path = _storage_path()
+    if not path.exists():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if not isinstance(raw, list):
+        return []
+    changed: list[str] = []
+    out: list[dict[str, Any]] = []
+    for entry in raw:
+        rec = _coerce_record(entry)
+        if rec is None:
+            continue
+        if isinstance(entry, dict) and "owner_id" not in entry:
+            if rec["auth"] == "oauth":
+                rec["owner_id"] = str(await oauth_signer(rec) or "")
+                rec["deck_wide"] = False
+            changed.append(rec["name"])
+        out.append(rec)
+    if changed:
+        await save_servers(out)
+    return changed
 
 
 async def upsert_server(record: dict[str, Any]) -> dict[str, Any]:

@@ -338,7 +338,8 @@ def _make_app(monkeypatch: pytest.MonkeyPatch, fake: FakeMCPServer) -> FastAPI:
     # Override the auth dependency so admin endpoints don't require a real user.
     from captain_claw.flight_deck.auth import get_current_user
 
-    app.dependency_overrides[get_current_user] = lambda: {"username": "test"}
+    # u1 owns what it adds — the agent registry below records owner u1 too.
+    app.dependency_overrides[get_current_user] = lambda: {"id": "u1", "username": "test", "role": "user"}
 
     # Replace the global manager so its httpx client uses our mock.
     if mcp_manager._manager is not None:  # noqa: SLF001
