@@ -1,0 +1,821 @@
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import {
+  AlertTriangle,
+  ArrowLeft,
+  Braces,
+  Download,
+  Eye,
+  File,
+  FileArchive,
+  FileCode,
+  FileSpreadsheet,
+  FileText,
+  Film,
+  Globe,
+  Image,
+  LibraryBig,
+  Loader2,
+  MessageSquare,
+  Presentation,
+  RotateCw,
+  Search,
+  Settings2,
+  SlidersHorizontal,
+  Sparkles,
+  X,
+} from 'lucide-react'
+import { useNotificationStore } from '../../stores/notificationStore'
+import { FileViewer } from '../agents/FileViewer'
+import type { AgentFile } from '../../services/fileTransfer'
+import { formatSize, getFileTypeGroup, isViewable } from '../../services/fileTransfer'
+import { fmtRelative, fmtWhen } from '../../services/schedulerApi'
+import {
+  fileLibraryApi,
+  type Facet,
+  type LibraryItem,
+  type LibraryPage,
+  type LibrarySort,
+  type LibraryState,
+} from '../../services/fileLibraryApi'
+
+// ── File library ────────────────────────────────────────────────────
+//
+// Every file your agents made, in one place: Flight Deck reads each new or
+// changed file, writes a title and a short summary, sorts it into a category
+// and tags it. Search finds a file by any of that or by its text; filters
+// narrow it to a category, an agent or a kind of file. Opening the library
+// looks for new files in the background; the list fills in as they're read.
+
+const PAGE = 60
+
+const CATEGORY_LABEL: Record<string, string> = {
+  report: 'Report', research: 'Research', notes: 'Notes', plan: 'Plan', data: 'Data & lists',
+  finance: 'Finance', legal: 'Legal', correspondence: 'Correspondence', presentation: 'Presentation',
+  code: 'Code', media: 'Images & media', other: 'Other', pending: 'Not summarised yet',
+}
+
+const CATEGORY_TONE: Record<string, string> = {
+  report: 'bg-violet-500/10 text-violet-700 dark:text-violet-300',
+  research: 'bg-sky-500/10 text-sky-700 dark:text-sky-300',
+  notes: 'bg-amber-500/10 text-amber-700 dark:text-amber-300',
+  plan: 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300',
+  data: 'bg-cyan-500/10 text-cyan-700 dark:text-cyan-300',
+  finance: 'bg-lime-500/10 text-lime-700 dark:text-lime-300',
+  legal: 'bg-rose-500/10 text-rose-700 dark:text-rose-300',
+  correspondence: 'bg-indigo-500/10 text-indigo-700 dark:text-indigo-300',
+  presentation: 'bg-orange-500/10 text-orange-700 dark:text-orange-300',
+  code: 'bg-teal-500/10 text-teal-700 dark:text-teal-300',
+  media: 'bg-pink-500/10 text-pink-700 dark:text-pink-300',
+  other: 'bg-zinc-800 text-zinc-400',
+  pending: 'bg-zinc-800 text-zinc-500',
+}
+
+const CATEGORY_DOT: Record<string, string> = {
+  report: 'bg-violet-500', research: 'bg-sky-500', notes: 'bg-amber-500', plan: 'bg-emerald-500',
+  data: 'bg-cyan-500', finance: 'bg-lime-500', legal: 'bg-rose-500', correspondence: 'bg-indigo-500',
+  presentation: 'bg-orange-500', code: 'bg-teal-500', media: 'bg-pink-500', other: 'bg-zinc-500', pending: 'bg-zinc-600',
+}
+
+const KIND_ICON: Record<string, typeof FileText> = {
+  document: FileText, spreadsheet: FileSpreadsheet, presentation: Presentation, web: Globe,
+  data: Braces, code: FileCode, image: Image, media: Film, archive: FileArchive, config: Settings2,
+}
+const KIND_TONE: Record<string, string> = {
+  document: 'text-violet-500 dark:text-violet-400', spreadsheet: 'text-cyan-600 dark:text-cyan-400',
+  presentation: 'text-orange-600 dark:text-orange-400', web: 'text-orange-500 dark:text-orange-300',
+  data: 'text-sky-600 dark:text-sky-400', code: 'text-emerald-600 dark:text-emerald-400',
+  image: 'text-blue-600 dark:text-blue-400', media: 'text-pink-600 dark:text-pink-400',
+}
+
+const SORTS: { id: LibrarySort; label: string }[] = [
+  { id: 'recent', label: 'Newest first' },
+  { id: 'name', label: 'Name' },
+  { id: 'size', label: 'Largest first' },
+  { id: 'agent', label: 'By agent' },
+]
+
+const iconBtn = 'rounded-lg p-2 text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-200 disabled:opacity-50'
+
+function categoryOf(item: LibraryItem): string {
+  return item.category || 'pending'
+}
+
+/** The library's file in the shape the shared FileViewer reads. */
+function toViewerFile(item: LibraryItem): AgentFile {
+  return {
+    logical: item.rel_path,
+    physical: item.id,
+    filename: item.filename,
+    extension: item.extension,
+    exists: true,
+    size: item.size,
+    modified: item.modified,
+    mime_type: item.mime_type,
+    is_text: ['document', 'data', 'code', 'web', 'config'].includes(item.kind),
+    source: 'workspace',
+  }
+}
+
+export function FileLibrary({ phone = false, initialAgent, onClose, onOpenAgent }: {
+  phone?: boolean
+  /** Open filtered to this agent's files. */
+  initialAgent?: string | null
+  onClose: () => void
+  /** Chat with the agent a file belongs to. */
+  onOpenAgent?: (agentSlug: string) => void
+}) {
+  const notify = useNotificationStore((s) => s.add)
+  const [state, setState] = useState<LibraryState | null>(null)
+  const [query, setQuery] = useState('')
+  const [debounced, setDebounced] = useState('')
+  const [agent, setAgent] = useState(initialAgent || '')
+  const [category, setCategory] = useState('')
+  const [kind, setKind] = useState('')
+  const [sort, setSort] = useState<LibrarySort>('recent')
+  const [page, setPage] = useState<LibraryPage | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [loadingMore, setLoadingMore] = useState(false)
+  const [error, setError] = useState('')
+  const [selected, setSelected] = useState<LibraryItem | null>(null)
+  const [viewing, setViewing] = useState<LibraryItem | null>(null)
+  const [filtersOpen, setFiltersOpen] = useState(false)
+  const reqId = useRef(0)
+  const shown = useRef(PAGE)
+
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(query.trim()), query ? 250 : 0)
+    return () => clearTimeout(t)
+  }, [query])
+
+  const load = useCallback(async (quiet = false) => {
+    const id = ++reqId.current
+    if (!quiet) { setLoading(true); shown.current = PAGE }
+    try {
+      const res = await fileLibraryApi.files({
+        q: debounced, agent, category, kind, sort, limit: Math.max(PAGE, shown.current), offset: 0,
+      })
+      if (id !== reqId.current) return
+      setPage(res)
+      setError('')
+      // The open file follows its fresh copy (a summary that just arrived).
+      setSelected((cur) => (cur ? res.items.find((i) => i.id === cur.id) ?? cur : cur))
+    } catch (e) {
+      if (id === reqId.current && !quiet) setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      if (id === reqId.current) setLoading(false)
+    }
+  }, [debounced, agent, category, kind, sort])
+
+  useEffect(() => { load() }, [load])
+
+  const loadMore = async () => {
+    if (!page) return
+    setLoadingMore(true)
+    try {
+      const res = await fileLibraryApi.files({
+        q: debounced, agent, category, kind, sort, limit: PAGE, offset: page.items.length,
+      })
+      setPage((cur) => cur && {
+        ...res,
+        items: [...cur.items, ...res.items.filter((i) => !cur.items.some((c) => c.id === i.id))],
+      })
+      shown.current = page.items.length + res.items.length
+    } catch (e) {
+      notify('error', 'Could not load more files', e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoadingMore(false)
+    }
+  }
+
+  // Opening the library looks for new and changed files.
+  useEffect(() => {
+    fileLibraryApi.scan().then(setState).catch(() => fileLibraryApi.status().then(setState).catch(() => {}))
+  }, [])
+
+  // While a scan runs: its progress often, the list as summaries land.
+  const running = !!state?.job.running
+  const loadRef = useRef(load)
+  loadRef.current = load
+  useEffect(() => {
+    if (!running) return
+    const t = setInterval(() => {
+      fileLibraryApi.status().then(setState).catch(() => {})
+      loadRef.current(true)
+    }, 2500)
+    return () => clearInterval(t)
+  }, [running])
+  // …and once more when it finishes.
+  const wasRunning = useRef(false)
+  useEffect(() => {
+    if (wasRunning.current && !running) loadRef.current(true)
+    wasRunning.current = running
+  }, [running])
+
+  const rescan = async () => {
+    try { setState(await fileLibraryApi.scan(true)) } catch (e) {
+      notify('error', 'Could not scan for files', e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  const resummarize = async (item: LibraryItem) => {
+    const fresh = await fileLibraryApi.resummarize(item.id)
+    setSelected((cur) => (cur?.id === fresh.id ? fresh : cur))
+    setPage((cur) => cur && { ...cur, items: cur.items.map((i) => (i.id === fresh.id ? fresh : i)) })
+    fileLibraryApi.status().then(setState).catch(() => {})
+  }
+
+  const openFile = (item: LibraryItem) => {
+    if (getFileTypeGroup(toViewerFile(item)) === 'pdf') {
+      window.open(fileLibraryApi.viewUrl(item.id), '_blank')
+      return
+    }
+    setViewing(item)
+  }
+  const download = (item: LibraryItem) => {
+    const a = document.createElement('a')
+    a.href = fileLibraryApi.downloadUrl(item.id)
+    a.download = item.filename
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+  }
+
+  // Escape: the viewer closes itself; then the open file (phone), then the library.
+  const viewingRef = useRef(viewing)
+  viewingRef.current = viewing
+  const selectedRef = useRef(selected)
+  selectedRef.current = selected
+  const filtersRef = useRef(filtersOpen)
+  filtersRef.current = filtersOpen
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || viewingRef.current) return
+      if (filtersRef.current) { setFiltersOpen(false); return }
+      if (phone && selectedRef.current) { setSelected(null); return }
+      onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [onClose, phone])
+
+  const items = page?.items ?? []
+  const facets = page?.facets
+  const terms = useMemo(() => debounced.toLowerCase().split(/\s+/).filter(Boolean), [debounced])
+  const filtered = !!(debounced || agent || category || kind)
+  const clearFilters = () => { setQuery(''); setAgent(''); setCategory(''); setKind('') }
+  const viewable = items.filter((i) => isViewable(toViewerFile(i)) && getFileTypeGroup(toViewerFile(i)) !== 'pdf')
+  const viewIdx = viewing ? viewable.findIndex((i) => i.id === viewing.id) : -1
+
+  const header = (
+    <div className="flex items-center gap-3 border-b border-zinc-800 px-4 py-3 wide:px-5">
+      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-violet-500/15 text-violet-600 dark:text-violet-400">
+        <LibraryBig className="h-[18px] w-[18px]" />
+      </span>
+      <div className="min-w-0 flex-1">
+        <h2 className="truncate text-base font-semibold text-zinc-100">File library</h2>
+        {!phone && <p className="truncate text-xs text-zinc-500">Every file your agents made — summarised, sorted and searchable.</p>}
+      </div>
+      {!phone && <ScanStatus state={state} />}
+      <button onClick={rescan} disabled={running} className={iconBtn} title="Look for new files" aria-label="Look for new files">
+        <RotateCw className={`h-4 w-4 ${running ? 'animate-spin' : ''}`} />
+      </button>
+      <button onClick={onClose} className={iconBtn} title="Close" aria-label="Close">
+        <X className="h-4 w-4" />
+      </button>
+    </div>
+  )
+
+  const toolbar = (
+    <div className="flex items-center gap-2 border-b border-zinc-800 px-3 py-2.5 wide:px-4">
+      <div className="relative min-w-0 flex-1">
+        <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-500" />
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder={phone ? 'Search files…' : 'Search titles, summaries, tags and the text inside…'}
+          className="w-full rounded-lg border border-zinc-800 bg-zinc-900 py-2 pl-8 pr-8 text-sm text-zinc-200 placeholder-zinc-500 focus:border-violet-500/60 focus:outline-none"
+        />
+        {query && (
+          <button onClick={() => setQuery('')} className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded p-1 text-zinc-500 hover:text-zinc-200" aria-label="Clear search">
+            <X className="h-3.5 w-3.5" />
+          </button>
+        )}
+      </div>
+      {phone ? (
+        <button
+          onClick={() => setFiltersOpen(true)}
+          className={`relative flex h-9 shrink-0 items-center gap-1.5 rounded-lg border px-3 text-sm ${
+            agent || category || kind ? 'border-violet-500/50 text-violet-700 dark:text-violet-300' : 'border-zinc-800 text-zinc-400'}`}
+        >
+          <SlidersHorizontal className="h-4 w-4" />Filters
+        </button>
+      ) : (
+        <select
+          value={sort}
+          onChange={(e) => setSort(e.target.value as LibrarySort)}
+          aria-label="Sort"
+          className="shrink-0 rounded-lg border border-zinc-800 bg-zinc-900 px-2.5 py-2 text-sm text-zinc-300 focus:border-violet-500/60 focus:outline-none"
+        >
+          {SORTS.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
+        </select>
+      )}
+    </div>
+  )
+
+  const filters = (
+    <Filters
+      facets={facets}
+      agent={agent} category={category} kind={kind}
+      onAgent={setAgent} onCategory={setCategory} onKind={setKind}
+    />
+  )
+
+  const list = (
+    <ResultList
+      items={items}
+      total={page?.total ?? 0}
+      state={state}
+      loading={loading}
+      error={error}
+      filtered={filtered}
+      terms={terms}
+      selectedId={selected?.id ?? null}
+      loadingMore={loadingMore}
+      onSelect={setSelected}
+      onMore={loadMore}
+      onClear={clearFilters}
+      onRetry={() => load()}
+    />
+  )
+
+  const detail = selected && (
+    <FileDetail
+      key={selected.id}
+      item={selected}
+      terms={terms}
+      phone={phone}
+      onClose={() => setSelected(null)}
+      onOpen={() => openFile(selected)}
+      onDownload={() => download(selected)}
+      onResummarize={() => resummarize(selected)}
+      onTag={(t) => setQuery(t)}
+      onAgent={() => setAgent(selected.agent_slug)}
+      onOpenAgent={onOpenAgent && selected.agent_running ? () => onOpenAgent(selected.agent_slug) : undefined}
+    />
+  )
+
+  const viewer = viewing && (
+    <FileViewer
+      file={toViewerFile(viewing)}
+      urls={{ view: fileLibraryApi.viewUrl(viewing.id), download: fileLibraryApi.downloadUrl(viewing.id) }}
+      readOnly
+      onClose={() => setViewing(null)}
+      hasPrev={viewIdx > 0}
+      hasNext={viewIdx >= 0 && viewIdx < viewable.length - 1}
+      onPrev={() => { if (viewIdx > 0) setViewing(viewable[viewIdx - 1]) }}
+      onNext={() => { if (viewIdx >= 0 && viewIdx < viewable.length - 1) setViewing(viewable[viewIdx + 1]) }}
+    />
+  )
+
+  if (phone) {
+    return (
+      <div className="relative flex h-full flex-col bg-zinc-950">
+        {header}
+        <div className="border-b border-zinc-800 px-3 py-2"><ScanStatus state={state} /></div>
+        {toolbar}
+        <div className="min-h-0 flex-1">{list}</div>
+        {selected && <div className="absolute inset-0 z-10 flex flex-col bg-zinc-950">{detail}</div>}
+        {filtersOpen && (
+          <div className="absolute inset-0 z-20 flex flex-col bg-zinc-950">
+            <div className="flex items-center gap-2 border-b border-zinc-800 px-4 py-3">
+              <h3 className="flex-1 text-base font-semibold text-zinc-100">Filters</h3>
+              <button onClick={() => setFiltersOpen(false)} className={iconBtn} aria-label="Close filters"><X className="h-5 w-5" /></button>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              <div className="px-4 pt-3">
+                <label className="mb-1 block text-[11px] font-medium uppercase tracking-wider text-zinc-500">Sort</label>
+                <select
+                  value={sort}
+                  onChange={(e) => setSort(e.target.value as LibrarySort)}
+                  className="h-11 w-full rounded-xl border border-zinc-800 bg-zinc-900 px-3 text-base text-zinc-200"
+                >
+                  {SORTS.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
+                </select>
+              </div>
+              {filters}
+            </div>
+            <div className="flex gap-2 border-t border-zinc-800 p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+              <button onClick={() => { setAgent(''); setCategory(''); setKind('') }} className="h-11 flex-1 rounded-xl border border-zinc-800 text-sm font-medium text-zinc-300">
+                Clear
+              </button>
+              <button onClick={() => setFiltersOpen(false)} className="h-11 flex-1 rounded-xl bg-violet-600 text-sm font-medium text-white">
+                Show {page?.total ?? 0} file{page?.total === 1 ? '' : 's'}
+              </button>
+            </div>
+          </div>
+        )}
+        {viewer}
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex h-full flex-col bg-zinc-950">
+      {header}
+      {toolbar}
+      <div className="flex min-h-0 flex-1">
+        <aside className="w-56 shrink-0 overflow-y-auto border-r border-zinc-800 bg-zinc-900/40">{filters}</aside>
+        <section className="min-w-0 flex-1">{list}</section>
+        {selected && <aside className="w-[380px] shrink-0 border-l border-zinc-800 bg-zinc-900/30">{detail}</aside>}
+      </div>
+      {viewer}
+    </div>
+  )
+}
+
+// ── Scan progress ──
+
+function ScanStatus({ state }: { state: LibraryState | null }) {
+  if (!state) return null
+  const { job, counts } = state
+  if (job.running) {
+    const pct = job.total ? Math.round(((job.done + job.failed) / job.total) * 100) : 0
+    return (
+      <div className="flex min-w-0 items-center gap-2 text-xs text-zinc-400" title={job.current ? `Reading ${job.current}` : undefined}>
+        <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-violet-500 dark:text-violet-400" />
+        {job.phase === 'summarizing' ? (
+          <>
+            <span className="shrink-0">Summarising {Math.min(job.done + job.failed + 1, job.total)} of {job.total}</span>
+            <span className="h-1.5 w-20 shrink-0 overflow-hidden rounded-full bg-zinc-800">
+              <span className="block h-full rounded-full bg-violet-500 transition-all" style={{ width: `${pct}%` }} />
+            </span>
+          </>
+        ) : <span>Looking for new files…</span>}
+      </div>
+    )
+  }
+  if (job.message) {
+    return (
+      <div className="flex min-w-0 items-center gap-1.5 text-xs text-amber-700 dark:text-amber-400" title={job.message}>
+        <AlertTriangle className="h-3.5 w-3.5 shrink-0" /><span className="truncate">{job.message}</span>
+      </div>
+    )
+  }
+  return (
+    <div className="flex min-w-0 items-center gap-1.5 text-xs text-zinc-500">
+      <Sparkles className="h-3.5 w-3.5 shrink-0 text-violet-500 dark:text-violet-400" />
+      <span className="truncate">
+        {counts.total === 0 ? 'No files yet'
+          : counts.pending ? `${counts.pending} file${counts.pending === 1 ? '' : 's'} waiting for a summary`
+            : `Up to date · ${counts.total} file${counts.total === 1 ? '' : 's'}`}
+        {job.finished_at && !counts.pending ? ` · checked ${fmtRelative(job.finished_at)}` : ''}
+      </span>
+    </div>
+  )
+}
+
+// ── Filters ──
+
+function Filters({ facets, agent, category, kind, onAgent, onCategory, onKind }: {
+  facets: LibraryPage['facets'] | undefined
+  agent: string; category: string; kind: string
+  onAgent: (v: string) => void; onCategory: (v: string) => void; onKind: (v: string) => void
+}) {
+  if (!facets) return <div className="flex justify-center py-8 text-zinc-500"><Loader2 className="h-4 w-4 animate-spin" /></div>
+  return (
+    <div className="flex flex-col gap-4 px-2 py-3">
+      <FacetGroup
+        title="Categories" allLabel="All files" facets={facets.categories} value={category} onChange={onCategory}
+        dot={(id) => <span className={`h-2 w-2 shrink-0 rounded-full ${CATEGORY_DOT[id] || CATEGORY_DOT.other}`} />}
+      />
+      <FacetGroup title="Agents" allLabel="All agents" facets={facets.agents} value={agent} onChange={onAgent} />
+      {facets.kinds.length > 1 && (
+        <FacetGroup
+          title="Type" allLabel="Any type" facets={facets.kinds} value={kind} onChange={onKind}
+          dot={(id) => { const Icon = KIND_ICON[id] || File; return <Icon className={`h-3.5 w-3.5 shrink-0 ${KIND_TONE[id] || 'text-zinc-500'}`} /> }}
+        />
+      )}
+    </div>
+  )
+}
+
+function FacetGroup({ title, allLabel, facets, value, onChange, dot }: {
+  title: string; allLabel: string; facets: Facet[]; value: string
+  onChange: (v: string) => void; dot?: (id: string) => ReactNode
+}) {
+  const all = facets.reduce((n, f) => n + f.count, 0)
+  // A filter whose value no longer has files still shows, so it can be cleared.
+  const rows = value && !facets.some((f) => f.id === value) ? [...facets, { id: value, label: CATEGORY_LABEL[value] || value, count: 0 }] : facets
+  const row = (id: string, label: string, count: number, icon?: ReactNode) => (
+    <li key={id || '_all'}>
+      <button
+        onClick={() => onChange(id === value ? '' : id)}
+        className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-left text-[13px] transition-colors ${
+          value === id ? 'bg-zinc-800 font-medium text-zinc-100' : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200'}`}
+      >
+        {icon}
+        <span className="min-w-0 flex-1 truncate">{label}</span>
+        <span className="shrink-0 text-[11px] tabular-nums text-zinc-500">{count}</span>
+      </button>
+    </li>
+  )
+  return (
+    <div>
+      <div className="px-2.5 pb-1 text-[11px] font-medium uppercase tracking-wider text-zinc-500">{title}</div>
+      <ul className="flex flex-col gap-0.5">
+        {row('', allLabel, all)}
+        {rows.map((f) => row(f.id, f.label, f.count, dot?.(f.id)))}
+      </ul>
+    </div>
+  )
+}
+
+// ── Results ──
+
+function ResultList({
+  items, total, state, loading, error, filtered, terms, selectedId, loadingMore, onSelect, onMore, onClear, onRetry,
+}: {
+  items: LibraryItem[]; total: number; state: LibraryState | null; loading: boolean; error: string
+  filtered: boolean; terms: string[]; selectedId: string | null; loadingMore: boolean
+  onSelect: (i: LibraryItem) => void; onMore: () => void; onClear: () => void; onRetry: () => void
+}) {
+  if (loading && items.length === 0) {
+    return <div className="flex h-full justify-center pt-16 text-zinc-500"><Loader2 className="h-5 w-5 animate-spin" /></div>
+  }
+  if (error) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center text-sm text-zinc-500">
+        <AlertTriangle className="h-5 w-5 text-red-500" />{error}
+        <button onClick={onRetry} className="text-sm font-medium text-violet-600 hover:underline dark:text-violet-400">Try again</button>
+      </div>
+    )
+  }
+  if (items.length === 0) {
+    const scanning = !!state?.job.running
+    return (
+      <div className="flex h-full flex-col items-center justify-center px-6 text-center">
+        <span className="flex h-14 w-14 items-center justify-center rounded-2xl bg-violet-500/15 text-violet-600 dark:text-violet-400">
+          {scanning ? <Loader2 className="h-7 w-7 animate-spin" /> : <LibraryBig className="h-7 w-7" />}
+        </span>
+        <h3 className="mt-4 text-base font-semibold text-zinc-100">
+          {filtered ? 'Nothing matches' : scanning ? 'Gathering your files…' : state?.agents === 0 ? 'No agents yet' : 'No files yet'}
+        </h3>
+        <p className="mt-1.5 max-w-sm text-sm leading-relaxed text-zinc-400">
+          {filtered
+            ? 'Try other words, or clear the filters.'
+            : scanning
+              ? 'Your agents\' files show up here as soon as they\'re found and read.'
+              : state?.agents === 0
+                ? 'Create an agent and the reports, notes and data it makes will collect here.'
+                : 'When your agents save reports, notes, spreadsheets or anything else, each one shows up here with a short summary.'}
+        </p>
+        {filtered && (
+          <button onClick={onClear} className="mt-4 text-sm font-medium text-violet-600 hover:underline dark:text-violet-400">Clear search and filters</button>
+        )}
+      </div>
+    )
+  }
+  return (
+    <div className="h-full overflow-y-auto px-3 py-3 wide:px-4">
+      <div className="mb-2 px-1 text-[11px] text-zinc-500">
+        {total} file{total === 1 ? '' : 's'}{terms.length ? <> for “{terms.join(' ')}”</> : null}
+      </div>
+      <ul className="flex flex-col gap-1.5">
+        {items.map((i) => (
+          <li key={i.id}>
+            <ResultRow item={i} terms={terms} active={i.id === selectedId} onClick={() => onSelect(i)} />
+          </li>
+        ))}
+      </ul>
+      {items.length < total && (
+        <div className="flex justify-center py-4">
+          <button
+            onClick={onMore}
+            disabled={loadingMore}
+            className="flex items-center gap-1.5 rounded-lg border border-zinc-800 px-4 py-2 text-sm text-zinc-300 hover:bg-zinc-800/60 disabled:opacity-60"
+          >
+            {loadingMore && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+            Show more ({total - items.length} left)
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function KindIcon({ kind, className = 'h-4 w-4' }: { kind: string; className?: string }) {
+  const Icon = KIND_ICON[kind] || File
+  return <Icon className={`${className} ${KIND_TONE[kind] || 'text-zinc-500'}`} />
+}
+
+function CategoryChip({ id }: { id: string }) {
+  return (
+    <span className={`shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-medium ${CATEGORY_TONE[id] || CATEGORY_TONE.other}`}>
+      {CATEGORY_LABEL[id] || id}
+    </span>
+  )
+}
+
+function ResultRow({ item, terms, active, onClick }: {
+  item: LibraryItem; terms: string[]; active: boolean; onClick: () => void
+}) {
+  const pending = item.status === 'pending' && !item.summary
+  return (
+    <button
+      onClick={onClick}
+      className={`flex w-full gap-3 rounded-xl border px-3 py-2.5 text-left transition-colors ${
+        active ? 'border-violet-500/40 bg-violet-500/5' : 'border-zinc-800 bg-zinc-900/40 hover:border-zinc-700 hover:bg-zinc-900/80'}`}
+    >
+      <span className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-zinc-800/80">
+        <KindIcon kind={item.kind} />
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="flex items-center gap-2">
+          <span className="min-w-0 flex-1 truncate text-sm font-medium text-zinc-100">
+            <Highlight text={item.title || item.filename} terms={terms} />
+          </span>
+          <CategoryChip id={categoryOf(item)} />
+        </span>
+        <span className="mt-0.5 block truncate text-[11px] text-zinc-500">
+          {item.title && item.title !== item.filename ? <><Highlight text={item.filename} terms={terms} /> · </> : null}
+          {item.agent_name} · {fmtRelative(item.modified)} · {formatSize(item.size)}
+        </span>
+        {pending ? (
+          <span className="mt-1 flex items-center gap-1.5 text-xs text-zinc-500">
+            <Loader2 className="h-3 w-3 animate-spin" />Waiting for its summary…
+          </span>
+        ) : item.status === 'error' && !item.summary ? (
+          <span className="mt-1 flex items-center gap-1.5 text-xs text-red-600 dark:text-red-400">
+            <AlertTriangle className="h-3 w-3" />Couldn't summarise it
+          </span>
+        ) : item.summary ? (
+          <span className="mt-1 line-clamp-2 block text-xs leading-relaxed text-zinc-400">
+            <Highlight text={item.summary} terms={terms} />
+          </span>
+        ) : null}
+        {item.snippet && (
+          <span className="mt-1 line-clamp-2 block border-l-2 border-amber-500/40 pl-2 text-[11px] italic leading-relaxed text-zinc-500">
+            <Highlight text={item.snippet} terms={terms} />
+          </span>
+        )}
+        {item.tags.length > 0 && (
+          <span className="mt-1.5 flex flex-wrap gap-1">
+            {item.tags.map((t) => (
+              <span key={t} className="rounded bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-400">
+                <Highlight text={t} terms={terms} />
+              </span>
+            ))}
+          </span>
+        )}
+      </span>
+    </button>
+  )
+}
+
+function Highlight({ text, terms }: { text: string; terms: string[] }) {
+  if (!terms.length || !text) return <>{text}</>
+  const re = new RegExp(`(${terms.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})`, 'gi')
+  const parts = text.split(re)
+  return (
+    <>
+      {parts.map((p, i) => (i % 2 === 1
+        ? <mark key={i} className="rounded-sm bg-amber-400/30 px-0.5 text-inherit">{p}</mark>
+        : <span key={i}>{p}</span>))}
+    </>
+  )
+}
+
+// ── One file ──
+
+function FileDetail({ item, terms, phone, onClose, onOpen, onDownload, onResummarize, onTag, onAgent, onOpenAgent }: {
+  item: LibraryItem; terms: string[]; phone: boolean
+  onClose: () => void; onOpen: () => void; onDownload: () => void
+  onResummarize: () => Promise<void>; onTag: (t: string) => void; onAgent: () => void
+  onOpenAgent?: () => void
+}) {
+  const notify = useNotificationStore((s) => s.add)
+  const [busy, setBusy] = useState(false)
+  const canView = isViewable(toViewerFile(item))
+  const redo = async () => {
+    setBusy(true)
+    try { await onResummarize() } catch (e) {
+      notify('error', 'Could not summarise the file', e instanceof Error ? e.message : String(e))
+    } finally { setBusy(false) }
+  }
+
+  const meta: [string, ReactNode][] = [
+    ['Agent', (
+      <button onClick={onAgent} className="truncate text-left text-violet-600 hover:underline dark:text-violet-400" title="Show only this agent's files">
+        {item.agent_name}
+      </button>
+    )],
+    ['Location', <span className="break-all font-mono text-[11px]">{item.rel_path}</span>],
+    ['Size', formatSize(item.size)],
+    ['Changed', fmtWhen(item.modified)],
+  ]
+  if (item.summarized_at && item.status !== 'pending') {
+    meta.push(['Summarised', `${fmtWhen(item.summarized_at)}${item.model ? ` · ${item.model.split('/').pop()}` : ''}`])
+  }
+
+  const btn = 'flex items-center justify-center gap-1.5 rounded-lg border border-zinc-800 px-3 py-2 text-sm text-zinc-300 transition-colors hover:bg-zinc-800/60 disabled:opacity-50'
+
+  return (
+    <div className="flex h-full flex-col">
+      <div className="flex items-center gap-2 border-b border-zinc-800 px-4 py-2.5">
+        {phone ? (
+          <button onClick={onClose} className="flex flex-1 items-center gap-1.5 text-sm text-violet-600 dark:text-violet-400">
+            <ArrowLeft className="h-4 w-4" />All files
+          </button>
+        ) : (
+          <>
+            <span className="flex-1 text-[11px] font-medium uppercase tracking-wider text-zinc-500">File</span>
+            <button onClick={onClose} className={iconBtn} title="Close" aria-label="Close file"><X className="h-4 w-4" /></button>
+          </>
+        )}
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
+        <div className="flex items-start gap-3">
+          <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-zinc-800/80">
+            <KindIcon kind={item.kind} className="h-5 w-5" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <h3 className="break-words text-base font-semibold leading-snug text-zinc-100">
+              <Highlight text={item.title || item.filename} terms={terms} />
+            </h3>
+            <div className="mt-0.5 truncate text-xs text-zinc-500" title={item.filename}>{item.filename}</div>
+          </div>
+        </div>
+        <div className="mt-3 flex flex-wrap items-center gap-1.5">
+          <CategoryChip id={categoryOf(item)} />
+          <span className="rounded-md bg-zinc-800 px-1.5 py-0.5 text-[10px] font-medium text-zinc-400">{item.extension.replace('.', '').toUpperCase() || 'FILE'}</span>
+        </div>
+
+        <div className="mt-4">
+          {item.status === 'pending' && !item.summary ? (
+            <p className="flex items-center gap-2 text-sm text-zinc-500"><Loader2 className="h-4 w-4 animate-spin" />Waiting for its summary…</p>
+          ) : item.status === 'error' ? (
+            <div className="rounded-lg border border-red-500/30 bg-red-500/5 px-3 py-2.5 text-sm text-red-700 dark:text-red-300">
+              <div className="flex items-center gap-1.5 font-medium"><AlertTriangle className="h-4 w-4" />Couldn't summarise it</div>
+              {item.error && <div className="mt-1 break-words text-xs opacity-80">{item.error}</div>}
+            </div>
+          ) : null}
+          {item.summary && (
+            <p className={`text-sm leading-relaxed ${item.status === 'skipped' ? 'text-zinc-500' : 'text-zinc-300'} ${item.status === 'error' ? 'mt-3' : ''}`}>
+              <Highlight text={item.summary} terms={terms} />
+            </p>
+          )}
+          {item.status === 'pending' && item.summary && (
+            <p className="mt-2 flex items-center gap-1.5 text-[11px] text-zinc-500"><Loader2 className="h-3 w-3 animate-spin" />Changed since — a new summary is on its way.</p>
+          )}
+        </div>
+
+        {item.snippet && (
+          <div className="mt-3 border-l-2 border-amber-500/40 pl-3 text-xs italic leading-relaxed text-zinc-500">
+            <Highlight text={item.snippet} terms={terms} />
+          </div>
+        )}
+
+        {item.tags.length > 0 && (
+          <div className="mt-4 flex flex-wrap gap-1.5">
+            {item.tags.map((t) => (
+              <button
+                key={t}
+                onClick={() => onTag(t)}
+                title={`Search for “${t}”`}
+                className="rounded-md bg-zinc-800 px-2 py-1 text-[11px] text-zinc-300 transition-colors hover:bg-violet-500/15 hover:text-violet-700 dark:hover:text-violet-300"
+              >
+                #{t}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <dl className="mt-5 grid grid-cols-[84px_1fr] gap-x-3 gap-y-2 text-xs">
+          {meta.map(([k, v]) => (
+            <div key={k} className="contents">
+              <dt className="text-zinc-500">{k}</dt>
+              <dd className="min-w-0 text-zinc-300">{v}</dd>
+            </div>
+          ))}
+        </dl>
+      </div>
+
+      <div className="grid grid-cols-2 gap-2 border-t border-zinc-800 p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] wide:pb-3">
+        {canView && (
+          <button onClick={onOpen} className="flex items-center justify-center gap-1.5 rounded-lg bg-violet-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-violet-500">
+            <Eye className="h-4 w-4" />Open
+          </button>
+        )}
+        <button onClick={onDownload} className={btn}><Download className="h-4 w-4" />Download</button>
+        {onOpenAgent && (
+          <button onClick={onOpenAgent} className={btn} title={`Chat with ${item.agent_name}`}>
+            <MessageSquare className="h-4 w-4" />Agent chat
+          </button>
+        )}
+        <button onClick={redo} disabled={busy || item.status === 'pending'} className={btn} title="Read the file again and write a fresh summary">
+          {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}Summarise again
+        </button>
+      </div>
+    </div>
+  )
+}

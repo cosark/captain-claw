@@ -26,6 +26,7 @@ import {
   Info,
   Compass,
   AlarmClock,
+  LibraryBig,
 } from 'lucide-react'
 import { useUIStore } from '../../stores/uiStore'
 import { useAgentStore } from '../../stores/agentStore'
@@ -40,6 +41,8 @@ import { useOnboardingStore } from '../../stores/onboardingStore'
 import { useSharedAgentStore } from '../../stores/sharedAgentStore'
 import { useScheduledStore } from '../../stores/scheduledStore'
 import { ScheduledTasks } from '../scheduler/ScheduledTasks'
+import { useFileLibraryStore } from '../../stores/fileLibraryStore'
+import { FileLibrary } from '../library/FileLibrary'
 import { isManagedAgent } from '../../utils/managedAgents'
 import { SHARED_PREFIX, sharedCaps, sharedContainerId } from '../../utils/sharedAgent'
 import { CHAT_ONLY_TEXT, workspaceVisible } from '../../utils/sharedWorkspace'
@@ -194,6 +197,12 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
   const fetchScheduled = useScheduledStore((s) => s.fetchJobs)
   const scheduledCount = useScheduledStore((s) => s.jobs.filter((j) => j.enabled === 1).length)
   const scheduledRunning = useScheduledStore((s) => s.jobs.some((j) => j.running))
+  // File library: every file the agents made, summarised (agent column,
+  // Settings, the phone header).
+  const libraryOpen = useFileLibraryStore((s) => s.open)
+  const libraryAgent = useFileLibraryStore((s) => s.agentFilter)
+  const openLibrary = useFileLibraryStore((s) => s.openLibrary)
+  const closeLibrary = useFileLibraryStore((s) => s.close)
   useEffect(() => {
     if (authEnabled === true && !isAuthenticated) return
     fetchScheduled()
@@ -402,6 +411,16 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
     }
     setTimeout(attempt, 250)
   }
+  // A library file's "Agent chat": its agent's chat, in front.
+  const openLibraryAgent = (slug: string) => {
+    const a = agents.find((x) => x.id === `proc-${slug}`)
+    if (!a || (!a.reachable && !useChatStore.getState().sessions.has(a.id))) {
+      useNotificationStore.getState().add('warning', 'Agent is off', 'Power the agent on to chat with it.')
+      return
+    }
+    closeLibrary()
+    handleOpen(a)
+  }
   const scheduledConnections = () => {
     closeScheduled()
     if (locked) { openConnections(); return }
@@ -484,6 +503,7 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
           onProfile={() => { setSettingsOpen(false); setProfileOpen(true) }}
           onGuide={() => { setSettingsOpen(false); setGuideOpen(true) }}
           onScheduled={() => { setSettingsOpen(false); openScheduled() }}
+          onLibrary={() => { setSettingsOpen(false); openLibrary() }}
         />
       )}
       {locked && infoOpen && (
@@ -499,7 +519,7 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
         <KioskOnboardingDialog phone={isMobile} onClose={() => setGuideOpen(false)} onAction={guideAction} />
       )}
       {scheduledOpen && (
-        <KioskScheduledDialog phone={isMobile} onClose={closeScheduled}>
+        <KioskWideDialog label="Scheduled tasks" phone={isMobile} onClose={closeScheduled}>
           <ScheduledTasks
             phone={isMobile}
             initialTaskId={scheduledFocus}
@@ -509,7 +529,12 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
             onOpenChat={openTaskChat}
             onOpenConnections={scheduledConnections}
           />
-        </KioskScheduledDialog>
+        </KioskWideDialog>
+      )}
+      {libraryOpen && (
+        <KioskWideDialog label="File library" phone={isMobile} onClose={closeLibrary} widest>
+          <FileLibrary phone={isMobile} initialAgent={libraryAgent} onClose={closeLibrary} onOpenAgent={openLibraryAgent} />
+        </KioskWideDialog>
       )}
       {locked && connectionsOpen && <KioskConnectionsDialog initialTab={connectionsTab} onClose={() => setConnectionsOpen(false)} />}
       {locked && profileOpen && <KioskProfileDialog onClose={() => setProfileOpen(false)} />}
@@ -545,6 +570,7 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
           onInfo={locked ? () => setInfoOpen(true) : undefined}
           onScheduled={() => openScheduled()}
           scheduledRunning={scheduledRunning}
+          onLibrary={() => openLibrary()}
           locked={locked}
         />
         {dialogs}
@@ -571,6 +597,7 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
         onScheduled={() => openScheduled()}
         scheduledCount={scheduledCount}
         scheduledRunning={scheduledRunning}
+        onLibrary={() => openLibrary()}
         locked={locked}
       />
 
@@ -598,13 +625,14 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
 // the Getting started guide, and sign-out (how a shared kiosk hands the
 // screen to the next person).
 
-function KioskSettingsDialog({ onClose, onRefresh, onConnections, onProfile, onGuide, onScheduled }: {
+function KioskSettingsDialog({ onClose, onRefresh, onConnections, onProfile, onGuide, onScheduled, onLibrary }: {
   onClose: () => void
   onRefresh: () => void
   onConnections: () => void
   onProfile: () => void
   onGuide: () => void
   onScheduled: () => void
+  onLibrary: () => void
 }) {
   const { theme, toggle: toggleTheme } = useThemeStore()
   const authEnabled = useAuthStore((s) => s.authEnabled)
@@ -622,6 +650,7 @@ function KioskSettingsDialog({ onClose, onRefresh, onConnections, onProfile, onG
     { icon: dark ? Sun : Moon, title: dark ? 'Light theme' : 'Dark theme', detail: `Switch to the ${dark ? 'light' : 'dark'} look`, onClick: toggleTheme },
     { icon: Plug, title: 'Connections', detail: 'Google, Microsoft, MCP and Jev', onClick: onConnections },
     { icon: AlarmClock, title: 'Scheduled tasks', detail: 'Your agents on a timer — results by chat or email', onClick: onScheduled },
+    { icon: LibraryBig, title: 'File library', detail: 'Every file your agents made, summarised and searchable', onClick: onLibrary },
     { icon: IdCard, title: 'Profile', detail: 'About you, your company, your preferences', onClick: onProfile },
     { icon: RefreshCw, title: 'Refresh agents', detail: 'Check every agent again', onClick: onRefresh },
     { icon: Compass, title: 'Getting started', detail: 'A short tour: agents, connections, Telegram and more', onClick: onGuide },
@@ -761,18 +790,23 @@ function KioskDialog({ label, onClose, children }: { label: string; onClose: () 
   )
 }
 
-// ── Scheduled tasks in a dialog ──────────────────────────────────────
+// ── Scheduled tasks / File library in a dialog ───────────────────────
 //
-// Wider than the other kiosk dialogs: a task list beside the selected task's
-// history. Escape is the component's (it keeps an unsaved edit open).
+// Wider than the other kiosk dialogs: a list beside the selected item's
+// detail (the library also has its filters). Escape is the component's
+// (Scheduled tasks keeps an unsaved edit open; the library closes its viewer
+// first).
 
-function KioskScheduledDialog({ phone, onClose, children }: { phone: boolean; onClose: () => void; children: ReactNode }) {
+function KioskWideDialog({ label, phone, widest = false, onClose, children }: {
+  label: string; phone: boolean; widest?: boolean; onClose: () => void; children: ReactNode
+}) {
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-stretch justify-center bg-black/60 wide:items-center wide:p-4" onClick={phone ? undefined : onClose}>
       <div
         role="dialog"
-        aria-label="Scheduled tasks"
-        className="relative flex h-[100dvh] w-full flex-col overflow-hidden bg-zinc-950 pb-[env(safe-area-inset-bottom)] shadow-2xl wide:h-[88vh] wide:max-w-5xl wide:rounded-xl wide:border wide:border-zinc-800 wide:pb-0"
+        aria-label={label}
+        className={`relative flex h-[100dvh] w-full flex-col overflow-hidden bg-zinc-950 pb-[env(safe-area-inset-bottom)] shadow-2xl wide:h-[88vh] wide:rounded-xl wide:border wide:border-zinc-800 wide:pb-0 ${
+          widest ? 'wide:max-w-6xl' : 'wide:max-w-5xl'}`}
         onClick={(e) => e.stopPropagation()}
       >
         {children}
@@ -782,23 +816,31 @@ function KioskScheduledDialog({ phone, onClose, children }: { phone: boolean; on
   )
 }
 
+const toolBtn = 'flex min-w-0 flex-1 items-center gap-2 rounded-lg px-2.5 py-2 text-sm font-medium text-zinc-300 transition-colors hover:bg-zinc-800 hover:text-zinc-100'
+
 /** The agent column's way into Scheduled tasks: how many are active, and a
- *  pulse while one runs. */
+ *  pulse while one runs. Shares its row with the File library button. */
 function ScheduledButton({ count, running, onClick }: { count: number; running: boolean; onClick: () => void }) {
   return (
-    <button
-      onClick={onClick}
-      className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium text-zinc-300 transition-colors hover:bg-zinc-800 hover:text-zinc-100"
-      title="Scheduled tasks — your agents on a timer"
-    >
-      <span className="relative">
+    <button onClick={onClick} className={toolBtn} title="Scheduled tasks — your agents on a timer">
+      <span className="relative shrink-0">
         <AlarmClock className="h-[18px] w-[18px] text-amber-600 dark:text-amber-400" />
         {running && <span className="absolute -right-0.5 -top-0.5 h-2 w-2 animate-pulse rounded-full bg-amber-500 ring-2 ring-zinc-900 dark:bg-amber-400" />}
       </span>
-      Scheduled tasks
+      <span className="min-w-0 truncate">Scheduled</span>
       {count > 0 && (
-        <span className="ml-auto rounded-full bg-zinc-800 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-300">{count}</span>
+        <span className="ml-auto shrink-0 rounded-full bg-zinc-800 px-1.5 py-0.5 text-[10px] font-semibold text-zinc-300">{count}</span>
       )}
+    </button>
+  )
+}
+
+/** The agent column's way into the File library. */
+function LibraryButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button onClick={onClick} className={toolBtn} title="File library — every file your agents made, summarised and searchable">
+      <LibraryBig className="h-[18px] w-[18px] shrink-0 text-violet-600 dark:text-violet-400" />
+      <span className="min-w-0 truncate">Library</span>
     </button>
   )
 }
@@ -807,7 +849,7 @@ function ScheduledButton({ count, running, onClick }: { count: number; running: 
 
 function AgentsColumn({
   agents, activeAgentId, sessionInfo, switching, booting, onOpen, onPower, onLeave, onRefresh, onSpawn, onOptions, onSettings, onInfo,
-  onScheduled, scheduledCount = 0, scheduledRunning = false, locked = false,
+  onScheduled, scheduledCount = 0, scheduledRunning = false, onLibrary, locked = false,
 }: {
   agents: SimpleAgent[]
   activeAgentId: string | null
@@ -831,6 +873,8 @@ function AgentsColumn({
   onScheduled?: () => void
   scheduledCount?: number
   scheduledRunning?: boolean
+  /** Opens the File library. */
+  onLibrary?: () => void
   locked?: boolean
 }) {
   const open = useUIStore((s) => s.simpleLeftOpen)
@@ -911,17 +955,29 @@ function AgentsColumn({
             <Plus className="h-4 w-4" />
           </button>
         </div>
-        {onScheduled && (
-          <div className="flex flex-col items-center border-t border-zinc-800 py-2">
-            <button
-              onClick={onScheduled}
-              title="Scheduled tasks"
-              aria-label="Scheduled tasks"
-              className="relative flex h-10 w-10 items-center justify-center rounded-lg text-amber-600 transition-colors hover:bg-zinc-800 dark:text-amber-400"
-            >
-              <AlarmClock className="h-5 w-5" />
-              {scheduledRunning && <span className="absolute right-1.5 top-1.5 h-2 w-2 animate-pulse rounded-full bg-amber-500 ring-2 ring-zinc-900 dark:bg-amber-400" />}
-            </button>
+        {(onScheduled || onLibrary) && (
+          <div className="flex flex-col items-center gap-0.5 border-t border-zinc-800 py-2">
+            {onScheduled && (
+              <button
+                onClick={onScheduled}
+                title="Scheduled tasks"
+                aria-label="Scheduled tasks"
+                className="relative flex h-10 w-10 items-center justify-center rounded-lg text-amber-600 transition-colors hover:bg-zinc-800 dark:text-amber-400"
+              >
+                <AlarmClock className="h-5 w-5" />
+                {scheduledRunning && <span className="absolute right-1.5 top-1.5 h-2 w-2 animate-pulse rounded-full bg-amber-500 ring-2 ring-zinc-900 dark:bg-amber-400" />}
+              </button>
+            )}
+            {onLibrary && (
+              <button
+                onClick={onLibrary}
+                title="File library"
+                aria-label="File library"
+                className="flex h-10 w-10 items-center justify-center rounded-lg text-violet-600 transition-colors hover:bg-zinc-800 dark:text-violet-400"
+              >
+                <LibraryBig className="h-5 w-5" />
+              </button>
+            )}
           </div>
         )}
         {onSettings ? (
@@ -1138,9 +1194,11 @@ function AgentsColumn({
         </ul>
       </div>
 
-      {onScheduled && (
-        <div className="border-t border-zinc-800 p-2 pb-0">
-          <ScheduledButton count={scheduledCount} running={scheduledRunning} onClick={onScheduled} />
+      {(onScheduled || onLibrary) && (
+        <div className="flex items-center gap-1 border-t border-zinc-800 p-2 pb-0">
+          {onScheduled && <ScheduledButton count={scheduledCount} running={scheduledRunning} onClick={onScheduled} />}
+          {onScheduled && onLibrary && <span className="h-5 w-px shrink-0 bg-zinc-800" aria-hidden />}
+          {onLibrary && <LibraryButton onClick={onLibrary} />}
         </div>
       )}
 
@@ -1436,7 +1494,7 @@ function ContextColumn({ agentId, agentName, onOptions }: { agentId: string | nu
 
 function PhoneLayout({
   agents, activeAgent, activeAgentId, activeSessionName, sessionInfo, switching, booting,
-  onOpen, onPower, onLeave, onSpawn, onSettings, onInfo, onScheduled, scheduledRunning = false, locked,
+  onOpen, onPower, onLeave, onSpawn, onSettings, onInfo, onScheduled, scheduledRunning = false, onLibrary, locked,
 }: {
   agents: SimpleAgent[]
   activeAgent: SimpleAgent | null
@@ -1453,6 +1511,7 @@ function PhoneLayout({
   onInfo?: () => void
   onScheduled?: () => void
   scheduledRunning?: boolean
+  onLibrary?: () => void
   locked: boolean
 }) {
   const wsConnected = useAgentStore((s) => s.wsConnected)
@@ -1544,6 +1603,11 @@ function PhoneLayout({
           <button onClick={onScheduled} className={`${phoneBtn} relative`} aria-label="Scheduled tasks" title="Scheduled tasks">
             <AlarmClock className="h-5 w-5 text-amber-600 dark:text-amber-400" />
             {scheduledRunning && <span className="absolute right-2 top-2 h-2 w-2 animate-pulse rounded-full bg-amber-500 ring-2 ring-zinc-950 dark:bg-amber-400" />}
+          </button>
+        )}
+        {onLibrary && (
+          <button onClick={onLibrary} className={phoneBtn} aria-label="File library" title="File library">
+            <LibraryBig className="h-5 w-5 text-violet-600 dark:text-violet-400" />
           </button>
         )}
         {onInfo && (

@@ -1,0 +1,121 @@
+/**
+ * File library — the kiosk's "Library": every file the caller's agents made,
+ * summarised and sorted by Flight Deck (`captain_claw/flight_deck/file_library.py`).
+ * A scan walks each agent's workspace, summarises new and changed files with
+ * the owner's fast tier, and keeps the results searchable by name, title,
+ * summary, tags and text.
+ */
+
+import { useAuthStore } from '../stores/authStore'
+
+export type LibraryStatus = 'pending' | 'done' | 'error' | 'skipped'
+
+export interface LibraryItem {
+  id: string
+  agent_slug: string
+  agent_name: string
+  agent_running: boolean
+  rel_path: string
+  filename: string
+  extension: string
+  kind: string
+  mime_type: string
+  size: number
+  /** Epoch seconds. */
+  modified: number
+  status: LibraryStatus
+  title: string
+  summary: string
+  category: string
+  tags: string[]
+  error: string
+  model: string
+  summarized_at: number | null
+  added_at: number
+  /** A line of the file's text around a search term the other fields don't show. */
+  snippet: string
+}
+
+export interface Facet { id: string; label: string; count: number }
+
+export interface LibraryPage {
+  items: LibraryItem[]
+  total: number
+  facets: { agents: Facet[]; categories: Facet[]; kinds: Facet[] }
+}
+
+export interface ScanJob {
+  running: boolean
+  phase: 'idle' | 'scanning' | 'summarizing'
+  total: number
+  done: number
+  failed: number
+  current: string
+  started_at: number | null
+  finished_at: number | null
+  message: string
+}
+
+export interface LibraryState {
+  job: ScanJob
+  counts: { total: number; done: number; pending: number; error: number; skipped: number }
+  agents: number
+}
+
+export type LibrarySort = 'recent' | 'name' | 'size' | 'agent'
+
+export interface LibraryQuery {
+  q?: string
+  agent?: string
+  category?: string
+  kind?: string
+  sort?: LibrarySort
+  limit?: number
+  offset?: number
+}
+
+async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const jwt = useAuthStore.getState().token
+  const r = await fetch(path, {
+    ...init,
+    cache: 'no-store',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(jwt ? { Authorization: `Bearer ${jwt}` } : {}),
+      ...(init?.headers || {}),
+    },
+  })
+  if (!r.ok) {
+    let detail = ''
+    try {
+      const body = await r.json()
+      detail = typeof body?.detail === 'string' ? body.detail : ''
+    } catch { /* not JSON */ }
+    throw new Error(detail || `${r.status} ${r.statusText}`)
+  }
+  return (await r.json()) as T
+}
+
+/** A file URL a viewer or link can open directly: the FD token rides along. */
+function fileUrl(id: string, what: 'view' | 'download'): string {
+  const { token, authEnabled } = useAuthStore.getState()
+  const qs = authEnabled && token ? `?fd_token=${encodeURIComponent(token)}` : ''
+  return `/fd/file-library/files/${encodeURIComponent(id)}/${what}${qs}`
+}
+
+export const fileLibraryApi = {
+  status: () => api<LibraryState>('/fd/file-library/status'),
+  /** Look for new and changed files; `retryErrors` also retries failed summaries now. */
+  scan: (retryErrors = false) =>
+    api<LibraryState>(`/fd/file-library/scan${retryErrors ? '?retry_errors=true' : ''}`, { method: 'POST' }),
+  files: (query: LibraryQuery = {}) => {
+    const p = new URLSearchParams()
+    for (const [k, v] of Object.entries(query)) if (v !== undefined && v !== '') p.set(k, String(v))
+    return api<LibraryPage>(`/fd/file-library/files?${p}`)
+  },
+  resummarize: (id: string) =>
+    api<LibraryItem>(`/fd/file-library/files/${encodeURIComponent(id)}/summarize`, { method: 'POST' }),
+  viewUrl: (id: string) => fileUrl(id, 'view'),
+  downloadUrl: (id: string) => fileUrl(id, 'download'),
+}

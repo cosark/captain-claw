@@ -1437,6 +1437,7 @@ from captain_claw.flight_deck.autonomy_routes import router as autonomy_router
 from captain_claw.flight_deck.event_routes import router as event_router
 from captain_claw.flight_deck.delivery_routes import router as delivery_router
 from captain_claw.flight_deck.agents_fs_routes import router as agents_fs_router
+from captain_claw.flight_deck.file_library import router as file_library_router
 from captain_claw.flight_deck.system_routes import router as system_router
 from captain_claw.flight_deck.share_routes import router as share_router
 from captain_claw.flight_deck import public_file_shares
@@ -1521,6 +1522,7 @@ app.include_router(autonomy_router)
 app.include_router(event_router)
 app.include_router(delivery_router)
 app.include_router(agents_fs_router)
+app.include_router(file_library_router)
 app.include_router(system_router)
 app.include_router(share_router)
 # Public file links: owner API (port-addressed → the ownership guard above
