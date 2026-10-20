@@ -714,7 +714,8 @@ export function AdminPage() {
         {tab === 'settings' && <DeckProfileDefaults />}
 
         {/* Set up once, used by everyone: the team Telegram bot (with its
-            access requests) and the shared Google / Microsoft / Jev credentials.
+            access requests) and the shared Google / Microsoft / Jev / Soniox
+            credentials and MCP servers.
             They load on their own, like the profile defaults above. */}
         {tab === 'integrations' && (
           <div className="space-y-4">

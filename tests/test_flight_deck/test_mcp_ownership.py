@@ -188,6 +188,31 @@ def test_an_omitted_deck_wide_keeps_the_servers_setting(client: TestClient) -> N
     assert mcp_storage.get_server("shared")["deck_wide"] is True
 
 
+def test_admin_integrations_shares_and_unshares_without_touching_the_rest(client: TestClient) -> None:
+    _add(client, "admin", "mine", client_id="cid", client_secret="s3cret", token_endpoint="/token",
+         allowed_agents=["analyst"])
+    resp = client.post("/fd/mcp/servers/mine/sharing", headers=_as("admin"), json={"deck_wide": True})
+    assert resp.status_code == 200
+    rec = mcp_storage.get_server("mine")
+    assert rec["deck_wide"] is True and rec["owner_id"] == "admin-id"
+    assert (rec["url"], rec["client_secret"], rec["allowed_agents"]) == (URL, "s3cret", ["analyst"])
+    assert _names(client, "bob") == ["mine"]
+
+    assert client.post("/fd/mcp/servers/mine/sharing", headers=_as("admin"),
+                       json={"deck_wide": False}).status_code == 200
+    assert _names(client, "bob") == []
+
+
+def test_only_an_admin_shares_and_only_what_they_can_see(client: TestClient) -> None:
+    _add(client, "alice")
+    # The owner isn't an admin; the admin can't see Alice's private server.
+    assert client.post("/fd/mcp/servers/fric/sharing", headers=_as("alice"),
+                       json={"deck_wide": True}).status_code == 403
+    assert client.post("/fd/mcp/servers/fric/sharing", headers=_as("admin"),
+                       json={"deck_wide": True}).status_code == 404
+    assert mcp_storage.get_server("fric")["deck_wide"] is False
+
+
 def test_an_oauth_sign_in_is_only_for_the_servers_manager(client: TestClient) -> None:
     _add(client, "alice", auth="oauth")
     assert client.post("/fd/mcp/oauth/connect-ticket", headers=_as("bob"), json={"server": "fric"}).status_code == 404

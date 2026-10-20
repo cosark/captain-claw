@@ -93,6 +93,8 @@ interface MCPStore {
   // blockers allow only that); without one, signIn opens it itself.
   signIn: (name: string, popup?: Window | null) => Promise<void>
   signOut: (name: string) => Promise<void>
+  // Admin → Integrations: share with everyone on the deck, or take it back.
+  setSharing: (name: string, deckWide: boolean) => Promise<boolean>
   startMessageListener: () => () => void
   saveServer: (input: MCPServerInput) => Promise<MCPServer | null>
   removeServer: (name: string) => Promise<boolean>
@@ -303,6 +305,21 @@ export const useMCPStore = create<MCPStore>((set, get) => ({
       await get().refresh()
     } catch (exc) {
       set({ error: exc instanceof Error ? exc.message : String(exc) })
+    }
+  },
+
+  setSharing: async (name, deckWide) => {
+    set({ error: null, notice: null })
+    try {
+      await fetchJson(`/fd/mcp/servers/${encodeURIComponent(name)}/sharing`, {
+        method: 'POST',
+        body: JSON.stringify({ deck_wide: deckWide }),
+      })
+      await get().refresh()
+      return true
+    } catch (exc) {
+      set({ error: exc instanceof Error ? exc.message : String(exc) })
+      return false
     }
   },
 

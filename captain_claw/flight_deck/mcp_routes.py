@@ -304,6 +304,28 @@ def _ownership(payload: dict, existing: dict[str, Any] | None, user: dict) -> tu
     return owner_id, deck_wide
 
 
+@router.post("/servers/{name}/sharing")
+async def set_server_sharing(
+    name: str,
+    payload: dict = Body(...),
+    user: dict = Depends(get_current_user),
+) -> dict[str, Any]:
+    """Admin → Integrations: share a server with everyone on the deck, or
+    take that back (``{"deck_wide": bool}``). Changes nothing else — the
+    full save above needs the whole record."""
+    record = _managed_server(name, user)
+    if user.get("role") != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Only an admin can share an MCP server with everyone on this deck",
+        )
+    owner_id, deck_wide = _ownership({"deck_wide": bool(payload.get("deck_wide"))}, record, user)
+    saved = await mcp_storage.upsert_server({**record, "owner_id": owner_id, "deck_wide": deck_wide})
+    # Agents re-read their tool lists; access itself is checked per call.
+    mcp_events.publish_server_updated(name)
+    return {"ok": True, "server": mcp_storage._public_view(saved)}
+
+
 @router.delete("/servers/{name}")
 async def remove_server(
     name: str,
