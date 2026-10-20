@@ -41,8 +41,13 @@ import {
   Sparkles,
   Eraser,
   Pencil,
+  Plus,
+  ArrowUp,
 } from 'lucide-react'
 import { createPortal } from 'react-dom'
+import { ChatGreeting, SkillsMenu } from './AgentSkills'
+import { useAgentSkills } from '../../hooks/useAgentSkills'
+import type { AgentSkill } from '../../services/agentSkills'
 import { fetchTopics, type TopicInfo } from '../../stores/chatStore'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -685,6 +690,7 @@ export function ChatPanel({ variant = 'default' }: { variant?: 'default' | 'simp
               session={session}
               sessionKey={session.key}
               shared={!!shared}
+              simple={simple}
               minWidth={simple && !isMobile ? 300 : undefined}
               onSend={(content) => sendMessage(session.key, content)}
               onCancel={() => cancelTask(session.key)}
@@ -741,6 +747,7 @@ function ChatContent({
   session,
   sessionKey,
   shared = false,
+  simple = false,
   minWidth,
   onSend,
   onCancel,
@@ -751,6 +758,9 @@ function ChatContent({
   sessionKey: string
   /** An agent shared with you: chat only — no attachments, no plan card. */
   shared?: boolean
+  /** The simple (kiosk) layout: larger text, a greeting with the agent's
+   *  skill cards on a fresh chat, and the roomier composer. */
+  simple?: boolean
   /** Conversation floor (simple layout): the queue column shrinks before this. */
   minWidth?: number
   onSend: (content: string) => void
@@ -860,6 +870,22 @@ function ChatContent({
   const pendingUploads = attachments.filter((a) => a.status === 'uploading').length
   const hasErrors = attachments.some((a) => a.status === 'error')
 
+  // Simple layout: the agent's skill cards — under a greeting on a fresh chat,
+  // and behind the composer's "What can I do?". A card sends its prompt.
+  const skills = useAgentSkills(session.containerId, simple && !shared)
+  const [skillsOpen, setSkillsOpen] = useState(false)
+  const canPick = session.connected && !closed && !quotaSpent && !session.busy
+  const pickSkill = (skill: AgentSkill) => { if (canPick) onSend(skill.prompt) }
+  // Fresh: nothing said yet, or a new topic (or a cleared context) just began.
+  const last = visibleMessages[visibleMessages.length - 1]
+  const fresh = simple && session.connected && !session.busy && !session.hasNewer && (
+    !last || (last.role === 'system' && (last.topic?.action === 'new' || last.topic?.action === 'clear')))
+  const sendDisabled = (!input.trim() && attachments.filter((a) => a.status === 'uploaded').length === 0)
+    || !session.connected || closed || pendingUploads > 0 || quotaSpent
+  const placeholder = closed ? 'Disconnected' : !session.connected ? 'Connecting...' : quotaSpent ? 'Daily limit reached'
+    : simple ? (skills.available ? 'Ask anything, or try a skill…' : 'Ask anything…')
+    : shared || isMobile ? 'Message…' : 'Message, paste image, or drop files...'
+
   return (
     <div
       className={`flex flex-1 flex-col overflow-hidden ${dragOver ? 'ring-2 ring-inset ring-violet-500/50' : ''}`}
@@ -882,7 +908,7 @@ function ChatContent({
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto py-3">
-        <div className="px-4">
+        <div className={simple ? 'mx-auto w-full max-w-4xl px-4 wide:px-6' : 'px-4'}>
         {/* The loaded window is the newest page of the lane's log. */}
         {session.hasOlder && (
           <div className="mb-3 flex justify-center">
@@ -894,7 +920,7 @@ function ChatContent({
             </button>
           </div>
         )}
-        {visibleMessages.length === 0 && session.connected && (
+        {visibleMessages.length === 0 && session.connected && !simple && (
           <div className="mt-12 text-center">
             <MessageSquare className="mx-auto h-8 w-8 text-zinc-700" />
             <p className="mt-2 text-sm text-zinc-500">Send a message to start chatting with this agent.</p>
@@ -928,9 +954,18 @@ function ChatContent({
               liveTurnUsage={live ? session.liveTurnUsage ?? null : null}
             />
           ) : (
-            <MessageBubble key={grp.items[0].id} message={grp.items[0]} sourceName={session.containerName} agentId={session.containerId} />
+            <MessageBubble key={grp.items[0].id} message={grp.items[0]} sourceName={session.containerName} agentId={session.containerId} large={simple} />
           )
         })}
+
+        {fresh && (
+          <ChatGreeting
+            skills={skills}
+            disabled={!canPick}
+            onPick={pickSkill}
+            onMore={() => setSkillsOpen(true)}
+          />
+        )}
 
         {/* The window stops before newer rows (a jump, or paging back). */}
         {session.hasNewer && (
@@ -980,6 +1015,92 @@ function ChatContent({
       )}
 
       {/* Input */}
+      {!shared && <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        className="hidden"
+        onChange={(e) => {
+          if (e.target.files && e.target.files.length > 0) {
+            addFiles(e.target.files)
+            e.target.value = ''
+          }
+        }}
+      />}
+      {simple ? (
+        /* The simple layout's composer: the box, and under the text its row
+           of attach · paste · "What can I do?" … send. */
+        <div className="px-3 pb-3 pt-2 wide:px-6 wide:pb-4">
+          <div className="relative mx-auto w-full max-w-4xl rounded-2xl border border-zinc-700 bg-zinc-900 shadow-sm transition-colors focus-within:border-violet-500/50">
+            <textarea
+              ref={inputRef}
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              onPaste={shared ? undefined : handlePasteEvent}
+              placeholder={placeholder}
+              disabled={!session.connected || closed || quotaSpent}
+              rows={1}
+              className="block max-h-48 min-h-[52px] w-full resize-none rounded-2xl bg-transparent px-4 pb-1 pt-3.5 text-base text-zinc-100 placeholder-zinc-500 focus:outline-none disabled:opacity-40 wide:text-[17px]"
+              style={{ height: 'auto', overflow: 'hidden' }}
+              onInput={(e) => {
+                const el = e.currentTarget
+                el.style.height = 'auto'
+                el.style.height = Math.min(el.scrollHeight, 192) + 'px'
+              }}
+            />
+            <div className="flex items-center gap-1 px-2 pb-2">
+              {!shared && <>
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={!session.connected}
+                  className="flex h-9 w-9 items-center justify-center rounded-lg text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300 disabled:opacity-40"
+                  title="Attach files"
+                >
+                  <Plus className="h-5 w-5" />
+                </button>
+                <button
+                  onClick={() => pasteFromClipboard(handlePasteText)}
+                  disabled={!session.connected}
+                  className="flex h-9 w-9 items-center justify-center rounded-lg text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300 disabled:opacity-40"
+                  title="Paste from clipboard"
+                >
+                  <Clipboard className="h-4 w-4" />
+                </button>
+              </>}
+              <SkillsMenu
+                skills={skills}
+                open={skillsOpen}
+                setOpen={setSkillsOpen}
+                disabled={!canPick}
+                onPick={pickSkill}
+                compact={isMobile}
+              />
+              <div className="flex-1" />
+              {!isMobile && <span className="pr-2 text-xs text-zinc-500">Enter to send</span>}
+              {session.busy ? (
+                <button
+                  onClick={onCancel}
+                  className="flex h-9 items-center gap-1.5 rounded-xl bg-red-600/20 px-3 text-sm font-medium text-red-400 hover:bg-red-600/30"
+                >
+                  <StopCircle className="h-4 w-4" />
+                  Stop
+                </button>
+              ) : (
+                <button
+                  onClick={handleSend}
+                  disabled={sendDisabled}
+                  className="flex h-9 w-9 items-center justify-center rounded-xl bg-violet-600 text-white hover:bg-violet-500 disabled:bg-zinc-700 disabled:text-zinc-400"
+                  title={pendingUploads > 0 ? 'Waiting for uploads...' : 'Send'}
+                  aria-label="Send"
+                >
+                  {pendingUploads > 0 ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUp className="h-5 w-5" />}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      ) : (
       <div className="border-t border-zinc-800 p-3">
         <div className="flex items-end gap-2">
           {/* Attach button */}
@@ -1001,25 +1122,13 @@ function ChatContent({
               <Clipboard className="h-4 w-4" />
             </button>
           </div>}
-          {!shared && <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            className="hidden"
-            onChange={(e) => {
-              if (e.target.files && e.target.files.length > 0) {
-                addFiles(e.target.files)
-                e.target.value = ''
-              }
-            }}
-          />}
           <textarea
             ref={inputRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
             onPaste={shared ? undefined : handlePasteEvent}
-            placeholder={closed ? 'Disconnected' : !session.connected ? 'Connecting...' : quotaSpent ? 'Daily limit reached' : shared || isMobile ? 'Message…' : 'Message, paste image, or drop files...'}
+            placeholder={placeholder}
             disabled={!session.connected || closed || quotaSpent}
             rows={1}
             className="max-h-32 min-h-[38px] min-w-0 flex-1 resize-none rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-base text-zinc-200 wide:text-sm placeholder-zinc-600 focus:border-violet-500/50 focus:outline-none disabled:opacity-40"
@@ -1041,7 +1150,7 @@ function ChatContent({
           ) : (
             <button
               onClick={handleSend}
-              disabled={(!input.trim() && attachments.filter((a) => a.status === 'uploaded').length === 0) || !session.connected || closed || pendingUploads > 0 || quotaSpent}
+              disabled={sendDisabled}
               className="flex h-[38px] items-center gap-1.5 rounded-lg bg-violet-600 px-3 text-xs font-medium text-white hover:bg-violet-500 disabled:opacity-40"
               title={pendingUploads > 0 ? 'Waiting for uploads...' : 'Send'}
             >
@@ -1050,6 +1159,7 @@ function ChatContent({
           )}
         </div>
       </div>
+      )}
     </div>
   )
 }
@@ -1918,7 +2028,9 @@ function processImagePaths(content: string, agentHost?: string, agentPort?: numb
 // resolution replaces the one message with a new object), so a default shallow
 // compare on {message, sourceName, agentId} skips every unchanged bubble when a
 // later turn streams — no markdown re-parse. This is the heavy-chat fix.
-const MessageBubble = memo(function MessageBubble({ message, sourceName, agentId }: { message: ChatMessage; sourceName?: string; agentId?: string }) {
+// `large` — the simple layout's chat: the conversation in bigger type.
+const MessageBubble = memo(function MessageBubble({ message, sourceName, agentId, large = false }: { message: ChatMessage; sourceName?: string; agentId?: string; large?: boolean }) {
+  const bodyText = large ? 'text-base leading-relaxed' : 'text-sm'
   const [toolExpanded, setToolExpanded] = useState(false)
   const [copied, setCopied] = useState(false)
   const [showForward, setShowForward] = useState(false)
@@ -2064,8 +2176,8 @@ const MessageBubble = memo(function MessageBubble({ message, sourceName, agentId
   if (message.role === 'user') {
     return (
       <div className="group mb-3 flex flex-col items-end gap-0.5">
-        <div className="max-w-[85%] rounded-xl rounded-br-sm bg-violet-600/20 px-3.5 py-2.5">
-          <div className="fd-markdown text-sm text-zinc-200">
+        <div className={`max-w-[85%] rounded-br-sm bg-violet-600/20 ${large ? 'rounded-2xl px-4 py-3' : 'rounded-xl px-3.5 py-2.5'}`}>
+          <div className={`fd-markdown ${bodyText} text-zinc-200`}>
             <MarkdownMessage content={processImagePaths(message.content, agentConn?.host, agentConn?.port, agentConn?.auth)} />
           </div>
           <span className="mt-1 block text-right text-[10px] text-zinc-500">
@@ -2191,7 +2303,7 @@ const MessageBubble = memo(function MessageBubble({ message, sourceName, agentId
 
   return (
     <div className="group mb-3 flex flex-col items-start gap-0.5">
-      <div className={`max-w-[85%] rounded-xl rounded-bl-sm bg-zinc-800/60 px-3.5 py-2.5 ${message.replay ? 'opacity-60' : ''} ${message.task ? 'border-l-2 border-amber-500/60' : ''}`}>
+      <div className={`max-w-[85%] rounded-bl-sm bg-zinc-800/60 ${large ? 'rounded-2xl px-4 py-3' : 'rounded-xl px-3.5 py-2.5'} ${message.replay ? 'opacity-60' : ''} ${message.task ? 'border-l-2 border-amber-500/60' : ''}`}>
         {message.task && (
           <button
             onClick={() => useScheduledStore.getState().openTasks(message.task!.id)}
@@ -2202,7 +2314,7 @@ const MessageBubble = memo(function MessageBubble({ message, sourceName, agentId
             Scheduled · {message.task.name}
           </button>
         )}
-        <div className="fd-markdown text-sm text-zinc-300">
+        <div className={`fd-markdown ${bodyText} text-zinc-300`}>
           <MarkdownMessage content={processImagePaths(cleanContent, agentConn?.host, agentConn?.port, agentConn?.auth)} />
         </div>
         <div className="mt-1 flex items-center gap-2 text-[10px] text-zinc-600">

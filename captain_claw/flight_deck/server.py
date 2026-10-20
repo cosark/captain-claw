@@ -1439,6 +1439,7 @@ from captain_claw.flight_deck.delivery_routes import router as delivery_router
 from captain_claw.flight_deck.agents_fs_routes import router as agents_fs_router
 from captain_claw.flight_deck.file_library import router as file_library_router
 from captain_claw.flight_deck.data_library import router as data_library_router
+from captain_claw.flight_deck.agent_skills import router as agent_skills_router
 from captain_claw.flight_deck.system_routes import router as system_router
 from captain_claw.flight_deck.share_routes import router as share_router
 from captain_claw.flight_deck import public_file_shares
@@ -1525,6 +1526,7 @@ app.include_router(delivery_router)
 app.include_router(agents_fs_router)
 app.include_router(file_library_router)
 app.include_router(data_library_router)
+app.include_router(agent_skills_router)
 app.include_router(system_router)
 app.include_router(share_router)
 # Public file links: owner API (port-addressed → the ownership guard above
@@ -8054,6 +8056,9 @@ async def _spawn_process_locked(config: AgentConfig, request: Request, user: dic
         "model": config.model,
         "tier": config.tier,
         "owner": owner_id,
+        # The archetype it was made from (id, no `@tier`): the kiosk's skill
+        # cards start from what the agent is for.
+        "archetype": config.archetype.strip().partition("@")[0],
         # Deep-memory grid config (empty for non-grid agents) — the FD deep-memory
         # proxy reads these to stamp write-tags and narrow reads without the agent
         # asserting anything (mirrors how `owner` is server-resolved).

@@ -1,0 +1,52 @@
+/**
+ * Agent skills — the "things I can do" cards of the kiosk chat
+ * (`captain_claw/flight_deck/agent_skills.py`). Flight Deck writes them per
+ * agent from its archetype, instructions, experience, scheduled tasks, cron
+ * jobs, topics and intentions; a click sends the card's prompt to the agent.
+ */
+
+import {
+  BarChart3, Bell, BookOpen, Calendar, Clock, Code2, Database, FileText, Folder, Globe,
+  Image, ListChecks, Mail, MessageSquare, PenLine, Search, Sparkles, Target, User, Wallet,
+  type LucideIcon,
+} from 'lucide-react'
+import { api } from './fileLibraryApi'
+
+export type SkillSource = 'archetype' | 'experience' | 'schedule' | 'topic' | 'intention'
+
+export interface AgentSkill {
+  title: string
+  description: string
+  /** What a click sends, as if the person typed it. */
+  prompt: string
+  icon: string
+  source: SkillSource
+}
+
+export interface AgentSkills {
+  skills: AgentSkill[]
+  /** 'model' — written by the owner's fast tier; 'basic' — built from schedules and topics. */
+  source: 'model' | 'basic'
+  model: string
+  generated_at: number | null
+  /** A new set is being written; ask again shortly. */
+  generating: boolean
+}
+
+export const SKILL_ICONS: Record<string, LucideIcon> = {
+  calendar: Calendar, mail: Mail, user: User, search: Search, file: FileText, chart: BarChart3,
+  clock: Clock, sparkles: Sparkles, list: ListChecks, globe: Globe, pen: PenLine, bell: Bell,
+  folder: Folder, database: Database, message: MessageSquare, book: BookOpen, target: Target,
+  code: Code2, image: Image, wallet: Wallet,
+}
+
+/** The agent's process slug, for the agents that have cards (process agents). */
+export function skillsSlug(agentId: string): string | null {
+  return agentId.startsWith('proc-') ? agentId.slice(5) : null
+}
+
+export const agentSkillsApi = {
+  get: (slug: string) => api<AgentSkills>(`/fd/agent-skills/${encodeURIComponent(slug)}`),
+  refresh: (slug: string) =>
+    api<AgentSkills>(`/fd/agent-skills/${encodeURIComponent(slug)}/refresh`, { method: 'POST' }),
+}
