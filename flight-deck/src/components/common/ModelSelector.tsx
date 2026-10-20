@@ -12,6 +12,7 @@ export interface ModelInfo {
   provider: string
   model: string
   api_key: string
+  base_url: string
   // Does the model see images itself (model.vision): 'auto' | 'on' | 'off'
   vision: string
 }
@@ -22,14 +23,14 @@ export const VISION_OPTIONS = [
   { value: 'off', label: 'Off — a vision model describes them' },
 ]
 
-const KNOWN_PROVIDERS = [
+export const KNOWN_PROVIDERS = [
   'ollama', 'anthropic', 'openai', 'gemini', 'groq', 'mistral',
   'deepseek', 'openrouter', 'xai', 'together', 'cerebras', 'sambanova', 'fireworks',
   'litert', 'antigravity-cli',
 ]
 
 export function parseModelFromYaml(yaml: string): ModelInfo {
-  const info: ModelInfo = { provider: '', model: '', api_key: '', vision: 'auto' }
+  const info: ModelInfo = { provider: '', model: '', api_key: '', base_url: '', vision: 'auto' }
   // Simple YAML parser for the model section
   const lines = yaml.split('\n')
   let inModel = false
@@ -54,6 +55,9 @@ export function parseModelFromYaml(yaml: string): ModelInfo {
 
     const keyMatch = trimmed.match(/^\s*api_key\s*:\s*["']?([^"'#]*)/)
     if (keyMatch) info.api_key = keyMatch[1].trim()
+
+    const urlMatch = trimmed.match(/^\s*base_url\s*:\s*["']?([^"'\s#]*)/)
+    if (urlMatch) info.base_url = urlMatch[1]
 
     const visionMatch = trimmed.match(/^vision\s*:\s*["']?([^"'\s#]+)/)
     if (visionMatch) {

@@ -2,8 +2,10 @@ import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import {
   AlertTriangle,
+  BookOpen,
   BrainCog,
   Check,
+  Cpu,
   Eye,
   Info,
   LibraryBig,
@@ -19,18 +21,21 @@ import {
 import { IntentionsPanel } from '../agents/IntentionsPanel'
 import { TopicsPanel } from '../agents/TopicsPanel'
 import { MODES } from '../common/CognitiveModeSelector'
-import { VISION_OPTIONS, parseModelFromYaml } from '../common/ModelSelector'
-import { getAgentConfig, getAgentMode, setAgentMode, setAgentVision } from '../../services/docker'
+import { KNOWN_PROVIDERS, VISION_OPTIONS, parseModelFromYaml } from '../common/ModelSelector'
+import { getAgentConfig, getAgentMode, setAgentMode, setAgentModel, setAgentVision } from '../../services/docker'
+import { useChatStore } from '../../stores/chatStore'
 import { useContainerStore } from '../../stores/containerStore'
+import { useNotificationStore } from '../../stores/notificationStore'
 import { useProcessStore } from '../../stores/processStore'
 
 // ── Kiosk: one agent's menu and dialogs ──────────────────────────────
 //
 // The "⋯" on a kiosk agent row opens what a kiosk user may do with one agent
 // of theirs besides chatting and the power switch: look at what it means to
-// do and what they talked about (Info: its intentions and topics), change how
-// it thinks and whether it sees images itself (Settings), or remove it for
-// good, folder and all (Remove).
+// do and what they talked about (Info: its intentions and topics), give it
+// standing instructions (Instructions), change its model, how it thinks and
+// whether it sees images itself (Settings), or remove it for good, folder and
+// all (Remove).
 
 /** What these dialogs need of an agent row. */
 export interface KioskAgent {
@@ -164,14 +169,21 @@ export function AgentMenu({ agentName, items, phone = false, shown = false }: {
 
 // ── Dialog shell ──
 //
-// `wide` (Info): a panel on a larger screen, the whole screen on a phone.
-// Otherwise a narrow panel — a bottom sheet on a phone — like kiosk Settings.
+// `lg` (Info) and `md` (Instructions): a panel on a larger screen, the whole
+// screen on a phone. `sm`: a narrow panel — a bottom sheet on a phone — like
+// kiosk Settings.
 
-function AgentDialog({ title, icon: Icon, agentName, wide = false, onClose, children }: {
+const DIALOG_SIZE = {
+  sm: 'max-h-[100dvh] max-w-md rounded-t-2xl border border-zinc-800 wide:max-h-[88vh]',
+  md: 'h-[100dvh] wide:h-[80vh] wide:max-w-2xl wide:border wide:border-zinc-800',
+  lg: 'h-[100dvh] wide:h-[88vh] wide:max-w-5xl wide:border wide:border-zinc-800',
+}
+
+function AgentDialog({ title, icon: Icon, agentName, size = 'sm', onClose, children }: {
   title: string
   icon: typeof Info
   agentName: string
-  wide?: boolean
+  size?: keyof typeof DIALOG_SIZE
   onClose: () => void
   children: ReactNode
 }) {
@@ -183,15 +195,13 @@ function AgentDialog({ title, icon: Icon, agentName, wide = false, onClose, chil
 
   return createPortal(
     <div
-      className={`fixed inset-0 z-50 flex justify-center bg-black/60 wide:items-center wide:p-4 ${wide ? 'items-stretch' : 'items-end'}`}
+      className={`fixed inset-0 z-50 flex justify-center bg-black/60 wide:items-center wide:p-4 ${size === 'sm' ? 'items-end' : 'items-stretch'}`}
       onClick={onClose}
     >
       <div
         role="dialog"
         aria-label={`${title} — ${agentName}`}
-        className={wide
-          ? 'relative flex h-[100dvh] w-full flex-col overflow-hidden bg-zinc-950 pb-[env(safe-area-inset-bottom)] shadow-2xl wide:h-[88vh] wide:max-w-5xl wide:rounded-2xl wide:border wide:border-zinc-800 wide:pb-0'
-          : 'relative flex max-h-[100dvh] w-full max-w-md flex-col overflow-hidden rounded-t-2xl border border-zinc-800 bg-zinc-950 pb-[env(safe-area-inset-bottom)] shadow-2xl wide:max-h-[88vh] wide:rounded-2xl wide:pb-0'}
+        className={`relative flex w-full flex-col overflow-hidden bg-zinc-950 pb-[env(safe-area-inset-bottom)] shadow-2xl wide:rounded-2xl wide:pb-0 ${DIALOG_SIZE[size]}`}
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex h-14 shrink-0 items-center justify-between gap-2 border-b border-zinc-800 pl-5 pr-3">
@@ -227,7 +237,7 @@ export function KioskAgentInfoDialog({ agent, phone, onClose }: { agent: KioskAg
   const up = agent.reachable && agent.port > 0
 
   return (
-    <AgentDialog title="Info" icon={Info} agentName={agent.name} wide onClose={onClose}>
+    <AgentDialog title="Info" icon={Info} agentName={agent.name} size="lg" onClose={onClose}>
       <div className="shrink-0 border-b border-zinc-800 p-2">
         <div className="grid grid-cols-2 rounded-xl bg-zinc-900 p-1 wide:max-w-xs" role="tablist">
           {INFO_TABS.map(({ id, label, icon: Icon }) => (
@@ -261,18 +271,28 @@ export function KioskAgentInfoDialog({ agent, phone, onClose }: { agent: KioskAg
   )
 }
 
-// ── Settings: cognitive mode and vision ──
+// ── Settings: model, cognitive mode and vision ──
 
 const VISION_CHOICES = VISION_OPTIONS.map((o) => {
   const [title, detail = ''] = o.label.split(' — ')
   return { value: o.value, title, detail: detail.charAt(0).toUpperCase() + detail.slice(1) }
 })
 
+// Providers that sign in on their own — no key, no endpoint.
+const SIGN_IN_PROVIDERS = new Set(['antigravity-cli', 'antigravity', 'google-subscription'])
+
+/** The endpoint a provider gets when nobody names one — as the server writes it. */
+function defaultEndpoint(provider: string): string {
+  return provider === 'ollama' ? 'http://127.0.0.1:11434' : ''
+}
+
+interface ModelSetting { provider: string; model: string; baseUrl: string }
+
 export function KioskAgentSettingsDialog({ agent, restarting, onRestart, onClose }: {
   agent: KioskAgent & { kind: 'docker' | 'process' }
   /** Being restarted right now (or switched on/off). */
   restarting: boolean
-  /** Restart it so a start-up setting (vision) applies. Resolves once it's on its way back. */
+  /** Restart it so a start-up setting (model, vision) applies. Resolves once it's on its way back. */
   onRestart: () => Promise<boolean>
   onClose: () => void
 }) {
@@ -282,10 +302,16 @@ export function KioskAgentSettingsDialog({ agent, restarting, onRestart, onClose
   const [mode, setMode] = useState('neutra')
   const [modeSaved, setModeSaved] = useState(false)
   const [vision, setVision] = useState('auto')
-  const [model, setModel] = useState({ provider: '', model: '' })
-  const [saving, setSaving] = useState<'' | 'mode' | 'vision'>('')
-  // Vision is read when the agent starts: changed since it last did.
-  const [visionPending, setVisionPending] = useState(false)
+  // What its config holds, and the change being typed.
+  const [model, setModel] = useState<ModelSetting>({ provider: '', model: '', baseUrl: '' })
+  const [draft, setDraft] = useState({ provider: '', model: '', baseUrl: '' })
+  const [apiKey, setApiKey] = useState('')
+  // The endpoint follows the provider until it is typed in.
+  const [urlTouched, setUrlTouched] = useState(false)
+  const [modelSaved, setModelSaved] = useState(false)
+  const [saving, setSaving] = useState<'' | 'mode' | 'vision' | 'model'>('')
+  // Model and vision are read when the agent starts: changed since it last did.
+  const [pendingRestart, setPendingRestart] = useState(false)
   const [restarted, setRestarted] = useState(false)
   const running = agent.state === 'running'
 
@@ -297,12 +323,51 @@ export function KioskAgentSettingsDialog({ agent, restarting, onRestart, onClose
         const info = parseModelFromYaml(cfg.config_yaml || '')
         setMode(m.mode || 'neutra')
         setVision(info.vision)
-        setModel({ provider: info.provider, model: info.model })
+        setModel({ provider: info.provider, model: info.model, baseUrl: info.base_url })
+        setDraft({ provider: info.provider, model: info.model, baseUrl: info.base_url })
       })
       .catch((e) => { if (live) setError(`Couldn't load its settings: ${e instanceof Error ? e.message : String(e)}`) })
       .finally(() => { if (live) setLoading(false) })
     return () => { live = false }
   }, [kind, key])
+
+  const provider = draft.provider.trim()
+  const switched = provider !== model.provider
+  const modelDirty = switched || draft.model.trim() !== model.model || draft.baseUrl.trim() !== model.baseUrl || !!apiKey.trim()
+  const signIn = SIGN_IN_PROVIDERS.has(provider)
+
+  const pickProvider = (next: string) => {
+    setDraft((d) => ({ ...d, provider: next, baseUrl: urlTouched ? d.baseUrl : next.trim() === model.provider ? model.baseUrl : defaultEndpoint(next.trim()) }))
+  }
+
+  const saveModel = async () => {
+    if (!modelDirty || !provider || !draft.model.trim() || saving) return
+    setSaving('model'); setError(''); setModelSaved(false)
+    const next = { provider, model: draft.model.trim(), baseUrl: signIn ? '' : draft.baseUrl.trim() }
+    try {
+      await setAgentModel(kind, key, {
+        provider: next.provider, model: next.model,
+        ...(signIn ? {} : { base_url: next.baseUrl, ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}) }),
+      })
+      // The agent list shows the new model at once (and no older label of it hides it).
+      if (kind === 'process') useProcessStore.getState().setModelOverride(key, next.provider, next.model)
+      setModel(next)
+      setDraft(next)
+      setApiKey(''); setUrlTouched(false)
+      setPendingRestart(true); setRestarted(false)
+      setModelSaved(true)
+      setTimeout(() => setModelSaved(false), 2000)
+    } catch (e) {
+      setError(`Couldn't change its model: ${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setSaving('')
+    }
+  }
+
+  const undoModel = () => {
+    setDraft({ provider: model.provider, model: model.model, baseUrl: model.baseUrl })
+    setApiKey(''); setUrlTouched(false)
+  }
 
   // The mode applies on its next reply — no restart.
   const pickMode = async (next: string) => {
@@ -330,7 +395,7 @@ export function KioskAgentSettingsDialog({ agent, restarting, onRestart, onClose
     setVision(next); setSaving('vision'); setError('')
     try {
       await setAgentVision(kind, key, next)
-      setVisionPending(true)
+      setPendingRestart(true)
       setRestarted(false)
     } catch (e) {
       setVision(was)
@@ -341,14 +406,23 @@ export function KioskAgentSettingsDialog({ agent, restarting, onRestart, onClose
   }
 
   const restart = async () => {
-    if (await onRestart()) { setVisionPending(false); setRestarted(true) }
+    if (await onRestart()) { setPendingRestart(false); setRestarted(true) }
   }
 
-  const textOnly = model.provider === 'antigravity-cli'
+  // A model change being typed isn't thrown away without asking.
+  const close = () => {
+    if (modelDirty && !confirm('Discard the model change you have not saved?')) return
+    onClose()
+  }
+
+  const textOnly = SIGN_IN_PROVIDERS.has(model.provider)
   const current = MODES.find((m) => m.id === mode) ?? MODES[0]
+  const keyHint = switched
+    ? `The key for ${provider || 'the new provider'}. Leave it empty to use your team's key, if your deck has one.`
+    : 'Leave it empty to keep the key it uses now.'
 
   return (
-    <AgentDialog title="Agent settings" icon={SlidersHorizontal} agentName={agent.name} onClose={onClose}>
+    <AgentDialog title="Agent settings" icon={SlidersHorizontal} agentName={agent.name} onClose={close}>
       <div className="min-h-0 flex-1 space-y-6 overflow-y-auto overscroll-contain p-5">
         {loading ? (
           <div className="flex items-center justify-center py-10 text-sm text-zinc-500">
@@ -356,6 +430,54 @@ export function KioskAgentSettingsDialog({ agent, restarting, onRestart, onClose
           </div>
         ) : (
           <>
+            <section>
+              <SectionTitle icon={Cpu} title="Model" saving={saving === 'model'} saved={modelSaved} />
+              <p className="mb-2.5 text-[11px] leading-relaxed text-zinc-500">
+                The AI model it runs on, and the key that pays for it. Applies once the agent restarts.
+              </p>
+              <div className="grid grid-cols-1 gap-2 wide:grid-cols-[2fr_3fr]">
+                <TextField label="Provider" value={draft.provider} onChange={pickProvider} placeholder="openai" list={`kiosk-providers-${key}`} />
+                <TextField label="Model" value={draft.model} onChange={(v) => setDraft((d) => ({ ...d, model: v }))} placeholder="e.g. gpt-4.1-mini" />
+              </div>
+              <datalist id={`kiosk-providers-${key}`}>
+                {KNOWN_PROVIDERS.map((p) => <option key={p} value={p} />)}
+              </datalist>
+              {signIn ? (
+                <p className="mt-2 text-[11px] text-zinc-500">Local Google sign-in — no API key or endpoint.</p>
+              ) : (
+                <div className="mt-2 space-y-2">
+                  <TextField
+                    label="API key" type="password" value={apiKey} onChange={setApiKey}
+                    placeholder={switched ? 'sk-…' : 'Unchanged'} hint={keyHint}
+                  />
+                  <TextField
+                    label="Endpoint (optional)" value={draft.baseUrl}
+                    onChange={(v) => { setUrlTouched(true); setDraft((d) => ({ ...d, baseUrl: v })) }}
+                    placeholder="The provider's own" hint="Only for a self-hosted or local server, e.g. http://127.0.0.1:8000/v1"
+                  />
+                </div>
+              )}
+              {modelDirty && (
+                <div className="mt-2.5 flex items-center justify-end gap-2">
+                  <button
+                    onClick={undoModel}
+                    disabled={saving === 'model'}
+                    className="rounded-lg px-3 py-1.5 text-xs font-medium text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-200 disabled:opacity-50"
+                  >
+                    Undo
+                  </button>
+                  <button
+                    onClick={saveModel}
+                    disabled={!!saving || !provider || !draft.model.trim()}
+                    className="flex items-center gap-1.5 rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-violet-500 disabled:opacity-50"
+                  >
+                    {saving === 'model' ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Check className="h-3.5 w-3.5" />}
+                    Save model
+                  </button>
+                </div>
+              )}
+            </section>
+
             <section>
               <SectionTitle icon={BrainCog} title="How it thinks" saving={saving === 'mode'} saved={modeSaved} />
               <p className="mb-2.5 text-[11px] leading-relaxed text-zinc-500">
@@ -424,28 +546,6 @@ export function KioskAgentSettingsDialog({ agent, restarting, onRestart, onClose
                   })}
                 </div>
               )}
-              {visionPending && (
-                <div className="mt-2.5 flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-                  <span className="min-w-0 flex-1">
-                    {running ? 'Saved. It applies once the agent restarts.' : 'Saved. It applies the next time the agent starts.'}
-                  </span>
-                  {running && (
-                    <button
-                      onClick={restart}
-                      disabled={restarting}
-                      className="flex shrink-0 items-center gap-1 rounded-md bg-amber-500/20 px-2 py-1 font-medium hover:bg-amber-500/30 disabled:opacity-60"
-                    >
-                      {restarting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCw className="h-3.5 w-3.5" />}
-                      Restart now
-                    </button>
-                  )}
-                </div>
-              )}
-              {restarted && (
-                <p className="mt-2.5 flex items-center gap-1.5 text-xs text-emerald-700 dark:text-emerald-400">
-                  <Check className="h-3.5 w-3.5" /> Restarting — it's back in a moment.
-                </p>
-              )}
             </section>
           </>
         )}
@@ -455,7 +555,59 @@ export function KioskAgentSettingsDialog({ agent, restarting, onRestart, onClose
           </div>
         )}
       </div>
+      {(pendingRestart || restarted) && (
+        <div className="shrink-0 border-t border-zinc-800 px-5 py-3">
+          {pendingRestart ? (
+            <div className="flex items-center gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+              <span className="min-w-0 flex-1">
+                {running ? 'Saved. It applies once the agent restarts.' : 'Saved. It applies the next time the agent starts.'}
+              </span>
+              {running && (
+                <button
+                  onClick={restart}
+                  disabled={restarting}
+                  className="flex shrink-0 items-center gap-1 rounded-md bg-amber-500/20 px-2 py-1 font-medium hover:bg-amber-500/30 disabled:opacity-60"
+                >
+                  {restarting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RotateCw className="h-3.5 w-3.5" />}
+                  Restart now
+                </button>
+              )}
+            </div>
+          ) : (
+            <p className="flex items-center gap-1.5 text-xs text-emerald-700 dark:text-emerald-400">
+              <Check className="h-3.5 w-3.5" /> Restarting — it's back in a moment.
+            </p>
+          )}
+        </div>
+      )}
     </AgentDialog>
+  )
+}
+
+function TextField({ label, value, onChange, placeholder, hint, type = 'text', list }: {
+  label: string
+  value: string
+  onChange: (v: string) => void
+  placeholder?: string
+  hint?: string
+  type?: 'text' | 'password'
+  list?: string
+}) {
+  return (
+    <label className="block min-w-0">
+      <span className="mb-1 block text-[11px] font-medium text-zinc-400">{label}</span>
+      <input
+        type={type}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        list={list}
+        spellCheck={false}
+        autoComplete={type === 'password' ? 'new-password' : 'off'}
+        className="w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 placeholder-zinc-600 focus:border-violet-500/60 focus:outline-none"
+      />
+      {hint && <span className="mt-1 block text-[11px] leading-snug text-zinc-500">{hint}</span>}
+    </label>
   )
 }
 
@@ -467,6 +619,92 @@ function SectionTitle({ icon: Icon, title, saving, saved = false }: { icon: type
       {saving && <Loader2 className="h-3 w-3 animate-spin text-zinc-500" />}
       {saved && <span className="flex items-center gap-0.5 normal-case tracking-normal text-emerald-600 dark:text-emerald-400"><Check className="h-3 w-3" />saved</span>}
     </h3>
+  )
+}
+
+// ── Instructions ──
+//
+// The owner's standing instructions: added to the agent's system prompt in
+// every conversation. Saved where the agent cards keep them; open chats are
+// told at once, so they apply from its next reply.
+
+const MAX_INSTRUCTIONS = 64_000  // the server's limit
+
+export function KioskAgentInstructionsDialog({ agent, onClose }: {
+  agent: KioskAgent & { kind: 'docker' | 'process' }
+  onClose: () => void
+}) {
+  const { kind, startKey: key } = agent
+  const cards = () => (kind === 'docker' ? useContainerStore.getState() : useProcessStore.getState())
+  const [saved] = useState(() => cards().getFleetInstructions(key))
+  const [text, setText] = useState(saved)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const dirty = text.trim() !== saved.trim()
+
+  const save = async () => {
+    setSaving(true); setError('')
+    try {
+      await cards().setFleetInstructions(key, text.trim())
+      useChatStore.getState().resendFleetIdentity(agent.id)
+      useNotificationStore.getState().add('info', 'Instructions saved', `${agent.name} follows them from its next reply.`)
+      onClose()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+      setSaving(false)
+    }
+  }
+
+  const close = () => {
+    if (saving) return
+    if (dirty && !confirm('Discard the changes to its instructions?')) return
+    onClose()
+  }
+
+  return (
+    <AgentDialog title="Instructions" icon={BookOpen} agentName={agent.name} size="md" onClose={close}>
+      <div className="flex min-h-0 flex-1 flex-col gap-3 p-5">
+        <p className="shrink-0 text-xs leading-relaxed text-zinc-500">
+          What {agent.name} should always keep in mind — tone, format, house rules, or things about
+          you and your work. They go with every conversation and apply from its next reply.
+        </p>
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          maxLength={MAX_INSTRUCTIONS}
+          autoFocus
+          placeholder={'For example:\n- Answer in British English\n- Keep answers short, with bullet points\n- Cite your sources\n- I run a small bakery in Zagreb'}
+          className="min-h-[12rem] w-full flex-1 resize-none rounded-lg border border-zinc-700 bg-zinc-950 px-4 py-3 text-sm leading-relaxed text-zinc-200 placeholder-zinc-600 focus:border-violet-500/60 focus:outline-none"
+        />
+        {text.length > MAX_INSTRUCTIONS * 0.9 && (
+          <p className="shrink-0 text-right text-[11px] text-amber-700 dark:text-amber-400">
+            {text.length.toLocaleString()} / {MAX_INSTRUCTIONS.toLocaleString()} characters
+          </p>
+        )}
+        {error && (
+          <div className="flex shrink-0 items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-700 dark:text-red-300">
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" /> Couldn't save them: {error}
+          </div>
+        )}
+      </div>
+      <div className="flex shrink-0 items-center justify-end gap-2 border-t border-zinc-800 px-5 py-3.5">
+        <button
+          onClick={close}
+          disabled={saving}
+          className="rounded-lg px-3.5 py-2 text-sm font-medium text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-200 disabled:opacity-50"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={save}
+          disabled={saving || !dirty}
+          className="flex items-center gap-1.5 rounded-lg bg-violet-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-violet-500 disabled:opacity-50"
+        >
+          {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}
+          Save
+        </button>
+      </div>
+    </AgentDialog>
   )
 }
 

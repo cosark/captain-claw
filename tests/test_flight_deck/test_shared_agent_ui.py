@@ -418,7 +418,7 @@ def test_shared_welcome_returns_before_the_peer_agents_handshake():
       const body = welcome[0].arguments[1].body;
       const first = body.statements.find((st) => ts.isIfStatement(st)
           && st.expression.getText(sf) === 'shared');
-      const peerAt = body.getText(sf).indexOf("type: 'peer_agents'");
+      const peerAt = body.getText(sf).indexOf("peerAgentsFrame(");
       return {
         count: 1,
         guard: !!first,
@@ -706,7 +706,7 @@ _SLICE_DECLS = [
     (_SHARED, ["SHARED_PREFIX", "sharedContainerId", "sliceUser", "sharedSliceId"]),
     (_CHAT_STORE, [
         "_planLSKey", "savePlanSlice", "loadPlanSlice", "_queueLSKey", "saveQueueSlice",
-        "loadQueueSlice", "_sliceId", "purgeSharedSlices", "clearSharedSlices",
+        "loadQueueSlice", "_sliceId", "purgeSharedSlices", "clearSharedSlices", "clearAgentSlices",
         "LANE_MAIN", "LANE_AUTO", "LANES", "laneKey",
     ]),
 ]

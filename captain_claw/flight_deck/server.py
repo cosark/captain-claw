@@ -3785,8 +3785,28 @@ class AgentModelUpdate(BaseModel):
     # Both empty leaves the model as it is (a vision-only change).
     provider: str = ""
     model: str = ""
+    # None keeps the key / endpoint — unless the provider changes: then the old
+    # provider's key is dropped and the endpoint is the new provider's default.
     api_key: str | None = None
+    base_url: str | None = None
     vision: str | None = None  # auto | on | off; None leaves it as it is
+
+
+def _agent_config_paths(agent_dir: Path) -> list[Path]:
+    """Every copy of an agent's config.yaml: its directory's, the home-config
+    one (a container's ~/.captain-claw) and the one a process agent loads from
+    its HOME. A change must reach all of them, or the one that wins at start-up
+    still holds the old value."""
+    return [
+        agent_dir / "config.yaml",
+        agent_dir / "data" / "home-config" / "config.yaml",
+        agent_dir / "data" / "home-config-parent" / ".captain-claw" / "config.yaml",
+    ]
+
+
+def _default_base_url(provider: str) -> str:
+    """A provider's endpoint when nobody names one — as spawn writes it."""
+    return "http://127.0.0.1:11434" if provider == "ollama" else ""
 
 
 @app.put("/fd/agent-model/{kind}/{identifier}")
@@ -3801,18 +3821,14 @@ async def update_agent_model(
     changes_model = bool(body.provider.strip() or body.model.strip())
     if not changes_model and body.vision is None:
         raise HTTPException(400, "Nothing to update: give a provider and model, or vision")
+    if changes_model and not (body.provider.strip() and body.model.strip()):
+        raise HTTPException(400, "Give both a provider and a model")
     user_id = getattr(request.state, "user_id", "")
     agent_dir = _resolve_agent_dir(identifier, kind, user_id)
-
-    # Gather all config file paths that may exist
-    config_paths = [
-        agent_dir / "config.yaml",
-        agent_dir / "data" / "home-config" / "config.yaml",
-        agent_dir / "data" / "home-config-parent" / ".captain-claw" / "config.yaml",
-    ]
+    provider, model_name = body.provider.strip(), body.model.strip()
 
     updated_count = 0
-    for cfg_path in config_paths:
+    for cfg_path in _agent_config_paths(agent_dir):
         if not cfg_path.is_file():
             continue
         try:
@@ -3824,13 +3840,21 @@ async def update_agent_model(
         if "model" not in data or not isinstance(data.get("model"), dict):
             data["model"] = {}
         if changes_model:
-            data["model"]["provider"] = body.provider
-            data["model"]["model"] = body.model
-            if body.provider.strip() in {"antigravity-cli", "antigravity", "google-subscription"}:
+            switched = str(data["model"].get("provider") or "") != provider
+            data["model"]["provider"] = provider
+            data["model"]["model"] = model_name
+            if provider in {"antigravity-cli", "antigravity", "google-subscription"}:
                 data["model"].pop("api_key", None)
                 data["model"].pop("base_url", None)
-            elif body.api_key is not None:
-                data["model"]["api_key"] = body.api_key
+            else:
+                if body.api_key is not None:
+                    data["model"]["api_key"] = body.api_key.strip()
+                elif switched:
+                    data["model"]["api_key"] = ""  # never the old provider's key
+                if body.base_url is not None:
+                    data["model"]["base_url"] = body.base_url.strip()
+                elif switched:
+                    data["model"]["base_url"] = _default_base_url(provider)
         if body.vision is not None:
             switch = _vision_switch(body.vision)
             if switch is None:
@@ -3839,6 +3863,14 @@ async def update_agent_model(
                 data["model"]["vision"] = switch
         cfg_path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False, allow_unicode=True))
         updated_count += 1
+
+    # …and the registry, which the agent list reads its model from.
+    if changes_model and kind == "process":
+        registry = _load_process_registry()
+        if identifier in registry:
+            registry[identifier]["provider"] = provider
+            registry[identifier]["model"] = model_name
+            _save_process_registry(registry)
 
     return {"ok": True, "updated": updated_count, "message": "Restart the agent for changes to take effect."}
 
@@ -3879,6 +3911,20 @@ async def update_agent_mode(
     for cc_dir in cc_dirs:
         if cc_dir.is_dir():
             (cc_dir / "cognitive_mode.txt").write_text(mode_name, encoding="utf-8")
+    # The configs' default mode too, in every copy — the one the agent falls
+    # back on without a file, which spawn wrote from the archetype.
+    for cfg_path in _agent_config_paths(agent_dir):
+        if not cfg_path.is_file():
+            continue
+        try:
+            data = yaml.safe_load(cfg_path.read_text()) or {}
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        section = data.get("cognitive_mode")
+        data["cognitive_mode"] = {**(section if isinstance(section, dict) else {}), "default_mode": mode_name}
+        cfg_path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False, allow_unicode=True))
 
     return {"ok": True, "mode": mode_name, "message": "Mode updated. Takes effect on the agent's next response."}
 

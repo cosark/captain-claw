@@ -73,7 +73,8 @@ interface ProcessStore {
   getForwardingTask: (slug: string) => string
   setConsultApproval: (slug: string, required: boolean) => void
   getConsultApproval: (slug: string) => boolean
-  setFleetInstructions: (slug: string, instructions: string) => void
+  /** Resolves once saved (on the server with accounts, else this browser). */
+  setFleetInstructions: (slug: string, instructions: string) => Promise<void>
   getFleetInstructions: (slug: string) => string
   setCognitiveMode: (slug: string, mode: string) => void
   getCognitiveMode: (slug: string) => string
@@ -209,14 +210,14 @@ export const useProcessStore = create<ProcessStore>((set, get) => ({
     set({ fleetInstructionsOverrides: overrides })
     if (!useAuthStore.getState().authEnabled) {
       localStorage.setItem(FLEET_INSTRUCTIONS_KEY, JSON.stringify(overrides))
-      return
+      return Promise.resolve()
     }
     // With accounts, save just this agent's entry: writing the whole map from
     // this tab would undo entries Flight Deck added since it loaded. If that
     // isn't possible (agent not registered yet, older server) keep the old way.
     _savingInstructions.add(slug)
-    dockerApi.saveAgentInstructions('process', slug, instructions)
-      .catch(() => persistMap(FLEET_INSTRUCTIONS_KEY, get().fleetInstructionsOverrides))
+    return dockerApi.saveAgentInstructions('process', slug, instructions)
+      .then(() => undefined, () => persistMap(FLEET_INSTRUCTIONS_KEY, get().fleetInstructionsOverrides))
       .finally(() => _savingInstructions.delete(slug))
   },
 

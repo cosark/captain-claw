@@ -29,6 +29,7 @@ import {
   LibraryBig,
   SlidersHorizontal,
   Trash2,
+  BookOpen,
 } from 'lucide-react'
 import { useUIStore } from '../../stores/uiStore'
 import { useAgentStore } from '../../stores/agentStore'
@@ -65,7 +66,8 @@ import { BrandMark } from '../common/BrandMark'
 import { KioskInfoDialog, type InfoAgent } from './KioskInfoDialog'
 import { KioskOnboardingDialog, type OnboardingAction } from './KioskOnboardingDialog'
 import {
-  AgentMenu, KioskAgentInfoDialog, KioskAgentSettingsDialog, KioskRemoveAgentDialog, type AgentMenuItem,
+  AgentMenu, KioskAgentInfoDialog, KioskAgentInstructionsDialog, KioskAgentSettingsDialog, KioskRemoveAgentDialog,
+  type AgentMenuItem,
 } from './KioskAgentDialogs'
 import { useIsMobile } from '../../hooks/useMediaQuery'
 
@@ -187,8 +189,9 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
   // Kiosk Info dialog — models, agents, archetypes, profile, plan, connections.
   const [infoOpen, setInfoOpen] = useState(false)
   // Kiosk agent dialogs from an agent's "⋯": its Info (intentions, topics),
-  // its Settings and its removal. By id — they follow the live agent row.
+  // Instructions, Settings and its removal. By id — they follow the live agent row.
   const [agentInfoId, setAgentInfoId] = useState<string | null>(null)
+  const [agentInstructionsId, setAgentInstructionsId] = useState<string | null>(null)
   const [agentSettingsId, setAgentSettingsId] = useState<string | null>(null)
   const [agentRemoveId, setAgentRemoveId] = useState<string | null>(null)
   // Kiosk Getting started guide. It opens by itself once per page load (so
@@ -468,9 +471,9 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
     }
   }
 
-  // The kiosk's "⋯" on an agent. Settings and Remove are for the user's own
-  // agents only — not one shared with them, a local one, or one Flight Deck
-  // runs itself.
+  // The kiosk's "⋯" on an agent. Instructions, Settings and Remove are for the
+  // user's own agents only — not one shared with them, a local one, or one
+  // Flight Deck runs itself.
   const agentMenuItems = (a: SimpleAgent): AgentMenuItem[] => {
     if (a.kind === 'shared') return []
     const up = a.reachable && !booting.has(a.id) && !switching.has(a.id)
@@ -480,7 +483,8 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
     }]
     if ((a.kind === 'docker' || a.kind === 'process') && !a.managed) {
       items.push(
-        { icon: SlidersHorizontal, label: 'Settings', hint: 'How it thinks, and vision', onSelect: () => setAgentSettingsId(a.id) },
+        { icon: BookOpen, label: 'Instructions', hint: 'What it should always keep in mind', onSelect: () => setAgentInstructionsId(a.id) },
+        { icon: SlidersHorizontal, label: 'Settings', hint: 'Model, how it thinks, vision', onSelect: () => setAgentSettingsId(a.id) },
         { icon: Trash2, label: 'Remove agent', hint: 'Delete it and its folder', danger: true,
           onSelect: () => setAgentRemoveId(a.id), disabled: switching.has(a.id) },
       )
@@ -489,6 +493,7 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
   }
   const menuFor = locked ? agentMenuItems : undefined
   const agentInfo = agentInfoId ? agents.find((a) => a.id === agentInfoId) : undefined
+  const agentInstructions = agentInstructionsId ? agents.find((a) => a.id === agentInstructionsId) : undefined
   const agentSettings = agentSettingsId ? agents.find((a) => a.id === agentSettingsId) : undefined
   const agentRemove = agentRemoveId ? agents.find((a) => a.id === agentRemoveId) : undefined
 
@@ -646,6 +651,12 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
       )}
       {locked && agentInfo && (
         <KioskAgentInfoDialog agent={agentInfo} phone={isMobile} onClose={() => setAgentInfoId(null)} />
+      )}
+      {locked && agentInstructions && (agentInstructions.kind === 'docker' || agentInstructions.kind === 'process') && (
+        <KioskAgentInstructionsDialog
+          agent={{ ...agentInstructions, kind: agentInstructions.kind }}
+          onClose={() => setAgentInstructionsId(null)}
+        />
       )}
       {locked && agentSettings && (agentSettings.kind === 'docker' || agentSettings.kind === 'process') && (
         <KioskAgentSettingsDialog

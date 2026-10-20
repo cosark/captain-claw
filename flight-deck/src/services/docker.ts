@@ -332,6 +332,18 @@ export const setAgentMode = (kind: 'process' | 'docker', id: string, mode: strin
 export const getAgentConfig = (kind: 'process' | 'docker', id: string) =>
   fdFetch<{ config_yaml: string; env: string }>(`/agent-config/${kind}/${id}`)
 
+/** Provider and model — with a new key and endpoint, or (left out) the ones it
+ *  has; a new provider drops the old one's key and endpoint. Written to every
+ *  copy of its config and the agent list. Read at start-up. */
+export const setAgentModel = (
+  kind: 'process' | 'docker', id: string,
+  change: { provider: string; model: string; api_key?: string; base_url?: string },
+) =>
+  fdFetch<{ ok: boolean }>(`/agent-model/${kind}/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(change),
+  })
+
 /** model.vision only (auto | on | off) — the model stays. Read at start-up. */
 export const setAgentVision = (kind: 'process' | 'docker', id: string, vision: string) =>
   fdFetch<{ ok: boolean }>(`/agent-model/${kind}/${id}`, {

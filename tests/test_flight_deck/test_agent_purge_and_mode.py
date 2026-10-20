@@ -208,3 +208,82 @@ async def test_a_vision_only_update_keeps_the_model(deck):
 
         r = await c.put("/fd/agent-model/process/bob-agent", headers=_hdr(BOB), json={})
         assert r.status_code == 400
+
+
+# ── model, key and endpoint reach every copy ────────────────────────────────
+
+
+def _copies(slug: str) -> list[Path]:
+    agent_dir = server.DATA_DIR / slug
+    return server._agent_config_paths(agent_dir)
+
+
+def _with_all_copies(slug: str, model: dict) -> None:
+    for path in _copies(slug):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(yaml.dump({"model": dict(model), "context": {"max_tokens": 32768}}))
+
+
+@pytest.mark.asyncio
+async def test_a_new_provider_drops_the_old_key_and_endpoint_everywhere(deck):
+    _with_all_copies("bob-agent", {"provider": "ollama", "model": "ornith:9b",
+                                   "api_key": "old-key", "base_url": "http://127.0.0.1:11434"})
+    async with _client() as c:
+        r = await c.put("/fd/agent-model/process/bob-agent", headers=_hdr(BOB),
+                        json={"provider": "anthropic", "model": "claude-sonnet-5-5"})
+    assert r.status_code == 200 and r.json()["updated"] == 3, r.text
+    for path in _copies("bob-agent"):
+        data = yaml.safe_load(path.read_text())
+        assert data["model"] == {"provider": "anthropic", "model": "claude-sonnet-5-5", "api_key": "", "base_url": ""}
+        assert data["context"] == {"max_tokens": 32768}
+    entry = server._load_process_registry()["bob-agent"]
+    assert (entry["provider"], entry["model"]) == ("anthropic", "claude-sonnet-5-5")
+    async with _client() as c:
+        listed = {p["slug"]: p for p in (await c.get("/fd/processes", headers=_hdr(BOB))).json()}
+    assert listed["bob-agent"]["model"] == "claude-sonnet-5-5"
+    # Carol's agent is untouched.
+    assert server._load_process_registry()["carol-agent"].get("model") is None
+
+
+@pytest.mark.asyncio
+async def test_the_same_provider_keeps_its_endpoint_and_takes_a_new_key(deck):
+    _with_all_copies("bob-agent", {"provider": "openai", "model": "a", "api_key": "k1",
+                                   "base_url": "http://127.0.0.1:8000/v1"})
+    async with _client() as c:
+        await c.put("/fd/agent-model/process/bob-agent", headers=_hdr(BOB),
+                    json={"provider": "openai", "model": "b", "api_key": " k2 "})
+        for path in _copies("bob-agent"):
+            assert yaml.safe_load(path.read_text())["model"] == {
+                "provider": "openai", "model": "b", "api_key": "k2", "base_url": "http://127.0.0.1:8000/v1"}
+
+        # No key named: the one it has stays. A named endpoint is written.
+        await c.put("/fd/agent-model/process/bob-agent", headers=_hdr(BOB),
+                    json={"provider": "openai", "model": "b", "base_url": "http://box:9000/v1"})
+        for path in _copies("bob-agent"):
+            m = yaml.safe_load(path.read_text())["model"]
+            assert (m["api_key"], m["base_url"]) == ("k2", "http://box:9000/v1")
+
+        # Back to ollama: its own endpoint.
+        await c.put("/fd/agent-model/process/bob-agent", headers=_hdr(BOB),
+                    json={"provider": "ollama", "model": "ornith:9b"})
+        assert yaml.safe_load(_copies("bob-agent")[2].read_text())["model"]["base_url"] == "http://127.0.0.1:11434"
+
+        r = await c.put("/fd/agent-model/process/bob-agent", headers=_hdr(BOB), json={"provider": "openai"})
+        assert r.status_code == 400
+        r = await c.put("/fd/agent-model/process/bob-agent", headers=_hdr(CAROL),
+                        json={"provider": "openai", "model": "x"})
+        assert r.status_code in (403, 404)
+
+
+@pytest.mark.asyncio
+async def test_the_mode_reaches_every_config_copy_too(deck):
+    _with_all_copies("bob-agent", {"provider": "openai", "model": "a"})
+    async with _client() as c:
+        r = await c.put("/fd/agent-mode/process/bob-agent", headers=_hdr(BOB), json={"mode": "dorian"})
+    assert r.status_code == 200
+    for path in _copies("bob-agent"):
+        data = yaml.safe_load(path.read_text())
+        assert data["cognitive_mode"]["default_mode"] == "dorian"
+        assert data["model"]["model"] == "a"
+    cc = server.DATA_DIR / "bob-agent" / "data" / "home-config-parent" / ".captain-claw"
+    assert (cc / "cognitive_mode.txt").read_text() == "dorian"

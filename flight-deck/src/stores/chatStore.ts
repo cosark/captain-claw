@@ -915,6 +915,95 @@ export function parseLaneKey(key: string): { containerId: string; lane: string }
     : { containerId: key.slice(0, at), lane: key.slice(at + 2) }
 }
 
+/** What a connected agent is told about its fleet: its peers, and itself —
+ *  name, model and the owner's standing instructions. Sent when a chat
+ *  connects, and again when the instructions change. */
+function peerAgentsFrame(containerId: string): Record<string, unknown> {
+  const containers = useContainerStore.getState().containers
+  const localAgents = useLocalAgentStore.getState().agents
+  const { getForwardingTask: getFwd, getConsultApproval } = useContainerStore.getState()
+  const peers: { name: string; description: string; forwardingTask: string; host: string; port: number; auth: string; requireApproval: boolean }[] = []
+  for (const c of containers) {
+    if (c.id === containerId || c.status !== 'running' || !c.web_port) continue
+    peers.push({
+      name: c.agent_name || c.name,
+      description: c.description || '',
+      forwardingTask: getFwd(c.id),
+      host: 'localhost',
+      port: c.web_port,
+      auth: c.web_auth || '',
+      requireApproval: getConsultApproval(c.id),
+    })
+  }
+  for (const a of localAgents) {
+    if (a.id === containerId || a.status !== 'online') continue
+    peers.push({
+      name: a.name,
+      description: a.description || '',
+      forwardingTask: a.forwardingTask || '',
+      host: a.host,
+      port: a.port,
+      auth: a.authToken || '',
+      requireApproval: a.consultApproval ?? false,
+    })
+  }
+  const processes = useProcessStore.getState().processes
+  const { getForwardingTask: getProcFwd, getConsultApproval: getProcApproval } = useProcessStore.getState()
+  for (const p of processes) {
+    if (p.slug === containerId || p.status !== 'running' || !p.web_port) continue
+    peers.push({
+      name: p.name || p.slug,
+      description: p.description || '',
+      forwardingTask: getProcFwd(p.slug),
+      host: 'localhost',
+      port: p.web_port,
+      auth: '',
+      requireApproval: getProcApproval(p.slug),
+    })
+  }
+  // Build self identity so the agent knows who it is in the fleet
+  const { getFleetInstructions: getContainerFleetInst } = useContainerStore.getState()
+  const { getFleetInstructions: getProcFleetInst } = useProcessStore.getState()
+  let selfIdentity: { name: string; description: string; port: number; model?: string; provider?: string; fleet_instructions?: string } | null = null
+  const selfContainer = containers.find((c) => c.id === containerId)
+  if (selfContainer) {
+    selfIdentity = {
+      name: selfContainer.agent_name || selfContainer.name,
+      description: selfContainer.description || '',
+      port: selfContainer.web_port || 0,
+      fleet_instructions: getContainerFleetInst(selfContainer.id),
+    }
+  }
+  if (!selfIdentity) {
+    const selfProcess = processes.find((p) => `proc-${p.slug}` === containerId || p.slug === containerId)
+    if (selfProcess) {
+      selfIdentity = {
+        name: selfProcess.name || selfProcess.slug,
+        description: selfProcess.description || '',
+        port: selfProcess.web_port || 0,
+        model: selfProcess.model || '',
+        provider: selfProcess.provider || '',
+        fleet_instructions: getProcFleetInst(selfProcess.slug),
+      }
+    }
+  }
+  if (!selfIdentity) {
+    const selfLocal = localAgents.find((a) => a.id === containerId)
+    if (selfLocal) {
+      selfIdentity = {
+        name: selfLocal.name,
+        description: selfLocal.description || '',
+        port: selfLocal.port || 0,
+      }
+    }
+  }
+
+  // Use internal FD URL if available (container mode), otherwise derive from browser
+  const { internalFdUrl } = useAuthStore.getState()
+  const fdUrl = internalFdUrl || `${window.location.protocol}//${window.location.host}`
+  return { type: 'peer_agents', agents: peers, self: selfIdentity, fd_url: fdUrl }
+}
+
 interface ChatSession {
   /** The agent's container id — NOT the store key. Use `key` for store calls
    *  and `containerId` for anything that addresses the agent itself. */
@@ -1030,6 +1119,9 @@ interface ChatStore {
   closeChat: () => void
   switchChat: (containerId: string) => void
   disconnectChat: (containerId: string) => void
+  /** Tell every open chat with this agent who it is again — after its
+   *  instructions (or name) changed, so they apply without a reconnect. */
+  resendFleetIdentity: (agentId: string) => void
   /** `fromQueue` marks a turn the queue dispatched: no next-step suggestions. */
   sendMessage: (containerId: string, content: string, opts?: { fromQueue?: boolean }) => void
   sendBtw: (containerId: string, content: string) => void
@@ -1308,89 +1400,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       reconcileTopic(key)
 
       // Send peer agent awareness to the connected agent
-      const containers = useContainerStore.getState().containers
-      const localAgents = useLocalAgentStore.getState().agents
-      const { getForwardingTask: getFwd, getConsultApproval } = useContainerStore.getState()
-      const peers: { name: string; description: string; forwardingTask: string; host: string; port: number; auth: string; requireApproval: boolean }[] = []
-      for (const c of containers) {
-        if (c.id === containerId || c.status !== 'running' || !c.web_port) continue
-        peers.push({
-          name: c.agent_name || c.name,
-          description: c.description || '',
-          forwardingTask: getFwd(c.id),
-          host: 'localhost',
-          port: c.web_port,
-          auth: c.web_auth || '',
-          requireApproval: getConsultApproval(c.id),
-        })
-      }
-      for (const a of localAgents) {
-        if (a.id === containerId || a.status !== 'online') continue
-        peers.push({
-          name: a.name,
-          description: a.description || '',
-          forwardingTask: a.forwardingTask || '',
-          host: a.host,
-          port: a.port,
-          auth: a.authToken || '',
-          requireApproval: a.consultApproval ?? false,
-        })
-      }
-      const processes = useProcessStore.getState().processes
-      const { getForwardingTask: getProcFwd, getConsultApproval: getProcApproval } = useProcessStore.getState()
-      for (const p of processes) {
-        if (p.slug === containerId || p.status !== 'running' || !p.web_port) continue
-        peers.push({
-          name: p.name || p.slug,
-          description: p.description || '',
-          forwardingTask: getProcFwd(p.slug),
-          host: 'localhost',
-          port: p.web_port,
-          auth: '',
-          requireApproval: getProcApproval(p.slug),
-        })
-      }
-      // Build self identity so the agent knows who it is in the fleet
-      const { getFleetInstructions: getContainerFleetInst } = useContainerStore.getState()
-      const { getFleetInstructions: getProcFleetInst } = useProcessStore.getState()
-      let selfIdentity: { name: string; description: string; port: number; model?: string; provider?: string; fleet_instructions?: string } | null = null
-      const selfContainer = containers.find((c) => c.id === containerId)
-      if (selfContainer) {
-        selfIdentity = {
-          name: selfContainer.agent_name || selfContainer.name,
-          description: selfContainer.description || '',
-          port: selfContainer.web_port || 0,
-          fleet_instructions: getContainerFleetInst(selfContainer.id),
-        }
-      }
-      if (!selfIdentity) {
-        const selfProcess = processes.find((p) => `proc-${p.slug}` === containerId || p.slug === containerId)
-        if (selfProcess) {
-          selfIdentity = {
-            name: selfProcess.name || selfProcess.slug,
-            description: selfProcess.description || '',
-            port: selfProcess.web_port || 0,
-            model: selfProcess.model || '',
-            provider: selfProcess.provider || '',
-            fleet_instructions: getProcFleetInst(selfProcess.slug),
-          }
-        }
-      }
-      if (!selfIdentity) {
-        const selfLocal = localAgents.find((a) => a.id === containerId)
-        if (selfLocal) {
-          selfIdentity = {
-            name: selfLocal.name,
-            description: selfLocal.description || '',
-            port: selfLocal.port || 0,
-          }
-        }
-      }
-
-      // Use internal FD URL if available (container mode), otherwise derive from browser
-      const { internalFdUrl } = useAuthStore.getState()
-      const fdUrl = internalFdUrl || `${window.location.protocol}//${window.location.host}`
-      ws.sendJSON({ type: 'peer_agents', agents: peers, self: selfIdentity, fd_url: fdUrl })
+      ws.sendJSON(peerAgentsFrame(containerId))
     })
 
     ws.on('next_steps', (data) => {
@@ -2159,6 +2169,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         activeChatId: s.activeChatId === containerId ? null : s.activeChatId,
         chatOpen: s.activeChatId === containerId ? false : s.chatOpen,
       }))
+    }
+  },
+
+  resendFleetIdentity: (agentId) => {
+    for (const session of get().sessions.values()) {
+      if (session.containerId === agentId && session.connected) session.ws.sendJSON(peerAgentsFrame(agentId))
     }
   },
 
