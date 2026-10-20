@@ -40,6 +40,10 @@ export const SKILL_ICONS: Record<string, LucideIcon> = {
   code: Code2, image: Image, wallet: Wallet,
 }
 
+/** The cards the composer's list offers; the rest are behind its "More"
+ *  (Flight Deck writes up to 6 + 16). */
+export const SKILLS_UP_FRONT = 6
+
 /** The agent's process slug, for the agents that have cards (process agents). */
 export function skillsSlug(agentId: string): string | null {
   return agentId.startsWith('proc-') ? agentId.slice(5) : null

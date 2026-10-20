@@ -45,7 +45,7 @@ import {
   ArrowUp,
 } from 'lucide-react'
 import { createPortal } from 'react-dom'
-import { ChatGreeting, SkillsMenu } from './AgentSkills'
+import { ChatGreeting, SkillsDialog, SkillsMenu } from './AgentSkills'
 import { useAgentSkills } from '../../hooks/useAgentSkills'
 import type { AgentSkill } from '../../services/agentSkills'
 import { fetchTopics, type TopicInfo } from '../../stores/chatStore'
@@ -874,6 +874,7 @@ function ChatContent({
   // and behind the composer's "What can I do?". A card sends its prompt.
   const skills = useAgentSkills(session.containerId, simple && !shared)
   const [skillsOpen, setSkillsOpen] = useState(false)
+  const [skillsDialog, setSkillsDialog] = useState(false)
   const canPick = session.connected && !closed && !quotaSpent && !session.busy
   const pickSkill = (skill: AgentSkill) => { if (canPick) onSend(skill.prompt) }
   // Fresh: nothing said yet, or a new topic (or a cleared context) just began.
@@ -963,7 +964,7 @@ function ChatContent({
             skills={skills}
             disabled={!canPick}
             onPick={pickSkill}
-            onMore={() => setSkillsOpen(true)}
+            onMore={() => setSkillsDialog(true)}
           />
         )}
 
@@ -1027,6 +1028,15 @@ function ChatContent({
           }
         }}
       />}
+      {skillsDialog && (
+        <SkillsDialog
+          skills={skills}
+          agentName={session.containerName}
+          disabled={!canPick}
+          onPick={pickSkill}
+          onClose={() => setSkillsDialog(false)}
+        />
+      )}
       {simple ? (
         /* The simple layout's composer: the box, and under the text its row
            of attach · paste · "What can I do?" … send. */
@@ -1074,6 +1084,7 @@ function ChatContent({
                 setOpen={setSkillsOpen}
                 disabled={!canPick}
                 onPick={pickSkill}
+                onMore={() => setSkillsDialog(true)}
                 compact={isMobile}
               />
               <div className="flex-1" />

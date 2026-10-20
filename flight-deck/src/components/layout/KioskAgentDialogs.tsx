@@ -180,7 +180,7 @@ const DIALOG_SIZE = {
   lg: 'h-[100dvh] wide:h-[88vh] wide:max-w-5xl wide:border wide:border-zinc-800',
 }
 
-function AgentDialog({ title, icon: Icon, agentName, size = 'sm', onClose, children }: {
+export function AgentDialog({ title, icon: Icon, agentName, size = 'sm', onClose, children }: {
   title: string
   icon: typeof Info
   agentName: string

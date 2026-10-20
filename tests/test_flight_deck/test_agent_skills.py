@@ -119,10 +119,24 @@ def test_parse_keeps_only_sources_the_agent_has():
 
 
 def test_parse_caps_and_refuses_empty():
-    many = {"skills": [{"title": f"Task {i}", "prompt": f"Do {i}", "description": ""} for i in range(20)]}
+    many = {"skills": [{"title": f"Task {i}", "prompt": f"Do {i}", "description": ""} for i in range(30)]}
     assert len(skills.parse_skills(json.dumps(many))) == skills._MAX_SKILLS
     with pytest.raises(ValueError):
         skills.parse_skills('{"skills": []}')
+
+
+def test_parse_salvages_a_reply_cut_off_mid_list():
+    cut = ('{"skills": [{"title": "Plan my week", "description": "x", "prompt": "Plan my week.", "icon": "calendar"},'
+           ' {"title": "Label my emails", "description": "y", "prompt": "Label my emails.", "icon": "mail"},'
+           ' {"title": "Prep my meet')
+    assert [c["title"] for c in skills.parse_skills(cut)] == ["Plan my week", "Label my emails"]
+
+
+def test_system_prompt_per_pass():
+    assert "- 6 cards, the most useful first" in skills._system(None)
+    more = skills._system([])
+    assert "- 8 MORE cards" in more and "Already offered" in more
+    assert skills._MAX_SKILLS == 22
 
 
 # ── Without the model ─────────────────────────────────────────────────
@@ -185,7 +199,7 @@ async def test_write_caches_the_models_cards(deck, monkeypatch):
     async def tier(owner):
         return {"provider": "openai", "model": "fast-m"}
 
-    async def model(tier, system, user, owner, max_tokens=0):
+    async def model(tier, system, user, owner, max_tokens=0, **_):
         seen.update(user=user, owner=owner)
         return json.dumps({"skills": [{"title": "Label my emails", "description": "Sorted inbox.",
                                        "prompt": "Label my unread emails by category.", "icon": "mail",
@@ -229,9 +243,9 @@ def _patch_model(monkeypatch, replies: list[str]) -> list[str]:
     async def tier(owner):
         return {"provider": "openai", "model": "fast-m"}
 
-    async def model(tier, system, user, owner, max_tokens=0):
+    async def model(tier, system, user, owner, max_tokens=0, **_):
         sent.append(user)
-        return replies[len(sent) - 1], 5
+        return replies[min(len(sent), len(replies)) - 1], 5  # the last one, over and over
 
     async def not_spent(owner):
         return False
@@ -260,6 +274,52 @@ async def test_retry_can_succeed(deck, monkeypatch):
     entry = server._load_process_registry()["bob-agent"]
     payload = await skills.generate("bob-agent", entry, BOB)
     assert payload["source"] == "model" and payload["skills"][0]["title"] == "Plan my week"
+
+
+def _cards(prefix: str, n: int) -> str:
+    return json.dumps({"skills": [{"title": f"{prefix} {i}", "description": f"{prefix} card {i}",
+                                   "prompt": f"Do {prefix} {i}.", "icon": "list"} for i in range(n)]})
+
+
+async def test_two_passes_up_front_then_more(deck, monkeypatch):
+    entry = server._load_process_registry()["bob-agent"]
+    seen_cache: list = []
+    sent = _patch_model(monkeypatch, [_cards("Top", 9), _cards("A", 10), _cards("B", 10)])
+    orig = skills.call_model
+
+    async def watching(tier, system, user, owner, max_tokens=0, **kw):
+        if len(sent) == 1:  # the "More" pass: the cards up front are cached already
+            seen_cache.append(skills.read_cache("bob-agent"))
+        assert kw.get("request_timeout") == skills._CALL_TIMEOUT
+        return await orig(tier, system, user, owner, max_tokens)
+
+    monkeypatch.setattr(skills, "call_model", watching)
+    payload = await skills.generate("bob-agent", entry, BOB)
+    titles = [c["title"] for c in payload["skills"]]
+    assert titles[:6] == [f"Top {i}" for i in range(6)]          # capped at 6 up front
+    assert titles[6:] == [f"A {i}" for i in range(8)] + [f"B {i}" for i in range(8)]  # 8 at a time, 16 more
+    assert "Already offered:\n- Top 0: Top card 0" in sent[1]
+    assert "- A 7: A card 7" in sent[2]                          # the second batch knows the first
+    assert [c["title"] for c in seen_cache[0]["skills"]] == titles[:6]
+
+
+async def test_failed_more_pass_keeps_the_earlier_more_list(deck, monkeypatch):
+    entry = server._load_process_registry()["bob-agent"]
+    _patch_model(monkeypatch, [_cards("Top", 6), _cards("A", 8), _cards("B", 8)])
+    await skills.generate("bob-agent", entry, BOB)
+    _patch_model(monkeypatch, [_cards("New", 6), "no", "no"])
+    payload = await skills.generate("bob-agent", entry, BOB)
+    titles = [c["title"] for c in payload["skills"]]
+    assert titles[:6] == [f"New {i}" for i in range(6)]
+    assert titles[6:] == [f"A {i}" for i in range(8)] + [f"B {i}" for i in range(8)]
+    assert payload["error"] and payload["source"] == "model"
+
+
+async def test_more_stops_when_nothing_new(deck, monkeypatch):
+    entry = server._load_process_registry()["bob-agent"]
+    sent = _patch_model(monkeypatch, [_cards("Top", 6), _cards("A", 3)])  # then A again: nothing new
+    payload = await skills.generate("bob-agent", entry, BOB)
+    assert len(payload["skills"]) == 9 and len(sent) == 3 and not payload["error"]
 
 
 async def test_failed_rewrite_keeps_the_last_good_set(deck, monkeypatch):

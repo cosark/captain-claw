@@ -11,11 +11,12 @@ and what it has done:
 - its schedules: the deck's scheduled tasks for it and its own cron jobs;
 - its conversation topics and open intentions.
 
-The owner's fast tier writes the set (one call, the File library's model) and
-it is cached in the agent's folder (``kiosk_skills.json``, gone with the
-agent). The set is rewritten when the agent's make-up changes (name,
-description, archetype, instructions, tools, accounts, scheduled tasks) or it is
-``_TTL`` old, which is how new topics and experience reach it. Until then —
+The owner's fast tier writes the set (the File library's model): the 6 cards
+offered up front first, then the "More" list, 8 at a time, up to 16 — each
+step cached as it lands, in the agent's folder (``kiosk_skills.json``, gone
+with the agent). The set is rewritten when the agent's make-up changes (name,
+description, archetype, instructions, tools, accounts, scheduled tasks) or it
+is ``_TTL`` old, which is how new topics and experience reach it. Until then —
 and without a model, or with the day's allowance spent — cards are built
 straight from the schedules, intentions and topics.
 """
@@ -25,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -54,10 +56,15 @@ ICONS = (
 # Where a card comes from.
 SOURCES = ("archetype", "experience", "schedule", "topic", "intention")
 
-_MAX_SKILLS = 8
+_TOP = 6                  # the cards offered up front (the composer's list)
+_MORE = 16                # and behind its "More"
+_MAX_SKILLS = _TOP + _MORE
+_VERSION = 2              # in the fingerprint: a new card set rewrites every cache
 _TTL = 12 * 3600          # a model-written set is rewritten after this
 _BASIC_TTL = 3600         # a set built without the model, before trying again
+_MORE_BATCH = 8           # "More" cards per call: a small local model writes 8 in time
 _MAX_TOKENS = 4000        # reasoning models think before the JSON
+_CALL_TIMEOUT = 300.0     # each background call (a provider's own may be 120s)
 _RETRY_NUDGE = "Reply now with the JSON object only: no thinking aloud, no prose."
 _AGENT_TIMEOUT = 5.0      # each read from the running agent
 _CACHE_FILE = "kiosk_skills.json"
@@ -162,7 +169,7 @@ async def _make_up(slug: str, entry: dict, owner_id: str) -> dict:
 
 
 def fingerprint(make_up: dict) -> str:
-    return hashlib.sha1(json.dumps(make_up, sort_keys=True, default=str).encode()).hexdigest()
+    return hashlib.sha1(json.dumps({**make_up, "v": _VERSION}, sort_keys=True, default=str).encode()).hexdigest()
 
 
 # ── What the agent has done (read from it while it runs) ──────────────
@@ -280,16 +287,22 @@ their AI agent exactly as if they had typed it.
 Reply with ONLY a JSON object, no prose, no code fence:
 {"skills": [{"title": "...", "description": "...", "prompt": "...", "icon": "...", "source": "..."}]}
 
-- 6 cards, the most useful first.
+%(cards)s
 - title: 2-5 words in the person's voice, imperative ("Plan my week", "Label my emails"), at most 40 characters.
 - description: one short sentence on what they get, at most 90 characters.
 - prompt: the request itself, written as the person, specific and complete enough for the agent to act without asking back, at most 400 characters. It is sent as it is: no placeholders ("[name]", "<topic>") and nothing left for the person to fill in.
-- icon: exactly one of: %s
+- icon: exactly one of: %(icons)s
 - source: where the card comes from, exactly one of: archetype (what the agent is for), experience (what it has learned about the person), schedule (a scheduled task or cron job: run it now), topic (an ongoing conversation to pick up), intention (something the agent means to do).
 - Only tasks this agent can do with its role, instructions and tools. Prefer the person's real topics, schedules and intentions over generic ideas, and mix sources when there are several.
 - Email, calendar and file-drive tasks need the person's account connected (see "Connected accounts"). For an account that isn't, offer none of its tasks; when the agent is made for that work, one card may help the person connect it instead.
 - Never a card that sends email, posts, pays or deletes by itself; drafting and preparing are fine.
 - Write in the language the person uses with the agent (see the topics and instructions); English if unsure."""
+
+# What a pass asks for: the cards offered up front, then the "More" list.
+_TOP_CARDS = """- %d cards, the most useful first: the everyday tasks that matter most to this person."""
+_MORE_CARDS = """- %d MORE cards, for its "More" list: the rest of the agent's range (other tools, rarer
+  tasks, other topics). The person already has the cards under "Already offered": every new card
+  is different from those and from each other."""
 
 
 def _prompt(make_up: dict, done: dict) -> str:
@@ -345,12 +358,28 @@ def _sources(make_up: dict, done: dict) -> set[str]:
     return have
 
 
+def _salvage(content: str) -> list[dict]:
+    """The whole cards in a reply that is not valid JSON — one cut off at
+    the output limit mid-list, say."""
+    found: list[dict] = []
+    for m in re.finditer(r"\{[^{}]*\}", content or ""):
+        try:
+            obj = json.loads(m.group(0))
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and obj.get("title") and obj.get("prompt"):
+            found.append(obj)
+    return found
+
+
 def parse_skills(content: str, sources: set[str] | None = None) -> list[dict]:
     """The cards in a model's reply, cleaned; raises when there are none. A
     card naming a source the agent has nothing in counts as its archetype's."""
     allowed = set(SOURCES) if sources is None else sources
-    data = reply_json(content)
-    raw = data.get("skills")
+    try:
+        raw = reply_json(content).get("skills")
+    except ValueError:
+        raw = _salvage(content)
     cards: list[dict] = []
     for s in raw if isinstance(raw, list) else []:
         if not isinstance(s, dict):
@@ -399,28 +428,43 @@ def is_fresh(cache: dict | None, fp: str, now: float | None = None) -> bool:
     return (now or time.time()) - float(cache.get("generated_at") or 0) < ttl
 
 
-async def _model_skills(tier: dict, make_up: dict, done: dict, owner_id: str) -> list[dict]:
-    """The model's cards; one more try, told to skip straight to the JSON,
-    when a reply has none (a small reasoning model can think its budget away)."""
-    system, user = _SYSTEM % ", ".join(ICONS), _prompt(make_up, done)
+def _system(offered: list[dict] | None) -> str:
+    cards = _TOP_CARDS % _TOP if offered is None else _MORE_CARDS % _MORE_BATCH
+    return _SYSTEM % {"icons": ", ".join(ICONS), "cards": cards}
+
+
+async def _model_skills(tier: dict, make_up: dict, done: dict, owner_id: str,
+                        offered: list[dict] | None = None) -> list[dict]:
+    """The model's cards up front — or, given the ones *offered*, the "More"
+    list. One more try, told to skip straight to the JSON, when a reply has
+    none (a small reasoning model can think its budget away)."""
+    system, user = _system(offered), _prompt(make_up, done)
+    if offered is not None:
+        user += "\n\nAlready offered:\n" + "\n".join(f"- {c['title']}: {c['description']}" for c in offered)
     sources = _sources(make_up, done)
+    limit = _TOP if offered is None else _MORE_BATCH
     try:
-        content, _tokens = await call_model(tier, system, user, owner_id, max_tokens=_MAX_TOKENS)
-        return parse_skills(content, sources)
+        content, _tokens = await call_model(tier, system, user, owner_id, max_tokens=_MAX_TOKENS,
+                                            request_timeout=_CALL_TIMEOUT)
+        return parse_skills(content, sources)[:limit]
     except ValueError:
         content, _tokens = await call_model(tier, system, f"{user}\n\n{_RETRY_NUDGE}", owner_id,
-                                            max_tokens=_MAX_TOKENS)
-        return parse_skills(content, sources)
+                                            max_tokens=_MAX_TOKENS, request_timeout=_CALL_TIMEOUT)
+        return parse_skills(content, sources)[:limit]
 
 
 async def generate(slug: str, entry: dict, owner_id: str) -> dict:
-    """Write the agent's cards and cache them. Without a tier, with the
-    allowance spent or after bad replies, the last model-written set stays
-    (tried again sooner); with none, the cards built without the model."""
+    """Write the agent's cards and cache them, in two passes: the cards up
+    front (cached at once, so they show while the rest are written), then the
+    "More" list. Without a tier, with the allowance spent or after bad
+    replies, the last model-written cards stay (tried again sooner); with
+    none, the cards built without the model."""
     from captain_claw.flight_deck.server import _process_is_alive
 
     make_up = await _make_up(slug, entry, owner_id)
     done = await _agent_reads(entry) if _process_is_alive(slug) else {}
+    prev = read_cache(slug)
+    prev_model = prev if prev and prev.get("source") == "model" else None
     payload: dict = {
         "fingerprint": fingerprint(make_up), "generated_at": time.time(),
         "skills": basic_skills(make_up, done), "source": "basic", "model": "", "error": "",
@@ -433,16 +477,36 @@ async def generate(slug: str, entry: dict, owner_id: str) -> dict:
         error = "daily allowance spent"
     else:
         try:
-            payload.update(skills=await _model_skills(tier, make_up, done, owner_id), source="model",
-                           model=str(tier.get("model") or ""))
+            top = await _model_skills(tier, make_up, done, owner_id)
+            payload.update(skills=top, source="model", model=str(tier.get("model") or ""))
         except Exception as exc:
             log.info("agent skills: model write failed", agent=slug, error=str(exc))
             error = str(exc)[:300]
     if error:
         payload["error"] = error
-        prev = read_cache(slug)
-        if prev and prev.get("source") == "model":
-            payload.update(skills=prev["skills"], source="model", model=prev.get("model") or "")
+        if prev_model:
+            payload.update(skills=prev_model["skills"], source="model", model=prev_model.get("model") or "")
+        _write_cache(slug, payload)
+        return payload
+
+    _write_cache(slug, payload)
+    cards = list(top)
+    while len(cards) < _MAX_SKILLS:
+        try:
+            batch = await _model_skills(tier, make_up, done, owner_id, offered=cards)
+        except Exception as exc:
+            log.info("agent skills: more cards failed", agent=slug, error=str(exc))
+            payload["error"] = str(exc)[:300]
+            if prev_model:  # the earlier "More" cards fill in, until the retry
+                cards = _dedupe(cards + prev_model["skills"][_TOP:])
+            break
+        grown = _dedupe(cards + batch)
+        if len(grown) == len(cards):
+            break  # nothing new: the agent's range is covered
+        cards = grown
+        payload["skills"] = cards
+        _write_cache(slug, payload)
+    payload["skills"] = cards
     _write_cache(slug, payload)
     return payload
 

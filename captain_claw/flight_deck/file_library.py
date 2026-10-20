@@ -502,15 +502,19 @@ def _parse_reply(content: str) -> dict:
 
 
 async def call_model(tier: dict, system: str, user: str, owner_id: str,
-                     max_tokens: int = _MAX_TOKENS) -> tuple[str, int]:
+                     max_tokens: int = _MAX_TOKENS,
+                     request_timeout: float | None = None) -> tuple[str, int]:
     """One call to *tier*'s model: (reply text, tokens spent). The tokens
-    count toward the owner's daily allowance."""
+    count toward the owner's daily allowance. ``request_timeout`` overrides
+    the provider's own (Ollama's is 120s) for a long background call."""
     from captain_claw.flight_deck.basna_routes import tier_api_key
     from captain_claw.llm import Message, create_provider
     provider = create_provider(
         provider=tier.get("provider", "anthropic"), model=tier.get("model", ""),
         base_url=tier.get("base_url") or None, api_key=tier_api_key(tier),
         temperature=0.2, max_tokens=max_tokens)
+    if request_timeout:
+        provider.request_timeout = request_timeout
     resp = await provider.complete(
         messages=[Message(role="system", content=system), Message(role="user", content=user)],
         temperature=0.2, max_tokens=max_tokens)

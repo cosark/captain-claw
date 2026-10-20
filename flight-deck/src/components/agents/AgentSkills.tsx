@@ -1,21 +1,42 @@
 import { useEffect, useRef } from 'react'
-import { ChevronDown, Loader2, RefreshCw, Sparkles } from 'lucide-react'
+import { ChevronDown, ChevronRight, Loader2, RefreshCw, Sparkles } from 'lucide-react'
 import { useAuthStore } from '../../stores/authStore'
-import { SKILL_ICONS, type AgentSkill } from '../../services/agentSkills'
+import { SKILL_ICONS, SKILLS_UP_FRONT, type AgentSkill } from '../../services/agentSkills'
 import type { SkillsState } from '../../hooks/useAgentSkills'
+import { AgentDialog } from '../layout/KioskAgentDialogs'
 
 // The kiosk chat's "things I can do": a greeting with the agent's top cards
-// on an empty chat (or a fresh topic), and the same cards behind the
-// composer's "What can I do?" button. A card's click sends its prompt.
+// on an empty chat (or a fresh topic), the first few behind the composer's
+// "What can I do?" button, and every one in its "More" dialog. A card's
+// click sends its prompt.
 
-function SkillIcon({ name, size }: { name: string; size: 'sm' | 'lg' }) {
+const ICON_SIZE = {
+  sm: ['h-8 w-8 rounded-lg', 'h-4 w-4'],
+  md: ['h-10 w-10 rounded-xl', 'h-5 w-5'],
+  lg: ['h-11 w-11 rounded-xl wide:h-12 wide:w-12', 'h-5 w-5 wide:h-6 wide:w-6'],
+} as const
+
+function SkillIcon({ name, size }: { name: string; size: keyof typeof ICON_SIZE }) {
   const Icon = SKILL_ICONS[name] || Sparkles
+  const [box, glyph] = ICON_SIZE[size]
   return (
-    <span className={`flex shrink-0 items-center justify-center bg-violet-500/10 text-violet-600 dark:text-violet-300 ${
-      size === 'lg' ? 'h-11 w-11 rounded-xl wide:h-12 wide:w-12' : 'h-8 w-8 rounded-lg'
-    }`}>
-      <Icon className={size === 'lg' ? 'h-5 w-5 wide:h-6 wide:w-6' : 'h-4 w-4'} strokeWidth={1.75} />
+    <span className={`flex shrink-0 items-center justify-center bg-violet-500/10 text-violet-600 dark:text-violet-300 ${box}`}>
+      <Icon className={glyph} strokeWidth={1.75} />
     </span>
+  )
+}
+
+function RefreshButton({ skills }: { skills: SkillsState }) {
+  return (
+    <button
+      type="button"
+      onClick={skills.refresh}
+      disabled={skills.generating}
+      title="Suggest again from what the agent knows now"
+      className="ml-auto rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-300 disabled:opacity-60"
+    >
+      <RefreshCw className={`h-4 w-4 ${skills.generating ? 'animate-spin' : ''}`} />
+    </button>
   )
 }
 
@@ -86,12 +107,14 @@ export function ChatGreeting({ skills, disabled, onPick, onMore }: {
 
 /** The composer's "What can I do?" button and its list. The list opens above
  *  the composer: the nearest positioned ancestor places it. */
-export function SkillsMenu({ skills, open, setOpen, disabled, onPick, compact }: {
+export function SkillsMenu({ skills, open, setOpen, disabled, onPick, onMore, compact }: {
   skills: SkillsState
   open: boolean
   setOpen: (open: boolean) => void
   disabled: boolean
   onPick: (skill: AgentSkill) => void
+  /** Open the dialog with every card. */
+  onMore: () => void
   /** Phone: the button shows its icon only. */
   compact?: boolean
 }) {
@@ -116,6 +139,7 @@ export function SkillsMenu({ skills, open, setOpen, disabled, onPick, compact }:
   }, [open])
 
   if (!skills.available) return null
+  const more = skills.skills.length - SKILLS_UP_FRONT
   return (
     <>
       <button
@@ -142,15 +166,7 @@ export function SkillsMenu({ skills, open, setOpen, disabled, onPick, compact }:
           <div className="flex items-center gap-2 border-b border-zinc-800 px-4 py-2.5">
             <span className="text-sm font-medium text-zinc-200">Things I can do</span>
             {skills.generating && <span className="text-xs text-zinc-500">· finding more…</span>}
-            <button
-              type="button"
-              onClick={skills.refresh}
-              disabled={skills.generating}
-              title="Suggest again from what the agent knows now"
-              className="ml-auto rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-300 disabled:opacity-60"
-            >
-              <RefreshCw className={`h-4 w-4 ${skills.generating ? 'animate-spin' : ''}`} />
-            </button>
+            <RefreshButton skills={skills} />
           </div>
           <div className="overflow-y-auto p-1.5">
             {skills.skills.length === 0 && (
@@ -159,7 +175,7 @@ export function SkillsMenu({ skills, open, setOpen, disabled, onPick, compact }:
                 {skills.loading ? 'Looking at what I can do…' : 'Nothing to suggest yet.'}
               </div>
             )}
-            {skills.skills.map((s) => (
+            {skills.skills.slice(0, SKILLS_UP_FRONT).map((s) => (
               <button
                 key={s.title}
                 type="button"
@@ -176,8 +192,78 @@ export function SkillsMenu({ skills, open, setOpen, disabled, onPick, compact }:
               </button>
             ))}
           </div>
+          {more > 0 && (
+            <button
+              type="button"
+              onClick={() => { setOpen(false); onMore() }}
+              className="flex shrink-0 items-center justify-center gap-1 border-t border-zinc-800 px-4 py-2.5 text-sm font-medium text-violet-600 transition-colors hover:bg-zinc-800 dark:text-violet-300"
+            >
+              More
+              <span className="font-normal text-zinc-500">· {more}</span>
+              <ChevronRight className="h-4 w-4" />
+            </button>
+          )}
         </div>
       )}
     </>
+  )
+}
+
+function SkillCard({ skill, disabled, onPick }: { skill: AgentSkill; disabled: boolean; onPick: (skill: AgentSkill) => void }) {
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={() => onPick(skill)}
+      title={skill.prompt}
+      className="flex w-full items-start gap-3 rounded-2xl border border-zinc-800 bg-zinc-900/60 px-4 py-3 text-left transition-colors hover:border-violet-500/40 hover:bg-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      <SkillIcon name={skill.icon} size="md" />
+      <span className="min-w-0 pt-0.5">
+        <span className="block text-[15px] font-semibold leading-snug tracking-tight text-zinc-100">{skill.title}</span>
+        <span className="mt-0.5 line-clamp-2 block text-sm text-zinc-400">{skill.description}</span>
+      </span>
+    </button>
+  )
+}
+
+/** Every card the agent has: the ones offered up front, then the rest. */
+export function SkillsDialog({ skills, agentName, disabled, onPick, onClose }: {
+  skills: SkillsState
+  agentName: string
+  disabled: boolean
+  onPick: (skill: AgentSkill) => void
+  onClose: () => void
+}) {
+  const pick = (s: AgentSkill) => { onClose(); onPick(s) }
+  const sections = [
+    { title: 'Suggested', cards: skills.skills.slice(0, SKILLS_UP_FRONT) },
+    { title: 'More', cards: skills.skills.slice(SKILLS_UP_FRONT) },
+  ].filter((sec) => sec.cards.length > 0)
+  return (
+    <AgentDialog title="Things I can do" icon={Sparkles} agentName={agentName} size="lg" onClose={onClose}>
+      <div className="flex shrink-0 items-center gap-2 border-b border-zinc-800 px-5 py-2 text-sm text-zinc-500">
+        <span className="min-w-0 truncate">
+          {skills.generating ? 'Finding more…' : disabled ? 'Ready when the current reply finishes.' : 'Pick one and I start on it right away.'}
+        </span>
+        <RefreshButton skills={skills} />
+      </div>
+      <div className="flex-1 overflow-y-auto px-5 py-4">
+        {sections.length === 0 && (
+          <div className="flex items-center gap-2 py-6 text-sm text-zinc-500">
+            {skills.loading && <Loader2 className="h-4 w-4 animate-spin" />}
+            {skills.loading ? 'Looking at what I can do…' : 'Nothing to suggest yet.'}
+          </div>
+        )}
+        {sections.map((sec) => (
+          <section key={sec.title} className="mb-6 last:mb-0">
+            <h3 className="mb-2.5 text-xs font-medium uppercase tracking-wider text-zinc-500">{sec.title}</h3>
+            <div className="grid grid-cols-1 gap-2.5 wide:grid-cols-2">
+              {sec.cards.map((s) => <SkillCard key={s.title} skill={s} disabled={disabled} onPick={pick} />)}
+            </div>
+          </section>
+        ))}
+      </div>
+    </AgentDialog>
   )
 }
