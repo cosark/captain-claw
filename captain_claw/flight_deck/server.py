@@ -3017,7 +3017,7 @@ async def restart_container(container_id: str, request: Request, user: dict | No
 
 
 @app.delete("/fd/containers/{container_id}", response_model=ContainerActionResult)
-async def remove_container(container_id: str, force: bool = False, request: Request = None, user: dict | None = _agent_manager_dep):
+async def remove_container(container_id: str, force: bool = False, purge: bool = False, request: Request = None, user: dict | None = _agent_manager_dep):
     import asyncio
     c = _find_container(container_id, getattr(request.state, "user_id", ""))
     name = c.name
@@ -3026,7 +3026,68 @@ async def remove_container(container_id: str, force: bool = False, request: Requ
     await asyncio.get_event_loop().run_in_executor(None, lambda: c.remove(force=force))
     await _set_owner_agent_instructions(owner_id, "docker", short_id, "")
     await _forget_shared_agent(agent_ref, owner_id)
+    if purge:
+        problem = await _purge_agent(name, short_id)
+        if problem:
+            return ContainerActionResult(ok=False, container_id=container_id, message=f"Removed '{name}', but {problem}")
     return ContainerActionResult(ok=True, container_id=container_id, message=f"Removed '{name}'")
+
+
+def _remove_agent_dir(slug: str) -> str:
+    """Delete ``DATA_DIR/<slug>``, a removed agent's whole folder (config,
+    workspace, sessions, memory, datastore, logs). Only ever one folder
+    directly under DATA_DIR. Returns "" or why some of it stayed."""
+    if not slug or slug in (".", "..") or "/" in slug or "\\" in slug:
+        return f"its folder name {slug!r} is not one Flight Deck deletes"
+    target = DATA_DIR / slug
+    if target.is_symlink():
+        target.unlink()  # the link, never what it points at
+        return ""
+    if not target.exists():
+        return ""
+    if target.resolve().parent != DATA_DIR.resolve():
+        return f"its folder {target} is outside the data directory"
+
+    failed: list[str] = []
+
+    def _retry(func, path, _exc_info):
+        # Read-only entries (git objects, a copied package): make them and
+        # their folder writable, then try once more.
+        try:
+            os.chmod(os.path.dirname(path), 0o700)
+            os.chmod(path, 0o700)
+            func(path)
+        except OSError:
+            failed.append(path)
+
+    shutil.rmtree(target, onerror=_retry)
+    if target.exists():
+        return f"{len(failed) or 'some'} item(s) in {target} could not be deleted"
+    return ""
+
+
+async def _purge_agent(slug: str, chat_agent_id: str) -> str:
+    """Delete what a removed agent leaves on this deck: its folder, Flight
+    Deck's log of the chats with it and its scheduled tasks — so a later agent
+    of the same name starts clean. Returns "" or what could not go."""
+    import asyncio
+    problem = await asyncio.get_event_loop().run_in_executor(None, _remove_agent_dir, slug)
+    if problem:
+        log.warning("Could not delete a removed agent's folder", agent=slug, problem=problem)
+    try:
+        if AUTH_ENABLED:
+            from captain_claw.flight_deck.auth import get_db
+
+            await get_db().delete_chat_sessions_for_agent(chat_agent_id)
+    except Exception as exc:
+        log.warning("Could not drop a removed agent's chat log", agent=slug, error=type(exc).__name__)
+    try:
+        from captain_claw.flight_deck.fd_scheduler import get_store as _scheduler_store
+
+        _scheduler_store().delete_for_agent(slug)
+    except Exception as exc:
+        log.warning("Could not drop a removed agent's scheduled tasks", agent=slug, error=type(exc).__name__)
+    return problem
 
 
 def _refuse_other_owners_container(existing, owner_id: str, slug: str) -> None:
@@ -3721,8 +3782,9 @@ async def update_agent_config(
 
 
 class AgentModelUpdate(BaseModel):
-    provider: str
-    model: str
+    # Both empty leaves the model as it is (a vision-only change).
+    provider: str = ""
+    model: str = ""
     api_key: str | None = None
     vision: str | None = None  # auto | on | off; None leaves it as it is
 
@@ -3736,6 +3798,9 @@ async def update_agent_model(
     in all config locations."""
     if kind not in ("docker", "process"):
         raise HTTPException(400, "kind must be 'docker' or 'process'")
+    changes_model = bool(body.provider.strip() or body.model.strip())
+    if not changes_model and body.vision is None:
+        raise HTTPException(400, "Nothing to update: give a provider and model, or vision")
     user_id = getattr(request.state, "user_id", "")
     agent_dir = _resolve_agent_dir(identifier, kind, user_id)
 
@@ -3758,13 +3823,14 @@ async def update_agent_model(
             data = {}
         if "model" not in data or not isinstance(data.get("model"), dict):
             data["model"] = {}
-        data["model"]["provider"] = body.provider
-        data["model"]["model"] = body.model
-        if body.provider.strip() in {"antigravity-cli", "antigravity", "google-subscription"}:
-            data["model"].pop("api_key", None)
-            data["model"].pop("base_url", None)
-        elif body.api_key is not None:
-            data["model"]["api_key"] = body.api_key
+        if changes_model:
+            data["model"]["provider"] = body.provider
+            data["model"]["model"] = body.model
+            if body.provider.strip() in {"antigravity-cli", "antigravity", "google-subscription"}:
+                data["model"].pop("api_key", None)
+                data["model"].pop("base_url", None)
+            elif body.api_key is not None:
+                data["model"]["api_key"] = body.api_key
         if body.vision is not None:
             switch = _vision_switch(body.vision)
             if switch is None:
@@ -3803,18 +3869,59 @@ async def update_agent_mode(
     user_id = getattr(request.state, "user_id", "")
     agent_dir = _resolve_agent_dir(identifier, kind, user_id)
 
-    # Write to all potential home config locations.
-    for subdir in ("home-config", "home-config-parent"):
-        cc_dir = agent_dir / "data" / subdir / ".captain-claw"
+    # Write to all potential home config locations — the agent's own
+    # ~/.captain-claw among them. Neutra is written too, not left out: with no
+    # file the agent falls back to its config's default mode, which an
+    # archetype may have set to another one.
+    cc_dirs = [agent_dir / "data" / subdir / ".captain-claw" for subdir in ("home-config", "home-config-parent")]
+    if kind == "docker":
+        cc_dirs.append(_agent_home_cc(agent_dir, kind))
+    for cc_dir in cc_dirs:
         if cc_dir.is_dir():
-            mode_file = cc_dir / "cognitive_mode.txt"
-            if mode_name == "neutra":
-                # Remove file for neutra (default no-op).
-                mode_file.unlink(missing_ok=True)
-            else:
-                mode_file.write_text(mode_name, encoding="utf-8")
+            (cc_dir / "cognitive_mode.txt").write_text(mode_name, encoding="utf-8")
 
     return {"ok": True, "mode": mode_name, "message": "Mode updated. Takes effect on the agent's next response."}
+
+
+def _agent_home_cc(agent_dir: Path, kind: str) -> Path:
+    """The agent's own ~/.captain-claw: a process agent runs with
+    HOME=data/home-config-parent; a container bind-mounts data/home-config."""
+    if kind == "docker":
+        return agent_dir / "data" / "home-config"
+    return agent_dir / "data" / "home-config-parent" / ".captain-claw"
+
+
+@app.get("/fd/agent-mode/{kind}/{identifier}")
+async def get_agent_mode(
+    kind: str, identifier: str, request: Request,
+    user: dict | None = _agent_manager_dep,
+):
+    """An agent's cognitive mode as the agent resolves it: its
+    cognitive_mode.txt, else its config's default mode, else neutra."""
+    if kind not in ("docker", "process"):
+        raise HTTPException(400, "kind must be 'docker' or 'process'")
+    from captain_claw.cognitive_mode import MODES
+
+    user_id = getattr(request.state, "user_id", "")
+    agent_dir = _resolve_agent_dir(identifier, kind, user_id)
+    cc_dir = _agent_home_cc(agent_dir, kind)
+    try:
+        text = (cc_dir / "cognitive_mode.txt").read_text(encoding="utf-8").strip().lower()
+        if text in MODES:
+            return {"mode": text}
+    except OSError:
+        pass
+    for cfg in (cc_dir / "config.yaml", agent_dir / "config.yaml"):
+        try:
+            data = yaml.safe_load(cfg.read_text()) or {}
+        except Exception:
+            continue
+        section = data.get("cognitive_mode") if isinstance(data, dict) else None
+        mode = str((section or {}).get("default_mode") or "").strip().lower() if isinstance(section, dict) else ""
+        if mode in MODES:
+            return {"mode": mode}
+        break
+    return {"mode": "neutra"}
 
 
 class AgentEcoModeUpdate(BaseModel):
@@ -8184,9 +8291,10 @@ async def restart_process(slug: str, request: Request, user: dict | None = _agen
 
 
 @app.delete("/fd/processes/{slug}", response_model=ProcessActionResult)
-async def remove_process(slug: str, force: bool = False, request: Request = None, user: dict | None = _agent_manager_dep):
+async def remove_process(slug: str, force: bool = False, purge: bool = False, request: Request = None, user: dict | None = _agent_manager_dep):
     _verify_process_owner(slug, getattr(request.state, "user_id", ""))
-    """Remove a process agent from the registry. Stops it first if running."""
+    """Remove a process agent from the registry. Stops it first if running.
+    With ``purge`` its folder, chat log and scheduled tasks are deleted too."""
     if _process_is_alive(slug):
         _do_stop_process(slug)
 
@@ -8199,6 +8307,11 @@ async def remove_process(slug: str, force: bool = False, request: Request = None
     # …and its instructions, so a later agent of the same name doesn't inherit them.
     await _set_owner_agent_instructions(owner_id, "process", slug, "")
     await _forget_shared_agent(agent_ref, owner_id)
+    if purge:
+        problem = await _purge_agent(slug, f"proc-{slug}")
+        if problem:
+            return ProcessActionResult(ok=False, slug=slug, message=f"Removed '{slug}', but {problem}")
+        return ProcessActionResult(ok=True, slug=slug, message=f"Removed '{slug}' and deleted its folder")
 
     return ProcessActionResult(ok=True, slug=slug, message=f"Removed '{slug}' from registry")
 

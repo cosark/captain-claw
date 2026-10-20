@@ -291,8 +291,14 @@ function purgeSharedSlices(): void {
 /** Drop this user's queue and plan slices of one shared agent, every lane —
  *  for a member leaving it (a later re-share starts clean). */
 export function clearSharedSlices(agentRef: string): void {
+  clearAgentSlices(sharedContainerId(agentRef))
+}
+
+/** Drop the queue and plan slices of one agent, every lane — for an agent
+ *  gone for good (a later one of the same name starts clean). */
+export function clearAgentSlices(agentId: string): void {
   for (const lane of LANES) {
-    const key = laneKey(sharedContainerId(agentRef), lane)
+    const key = laneKey(agentId, lane)
     try {
       window.localStorage.removeItem(_queueLSKey(key))
       window.localStorage.removeItem(_planLSKey(key))

@@ -27,11 +27,13 @@ import {
   Compass,
   AlarmClock,
   LibraryBig,
+  SlidersHorizontal,
+  Trash2,
 } from 'lucide-react'
 import { useUIStore } from '../../stores/uiStore'
 import { useAgentStore } from '../../stores/agentStore'
 import { useAuthStore, logoutUser } from '../../stores/authStore'
-import { useChatStore, parseLaneKey } from '../../stores/chatStore'
+import { useChatStore, parseLaneKey, clearAgentSlices } from '../../stores/chatStore'
 import { useNotificationStore } from '../../stores/notificationStore'
 import { useContainerStore } from '../../stores/containerStore'
 import { useLocalAgentStore } from '../../stores/localAgentStore'
@@ -62,6 +64,9 @@ import { NotificationBell } from '../common/NotificationCenter'
 import { BrandMark } from '../common/BrandMark'
 import { KioskInfoDialog, type InfoAgent } from './KioskInfoDialog'
 import { KioskOnboardingDialog, type OnboardingAction } from './KioskOnboardingDialog'
+import {
+  AgentMenu, KioskAgentInfoDialog, KioskAgentSettingsDialog, KioskRemoveAgentDialog, type AgentMenuItem,
+} from './KioskAgentDialogs'
 import { useIsMobile } from '../../hooks/useMediaQuery'
 
 // ── Simple layout ────────────────────────────────────────────────────
@@ -122,8 +127,13 @@ function initials(name: string): string {
 const iconBtn = 'rounded p-1.5 text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-300'
 
 export function SimpleLayout({ locked = false }: { locked?: boolean }) {
-  const { containers, fetchContainers, checkHealth, startContainer, stopContainer, descriptionOverrides: dockerDesc } = useContainerStore()
-  const { processes, fetchProcesses, startProcess, stopProcess, descriptionOverrides: procDesc } = useProcessStore()
+  const {
+    containers, fetchContainers, checkHealth, startContainer, stopContainer, restartContainer, removeContainer,
+    descriptionOverrides: dockerDesc,
+  } = useContainerStore()
+  const {
+    processes, fetchProcesses, startProcess, stopProcess, restartProcess, removeProcess, descriptionOverrides: procDesc,
+  } = useProcessStore()
   const { agents: localAgents, probeAll, probeAgent } = useLocalAgentStore()
   // Do NOT subscribe to the whole `sessions` Map — its identity churns on every
   // streaming event, which would re-render this always-mounted layout (and the
@@ -176,6 +186,11 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
   const [settingsOpen, setSettingsOpen] = useState(false)
   // Kiosk Info dialog — models, agents, archetypes, profile, plan, connections.
   const [infoOpen, setInfoOpen] = useState(false)
+  // Kiosk agent dialogs from an agent's "⋯": its Info (intentions, topics),
+  // its Settings and its removal. By id — they follow the live agent row.
+  const [agentInfoId, setAgentInfoId] = useState<string | null>(null)
+  const [agentSettingsId, setAgentSettingsId] = useState<string | null>(null)
+  const [agentRemoveId, setAgentRemoveId] = useState<string | null>(null)
   // Kiosk Getting started guide. It opens by itself once per page load (so
   // once per person on a shared kiosk: sign-out reloads) until its "Do not
   // show again" is ticked — which is per user, so it waits for their settings.
@@ -342,6 +357,20 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
     setBooting((prev) => { if (!prev.has(id)) return prev; const n = new Set(prev); n.delete(id); return n })
   }
 
+  // Its chats go first: a session left open reconnects to an agent that is no
+  // longer there and fills with "Connection failed" — already while the agent
+  // is shutting down. The conversation is the agent's; it comes back when the
+  // chat is opened again. A queue on Auto is parked — on every lane, open
+  // here or not: what was interrupted must not re-run by itself when the chat
+  // next connects.
+  const releaseChats = (id: string) => {
+    const chat = useChatStore.getState()
+    chat.parkQueues(id)
+    for (const [key, session] of [...chat.sessions]) {
+      if (session.containerId === id) chat.disconnectChat(key)
+    }
+  }
+
   // Power an agent on or off — the one switch a kiosk user has over an agent
   // of theirs (Flight Deck only lets them act on their own). A local agent
   // isn't ours to start or stop: "on" just checks whether it's back.
@@ -366,17 +395,7 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
     try {
       if (!on) {
         endBoot(a.id)
-        // Its chats go first: a session left open reconnects to an agent that
-        // is no longer there and fills with "Connection failed" — already
-        // while the agent is shutting down. The conversation is the agent's;
-        // it comes back when the chat is opened again. A queue on Auto is
-        // parked — on every lane, open here or not: what was interrupted must
-        // not re-run by itself when the chat next connects.
-        const chat = useChatStore.getState()
-        chat.parkQueues(a.id)
-        for (const [key, session] of [...chat.sessions]) {
-          if (session.containerId === a.id) chat.disconnectChat(key)
-        }
+        releaseChats(a.id)
       }
       if (a.kind === 'docker') await (on ? startContainer : stopContainer)(a.startKey)
       else if (a.kind === 'process') await (on ? startProcess : stopProcess)(a.startKey)
@@ -396,6 +415,82 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
       setSwitching((prev) => { const n = new Set(prev); n.delete(a.id); return n })
     }
   }
+
+  // Restart an agent so what it reads at start-up (vision) applies. Its chats
+  // close as for a power-off and the one in front opens again once it answers.
+  const handleRestart = async (a: SimpleAgent): Promise<boolean> => {
+    if (a.kind !== 'docker' && a.kind !== 'process') return false
+    const chat = useChatStore.getState()
+    const busy = [...chat.sessions.values()].some((x) => x.containerId === a.id && x.busy)
+    if (!confirm(
+      (busy ? `${a.name} is working right now. Restart it anyway?` : `Restart ${a.name}?`)
+      + ' Anything it is doing will be interrupted.'
+      + (chat.parkQueues(a.id, true) ? ' Its queue will wait — switch Auto back on to continue it.' : ''),
+    )) return false
+    setSwitching((prev) => new Set(prev).add(a.id))
+    try {
+      endBoot(a.id)
+      releaseChats(a.id)
+      await (a.kind === 'docker' ? restartContainer : restartProcess)(a.startKey)
+      startBoot(a.id, false)
+      return true
+    } catch (e) {
+      useNotificationStore.getState().add('error', 'Could not restart agent',
+        `${a.name}: ${e instanceof Error ? e.message : String(e)}`)
+      return false
+    } finally {
+      setSwitching((prev) => { const n = new Set(prev); n.delete(a.id); return n })
+    }
+  }
+
+  // Remove an agent for good: Flight Deck stops it and deletes it with its
+  // folder, its chat log and the scheduled tasks that run it; here its chats
+  // close and their queues go, so nothing of it comes back under its name.
+  const handleRemove = async (a: SimpleAgent) => {
+    if (a.kind !== 'docker' && a.kind !== 'process') return
+    setSwitching((prev) => new Set(prev).add(a.id))
+    try {
+      endBoot(a.id)
+      releaseChats(a.id)
+      const result = a.kind === 'docker' ? await removeContainer(a.startKey, true) : await removeProcess(a.startKey, true)
+      clearAgentSlices(a.id)
+      setAgentRemoveId(null)
+      if (result.ok) useNotificationStore.getState().add('info', 'Agent removed', `${a.name} and its folder are gone.`)
+      else useNotificationStore.getState().add('warning', 'Agent removed — not everything went', result.message)
+      fetchScheduled()
+    } catch (e) {
+      // Still listed (and maybe switched off by now): the list says how it is.
+      if (a.kind === 'docker') fetchContainers()
+      else fetchProcesses()
+      throw e
+    } finally {
+      setSwitching((prev) => { const n = new Set(prev); n.delete(a.id); return n })
+    }
+  }
+
+  // The kiosk's "⋯" on an agent. Settings and Remove are for the user's own
+  // agents only — not one shared with them, a local one, or one Flight Deck
+  // runs itself.
+  const agentMenuItems = (a: SimpleAgent): AgentMenuItem[] => {
+    if (a.kind === 'shared') return []
+    const up = a.reachable && !booting.has(a.id) && !switching.has(a.id)
+    const items: AgentMenuItem[] = [{
+      icon: Info, label: 'Info', hint: up ? 'Its intentions and topics' : 'Power it on to see its intentions and topics',
+      onSelect: () => setAgentInfoId(a.id), disabled: !up,
+    }]
+    if ((a.kind === 'docker' || a.kind === 'process') && !a.managed) {
+      items.push(
+        { icon: SlidersHorizontal, label: 'Settings', hint: 'How it thinks, and vision', onSelect: () => setAgentSettingsId(a.id) },
+        { icon: Trash2, label: 'Remove agent', hint: 'Delete it and its folder', danger: true,
+          onSelect: () => setAgentRemoveId(a.id), disabled: switching.has(a.id) },
+      )
+    }
+    return items
+  }
+  const menuFor = locked ? agentMenuItems : undefined
+  const agentInfo = agentInfoId ? agents.find((a) => a.id === agentInfoId) : undefined
+  const agentSettings = agentSettingsId ? agents.find((a) => a.id === agentSettingsId) : undefined
+  const agentRemove = agentRemoveId ? agents.find((a) => a.id === agentRemoveId) : undefined
 
   const refresh = () => { fetchContainers(); fetchProcesses(); fetchShared(); probeAll() }
 
@@ -549,6 +644,28 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
           <DataLibrary phone={isMobile} onClose={closeData} onOpenAgent={openLibraryAgent} />
         </KioskWideDialog>
       )}
+      {locked && agentInfo && (
+        <KioskAgentInfoDialog agent={agentInfo} phone={isMobile} onClose={() => setAgentInfoId(null)} />
+      )}
+      {locked && agentSettings && (agentSettings.kind === 'docker' || agentSettings.kind === 'process') && (
+        <KioskAgentSettingsDialog
+          agent={{ ...agentSettings, kind: agentSettings.kind }}
+          restarting={switching.has(agentSettings.id)}
+          onRestart={() => handleRestart(agentSettings)}
+          onClose={() => setAgentSettingsId(null)}
+        />
+      )}
+      {locked && agentRemove && (
+        <KioskRemoveAgentDialog
+          agent={agentRemove}
+          busy={!!sessionInfo.get(agentRemove.id)?.busy}
+          onRemove={() => handleRemove(agentRemove)}
+          onOpenLibrary={agentRemove.kind === 'process'
+            ? () => { setAgentRemoveId(null); openLibrary(agentRemove.startKey) }
+            : undefined}
+          onClose={() => setAgentRemoveId(null)}
+        />
+      )}
       {locked && connectionsOpen && <KioskConnectionsDialog initialTab={connectionsTab} onClose={() => setConnectionsOpen(false)} />}
       {locked && profileOpen && <KioskProfileDialog onClose={() => setProfileOpen(false)} />}
 
@@ -585,6 +702,7 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
           scheduledRunning={scheduledRunning}
           onLibrary={() => openLibrary()}
           onData={() => openData()}
+          menuFor={menuFor}
           locked={locked}
         />
         {dialogs}
@@ -613,6 +731,7 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
         scheduledRunning={scheduledRunning}
         onLibrary={() => openLibrary()}
         onData={() => openData()}
+        menuFor={menuFor}
         locked={locked}
       />
 
@@ -626,6 +745,9 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
         agentId={activeAgentId}
         agentName={activeSessionName}
         onOptions={!locked && activeAgent && activeAgent.kind !== 'shared' ? () => setOptionsAgent(activeAgent) : undefined}
+        menu={menuFor && activeAgent && menuFor(activeAgent).length > 0
+          ? <AgentMenu agentName={activeAgent.name} items={menuFor(activeAgent)} shown />
+          : undefined}
       />
 
       {dialogs}
@@ -877,7 +999,7 @@ function ToolTiles({ onScheduled, scheduledCount, scheduledRunning, onLibrary, o
 
 function AgentsColumn({
   agents, activeAgentId, sessionInfo, switching, booting, onOpen, onPower, onLeave, onRefresh, onSpawn, onOptions, onSettings, onInfo,
-  onScheduled, scheduledCount = 0, scheduledRunning = false, onLibrary, onData, locked = false,
+  onScheduled, scheduledCount = 0, scheduledRunning = false, onLibrary, onData, menuFor, locked = false,
 }: {
   agents: SimpleAgent[]
   activeAgentId: string | null
@@ -905,6 +1027,8 @@ function AgentsColumn({
   onLibrary?: () => void
   /** Opens the Data library. */
   onData?: () => void
+  /** Kiosk only: what an agent's "⋯" offers (Info, Settings, Remove). */
+  menuFor?: (a: SimpleAgent) => AgentMenuItem[]
   locked?: boolean
 }) {
   const open = useUIStore((s) => s.simpleLeftOpen)
@@ -1131,6 +1255,7 @@ function AgentsColumn({
             const powered = a.state === 'running'
             const canPower = a.kind !== 'local' && !shared && !a.managed && (powered || a.state === 'stopped')
             const canRecheck = a.kind === 'local' && a.state !== 'running' && !locked
+            const menu = menuFor?.(a) ?? []
             return (
               <li key={a.id} className="group flex items-center gap-0.5">
                 <button
@@ -1191,6 +1316,7 @@ function AgentsColumn({
                     <Settings className="h-3.5 w-3.5" />
                   </button>
                 )}
+                {menu.length > 0 && <AgentMenu agentName={a.name} items={menu} />}
                 {canPower && (
                   <button
                     onClick={() => onPower(a, !powered)}
@@ -1364,7 +1490,13 @@ function EmptyChat({ hasAgents, onSpawn, locked = false, onGuide }: {
 
 // ── Right: files + datastore of the active agent ─────────────────────
 
-function ContextColumn({ agentId, agentName, onOptions }: { agentId: string | null; agentName: string; onOptions?: () => void }) {
+function ContextColumn({ agentId, agentName, onOptions, menu }: {
+  agentId: string | null
+  agentName: string
+  onOptions?: () => void
+  /** Kiosk only: the active agent's "⋯". */
+  menu?: ReactNode
+}) {
   // A shared agent: on a process agent, on a deck that serves them, the
   // member's commons panels (the agent's saved/ files and datastore, read
   // through Flight Deck's member routes); otherwise chat only — a Docker
@@ -1442,6 +1574,7 @@ function ContextColumn({ agentId, agentName, onOptions }: { agentId: string | nu
               <Settings className="h-3.5 w-3.5" />
             </button>
           )}
+          {agentId && menu}
           <button onClick={() => setOpen(false)} className={iconBtn} title="Hide files and data">
             <ChevronRight className="h-4 w-4" />
           </button>
@@ -1536,7 +1669,7 @@ function ContextColumn({ agentId, agentName, onOptions }: { agentId: string | nu
 
 function PhoneLayout({
   agents, activeAgent, activeAgentId, activeSessionName, sessionInfo, switching, booting,
-  onOpen, onPower, onLeave, onSpawn, onSettings, onInfo, onScheduled, scheduledRunning = false, onLibrary, onData, locked,
+  onOpen, onPower, onLeave, onSpawn, onSettings, onInfo, onScheduled, scheduledRunning = false, onLibrary, onData, menuFor, locked,
 }: {
   agents: SimpleAgent[]
   activeAgent: SimpleAgent | null
@@ -1555,6 +1688,8 @@ function PhoneLayout({
   scheduledRunning?: boolean
   onLibrary?: () => void
   onData?: () => void
+  /** Kiosk only: what an agent's "⋯" offers (Info, Settings, Remove). */
+  menuFor?: (a: SimpleAgent) => AgentMenuItem[]
   locked: boolean
 }) {
   const wsConnected = useAgentStore((s) => s.wsConnected)
@@ -1608,6 +1743,7 @@ function PhoneLayout({
   if (showChat) {
     const a = activeAgent
     const info = activeAgentId ? sessionInfo.get(activeAgentId) : undefined
+    const menu = a && menuFor ? menuFor(a) : []
     return (
       <div className="flex h-[100dvh] flex-col overflow-hidden bg-zinc-950">
         <header className="flex h-14 shrink-0 items-center gap-1 border-b border-zinc-800 px-1.5">
@@ -1626,6 +1762,7 @@ function PhoneLayout({
           <button onClick={() => setFilesOpen(true)} className={phoneBtn} aria-label="Files and data" title="Files and data">
             <FolderOpen className="h-5 w-5" />
           </button>
+          {a && menu.length > 0 && <AgentMenu agentName={a.name} items={menu} phone />}
         </header>
         <main className="flex min-h-0 flex-1 flex-col overflow-hidden pb-[env(safe-area-inset-bottom)]">
           <ChatPanel variant="simple" />
@@ -1712,6 +1849,7 @@ function PhoneLayout({
             const openable = !working && ((a.reachable && !isBooting) || hasChat)
             const powered = a.state === 'running'
             const canPower = a.kind !== 'local' && !shared && !a.managed && (powered || a.state === 'stopped')
+            const menu = menuFor?.(a) ?? []
             return (
               <li
                 key={a.id}
@@ -1757,6 +1895,7 @@ function PhoneLayout({
                     {working ? <Loader2 className="h-5 w-5 animate-spin" /> : <Power className="h-5 w-5" />}
                   </button>
                 )}
+                {menu.length > 0 && <AgentMenu agentName={a.name} items={menu} phone />}
                 {shared && (
                   <button
                     onClick={() => onLeave(a)}

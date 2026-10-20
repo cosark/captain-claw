@@ -8,7 +8,7 @@ interface ModelSelectorProps {
   onModelChange?: (provider: string, model: string) => void
 }
 
-interface ModelInfo {
+export interface ModelInfo {
   provider: string
   model: string
   api_key: string
@@ -16,7 +16,7 @@ interface ModelInfo {
   vision: string
 }
 
-const VISION_OPTIONS = [
+export const VISION_OPTIONS = [
   { value: 'auto', label: 'Auto — known multimodal models' },
   { value: 'on', label: 'On — the model sees images itself' },
   { value: 'off', label: 'Off — a vision model describes them' },
@@ -28,7 +28,7 @@ const KNOWN_PROVIDERS = [
   'litert', 'antigravity-cli',
 ]
 
-function parseModelFromYaml(yaml: string): ModelInfo {
+export function parseModelFromYaml(yaml: string): ModelInfo {
   const info: ModelInfo = { provider: '', model: '', api_key: '', vision: 'auto' }
   // Simple YAML parser for the model section
   const lines = yaml.split('\n')

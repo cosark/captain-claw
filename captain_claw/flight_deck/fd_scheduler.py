@@ -653,6 +653,20 @@ class SchedulerStore:
             conn.commit()
             return cur.rowcount > 0
 
+    def delete_for_agent(self, agent_slug: str) -> int:
+        """Drop every job (and its runs) that prompts one agent — for an agent
+        removed for good, so a later one of the same name inherits none."""
+        if not agent_slug:
+            return 0
+        with self._lock:
+            conn = self._conn_or_open()
+            conn.execute(
+                "DELETE FROM scheduler_runs WHERE job_id IN "
+                "(SELECT id FROM scheduler_jobs WHERE agent_slug = ?)", (agent_slug,))
+            cur = conn.execute("DELETE FROM scheduler_jobs WHERE agent_slug = ?", (agent_slug,))
+            conn.commit()
+            return int(cur.rowcount or 0)
+
     def claim(self, job_id: str, *, next_run_at: float | None, enabled: int | None = None) -> None:
         """Move a due job on before it runs, so the next poll doesn't fire it
         again while this run is still going."""

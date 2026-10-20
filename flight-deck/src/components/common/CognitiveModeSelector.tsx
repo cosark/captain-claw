@@ -2,7 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import { createPortal } from 'react-dom'
 import { BrainCog, Check, ChevronDown } from 'lucide-react'
 
-interface ModeInfo {
+export interface ModeInfo {
   id: string
   label: string
   character: string
@@ -12,7 +12,7 @@ interface ModeInfo {
   bgActive: string   // tailwind bg class for active row
 }
 
-const MODES: ModeInfo[] = [
+export const MODES: ModeInfo[] = [
   { id: 'neutra',     label: 'Neutra',     character: 'Balanced generalist',
     description: 'No cognitive bias in any direction. The default mode — responds to cognitive tempo as the primary driver. Equal weight to analysis, creativity, speed, and caution.',
     color: 'bg-zinc-500',    textColor: 'text-zinc-400',    bgActive: 'bg-zinc-500/10' },

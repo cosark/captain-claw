@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { ContainerInfo } from '../services/docker'
+import type { ContainerActionResult, ContainerInfo } from '../services/docker'
 import * as dockerApi from '../services/docker'
 import { queueSave, registerHydrator } from '../services/settingsSync'
 import { useAuthStore } from './authStore'
@@ -48,7 +48,8 @@ interface ContainerStore {
   stopContainer: (id: string) => Promise<void>
   startContainer: (id: string) => Promise<void>
   restartContainer: (id: string) => Promise<void>
-  removeContainer: (id: string) => Promise<void>
+  /** `purge`: removed for good — its folder, chat log and scheduled tasks too. */
+  removeContainer: (id: string, purge?: boolean) => Promise<ContainerActionResult>
   rebuildContainer: (id: string) => Promise<void>
   cloneContainer: (id: string, newName: string) => Promise<void>
   setNameOverride: (id: string, name: string) => void
@@ -124,10 +125,11 @@ export const useContainerStore = create<ContainerStore>((set, get) => ({
     get().fetchContainers()
   },
 
-  removeContainer: async (id) => {
-    await dockerApi.removeContainer(id, true)
+  removeContainer: async (id, purge = false) => {
+    const result = await dockerApi.removeContainer(id, true, undefined, purge)
     if (get().selectedContainerId === id) set({ selectedContainerId: null })
     get().fetchContainers()
+    return result
   },
 
   rebuildContainer: async (id) => {

@@ -53,10 +53,13 @@ interface IntentionsPanelProps {
   port: number
   auth?: string
   agentName: string
-  onClose: () => void
+  onClose?: () => void
+  /** Inside another dialog (the kiosk's agent Info): no backdrop, frame or
+   *  close button — the host dialog has them. */
+  embedded?: boolean
 }
 
-export function IntentionsPanel({ host, port, auth, agentName, onClose }: IntentionsPanelProps) {
+export function IntentionsPanel({ host, port, auth, agentName, onClose, embedded = false }: IntentionsPanelProps) {
   const [intentions, setIntentions] = useState<Intention[]>([])
   const [decisions, setDecisions] = useState<Decision[]>([])
   const [loading, setLoading] = useState(true)
@@ -128,26 +131,25 @@ export function IntentionsPanel({ host, port, auth, agentName, onClose }: Intent
     ? <User className="h-3.5 w-3.5 text-sky-400/80 shrink-0" />
     : <Bot className="h-3.5 w-3.5 text-violet-400/80 shrink-0" />)
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={onClose}>
-      <div
-        className="flex flex-col rounded-xl border border-zinc-700/50 bg-zinc-900 shadow-2xl"
-        style={{ width: '70vw', maxWidth: '760px', height: '80vh' }}
-        onClick={(e) => e.stopPropagation()}
-      >
+  const panel = (
+    <>
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-3.5 border-b border-zinc-800 shrink-0">
-          <div className="flex items-center gap-2.5">
-            <Target className="h-4 w-4 text-amber-400" />
-            <span className="text-sm font-medium text-zinc-200">Intentions — {agentName}</span>
+          <div className="flex min-w-0 items-center gap-2.5">
+            <Target className="h-4 w-4 shrink-0 text-amber-400" />
+            {embedded
+              ? <span className="truncate text-xs text-zinc-400">What {agentName} means to do, and what waits for your call</span>
+              : <span className="text-sm font-medium text-zinc-200">Intentions — {agentName}</span>}
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-2">
             <button onClick={refresh} className="text-zinc-500 hover:text-zinc-300 transition-colors" title="Refresh">
               <RefreshCw className="h-3.5 w-3.5" />
             </button>
-            <button onClick={onClose} className="text-zinc-500 hover:text-zinc-300 transition-colors">
-              <X className="h-4 w-4" />
-            </button>
+            {!embedded && (
+              <button onClick={onClose} className="text-zinc-500 hover:text-zinc-300 transition-colors">
+                <X className="h-4 w-4" />
+              </button>
+            )}
           </div>
         </div>
 
@@ -308,6 +310,18 @@ export function IntentionsPanel({ host, port, auth, agentName, onClose }: Intent
             </div>
           )}
         </div>
+    </>
+  )
+
+  if (embedded) return <div className="flex h-full min-h-0 flex-col">{panel}</div>
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={onClose}>
+      <div
+        className="flex flex-col rounded-xl border border-zinc-700/50 bg-zinc-900 shadow-2xl"
+        style={{ width: '70vw', maxWidth: '760px', height: '80vh' }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {panel}
       </div>
     </div>
   )

@@ -178,8 +178,9 @@ export const cloneContainer = (id: string, newName: string) =>
     body: JSON.stringify({ new_name: newName }),
   })
 
-export const removeContainer = (id: string, force = false, asUser?: string) =>
-  fdFetch<ContainerActionResult>(`/containers/${id}?force=${force}`, { method: 'DELETE' }, asUser)
+/** `purge` also deletes the agent's folder, chat log and scheduled tasks. */
+export const removeContainer = (id: string, force = false, asUser?: string, purge = false) =>
+  fdFetch<ContainerActionResult>(`/containers/${id}?force=${force}${purge ? '&purge=true' : ''}`, { method: 'DELETE' }, asUser)
 
 export interface LogResult {
   logs: string
@@ -316,6 +317,28 @@ export const saveAgentInstructions = (
     body: JSON.stringify({ instructions }),
   }, asUser)
 
+// ── Cognitive mode, config and vision of one agent ──
+
+/** The mode as the agent resolves it (its file, else its config's default). */
+export const getAgentMode = (kind: 'process' | 'docker', id: string) =>
+  fdFetch<{ mode: string }>(`/agent-mode/${kind}/${id}`)
+
+export const setAgentMode = (kind: 'process' | 'docker', id: string, mode: string) =>
+  fdFetch<{ ok: boolean; mode: string }>(`/agent-mode/${kind}/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify({ mode }),
+  })
+
+export const getAgentConfig = (kind: 'process' | 'docker', id: string) =>
+  fdFetch<{ config_yaml: string; env: string }>(`/agent-config/${kind}/${id}`)
+
+/** model.vision only (auto | on | off) — the model stays. Read at start-up. */
+export const setAgentVision = (kind: 'process' | 'docker', id: string, vision: string) =>
+  fdFetch<{ ok: boolean }>(`/agent-model/${kind}/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify({ vision }),
+  })
+
 export const stopProcess = (slug: string, asUser?: string) =>
   fdFetch<ProcessActionResult>(`/processes/${slug}/stop`, { method: 'POST' }, asUser)
 
@@ -325,8 +348,9 @@ export const startProcess = (slug: string, asUser?: string) =>
 export const restartProcess = (slug: string, asUser?: string) =>
   fdFetch<ProcessActionResult>(`/processes/${slug}/restart`, { method: 'POST' }, asUser)
 
-export const removeProcess = (slug: string, asUser?: string) =>
-  fdFetch<ProcessActionResult>(`/processes/${slug}`, { method: 'DELETE' }, asUser)
+/** `purge` also deletes the agent's folder, chat log and scheduled tasks. */
+export const removeProcess = (slug: string, asUser?: string, purge = false) =>
+  fdFetch<ProcessActionResult>(`/processes/${slug}${purge ? '?purge=true' : ''}`, { method: 'DELETE' }, asUser)
 
 export const getProcessLogs = async (slug: string, tail = 200, sinceByte = 0): Promise<LogResult> => {
   const qs = sinceByte > 0

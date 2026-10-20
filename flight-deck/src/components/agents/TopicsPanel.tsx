@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { Tags, Loader2, AlertTriangle, RefreshCw, X, Sparkles, Search, Maximize2, Minimize2, Download, Combine, Trash2, Star, Settings, RotateCcw, History } from 'lucide-react'
+import { Tags, Loader2, AlertTriangle, RefreshCw, X, Sparkles, Search, Maximize2, Minimize2, Download, Combine, Trash2, Star, Settings, RotateCcw, History, ChevronLeft } from 'lucide-react'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useAuthStore, refreshAccessToken } from '../../stores/authStore'
@@ -45,7 +45,12 @@ interface TopicsPanelProps {
   port: number
   auth?: string
   agentName: string
-  onClose: () => void
+  onClose?: () => void
+  /** Inside another dialog (the kiosk's agent Info): no backdrop, frame,
+   *  fullscreen or close — the host dialog has them. */
+  embedded?: boolean
+  /** A phone: the list or one topic, full width, never side by side. */
+  phone?: boolean
 }
 
 const BACKFILL_WINDOWS: { label: string; hours: number }[] = [
@@ -66,7 +71,7 @@ function relTime(iso?: string): string {
   return `${Math.floor(s / 86400)}d ago`
 }
 
-export function TopicsPanel({ host, port, auth, agentName, onClose }: TopicsPanelProps) {
+export function TopicsPanel({ host, port, auth, agentName, onClose, embedded = false, phone = false }: TopicsPanelProps) {
   const [topics, setTopics] = useState<Topic[]>([])
   const [selected, setSelected] = useState<Topic | null>(null)
   const [loading, setLoading] = useState(true)
@@ -414,21 +419,20 @@ export function TopicsPanel({ host, port, auth, agentName, onClose }: TopicsPane
     URL.revokeObjectURL(url)
   }
 
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={onClose}>
-      <div
-        className="flex flex-col border border-zinc-700/50 bg-zinc-900 shadow-2xl"
-        style={fullscreen
-          ? { width: '100vw', height: '100vh', borderRadius: 0 }
-          : { width: '80vw', maxWidth: '1000px', height: '78vh', borderRadius: '0.75rem' }}
-        onClick={(e) => e.stopPropagation()}
-      >
+  const panel = (
+    <>
         {/* Header — actions moved behind the gear; status surfaces here */}
         <div className="relative flex items-center justify-between border-b border-zinc-800 px-5 py-3.5 shrink-0">
           <div className="flex min-w-0 items-center gap-2">
             <Tags className="h-4 w-4 shrink-0 text-sky-400" />
-            <span className="shrink-0 text-sm font-semibold text-zinc-100">Topics</span>
-            <span className="shrink-0 text-xs text-zinc-500">· {agentName}</span>
+            {embedded ? (
+              !(backfilling || note) && <span className="truncate text-xs text-zinc-400">What you and {agentName} talked about, grouped by subject</span>
+            ) : (
+              <>
+                <span className="shrink-0 text-sm font-semibold text-zinc-100">Topics</span>
+                <span className="shrink-0 text-xs text-zinc-500">· {agentName}</span>
+              </>
+            )}
             {(backfilling || note) && (
               <span className="flex min-w-0 items-center gap-1.5 truncate text-[11px] text-zinc-400">
                 <span className="text-zinc-600">·</span>
@@ -445,12 +449,16 @@ export function TopicsPanel({ host, port, auth, agentName, onClose }: TopicsPane
             <button onClick={refresh} className="rounded-md p-1 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200" title="Refresh">
               <RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />
             </button>
-            <button onClick={() => setFullscreen((v) => !v)} className="rounded-md p-1 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200" title={fullscreen ? 'Exit fullscreen' : 'Fullscreen'}>
-              {fullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
-            </button>
-            <button onClick={onClose} className="rounded-md p-1 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200">
-              <X className="h-4 w-4" />
-            </button>
+            {!embedded && (
+              <>
+                <button onClick={() => setFullscreen((v) => !v)} className="rounded-md p-1 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200" title={fullscreen ? 'Exit fullscreen' : 'Fullscreen'}>
+                  {fullscreen ? <Minimize2 className="h-4 w-4" /> : <Maximize2 className="h-4 w-4" />}
+                </button>
+                <button onClick={onClose} className="rounded-md p-1 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200">
+                  <X className="h-4 w-4" />
+                </button>
+              </>
+            )}
           </div>
           {/* Actions popover — anchored under the gear */}
           {actionsOpen && (
@@ -495,7 +503,8 @@ export function TopicsPanel({ host, port, auth, agentName, onClose }: TopicsPane
         {/* Body: topic list | messages */}
         <div ref={bodyRef} className="flex min-h-0 flex-1">
           {/* List */}
-          <div className="flex flex-col" style={{ width: `${listWidth}%` }}>
+          {(!phone || !selected) && (
+          <div className="flex flex-col" style={{ width: phone ? '100%' : `${listWidth}%` }}>
             <div className="flex items-center gap-2 border-b border-zinc-800 px-3 py-1.5">
               <span className="text-[11px] font-medium text-zinc-400">{topics.length} topic{topics.length === 1 ? '' : 's'}</span>
               <select value={order} onChange={(e) => setOrder(e.target.value as 'recent' | 'alpha')}
@@ -594,11 +603,22 @@ export function TopicsPanel({ host, port, auth, agentName, onClose }: TopicsPane
             </div>
           </div>
 
+          )}
+
           {/* Draggable divider */}
-          <div onMouseDown={startDrag} title="Drag to resize"
-            className="w-1 shrink-0 cursor-col-resize bg-zinc-800 hover:bg-sky-600/60" />
+          {!phone && (
+            <div onMouseDown={startDrag} title="Drag to resize"
+              className="w-1 shrink-0 cursor-col-resize bg-zinc-800 hover:bg-sky-600/60" />
+          )}
           {/* Messages pane: scrollable middle + chat pinned at the bottom */}
+          {(!phone || selected) && (
           <div className="flex min-h-0 flex-1 flex-col">
+            {phone && (
+              <button onClick={() => setSelected(null)}
+                className="flex shrink-0 items-center gap-1 border-b border-zinc-800 px-3 py-2.5 text-left text-xs font-medium text-zinc-400 hover:text-zinc-200">
+                <ChevronLeft className="h-4 w-4" /> All topics
+              </button>
+            )}
             {!selected ? (
               <div className="flex h-full items-center justify-center text-xs text-zinc-600">Select a topic to see its messages.</div>
             ) : (
@@ -700,7 +720,22 @@ export function TopicsPanel({ host, port, auth, agentName, onClose }: TopicsPane
               </>
             )}
           </div>
+          )}
         </div>
+    </>
+  )
+
+  if (embedded) return <div className="flex h-full min-h-0 flex-col">{panel}</div>
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={onClose}>
+      <div
+        className="flex flex-col border border-zinc-700/50 bg-zinc-900 shadow-2xl"
+        style={fullscreen
+          ? { width: '100vw', height: '100vh', borderRadius: 0 }
+          : { width: '80vw', maxWidth: '1000px', height: '78vh', borderRadius: '0.75rem' }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        {panel}
       </div>
     </div>
   )

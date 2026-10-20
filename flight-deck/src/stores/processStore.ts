@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { ProcessInfo } from '../services/docker'
+import type { ProcessActionResult, ProcessInfo } from '../services/docker'
 import * as dockerApi from '../services/docker'
 import { queueSave, registerHydrator } from '../services/settingsSync'
 import { useAuthStore } from './authStore'
@@ -18,7 +18,7 @@ const MODEL_OVERRIDE_KEY = 'fd:process-model-overrides'
 function loadMap(key: string): Record<string, string> {
   try { return JSON.parse(localStorage.getItem(key) || '{}') } catch { return {} }
 }
-function persistMap(key: string, m: Record<string, string | boolean>) {
+function persistMap(key: string, m: Record<string, unknown>) {
   const val = JSON.stringify(m)
   if (useAuthStore.getState().authEnabled) queueSave(key, val)
   else localStorage.setItem(key, val)
@@ -30,6 +30,20 @@ const _savingInstructions = new Set<string>()
 function loadBoolMap(key: string): Record<string, boolean> {
   try { return JSON.parse(localStorage.getItem(key) || '{}') } catch { return {} }
 }
+
+// The per-agent maps this store keeps (and syncs), each under its settings key.
+const OVERRIDE_FIELDS = [
+  [DESC_KEY, 'descriptionOverrides'],
+  [NAME_KEY, 'nameOverrides'],
+  [FWD_KEY, 'forwardingTaskOverrides'],
+  [APPROVAL_KEY, 'consultApprovalOverrides'],
+  [FLEET_INSTRUCTIONS_KEY, 'fleetInstructionsOverrides'],
+  [COGNITIVE_MODE_KEY, 'cognitiveModeOverrides'],
+  [ECO_MODE_KEY, 'ecoModeOverrides'],
+  [NANO_MODE_KEY, 'nanoModeOverrides'],
+  [MRAV_MODE_KEY, 'mravModeOverrides'],
+  [MODEL_OVERRIDE_KEY, 'modelOverrides'],
+] as const
 
 interface ProcessStore {
   processes: ProcessInfo[]
@@ -49,7 +63,9 @@ interface ProcessStore {
   stopProcess: (slug: string) => Promise<void>
   startProcess: (slug: string) => Promise<void>
   restartProcess: (slug: string) => Promise<void>
-  removeProcess: (slug: string) => Promise<void>
+  /** `purge`: removed for good — its folder, chat log and scheduled tasks
+   *  go on the server, its labels and switches here. */
+  removeProcess: (slug: string, purge?: boolean) => Promise<ProcessActionResult>
   cloneProcess: (slug: string, newName: string) => Promise<void>
   setDescription: (slug: string, description: string) => void
   setNameOverride: (slug: string, name: string) => void
@@ -133,9 +149,24 @@ export const useProcessStore = create<ProcessStore>((set, get) => ({
     get().fetchProcesses()
   },
 
-  removeProcess: async (slug) => {
-    await dockerApi.removeProcess(slug)
+  removeProcess: async (slug, purge = false) => {
+    const result = await dockerApi.removeProcess(slug, undefined, purge)
+    if (purge) {
+      // A later agent of the same name starts with none of this one's.
+      const s = get()
+      const updates: Partial<ProcessStore> = {}
+      for (const [key, field] of OVERRIDE_FIELDS) {
+        const map = s[field] as Record<string, unknown>
+        if (!(slug in map)) continue
+        const next = { ...map }
+        delete next[slug]
+        persistMap(key, next)
+        Object.assign(updates, { [field]: next })
+      }
+      set(updates)
+    }
     get().fetchProcesses()
+    return result
   },
 
   cloneProcess: async (slug, newName) => {
@@ -239,18 +270,7 @@ export const useProcessStore = create<ProcessStore>((set, get) => ({
 
 registerHydrator((settings) => {
   const updates: Record<string, any> = {}
-  for (const [key, field] of [
-    [DESC_KEY, 'descriptionOverrides'],
-    [NAME_KEY, 'nameOverrides'],
-    [FWD_KEY, 'forwardingTaskOverrides'],
-    [APPROVAL_KEY, 'consultApprovalOverrides'],
-    [FLEET_INSTRUCTIONS_KEY, 'fleetInstructionsOverrides'],
-    [COGNITIVE_MODE_KEY, 'cognitiveModeOverrides'],
-    [ECO_MODE_KEY, 'ecoModeOverrides'],
-    [NANO_MODE_KEY, 'nanoModeOverrides'],
-    [MRAV_MODE_KEY, 'mravModeOverrides'],
-    [MODEL_OVERRIDE_KEY, 'modelOverrides'],
-  ] as const) {
+  for (const [key, field] of OVERRIDE_FIELDS) {
     const raw = settings[key]
     if (raw) {
       try { updates[field] = JSON.parse(raw) } catch { /* ignore */ }

@@ -195,7 +195,7 @@ export function ProcessCard({ process: proc, onBrowseFiles, onDragStart, isDragg
     saveViewModes(m)
   }
 
-  const doAction = async (action: string, fn: () => Promise<void>) => {
+  const doAction = async (action: string, fn: () => Promise<unknown>) => {
     setActionLoading(action)
     try { await fn() } catch (e) { console.error(e) }
     finally { setActionLoading(null) }

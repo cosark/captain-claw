@@ -1594,6 +1594,20 @@ class FlightDeckDB:
         await self._db.commit()
         return cur.rowcount > 0
 
+    async def delete_chat_sessions_for_agent(self, agent_id: str) -> int:
+        """Drop every chat log with one agent (all its lanes, every user) —
+        for an agent removed for good. Messages go with them (cascade)."""
+        assert self._db is not None
+        if not agent_id:
+            return 0
+        lanes = f"{agent_id}::"
+        cur = await self._db.execute(
+            "DELETE FROM chat_sessions WHERE agent_id = ? OR id = ? OR substr(id, 1, ?) = ?",
+            (agent_id, agent_id, len(lanes), lanes),
+        )
+        await self._db.commit()
+        return int(cur.rowcount or 0)
+
     async def get_chat_messages(
         self, session_id: str, user_id: str,
         limit: int = 100, before_id: int | None = None, since_id: int | None = None,
