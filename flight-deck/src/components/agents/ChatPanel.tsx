@@ -13,10 +13,7 @@ import {
   Minus,
   Forward,
   Paperclip,
-  FileIcon,
-  ImageIcon,
   Clipboard,
-  XCircle,
   Copy,
   Check,
   Pin,
@@ -45,9 +42,11 @@ import {
   ArrowUp,
 } from 'lucide-react'
 import { createPortal } from 'react-dom'
-import { ChatGreeting, SkillsDialog, SkillsMenu } from './AgentSkills'
+import { ChatGreeting, SkillInputDialog, SkillsDialog, SkillsMenu } from './AgentSkills'
+import { AttachmentChip } from './AttachmentChip'
+import { appendAttachmentRefs, useFileAttachments } from '../../hooks/useFileAttachments'
 import { useAgentSkills } from '../../hooks/useAgentSkills'
-import type { AgentSkill } from '../../services/agentSkills'
+import { asksForInput, type AgentSkill } from '../../services/agentSkills'
 import { fetchTopics, type TopicInfo } from '../../stores/chatStore'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -77,7 +76,6 @@ import { PaymentCard } from '../payments/PaymentCard'
 import { PurchaseCard } from '../payments/PurchaseCard'
 import { paymentIntentOf, purchaseIntentOf } from '../../services/payments'
 import TraceTimeline from '../observability/TraceTimeline'
-import { uploadFileToAgent, formatSize } from '../../services/fileTransfer'
 import { AgentFilesPanel } from './AgentFilesPanel'
 import { AgentDatastorePanel } from './AgentDatastorePanel'
 import { QueuePlannerModal } from './QueuePlannerModal'
@@ -85,7 +83,7 @@ import { usePersistedSize } from '../../hooks/usePersistedSize'
 import { useIsMobile } from '../../hooks/useMediaQuery'
 import { useQuotaStore } from '../../stores/quotaStore'
 import { PlanUsageBar } from '../common/PlanUsage'
-import { imageRef, type ChatMessage, type TokenUsage } from '../../services/agentChat'
+import type { ChatMessage, TokenUsage } from '../../services/agentChat'
 
 // Plugin arrays hoisted to module scope so they keep a stable identity across
 // renders (react-markdown otherwise sees "new" plugins every render).
@@ -104,142 +102,10 @@ const MarkdownMessage = memo(function MarkdownMessage({ content }: { content: st
   return <Markdown remarkPlugins={REMARK_PLUGINS} rehypePlugins={REHYPE_PLUGINS}>{content}</Markdown>
 })
 
-interface Attachment {
-  id: string
-  file: File
-  name: string
-  size: number
-  type: string
-  preview?: string // data URL for images
-  status: 'pending' | 'uploading' | 'uploaded' | 'error'
-  uploadedPath?: string
-  error?: string
-}
-
-let attachId = 0
-function nextAttachId() { return `attach-${Date.now()}-${++attachId}` }
-
 // Shared chats take no files: a drag is accepted and dropped on the floor.
 function swallowDrop(e: React.DragEvent) {
   e.preventDefault()
   e.stopPropagation()
-}
-
-// Build the outgoing message text, appending references to any uploaded files
-// so the agent can locate them. Images use the "[Attached image: …]" ref,
-// which travels as the chat frame's image_paths (see splitImageRefs): the
-// agent shows them to its own model when it sees images, and otherwise has a
-// vision model describe them before the turn.
-function appendAttachmentRefs(text: string, uploadedFiles: Attachment[]): string {
-  if (uploadedFiles.length === 0) return text
-  const fileRefs = uploadedFiles.map((a) =>
-    a.type.startsWith('image/')
-      ? imageRef(a.uploadedPath || '')
-      : `[Attached file: ${a.name} → ${a.uploadedPath}]`,
-  ).join('\n')
-  return text ? `${text}\n\n${fileRefs}` : fileRefs
-}
-
-// Shared file-attachment state + handlers for the chat and queue inputs.
-// Files upload immediately on add; callers read `attachments` (filtering to
-// status==='uploaded') and bake refs into the outgoing text via
-// appendAttachmentRefs.
-function useFileAttachments(conn: ReturnType<typeof useAgentConnection>) {
-  const [attachments, setAttachments] = useState<Attachment[]>([])
-
-  const uploadAttachment = useCallback(async (att: Attachment) => {
-    if (!conn) return
-    setAttachments((prev) => prev.map((a) => a.id === att.id ? { ...a, status: 'uploading' } : a))
-    try {
-      const result = await uploadFileToAgent(conn.host, conn.port, conn.auth, att.file)
-      setAttachments((prev) => prev.map((a) => a.id === att.id ? { ...a, status: 'uploaded', uploadedPath: result.path } : a))
-    } catch (err) {
-      setAttachments((prev) => prev.map((a) => a.id === att.id ? { ...a, status: 'error', error: String(err) } : a))
-    }
-  }, [conn])
-
-  const addFiles = useCallback((files: FileList | File[]) => {
-    const newAttachments: Attachment[] = Array.from(files).map((file) => {
-      const att: Attachment = {
-        id: nextAttachId(),
-        file,
-        name: file.name,
-        size: file.size,
-        type: file.type,
-        status: 'pending',
-      }
-      // Generate preview for images
-      if (file.type.startsWith('image/')) {
-        const reader = new FileReader()
-        reader.onload = (e) => {
-          setAttachments((prev) => prev.map((a) => a.id === att.id ? { ...a, preview: e.target?.result as string } : a))
-        }
-        reader.readAsDataURL(file)
-      }
-      return att
-    })
-    setAttachments((prev) => [...prev, ...newAttachments])
-    newAttachments.forEach((att) => uploadAttachment(att))
-  }, [uploadAttachment])
-
-  const removeAttachment = useCallback((id: string) => {
-    setAttachments((prev) => prev.filter((a) => a.id !== id))
-  }, [])
-
-  const clearAttachments = useCallback(() => setAttachments([]), [])
-
-  // Paste event on a textarea. Returns true if clipboard files were extracted
-  // (caller should NOT also handle text); false → let the default text paste run.
-  const handlePasteEvent = useCallback((e: React.ClipboardEvent): boolean => {
-    const items = e.clipboardData.items
-    const files: File[] = []
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i]
-      if (item.kind === 'file') {
-        const file = item.getAsFile()
-        if (file) files.push(file)
-      }
-    }
-    if (files.length > 0) {
-      e.preventDefault()
-      addFiles(files)
-      return true
-    }
-    return false
-  }, [addFiles])
-
-  // Clipboard-button paste via the async Clipboard API. Files → addFiles;
-  // otherwise the text is handed to onText for the caller to insert.
-  const pasteFromClipboard = useCallback(async (onText: (text: string) => void) => {
-    try {
-      const items = await navigator.clipboard.read()
-      const files: File[] = []
-      for (const item of items) {
-        for (const type of item.types) {
-          if (type.startsWith('image/') || type === 'application/octet-stream') {
-            const blob = await item.getType(type)
-            const ext = type.split('/')[1] || 'png'
-            const file = new File([blob], `clipboard-${Date.now()}.${ext}`, { type })
-            files.push(file)
-          }
-        }
-      }
-      if (files.length > 0) {
-        addFiles(files)
-      } else {
-        const text = await navigator.clipboard.readText()
-        if (text) onText(text)
-      }
-    } catch {
-      // Fallback to text
-      try {
-        const text = await navigator.clipboard.readText()
-        if (text) onText(text)
-      } catch { /* clipboard not available */ }
-    }
-  }, [addFiles])
-
-  return { attachments, addFiles, removeAttachment, clearAttachments, handlePasteEvent, pasteFromClipboard }
 }
 
 // `variant`:
@@ -796,19 +662,26 @@ function ChatContent({
   // Handle drag-and-drop on the chat area
   const [dragOver, setDragOver] = useState(false)
 
+  // A dialog portalled out of the chat (a skill card's input) still bubbles
+  // its React events here: a drop there is the dialog's, not the composer's.
+  const fromPortal = (e: React.DragEvent) => !e.currentTarget.contains(e.target as Node)
+
   const handleDragOver = useCallback((e: React.DragEvent) => {
+    if (fromPortal(e)) return
     e.preventDefault()
     e.stopPropagation()
     setDragOver(true)
   }, [])
 
   const handleDragLeave = useCallback((e: React.DragEvent) => {
+    if (fromPortal(e)) return
     e.preventDefault()
     e.stopPropagation()
     setDragOver(false)
   }, [])
 
   const handleDrop = useCallback((e: React.DragEvent) => {
+    if (fromPortal(e)) return
     e.preventDefault()
     e.stopPropagation()
     setDragOver(false)
@@ -871,12 +744,18 @@ function ChatContent({
   const hasErrors = attachments.some((a) => a.status === 'error')
 
   // Simple layout: the agent's skill cards — under a greeting on a fresh chat,
-  // and behind the composer's "What can I do?". A card sends its prompt.
+  // and behind the composer's "What can I do?". A card sends its prompt, or
+  // first asks for what it needs (text, a file, a picture) in a dialog.
   const skills = useAgentSkills(session.containerId, simple && !shared)
   const [skillsOpen, setSkillsOpen] = useState(false)
   const [skillsDialog, setSkillsDialog] = useState(false)
+  const [skillAsking, setSkillAsking] = useState<AgentSkill | null>(null)
   const canPick = session.connected && !closed && !quotaSpent && !session.busy
-  const pickSkill = (skill: AgentSkill) => { if (canPick) onSend(skill.prompt) }
+  const pickSkill = (skill: AgentSkill) => {
+    if (!canPick) return
+    if (asksForInput(skill)) setSkillAsking(skill)
+    else onSend(skill.prompt)
+  }
   // Fresh: nothing said yet, or a new topic (or a cleared context) just began.
   const last = visibleMessages[visibleMessages.length - 1]
   const fresh = simple && session.connected && !session.busy && !session.hasNewer && (
@@ -1037,6 +916,17 @@ function ChatContent({
           onClose={() => setSkillsDialog(false)}
         />
       )}
+      {skillAsking && (
+        <SkillInputDialog
+          key={skillAsking.title}
+          skill={skillAsking}
+          conn={conn}
+          agentName={session.containerName}
+          disabled={!canPick}
+          onSend={(content) => { setSkillAsking(null); onSend(content) }}
+          onClose={() => setSkillAsking(null)}
+        />
+      )}
       {simple ? (
         /* The simple layout's composer: the box, and under the text its row
            of attach · paste · "What can I do?" … send. */
@@ -1179,46 +1069,6 @@ function ChatContent({
 // Send button sends), as in any messaging app.
 function touchKeyboard(): boolean {
   return typeof window !== 'undefined' && window.matchMedia('(pointer: coarse) and (hover: none)').matches
-}
-
-function AttachmentChip({ attachment, onRemove }: { attachment: Attachment; onRemove: (id: string) => void }) {
-  const isImage = attachment.type.startsWith('image/')
-
-  return (
-    <div
-      className={`group relative flex items-center gap-1.5 rounded-lg border px-2 py-1.5 text-xs ${
-        attachment.status === 'error'
-          ? 'border-red-800 bg-red-950/30 text-red-400'
-          : attachment.status === 'uploading'
-          ? 'border-violet-800/50 bg-violet-950/20 text-violet-300'
-          : attachment.status === 'uploaded'
-          ? 'border-zinc-700 bg-zinc-800/50 text-zinc-300'
-          : 'border-zinc-700 bg-zinc-800/50 text-zinc-400'
-      }`}
-    >
-      {/* Preview or icon */}
-      {attachment.preview ? (
-        <img src={attachment.preview} alt="" className="h-6 w-6 rounded object-cover" />
-      ) : isImage ? (
-        <ImageIcon className="h-3.5 w-3.5 shrink-0" />
-      ) : (
-        <FileIcon className="h-3.5 w-3.5 shrink-0" />
-      )}
-
-      <span className="max-w-[120px] truncate">{attachment.name}</span>
-      <span className="text-zinc-600">{formatSize(attachment.size)}</span>
-
-      {attachment.status === 'uploading' && <Loader2 className="h-3 w-3 animate-spin text-violet-400" />}
-
-      {/* Remove button */}
-      <button
-        onClick={() => onRemove(attachment.id)}
-        className="ml-0.5 rounded p-0.5 text-zinc-600 hover:text-zinc-300"
-      >
-        <XCircle className="h-3.5 w-3.5" />
-      </button>
-    </div>
-  )
 }
 
 function NextStepsBar({

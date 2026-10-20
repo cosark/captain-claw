@@ -2,7 +2,9 @@
 
 Each card is a task the person starts with one click ("Plan my week",
 "Label my emails"): a title, a one-line description and the prompt the click
-sends to the agent. Flight Deck writes them per agent from what the agent is
+sends to the agent — and what, if anything, the agent needs from the person
+first (``input``: a question, answered with text, a file or a picture, which
+the chat asks in a dialog before it sends). Flight Deck writes them per agent from what the agent is
 and what it has done:
 
 - what it is for: its archetype, description, standing instructions, tools,
@@ -59,11 +61,14 @@ ICONS = (
 )
 # Where a card comes from.
 SOURCES = ("archetype", "experience", "schedule", "topic", "intention")
+# What a card needs from the person before the agent can start, and in what form.
+NEEDS = ("none", "optional", "required")
+ACCEPTS = ("text", "file", "image")
 
 _TOP = 6                  # the cards offered up front (the composer's list)
 _MORE = 16                # and behind its "More", written only when asked for
 _MAX_SKILLS = _TOP + _MORE
-_VERSION = 2              # in the fingerprint: a new card set rewrites every cache
+_VERSION = 3              # in the fingerprint: a new card shape rewrites the cards up front
 _TTL = 12 * 3600          # a model-written set is rewritten after this
 _BASIC_TTL = 3600         # a set built without the model, before trying again
 _MORE_BATCH = 8           # "More" cards per call: a small local model writes 8 in time
@@ -241,9 +246,24 @@ async def _agent_reads(entry: dict) -> dict:
 # ── Cards without the model ───────────────────────────────────────────
 
 
-def _card(title: str, description: str, prompt: str, icon: str, source: str) -> dict:
+_NO_INPUT = {"needs": "none", "ask": "", "accepts": []}
+
+
+def _input(raw: Any) -> dict:
+    """What a card needs from the person, cleaned: ``none`` unless the model
+    said optional / required (with a question; any form when it named none)."""
+    d = raw if isinstance(raw, dict) else {}
+    needs = str(d.get("needs") or "").strip().lower()
+    if needs not in NEEDS or needs == "none":
+        return dict(_NO_INPUT)
+    accepts = d.get("accepts") if isinstance(d.get("accepts"), list) else []
+    kinds = [k for k in ACCEPTS if k in {str(a).strip().lower() for a in accepts}]
+    return {"needs": needs, "ask": _clip(d.get("ask"), 160), "accepts": kinds or list(ACCEPTS)}
+
+
+def _card(title: str, description: str, prompt: str, icon: str, source: str, needs: Any = None) -> dict:
     return {"title": _clip(title, 48), "description": _clip(description, 120),
-            "prompt": str(prompt).strip()[:1200], "icon": icon, "source": source}
+            "prompt": str(prompt).strip()[:1200], "icon": icon, "source": source, "input": _input(needs)}
 
 
 def basic_skills(make_up: dict, done: dict | None = None) -> list[dict]:
@@ -291,7 +311,8 @@ _SYSTEM = """You design the "things I can do" cards a chat app shows above its m
 Each card is a task the person starts with one click: the click sends the card's prompt to
 their AI agent exactly as if they had typed it.
 Reply with ONLY a JSON object, no prose, no code fence:
-{"skills": [{"title": "...", "description": "...", "prompt": "...", "icon": "...", "source": "..."}]}
+{"skills": [{"title": "...", "description": "...", "prompt": "...", "icon": "...", "source": "...",
+             "input": {"needs": "...", "ask": "...", "accepts": ["..."]}}]}
 
 %(cards)s
 - title: 2-5 words in the person's voice, imperative ("Plan my week", "Label my emails"), at most 40 characters.
@@ -299,6 +320,15 @@ Reply with ONLY a JSON object, no prose, no code fence:
 - prompt: the request itself, written as the person, specific and complete enough for the agent to act without asking back, at most 400 characters. It is sent as it is: no placeholders ("[name]", "<topic>") and nothing left for the person to fill in.
 - icon: exactly one of: %(icons)s
 - source: where the card comes from, exactly one of: archetype (what the agent is for), experience (what it has learned about the person), schedule (a scheduled task or cron job: run it now), topic (an ongoing conversation to pick up), intention (something the agent means to do).
+- input: what the agent needs from the person before it can start.
+  needs: "none" when it can act on its own (it reads the inbox, the calendar, the web, its files and memory);
+  "required" when it cannot start without something only the person has (a document, a picture, a link,
+  the text to check, a name or a date); "optional" when it can start but a detail would sharpen the result.
+  ask: with "optional" or "required", one short question to the person, at most 120 characters; "" with "none".
+  accepts: which of "text", "file", "image" would answer it ([] with "none").
+  Most cards need "none". Ask only for the material the task itself works on that the agent can't find on
+  its own; never ask whether an account is connected or how something is set up (the app knows that).
+  With "optional" or "required", write the prompt so what they add reads after it ("Fact-check the claims in what I add below.").
 - Only tasks this agent can do with its role, instructions and tools. Prefer the person's real topics, schedules and intentions over generic ideas, and mix sources when there are several.
 - Email, calendar and file-drive tasks need the person's account connected (see "Connected accounts"). For an account that isn't, offer none of its tasks; when the agent is made for that work, one card may help the person connect it instead.
 - Never a card that sends email, posts, pays or deletes by itself; drafting and preparing are fine.
@@ -394,7 +424,8 @@ def parse_skills(content: str, sources: set[str] | None = None) -> list[dict]:
         source = str(s.get("source") or "").strip().lower()
         cards.append(_card(
             str(s.get("title") or ""), str(s.get("description") or ""), str(s.get("prompt") or ""),
-            icon if icon in ICONS else "sparkles", source if source in allowed else "archetype"))
+            icon if icon in ICONS else "sparkles", source if source in allowed else "archetype",
+            s.get("input")))
     cards = _dedupe(cards)
     if not cards:
         raise ValueError("the model wrote no cards")

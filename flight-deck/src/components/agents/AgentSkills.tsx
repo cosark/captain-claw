@@ -1,14 +1,27 @@
-import { useEffect, useRef } from 'react'
-import { ChevronDown, ChevronRight, Loader2, RefreshCw, Sparkles } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { ChevronDown, ChevronRight, ImagePlus, Loader2, MessageSquarePlus, Paperclip, RefreshCw, Sparkles } from 'lucide-react'
 import { useAuthStore } from '../../stores/authStore'
-import { SKILL_ICONS, SKILLS_UP_FRONT, type AgentSkill } from '../../services/agentSkills'
+import { SKILL_ICONS, SKILLS_UP_FRONT, asksForInput, type AgentSkill } from '../../services/agentSkills'
 import type { SkillsState } from '../../hooks/useAgentSkills'
+import { appendAttachmentRefs, useFileAttachments, type AgentConn } from '../../hooks/useFileAttachments'
 import { AgentDialog } from '../layout/KioskAgentDialogs'
+import { AttachmentChip } from './AttachmentChip'
 
 // The kiosk chat's "things I can do": a greeting with the agent's top cards
 // on an empty chat (or a fresh topic), the cards up front behind the
 // composer's "What can I do?" button, and its "More" dialog — the only place
-// the More list is asked for. A card's click sends its prompt.
+// the More list is asked for. A card's click sends its prompt — or, for a
+// card that needs something from the person, first opens SkillInputDialog.
+
+/** Marks a card that asks for details (text, a file, a picture) first. */
+function AsksMark({ skill }: { skill: AgentSkill }) {
+  if (!asksForInput(skill)) return null
+  return (
+    <span className="ml-auto shrink-0 self-center pl-2 text-zinc-500" title="Asks you for details first">
+      <MessageSquarePlus className="h-4 w-4" aria-label="Asks you for details first" />
+    </span>
+  )
+}
 
 const ICON_SIZE = {
   sm: ['h-8 w-8 rounded-lg', 'h-4 w-4'],
@@ -101,6 +114,7 @@ export function ChatGreeting({ skills, disabled, onPick, onMore }: {
                   <span className="block text-[1.05rem] font-semibold leading-snug tracking-tight text-zinc-100 wide:text-lg">{s.title}</span>
                   <span className="mt-0.5 block text-sm text-zinc-400 wide:text-[15px]">{s.description}</span>
                 </span>
+                <AsksMark skill={s} />
               </button>
             ))}
           </div>
@@ -203,6 +217,7 @@ export function SkillsMenu({ skills, open, setOpen, disabled, onPick, onMore, co
                   <span className="block truncate text-[15px] font-medium text-zinc-100">{s.title}</span>
                   <span className="block truncate text-sm text-zinc-400">{s.description}</span>
                 </span>
+                <AsksMark skill={s} />
               </button>
             ))}
           </div>
@@ -237,6 +252,7 @@ function SkillCard({ skill, disabled, onPick }: { skill: AgentSkill; disabled: b
         <span className="block text-[15px] font-semibold leading-snug tracking-tight text-zinc-100">{skill.title}</span>
         <span className="mt-0.5 line-clamp-2 block text-sm text-zinc-400">{skill.description}</span>
       </span>
+      <AsksMark skill={skill} />
     </button>
   )
 }
@@ -343,6 +359,131 @@ export function SkillsDialog({ skills, agentName, disabled, onPick, onClose }: {
             </div>
           )}
         </section>
+      </div>
+    </AgentDialog>
+  )
+}
+
+/** A card that needs something from the person: its question, a box for
+ *  text, and files or pictures (attached, pasted or dropped — uploaded to the
+ *  agent as the composer does). Start sends the card's prompt with what they
+ *  added after it; a required answer must be there first. */
+export function SkillInputDialog({ skill, conn, agentName, disabled, onSend, onClose }: {
+  skill: AgentSkill
+  /** The agent's web server, for uploads (null — offline: text only). */
+  conn: AgentConn | null
+  agentName: string
+  disabled: boolean
+  onSend: (content: string) => void
+  onClose: () => void
+}) {
+  const [text, setText] = useState('')
+  const [dragOver, setDragOver] = useState(false)
+  const { attachments, addFiles, removeAttachment, handlePasteEvent } = useFileAttachments(conn)
+  const fileRef = useRef<HTMLInputElement>(null)
+  const imageRef = useRef<HTMLInputElement>(null)
+  const input = skill.input ?? { needs: 'optional' as const, ask: '', accepts: [] }
+  const accepts = input.accepts.length ? input.accepts : ['text', 'file', 'image']
+  const takesFiles = !!conn && (accepts.includes('file') || accepts.includes('image'))
+  const uploaded = attachments.filter((a) => a.status === 'uploaded' && a.uploadedPath)
+  const uploading = attachments.some((a) => a.status === 'pending' || a.status === 'uploading')
+  const failed = attachments.some((a) => a.status === 'error')
+  const given = text.trim() !== '' || uploaded.length > 0
+  const canStart = !disabled && !uploading && (input.needs !== 'required' || given)
+  const Icon = SKILL_ICONS[skill.icon] || Sparkles
+
+  const start = () => {
+    if (!canStart) return
+    const body = text.trim() ? `${skill.prompt}\n\n${text.trim()}` : skill.prompt
+    onSend(appendAttachmentRefs(body, uploaded))
+  }
+  // A drop here is this dialog's (and never opens the file in the tab).
+  const drop = {
+    onDragOver: (e: React.DragEvent) => { e.preventDefault(); if (takesFiles) setDragOver(true) },
+    onDragLeave: () => setDragOver(false),
+    onDrop: (e: React.DragEvent) => {
+      e.preventDefault()
+      setDragOver(false)
+      if (takesFiles && e.dataTransfer.files.length) addFiles(e.dataTransfer.files)
+    },
+  }
+
+  return (
+    <AgentDialog title={skill.title} icon={Icon} agentName={agentName} onClose={onClose}>
+      <div
+        className={`flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-5 py-4 ${dragOver ? 'ring-2 ring-inset ring-violet-500/50' : ''}`}
+        {...drop}
+      >
+        {skill.description && <p className="text-sm text-zinc-400">{skill.description}</p>}
+        <label htmlFor="skill-input-text" className="text-[15px] font-medium text-zinc-100">
+          {input.ask || 'Anything I should know first?'}
+          {input.needs === 'optional' && <span className="ml-1.5 text-xs font-normal text-zinc-500">optional</span>}
+        </label>
+        <textarea
+          id="skill-input-text"
+          autoFocus
+          rows={5}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onPaste={takesFiles ? handlePasteEvent : undefined}
+          onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); start() } }}
+          placeholder={accepts.includes('text') ? 'Type or paste it here…' : 'Add a note (optional)…'}
+          className="min-h-[7.5rem] w-full resize-y rounded-xl border border-zinc-700 bg-zinc-900 px-3.5 py-2.5 text-base text-zinc-100 placeholder-zinc-500 focus:border-violet-500/50 focus:outline-none wide:text-[15px]"
+        />
+        {attachments.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            {attachments.map((a) => <AttachmentChip key={a.id} attachment={a} onRemove={removeAttachment} />)}
+          </div>
+        )}
+        {failed && <p className="text-xs text-red-400">Some files failed to upload. Remove them and try again.</p>}
+        {takesFiles && (
+          <div className="flex flex-wrap items-center gap-2">
+            {accepts.includes('file') && (
+              <button
+                type="button"
+                onClick={() => fileRef.current?.click()}
+                className="flex items-center gap-1.5 rounded-lg border border-zinc-700 px-3 py-1.5 text-sm text-zinc-300 transition-colors hover:bg-zinc-800"
+              >
+                <Paperclip className="h-4 w-4" />
+                Attach a file
+              </button>
+            )}
+            {accepts.includes('image') && (
+              <button
+                type="button"
+                onClick={() => imageRef.current?.click()}
+                className="flex items-center gap-1.5 rounded-lg border border-zinc-700 px-3 py-1.5 text-sm text-zinc-300 transition-colors hover:bg-zinc-800"
+              >
+                <ImagePlus className="h-4 w-4" />
+                Add a picture
+              </button>
+            )}
+            <span className="hidden text-xs text-zinc-500 wide:inline">or drop or paste it here</span>
+          </div>
+        )}
+        <input ref={fileRef} type="file" multiple className="hidden"
+          onChange={(e) => { if (e.target.files?.length) addFiles(e.target.files); e.target.value = '' }} />
+        <input ref={imageRef} type="file" accept="image/*" multiple className="hidden"
+          onChange={(e) => { if (e.target.files?.length) addFiles(e.target.files); e.target.value = '' }} />
+      </div>
+      <div className="flex shrink-0 items-center justify-end gap-2 border-t border-zinc-800 px-5 py-3">
+        {disabled && <span className="mr-auto text-xs text-zinc-500">Ready when the current reply finishes.</span>}
+        <button
+          type="button"
+          onClick={onClose}
+          className="rounded-lg px-3 py-2 text-sm text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-200"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={start}
+          disabled={!canStart}
+          className="flex items-center gap-1.5 rounded-lg bg-violet-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-violet-500 disabled:opacity-40"
+        >
+          {uploading && <Loader2 className="h-4 w-4 animate-spin" />}
+          {uploading ? 'Uploading…' : 'Start'}
+        </button>
       </div>
     </AgentDialog>
   )

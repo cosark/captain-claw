@@ -14,13 +14,28 @@ import { api } from './fileLibraryApi'
 
 export type SkillSource = 'archetype' | 'experience' | 'schedule' | 'topic' | 'intention'
 
+/** What a card needs from the person before the agent can start. */
+export interface SkillInput {
+  needs: 'none' | 'optional' | 'required'
+  /** The question the input dialog asks. */
+  ask: string
+  accepts: ('text' | 'file' | 'image')[]
+}
+
 export interface AgentSkill {
   title: string
   description: string
-  /** What a click sends, as if the person typed it. */
+  /** What a click sends, as if the person typed it (with what they add, after it). */
   prompt: string
   icon: string
   source: SkillSource
+  /** Absent on cards written before cards could ask: none. */
+  input?: SkillInput
+}
+
+/** Does picking this card open the input dialog first? */
+export function asksForInput(skill: AgentSkill): boolean {
+  return !!skill.input && skill.input.needs !== 'none'
 }
 
 export interface AgentSkills {

@@ -1,7 +1,8 @@
 """The kiosk chat's skill cards (``/fd/agent-skills``).
 
 * the model's reply is cleaned: unknown icons / sources fall back, empty and
-  duplicate cards go, the set is capped;
+  duplicate cards go, the set is capped, and what a card needs from the
+  person (``input``) is none unless it says optional / required;
 * without the model, cards come from the agent's scheduled tasks, cron jobs,
   intentions and topics, plus "What can you do?";
 * a cached set is fresh until the agent's make-up changes or it is too old
@@ -111,6 +112,22 @@ def test_parse_cleans_the_cards():
     assert cards[1]["icon"] == "sparkles" and cards[1]["source"] == "archetype"
 
 
+def test_parse_cleans_what_a_card_needs():
+    reply = json.dumps({"skills": [
+        {"title": "Fact-check the claims", "description": "x", "prompt": "Fact-check what I add below.",
+         "input": {"needs": "Required", "ask": "What should I check?", "accepts": ["text", "file", "video"]}},
+        {"title": "Sharpen my pitch", "description": "x", "prompt": "Review my pitch below.",
+         "input": {"needs": "optional", "ask": "Anything to focus on?", "accepts": []}},
+        {"title": "Plan my week", "description": "x", "prompt": "Plan my week.", "input": {"needs": "none", "ask": "?"}},
+        {"title": "Odd", "description": "x", "prompt": "Do it.", "input": "lots"},
+    ]})
+    cards = {c["title"]: c["input"] for c in skills.parse_skills(reply)}
+    assert cards["Fact-check the claims"] == {"needs": "required", "ask": "What should I check?",
+                                              "accepts": ["text", "file"]}
+    assert cards["Sharpen my pitch"]["accepts"] == ["text", "file", "image"]  # none named: any form
+    assert cards["Plan my week"] == cards["Odd"] == {"needs": "none", "ask": "", "accepts": []}
+
+
 def test_parse_keeps_only_sources_the_agent_has():
     reply = json.dumps({"skills": [
         {"title": "Chase Ana", "description": "", "prompt": "Follow up with Ana.", "source": "intention"},
@@ -137,6 +154,7 @@ def test_parse_salvages_a_reply_cut_off_mid_list():
 
 def test_system_prompt_per_pass():
     assert "- 6 cards, the most useful first" in skills._system(None)
+    assert '"input": {"needs"' in skills._system(None) and 'accepts: which of "text", "file", "image"' in skills._system(None)
     more = skills._system([])
     assert "- 8 MORE cards" in more and "Already offered" in more
     assert skills._MAX_SKILLS == 22
@@ -157,7 +175,8 @@ def test_basic_cards_come_from_what_the_agent_does():
     by_source = {c["source"] for c in cards}
     assert by_source == {"schedule", "intention", "topic", "archetype"}
     assert cards[0] == {"title": "Morning brief", "description": "Run it now — normally daily 08:00",
-                        "prompt": "Brief me.", "icon": "clock", "source": "schedule"}
+                        "prompt": "Brief me.", "icon": "clock", "source": "schedule",
+                        "input": {"needs": "none", "ask": "", "accepts": []}}
     assert cards[-1]["title"] == "What can you do?"
     assert skills.basic_skills({})[0]["title"] == "What can you do?"
 
