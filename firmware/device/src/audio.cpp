@@ -84,6 +84,23 @@ void cueEnd() {
   M5.Speaker.tone(1046, 160, 1, false);  // then C6
 }
 
+void talkStart() {
+  if (micOn) return;
+  playStop();
+  if (!M5.Speaker.isEnabled()) M5.Speaker.begin();
+  M5.Speaker.tone(1760, 60, 1, true);  // A6
+  // Played out before the mic takes the codec (and so it isn't recorded).
+  uint32_t t0 = millis();
+  while (M5.Speaker.isPlaying(1) && millis() - t0 < 200) delay(2);
+  delay(10);
+}
+
+void talkEnd() {
+  if (micOn || streamOpen) return;
+  if (!M5.Speaker.isEnabled()) M5.Speaker.begin();
+  M5.Speaker.tone(880, 80, 1, true);  // A5
+}
+
 void click() {
   if (micOn || streamOpen) return;  // never over the mic or a voice
   if (!M5.Speaker.isEnabled()) M5.Speaker.begin();

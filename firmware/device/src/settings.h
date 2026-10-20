@@ -28,6 +28,7 @@ struct Settings {
   bool iconMode = false;    // screen: text stages, or an animated character
   uint8_t character = 0;    // face::Kind (0 = captain)
   bool cueBeep = true;      // chime before speech starts
+  bool talkSounds = true;   // a blip when recording starts, a lower one when it's let go
   bool cueFlash = true;     // flash the screen before speech starts
   bool cueBuzz = true;      // buzz before speech starts (devices with a motor)
   uint8_t cueLeadS = 1;     // the cue comes this many seconds (1 or 2) before speech

@@ -15,6 +15,9 @@ void setBoost(uint8_t db);
 void beep();  // short tone at the current volume (feedback for volume changes)
 void cue();   // two-tone "about to speak" chime
 void cueEnd(); // the same two tones the other way round: "done speaking"
+// Recording sounds — single notes, unlike the two-note speech chimes:
+void talkStart(); // a short high blip as a recording begins; returns once it has played
+void talkEnd();   // a short lower blip when it's let go (sent, or kept offline)
 void click(); // a short tick for a button press (the paper changes slowly)
 
 // ── microphone ──
