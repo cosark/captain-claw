@@ -126,6 +126,11 @@ chime (C6 → G6) before it speaks and the same two tones falling (G6 → C6)
 once the answer has played to its end, so you know it's done. A stopped
 answer or a replay gets neither.
 
+*Talk sounds* (on by default) are single notes, so they can't be mistaken for
+those: a short high blip (A6) as recording starts, and a lower one (A5) when
+you let go and it's sent or kept offline. A tap that only stops speech, or a
+press too short to send, gets no second blip.
+
 ## Buttons
 
 | | Front (A) | Side (B) |

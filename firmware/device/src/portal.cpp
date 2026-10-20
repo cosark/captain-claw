@@ -134,6 +134,9 @@ static void handleRoot() {
     h += settings.cueBuzz ? F("<option value=1 selected>Yes</option><option value=0>No</option>")
                           : F("<option value=1>Yes</option><option value=0 selected>No</option>");
   }
+  h += F("</select><label>Talk sounds (a blip when it listens, a lower one when you let go)</label><select name=talksnd>");
+  h += settings.talkSounds ? F("<option value=1 selected>On</option><option value=0>Off</option>")
+                           : F("<option value=1>On</option><option value=0 selected>Off</option>");
   h += F("</select><label>Cue comes</label><select name=lead>");
   h += settings.cueLeadS == 2 ? F("<option value=1>1 s before speech</option><option value=2 selected>2 s before speech</option>")
                               : F("<option value=1 selected>1 s before speech</option><option value=2>2 s before speech</option>");
@@ -261,6 +264,7 @@ static void handleSave() {
   settings.cueBeep = cue == "both" || cue == "beep";
   settings.cueFlash = cue == "both" || cue == "flash";
   settings.cueLeadS = server.arg("lead") == "2" ? 2 : 1;
+  settings.talkSounds = server.arg("talksnd") != "0";
   if (board::kHasMotor) settings.cueBuzz = server.arg("buzz") != "0";
   if (board::kRound || board::kEpaper) {
     String tz = server.arg("tz");

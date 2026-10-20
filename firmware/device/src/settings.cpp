@@ -35,6 +35,7 @@ void Settings::load() {
     character = character == 1 ? 1 : character == 3 ? 2 : 0;
   }
   cueBeep = p.getBool("cuebeep", true);
+  talkSounds = p.getBool("talksnd", true);
   cueFlash = p.getBool("cueflash", true);
   cueBuzz = p.getBool("cuebuzz", true);
   cueLeadS = constrain(p.getUChar("cuelead", 1), 1, 2);
@@ -89,6 +90,7 @@ void Settings::save() const {
   p.putUChar("char", character);
   p.putUChar("charv", 2);
   p.putBool("cuebeep", cueBeep);
+  p.putBool("talksnd", talkSounds);
   p.putBool("cueflash", cueFlash);
   p.putBool("cuebuzz", cueBuzz);
   p.putUChar("cuelead", cueLeadS);

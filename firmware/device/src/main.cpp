@@ -41,7 +41,7 @@
 #include <M5PM1.h>
 #endif
 
-#define FW_VERSION "0.11.0"
+#define FW_VERSION "0.11.1"
 
 // Home: the PaperColor's home screen even while there's an answer (C hold).
 // Link: the "settings on your phone" address.
@@ -100,6 +100,7 @@ static size_t prerollCap = 0, prerollSent = 0;  // in samples
 static uint32_t prerollStartMs = 0;
 static volatile uint32_t prerollEndMs = 0;     // when the button was let go (0 = still held)
 static bool prerollOn = false, prerollStreaming = false, prerollChecked = false;
+static bool prerollEndSounded = false;  // its "let go" blip has played
 
 // A menu row to read aloud (e-paper), once the presses settle.
 static String sayText;
@@ -319,7 +320,7 @@ static void showIdle() {
 // ── menu ─────────────────────────────────────────────────────────────
 
 enum MenuRow { MReplay, MPin, MStatus, MAgent, MVolume, MBoost, MVoice, MDisplay, MTextSize, MCharacter, MBeep,
-               MFlash, MBuzz, MLead, MScreenOff, MPowerOff, MRotation, MLeds, MClicks, MSayMenu, MAsleep, MPhone,
+               MTalkSnd, MFlash, MBuzz, MLead, MScreenOff, MPowerOff, MRotation, MLeds, MClicks, MSayMenu, MAsleep, MPhone,
                MUpdate, MAutoUpdate, MSetup, MCount };
 
 // The last answer can be heard again: from memory, or (part of it never
@@ -377,6 +378,7 @@ static String menuLabel(int row) {
     }
     case MCharacter: return String("Character: ") + face::name(settings.character) + " »";
     case MBeep: return String("Beeps around speech: ") + (settings.cueBeep ? "on" : "off");
+    case MTalkSnd: return String("Talk sounds: ") + (settings.talkSounds ? "on" : "off");
     case MFlash:
       return String(board::kEpaper ? "Light" : "Flash") + " before speech: " + (settings.cueFlash ? "on" : "off");
     case MBuzz: return String("Buzz before speech: ") + (settings.cueBuzz ? "on" : "off");
@@ -435,6 +437,12 @@ static ui::Item menuItem(int row) {
       it.badge = onOff(settings.cueBeep);
       it.on = settings.cueBeep;
       it.note = "a chime before it speaks, the reverse after";
+      break;
+    case MTalkSnd:
+      it.title = "Talk sounds";
+      it.badge = onOff(settings.talkSounds);
+      it.on = settings.talkSounds;
+      it.note = "a blip when it listens, a lower one when you let go";
       break;
     case MFlash:
       it.title = board::kEpaper ? "Light before speech" : "Flash before speech";
@@ -707,6 +715,7 @@ static void chooseMenuRow() {
       sayRow();
       return;
     case MBeep: settings.cueBeep = !settings.cueBeep; break;
+    case MTalkSnd: settings.talkSounds = !settings.talkSounds; break;
     case MFlash: settings.cueFlash = !settings.cueFlash; break;
     case MBuzz:
       settings.cueBuzz = !settings.cueBuzz;
@@ -735,6 +744,11 @@ static void chooseMenuRow() {
   redraw();
   if (menuSel == MVolume || menuSel == MBoost) audio::beep();
   if (menuSel == MBeep && settings.cueBeep) audio::cue();
+  if (menuSel == MTalkSnd && settings.talkSounds) {  // what it sounds like
+    audio::talkStart();
+    delay(250);
+    audio::talkEnd();
+  }
   sayRow();  // the new value
 }
 
@@ -775,6 +789,7 @@ static void startTalking() {
   flashing = false;
   quietSpeech = false;
   ui::setQuestion("");
+  if (settings.talkSounds) audio::talkStart();  // played out before the mic listens
   audio::micStart();  // also stops any playback
   JsonDocument d;
   d["type"] = "rec_start";
@@ -799,6 +814,7 @@ static void stopTalking(bool send) {
   audio::micStop(send ? micSink : [](const int16_t*, size_t) {});
   if (send) sendRecEnd();
   else sendType("rec_cancel");
+  if (send && settings.talkSounds) audio::talkEnd();  // not for a tap: nothing was sent
   if (send) {
     heard = "";
     statusLine = "Transcribing…";
@@ -861,7 +877,7 @@ static void startPreroll(uint32_t maxMs = kPrerollMaxMs) {
   prerollEndMs = 0;
   prerollSent = 0;
   prerollOn = true;
-  prerollStreaming = prerollChecked = prerollOffline = false;
+  prerollStreaming = prerollChecked = prerollOffline = prerollEndSounded = false;
   leds::set(leds::State::Listening, 50);
 }
 
@@ -881,6 +897,7 @@ static void startOfflineNote() {
   uint32_t maxMs = (uint32_t)min<uint64_t>(kOfflineMaxMs, (uint64_t)room * 1000 / audio::kMicRate);
   flashing = false;
   audio::playStop();
+  if (settings.talkSounds) audio::talkStart();
   startPreroll(maxMs);
   if (!prerollOn) {
     notice("Offline", "Not connected to Flight Deck, and no memory free to record.", kRed);
@@ -961,6 +978,15 @@ static bool prerollWokeOnly(uint32_t end) {
   return peak < kPrerollQuietPeak;
 }
 
+// The recording is over (let go, or full): the mic stops — what it wrote
+// stays in the buffer — and the "let go" blip plays, once.
+static void prerollEndSound() {
+  if (prerollEndSounded) return;
+  prerollEndSounded = true;
+  M5.Mic.end();
+  if (settings.talkSounds) audio::talkEnd();
+}
+
 // From loop(): once the deck is reached, what was said goes up — and the
 // rest follows live until the button is let go (or 30 s are used).
 static void pumpPreroll() {
@@ -979,6 +1005,7 @@ static void pumpPreroll() {
       else if (sent || mode == Mode::Listening) backToMain();
       return;
     }
+    prerollEndSound();  // a real recording: let go is heard at once, whatever the link does
   }
   const bool full = (int32_t)(now - prerollStartMs) >= (int32_t)prerollMaxMs;
   const uint32_t stopAt = end ? end : full ? prerollStartMs + prerollMaxMs : 0;  // 0 = still talking
@@ -986,7 +1013,10 @@ static void pumpPreroll() {
     // Let go and still no deck: keep it offline. A wake on Wi-Fi expects the
     // link any moment; without Wi-Fi (or recorded offline) there's no point waiting.
     bool noLink = prerollOffline || WiFi.status() != WL_CONNECTED;
-    if (stopAt && (int32_t)(now - stopAt) > (noLink ? 1500 : 25000) && !ui::busy()) keepOffline(stopAt);
+    if (stopAt && (int32_t)(now - stopAt) > (noLink ? 1500 : 25000) && !ui::busy()) {
+      prerollEndSound();  // (full while held: no release played it)
+      keepOffline(stopAt);
+    }
     return;
   }
   if (!prerollStreaming) {
@@ -1004,6 +1034,7 @@ static void pumpPreroll() {
     return;
   }
   if ((int32_t)(now - stopAt) < 150) return;  // let the last of it land
+  prerollEndSound();
   prerollSend(prerollReady(stopAt));
   if (!wsUp) return;  // dropped mid-send: it all goes again (or is kept offline)
   sendRecEnd();
