@@ -30,6 +30,7 @@
 #include "board.h"
 #include "face.h"
 #include "leds.h"
+#include "notes.h"
 #include "ota.h"
 #include "portal.h"
 #include "settings.h"
@@ -40,7 +41,7 @@
 #include <M5PM1.h>
 #endif
 
-#define FW_VERSION "0.10.1"
+#define FW_VERSION "0.11.0"
 
 // Home: the PaperColor's home screen even while there's an answer (C hold).
 // Link: the "settings on your phone" address.
@@ -88,7 +89,10 @@ static bool sideClickWoke = false;   // that click only woke the screen
 // Talking from sleep: the talk button woke the device and is still held. The
 // mic records into PSRAM at once (M5Unified fills the buffer by itself) while
 // Wi-Fi and the deck connect; then it all goes up, as if spoken just now.
-static constexpr uint32_t kPrerollMaxMs = 30000;
+static constexpr uint32_t kPrerollMaxMs = 30000;   // a wake-to-talk recording
+static constexpr uint32_t kOfflineMaxMs = 60000;   // a voice note kept offline (notes.h)
+static uint32_t prerollMaxMs = kPrerollMaxMs;      // this recording's cap
+static bool prerollOffline = false;                // recorded knowing the deck can't be reached
 static constexpr uint32_t kPrerollMinMs = 1000;    // less than this recorded is a press that woke it
 static constexpr int kPrerollQuietPeak = 900;      // a short recording that never got louder is too
 static int16_t* preroll = nullptr;
@@ -272,6 +276,14 @@ static std::vector<ui::Row> statusRows() {
                                "  up " + uptime(),
                   kText});
   rows.push_back({"Device", deviceId() + "  fw " FW_VERSION "  " + String(ESP.getFreePsram() / 1024) + "k free", kText});
+  if (board::kOfflineNotes && notes::count()) {
+    uint32_t secs = notes::seconds();
+    char len[12];
+    snprintf(len, sizeof(len), "%lu:%02lu", (unsigned long)(secs / 60), (unsigned long)(secs % 60));
+    rows.push_back({"Offline notes", String(notes::count()) + " waiting  " + len + "  on " + notes::where() +
+                                         (wsUp ? "  sending…" : ""),
+                    kYellow});
+  }
   if (offer.valid()) rows.push_back({"Update", offer.version + " available (menu → Software update)", kCyan});
   return rows;
 }
@@ -287,8 +299,10 @@ static void showIdle() {
   home.ready = ok;
   home.title = ok ? "All good" : "Getting ready";
   home.color = ok ? kGreen : kYellow;
+  // Offline, a device that keeps notes still takes one.
+  const bool keeps = board::kOfflineNotes && *notes::where();
   home.hint = ok        ? String("Hold the ") + board::kTalkButton + " to talk"
-              : !wifiOk ? String("No Wi-Fi")
+              : !wifiOk ? (keeps ? String("Offline · hold to keep a note") : String("No Wi-Fi"))
               : !wsUp   ? String("Connecting to Flight Deck…")
                         : String("Waiting for the agent");
   String noun = board::kNoun;
@@ -746,8 +760,15 @@ static void micSink(const int16_t* samples, size_t count) {
   if (wsUp) ws.sendBIN((const uint8_t*)samples, count * sizeof(int16_t));
 }
 
+static void startOfflineNote();
+
 static void startTalking() {
   if (!wsUp) {
+    // Kept as a voice note (sent once the deck is back) where the device can.
+    if (board::kOfflineNotes && notes::room(audio::kMicRate) > 3 * audio::kMicRate) {
+      startOfflineNote();
+      return;
+    }
     notice("Offline", "Not connected to Flight Deck yet.", kRed);
     return;
   }
@@ -819,9 +840,14 @@ static bool wokenToTalk() {
   return byTalk && gpio_get_level(board::kTalkPin) == 0;
 }
 
-static void startPreroll() {
-  prerollCap = kPrerollMaxMs / 1000 * audio::kMicRate;
-  preroll = (int16_t*)ps_calloc(prerollCap, sizeof(int16_t));  // anything unwritten is silence
+static void startPreroll(uint32_t maxMs = kPrerollMaxMs) {
+  // As long as memory allows, halving down to 10 s — but always one try,
+  // however short the cap (anything unwritten is silence).
+  for (prerollMaxMs = maxMs;; prerollMaxMs /= 2) {
+    prerollCap = (size_t)prerollMaxMs * audio::kMicRate / 1000;
+    preroll = (int16_t*)ps_calloc(prerollCap, sizeof(int16_t));
+    if (preroll || prerollMaxMs / 2 < 10000) break;
+  }
   if (!preroll) return;
   M5.Speaker.end();
   M5.Mic.begin();
@@ -835,7 +861,7 @@ static void startPreroll() {
   prerollEndMs = 0;
   prerollSent = 0;
   prerollOn = true;
-  prerollStreaming = prerollChecked = false;
+  prerollStreaming = prerollChecked = prerollOffline = false;
   leds::set(leds::State::Listening, 50);
 }
 
@@ -843,7 +869,67 @@ static void stopPreroll() {
   M5.Mic.end();
   free(preroll);
   preroll = nullptr;
-  prerollOn = prerollStreaming = false;
+  prerollOn = prerollStreaming = prerollOffline = false;
+}
+
+static size_t prerollReady(uint32_t atMs);
+
+// Talking while the deck can't be reached: the same background recording,
+// kept as a voice note when it's let go (keepOffline).
+static void startOfflineNote() {
+  size_t room = notes::room(audio::kMicRate);
+  uint32_t maxMs = (uint32_t)min<uint64_t>(kOfflineMaxMs, (uint64_t)room * 1000 / audio::kMicRate);
+  flashing = false;
+  audio::playStop();
+  startPreroll(maxMs);
+  if (!prerollOn) {
+    notice("Offline", "Not connected to Flight Deck, and no memory free to record.", kRed);
+    return;
+  }
+  prerollOffline = true;
+  recStartMs = prerollStartMs;
+  ui::setQuestion("");
+  mode = Mode::Listening;
+  buzz(35);
+  redraw();
+}
+
+// The mic's level now, from what it last wrote (for the screen and lights).
+static int prerollLevel() {
+  size_t end = prerollReady(millis() - 40), from = end > 800 ? end - 800 : 0;
+  int peak = 0;
+  for (size_t i = from; i < end; ++i) peak = max(peak, abs((int)preroll[i]));
+  return min(100, peak * 100 / 12000);
+}
+
+static String localTimeText(time_t t) {
+  if (t < 1700000000) return "";
+  struct tm tm;
+  localtime_r(&t, &tm);
+  char buf[40];
+  strftime(buf, sizeof(buf), "%a %Y-%m-%d %H:%M (%z)", &tm);
+  return buf;
+}
+
+// The deck wasn't reached: keep the recording as a voice note, sent with a
+// word to the agent that it was made offline once the deck is back.
+static void keepOffline(uint32_t stopAt) {
+  const size_t n = prerollReady(stopAt);
+  M5.Mic.end();  // nothing more lands in the buffer
+  time_t when = telemetry::clockSet() ? time(nullptr) - (time_t)((millis() - prerollStartMs) / 1000) : 0;
+  if (!board::kEpaper) ui::showMessage("Saving", "Keeping the voice note offline…", kText);
+  bool kept = board::kOfflineNotes && n >= audio::kMicRate && notes::save(preroll, n, audio::kMicRate, when);
+  bool knewOffline = prerollOffline;
+  stopPreroll();
+  if (kept) {
+    String waiting = notes::count() > 1 ? " (" + String(notes::count()) + " waiting)" : String("");
+    notice("Saved offline", "Kept on the " + String(notes::where()) + waiting + ". It goes to the agent when the " +
+                                String(board::kNoun) + " is back online.", kGreen);
+  } else if (board::kOfflineNotes) {
+    notice("Not kept", knewOffline ? "Offline, and no room left to keep it." : "Couldn't reach Flight Deck, and no room to keep it.", kRed);
+  } else {
+    notice("Not sent", "Couldn't reach Flight Deck in time — try again.", kRed);
+  }
 }
 
 // The samples the mic has surely written by `atMs` (it runs in real time).
@@ -852,11 +938,14 @@ static size_t prerollReady(uint32_t atMs) {
   return min(prerollCap, (size_t)((atMs - prerollStartMs) * (uint64_t)audio::kMicRate / 1000));
 }
 
+// A send can find the link gone: the disconnect is handled inside it (onWs),
+// which starts this recording over for the next link — so stop at once.
 static void prerollSend(size_t upTo) {
-  while (prerollSent < upTo) {
-    size_t n = min(upTo - prerollSent, (size_t)2048);
-    ws.sendBIN((const uint8_t*)(preroll + prerollSent), n * sizeof(int16_t));
-    prerollSent += n;
+  while (wsUp && prerollSent < upTo) {
+    size_t at = prerollSent, n = min(upTo - at, (size_t)2048);
+    ws.sendBIN((const uint8_t*)(preroll + at), n * sizeof(int16_t));
+    if (!wsUp) return;
+    prerollSent = at + n;
   }
 }
 
@@ -880,21 +969,24 @@ static void pumpPreroll() {
   const uint32_t now = millis();
   if (end && !prerollChecked && (int32_t)(now - end) >= 150) {
     prerollChecked = true;  // once: it reads the whole recording
-    if (prerollWokeOnly(end)) {
-      bool sent = prerollStreaming;
+    // Pressed on purpose (awake, offline): only too short counts as nothing.
+    bool nothing = prerollOffline ? end - prerollStartMs < kPrerollMinMs : prerollWokeOnly(end);
+    if (nothing) {
+      bool sent = prerollStreaming, offline = prerollOffline;
       stopPreroll();
-      if (sent) {  // nothing worth hearing went up after all
-        sendType("rec_cancel");
-        backToMain();
-      }
+      if (sent) sendType("rec_cancel");  // nothing worth hearing went up after all
+      if (offline) notice("Too short", "Hold the button while you talk.", kOrange);
+      else if (sent || mode == Mode::Listening) backToMain();
       return;
     }
   }
+  const bool full = (int32_t)(now - prerollStartMs) >= (int32_t)prerollMaxMs;
+  const uint32_t stopAt = end ? end : full ? prerollStartMs + prerollMaxMs : 0;  // 0 = still talking
   if (!wsUp) {
-    if ((int32_t)(now - prerollStartMs) > 45000 || (end && (int32_t)(now - end) > 25000)) {
-      stopPreroll();
-      notice("Not sent", "Couldn't reach Flight Deck in time — try again.", kRed);
-    }
+    // Let go and still no deck: keep it offline. A wake on Wi-Fi expects the
+    // link any moment; without Wi-Fi (or recorded offline) there's no point waiting.
+    bool noLink = prerollOffline || WiFi.status() != WL_CONNECTED;
+    if (stopAt && (int32_t)(now - stopAt) > (noLink ? 1500 : 25000) && !ui::busy()) keepOffline(stopAt);
     return;
   }
   if (!prerollStreaming) {
@@ -907,21 +999,151 @@ static void pumpPreroll() {
     mode = Mode::Listening;
     redraw();
   }
-  bool full = (int32_t)(now - prerollStartMs) >= (int32_t)kPrerollMaxMs;
-  if (!end && !full) {
+  if (!stopAt) {
     prerollSend(prerollReady(now - 120));  // stay behind the mic
     return;
   }
-  uint32_t stopAt = end ? end : prerollStartMs + kPrerollMaxMs;
   if ((int32_t)(now - stopAt) < 150) return;  // let the last of it land
   prerollSend(prerollReady(stopAt));
-  stopPreroll();
+  if (!wsUp) return;  // dropped mid-send: it all goes again (or is kept offline)
   sendRecEnd();
+  if (!wsUp) return;
+  stopPreroll();
   heard = "";
   statusLine = "Transcribing…";
   startWork();
   mode = Mode::Waiting;
   redraw();
+}
+
+// ── offline voice notes → Flight Deck ─────────────────────────────────
+
+// Once the deck is back and the device is idle, the waiting notes go up
+// (oldest first, up to 10 a time): notes_begin, then each as note_start +
+// PCM + note_end, then notes_end with the readings. The deck transcribes
+// them into one turn for the agent, marked as recorded offline, and answers
+// notes_done with the ids it has; only those are deleted here.
+static std::vector<notes::Note> upNotes;  // the batch going up
+static size_t upIndex = 0;
+static bool upOpen = false;               // the current note's file is open, its note_start sent
+static bool upAwaitAck = false;           // all sent: waiting for notes_done
+static uint32_t upAtMs = 0, upRetryAtMs = 0;
+static std::vector<String> upDelivered;   // acknowledged: deleted once the card's bus is free
+static bool upSentAny = false;            // this batch has a note the deck took
+static bool upCloseLater = false;         // the file is to be closed once the card's bus is free
+
+static void abortUpload(bool tellDeck) {
+  if (upNotes.empty() && !upAwaitAck) return;
+  if (upOpen) upCloseLater = true;  // closing touches the card: not during a redraw
+  if (tellDeck && wsUp && !upAwaitAck) sendType("notes_cancel");
+  upNotes.clear();
+  upIndex = 0;
+  upOpen = upAwaitAck = upSentAny = false;
+  upRetryAtMs = millis() + 20000;
+}
+
+// After the batch's last note: the deck transcribes what it took.
+static void finishBatch(uint32_t now) {
+  if (!upSentAny) {  // nothing readable went up
+    sendType("notes_cancel");
+    upNotes.clear();
+    upRetryAtMs = now + 20000;
+    return;
+  }
+  JsonDocument e;
+  e["type"] = "notes_end";
+  telemetry::fill(e["ctx"].to<JsonObject>());
+  sendJson(e);
+  if (!wsUp) return;  // dropped: abortUpload has reset everything
+  upAwaitAck = true;
+  upAtMs = now;
+}
+
+static void pumpUpload() {
+  if (!board::kOfflineNotes) return;
+  const uint32_t now = millis();
+  if (!ui::busy()) {  // card chores wait for the panel to let go of the bus
+    if (upCloseLater) {
+      notes::closeRead();
+      upCloseLater = false;
+    }
+    for (auto& id : upDelivered) notes::remove(id);
+    upDelivered.clear();
+  }
+  if (upAwaitAck) {
+    if (now - upAtMs > 300000) {  // no answer (a deck that doesn't know notes): try much later
+      upAwaitAck = false;
+      upNotes.clear();
+      upRetryAtMs = now + 600000;
+    }
+    return;
+  }
+  if (!wsUp) {
+    abortUpload(false);
+    return;
+  }
+  if (mode == Mode::Listening || mode == Mode::Waiting || prerollOn || audio::micActive()) {
+    abortUpload(true);  // they're talking: the notes wait
+    return;
+  }
+  // The card shares the panel's bus (a redraw holds it); and never over a voice.
+  if (ui::busy() || audio::playing() || upCloseLater) return;
+  // Every send below can find the link gone: onWs → abortUpload runs inside
+  // it and clears the batch, so each one is followed by a check.
+  if (upNotes.empty()) {
+    bool idle = mode == Mode::Idle || mode == Mode::Reply || mode == Mode::Home || mode == Mode::Image;
+    if (!notes::count() || !upDelivered.empty() || !agentLinked || !idle || (int32_t)(now - upRetryAtMs) < 0) return;
+    upNotes = notes::list(10);
+    if (upNotes.empty()) return;
+    upIndex = 0;
+    upOpen = upSentAny = false;
+    JsonDocument d;
+    d["type"] = "notes_begin";
+    d["count"] = upNotes.size();
+    sendJson(d);
+    if (!wsUp || upNotes.empty()) return;
+  }
+  const String id = upNotes[upIndex].id;
+  if (!upOpen) {
+    const notes::Note n = upNotes[upIndex];
+    uint32_t rate = audio::kMicRate;
+    if (!notes::openRead(n, &rate)) {  // not a readable note: set aside, never sent again
+      notes::quarantine(id);
+      if (++upIndex >= upNotes.size()) finishBatch(now);
+      return;
+    }
+    upOpen = true;
+    JsonDocument d;
+    d["type"] = "note_start";
+    d["id"] = id;
+    d["rate"] = rate;
+    d["seconds"] = (float)n.samples / rate;
+    if (n.when) {
+      d["epoch"] = (uint32_t)n.when;
+      d["recorded"] = localTimeText(n.when);
+    }
+    sendJson(d);
+    if (!wsUp || upNotes.empty()) return;
+  }
+  static uint8_t chunk[4096];
+  for (int i = 0; i < 8; ++i) {  // ~32 KB a pass keeps the loop lively
+    size_t got = notes::read(chunk, sizeof(chunk));
+    if (got) {
+      ws.sendBIN(chunk, got);
+      if (!wsUp || upNotes.empty()) return;
+      continue;
+    }
+    notes::closeRead();
+    upOpen = false;
+    JsonDocument d;
+    d["type"] = "note_end";
+    d["id"] = id;
+    sendJson(d);
+    if (!wsUp || upNotes.empty()) return;
+    upSentAny = true;
+    if (++upIndex >= upNotes.size()) finishBatch(now);
+    break;
+  }
 }
 
 static void pollFlash() {
@@ -1094,6 +1316,21 @@ static void onText(const char* payload, size_t len) {
       checkingUpdate = false;
       notice("Up to date", String("This is the latest version (" FW_VERSION ")."), kGreen);
     }
+  } else if (type == "notes_done") {
+    // The deck has these (and has sent them to the agent): gone from here.
+    // (a redraw may hold the card's bus right now: pumpUpload deletes them)
+    for (JsonVariant id : doc["ids"].as<JsonArray>()) upDelivered.push_back(id.as<String>());
+    upAwaitAck = false;
+    upNotes.clear();
+    upRetryAtMs = millis() + 3000;  // more waiting: the next batch shortly
+  } else if (type == "notes_failed") {
+    upAwaitAck = false;
+    upNotes.clear();
+    upRetryAtMs = millis() + 600000;
+    if (mode == Mode::Idle || mode == Mode::Reply || mode == Mode::Home) {
+      notice("Offline notes not sent", String(doc["text"] | "Flight Deck couldn't take them.") + " They stay on the " +
+                                           board::kNoun + ".", kOrange);
+    }
   } else if (type == "pong") {
     if (doc["t"].is<uint32_t>()) rttMs = millis() - doc["t"].as<uint32_t>();
   } else if (type == "error") {
@@ -1169,6 +1406,7 @@ static void onWs(WStype_t type, uint8_t* payload, size_t length) {
           prerollStreaming = false;
           prerollSent = 0;
         }
+        abortUpload(false);  // the notes go up again next time
         if (mode == Mode::Listening || mode == Mode::Waiting) mode = ui::hasReply() ? Mode::Reply : Mode::Idle;
         redraw();
       }
@@ -1338,7 +1576,7 @@ static void goToSleep() {
 // stick powers off (deep sleep; the front button wakes it).
 static void handleIdlePower() {
   if (mode == Mode::Listening || mode == Mode::Waiting || mode == Mode::Link || audio::playing() || flashing ||
-      probation || prerollOn) {
+      probation || prerollOn || !upNotes.empty() || upAwaitAck) {  // (an upload ends by the ack timeout at worst)
     lastActivityMs = millis();
     return;
   }
@@ -1493,7 +1731,7 @@ static void updateLeds() {
     batteryAt = millis();
     batteryPct = telemetry::onUsbPower() ? 100 : M5.Power.getBatteryLevel();
   }
-  if (prerollOn || mode == Mode::Listening) leds::set(S::Listening, prerollOn ? 60 : micLevel);
+  if (prerollOn || mode == Mode::Listening) leds::set(S::Listening, micLevel);
   else if (audio::playing()) leds::set(S::Speaking, audio::outputLevel());
   else if (mode == Mode::Waiting) leds::set(S::Working);
   else if (!wsUp && millis() - linkChangeMs < 60000) leds::set(S::Connecting);  // not forever
@@ -1529,6 +1767,39 @@ static void asleepRedraw() {
   ui::showSleeping(sleepHint(), settings.character);
   if ((int32_t)(buttonSeenMs - t0) > 0 || gpio_get_level(board::kTalkPin) == 0) return;  // awake after all
   sleepNow();
+}
+
+// Back onto Wi-Fi without stalling the loop: WiFiMulti scans synchronously
+// (2–3 s a call, every pass while offline). Instead an async scan every
+// 15 s, then the strongest saved network in reach.
+static void keepWifi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  static uint32_t lastScanMs = 0;
+  int found = WiFi.scanComplete();
+  if (found == WIFI_SCAN_RUNNING) return;
+  if (found >= 0) {
+    int best = -1, bestRssi = -1000;
+    for (int i = 0; i < found; ++i) {
+      for (int k = 0; k < settings.netCount; ++k) {
+        if (WiFi.SSID(i) == settings.nets[k].ssid && WiFi.RSSI(i) > bestRssi) {
+          best = k;
+          bestRssi = WiFi.RSSI(i);
+        }
+      }
+    }
+    WiFi.scanDelete();
+    if (best >= 0) WiFi.begin(settings.nets[best].ssid.c_str(), settings.nets[best].pass.c_str());
+    return;
+  }
+  if (!lastScanMs || millis() - lastScanMs > 15000) {
+    lastScanMs = millis();
+    // Refused while the driver keeps retrying the last network (it never
+    // gives up): stop that, so the next try can scan for another one.
+    if (WiFi.scanNetworks(true) == WIFI_SCAN_FAILED) {
+      WiFi.disconnect();
+      lastScanMs = millis() - 13000;
+    }
+  }
 }
 
 // ── setup / loop ─────────────────────────────────────────────────────
@@ -1573,6 +1844,7 @@ void setup() {
       startPreroll();
     }
   }
+  notes::begin();
   probation = ota::onProbation();
   Serial.printf("[claw] boot %s fw %s%s%s: %d network(s), server '%s'\n", deviceId().c_str(), FW_VERSION,
                 probation ? " (on probation)" : "", talking ? " (talking)" : "", settings.netCount,
@@ -1595,23 +1867,40 @@ void setup() {
   for (int i = 0; i < settings.netCount; ++i) {
     wifiMulti.addAP(settings.nets[i].ssid.c_str(), settings.nets[i].pass.c_str());
   }
+  // A device that keeps voice notes carries on offline when no Wi-Fi is in
+  // reach (it keeps looking); the others open setup. Setup stays a cold
+  // power-on with the talk button held, or Menu → Wi-Fi & settings.
+  const bool goesOffline = board::kOfflineNotes && *notes::where();
+  bool offline = false;
   uint32_t t0 = millis();
   while (wifiMulti.run(5000) != WL_CONNECTED) {
     M5.update();
     // A fresh update that can't even reach Wi-Fi goes back to the old version
     // (which may well be fine) rather than into setup.
     if (probation && millis() - t0 > 30000) ota::rollBack();
-    if (!probation && ((!prerollOn && M5.BtnA.wasPressed()) || millis() - t0 > 30000)) {
+    if (probation) continue;
+    // A talk-from-sleep recording already let go: no point waiting the full 30 s.
+    bool spoken = prerollOn && prerollEndMs && millis() - t0 > 8000;
+    if (goesOffline && (millis() - t0 > 30000 || spoken)) {
+      offline = true;
+      break;
+    }
+    if (!goesOffline && ((!prerollOn && M5.BtnA.wasPressed()) || millis() - t0 > 30000)) {
       if (prerollOn) stopPreroll();
       runSetupPortal("No Wi-Fi in reach");
     }
   }
-  Serial.printf("[claw] wifi %s ip %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
-  ui::setHealth(wifiHealth(), ui::Down);
-  if (!board::kEpaper) ui::showMessage("Wi-Fi connected", WiFi.SSID() + "  " + WiFi.localIP().toString(), kGreen);
+  if (offline) {
+    Serial.println("[claw] no wi-fi in reach: carrying on offline (voice notes are kept)");
+  } else {
+    Serial.printf("[claw] wifi %s ip %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+    ui::setHealth(wifiHealth(), ui::Down);
+    if (!board::kEpaper) ui::showMessage("Wi-Fi connected", WiFi.SSID() + "  " + WiFi.localIP().toString(), kGreen);
+  }
   configTzTime(settings.tz.c_str(), "pool.ntp.org", "time.google.com");  // clocks; the RTC follows
-  connectServer();
+  connectServer();  // it connects by itself once Wi-Fi is back
   lastActivityMs = millis();
+  if (offline) redraw();  // "Offline · hold to keep a note"
 }
 
 void loop() {
@@ -1620,9 +1909,10 @@ void loop() {
   bool wasUp = wsUp;
   ws.loop();
   if (wsUp != wasUp) linkChangeMs = millis();
-  if (WiFi.status() != WL_CONNECTED) wifiMulti.run(0);
+  keepWifi();
   telemetry::poll();
   pumpPreroll();
+  pumpUpload();
   if (phoneSettingsActive()) {
     if (mode == Mode::Link) phoneSettingsPoll();
     else phoneSettingsEnd();
@@ -1758,15 +2048,16 @@ void loop() {
   }
 
   // Keep the mic stream and the speaker fed.
-  if (mode == Mode::Listening && !prerollOn) {
-    int level = micLevel = audio::micPoll(micSink);
+  if (mode == Mode::Listening) {
+    // Live (mic → deck) or the background recording (talk from sleep, offline).
+    int level = micLevel = prerollOn ? prerollLevel() : audio::micPoll(micSink);
     if (millis() - lastDrawMs > 80) {
       lastDrawMs = millis();
       setBarState();
       if (settings.iconMode) ui::showFace(settings.character, face::Pose::Listening, level);
       else ui::showListening(level, millis() - recStartMs);
     }
-    if (millis() - recStartMs > 110000) stopTalking(true);  // the server caps at 120 s
+    if (!prerollOn && millis() - recStartMs > 110000) stopTalking(true);  // the server caps at 120 s
   }
   if (buzzOffMs && (int32_t)(millis() - buzzOffMs) >= 0) {
     M5.Power.setVibration(0);

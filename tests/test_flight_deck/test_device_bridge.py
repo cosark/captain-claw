@@ -595,3 +595,110 @@ async def test_an_answer_cuts_a_spoken_row_short(monkeypatch):
     assert say.cancelled() or say.done()
     assert conn._say_task is None
     await conn.close()
+
+
+# ── offline voice notes ───────────────────────────────────────────────
+
+
+def test_offline_notes_read_as_one_numbered_message():
+    one = db.offline_notes_message([{"recorded": "Mon 2026-10-20 14:02 (+0200)", "seconds": 12.4,
+                                     "text": " Buy milk. "}])
+    assert one == "A voice note I recorded while you were out of reach:\n1. (Mon 2026-10-20 14:02 (+0200), 0:12) Buy milk."
+    two = db.offline_notes_message([{"recorded": "", "seconds": 75, "text": "a"},
+                                    {"recorded": "x]\n[y", "seconds": "junk", "text": "b"}])
+    assert two.splitlines() == ["Voice notes I recorded while you were out of reach:",
+                                "1. (time unknown, 1:15) a", "2. (xy, 0:00) b"]
+
+
+def _note(note_id, seconds=2.0, rate=16000):
+    return {"id": note_id, "rate": rate, "seconds": seconds, "recorded": "Mon 14:02",
+            "pcm": bytearray(b"\x10\x00" * int(seconds * rate))}
+
+
+def _transcripts(monkeypatch, said: dict):
+    """Soniox stand-in by audio length: a string is what it heard ("" =
+    nothing said), an exception is a failed call."""
+    import types
+
+    from captain_claw.flight_deck import soniox_routes
+
+    async def _stt(_user, wav, **_kw):
+        result = said[len(wav)]
+        if isinstance(result, Exception):
+            raise result
+        return types.SimpleNamespace(text=result)
+
+    async def _spent(_user):
+        return None
+
+    monkeypatch.setattr(soniox_routes, "transcribe_for", _stt)
+    monkeypatch.setattr(db.usage_quota, "spent", _spent)
+
+
+def _wav_len(seconds, rate=16000):
+    return len(db.wav_from_pcm(b"\x10\x00" * int(seconds * rate), rate))
+
+
+@pytest.mark.asyncio
+async def test_offline_notes_become_one_turn_marked_offline(monkeypatch):
+    monkeypatch.setattr(db, "_delivered_notes", {})
+    from captain_claw.soniox_api import SonioxError
+
+    _transcripts(monkeypatch, {_wav_len(2.0): "Buy milk.", _wav_len(3.0): "Call Ana.",
+                               _wav_len(4.0): SonioxError(503, "Soniox is down"), _wav_len(1.0): ""})
+    conn = db._DeviceConn(_WS(), {"id": "u1"}, "watch", lang="", speak=False, screen=(466, 466),
+                          round_screen=True, hw="stopwatch")
+    agent = _bound(conn)
+    batch = [_note("a", 2.0), _note("b", 3.0), _note("c", 4.0), _note("d", 1.0), _note("e", 0.1)]
+    await conn.deliver_notes(batch, {"battery": {"percent": 40}})
+    assert len(agent.frames) == 1  # one turn for the whole batch
+    frame = agent.frames[0]
+    assert frame["content"] == db.offline_notes_message([{**batch[0], "text": "Buy milk."},
+                                                         {**batch[1], "text": "Call Ana."}])
+    assert frame["context_notes"][-1] == db.OFFLINE_NOTES_CONTEXT
+    assert frame["context_notes"][0].startswith("Device readings")
+    sent = [m for m in conn.ws.sent if isinstance(m, dict)]
+    assert sent[0] == {"type": "transcript", "text": "2 offline notes: “Buy milk.” · “Call Ana.”"}
+    done = next(m for m in sent if m["type"] == "notes_done")
+    assert sorted(done["ids"]) == ["a", "b", "d", "e"] and done["heard"] == 2  # d silent; not c: kept for a retry
+    assert next(m for m in sent if m["type"] == "notes_failed")["text"].endswith("Soniox is down")
+
+
+@pytest.mark.asyncio
+async def test_a_batch_sent_again_is_acknowledged_not_delivered_twice(monkeypatch):
+    monkeypatch.setattr(db, "_delivered_notes", {})
+    _transcripts(monkeypatch, {_wav_len(2.0): "Buy milk."})
+    conn = _conn()
+    agent = _bound(conn)
+    await conn.deliver_notes([_note("a")])
+    await conn.deliver_notes([_note("a")])  # its notes_done was lost with the link
+    assert len(agent.frames) == 1
+    dones = [m for m in conn.ws.sent if isinstance(m, dict) and m["type"] == "notes_done"]
+    assert [d["ids"] for d in dones] == [["a"], ["a"]] and dones[1]["heard"] == 0
+
+
+@pytest.mark.asyncio
+async def test_notes_stay_on_the_device_when_the_agent_cannot_take_them(monkeypatch):
+    monkeypatch.setattr(db, "_delivered_notes", {})
+    _transcripts(monkeypatch, {_wav_len(2.0): "Buy milk."})
+    conn = _conn()  # no agent bound
+    await conn.deliver_notes([_note("a")])
+    sent = [m for m in conn.ws.sent if isinstance(m, dict)]
+    assert not any(m["type"] == "notes_done" for m in sent)
+    assert sent[-1]["type"] == "notes_failed"
+    assert db._delivered_notes[conn.channel_id] == []
+
+
+@pytest.mark.asyncio
+async def test_notes_wait_while_the_user_is_over_their_limit(monkeypatch):
+    monkeypatch.setattr(db, "_delivered_notes", {})
+    _transcripts(monkeypatch, {})
+
+    async def _spent(_user):
+        return {"limit": 1}
+
+    monkeypatch.setattr(db.usage_quota, "spent", _spent)
+    monkeypatch.setattr(db.usage_quota, "short_limit_text", lambda q: "limit")
+    conn = _conn()
+    await conn.deliver_notes([_note("a")])  # nothing transcribed (the stand-in has no audio)
+    assert [m["type"] for m in conn.ws.sent if isinstance(m, dict)] == ["notes_failed"]

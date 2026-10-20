@@ -31,11 +31,32 @@ battery?" or "is it warm in here?" just work. The agent doesn't recite them
 unless asked, or unless the battery is nearly empty. They are never stored as
 the user's words.
 
+## Offline voice notes (StopWatch, PaperColor)
+
+Out of Wi-Fi, or Flight Deck down? Hold the talk button and talk as usual:
+the recording (up to 60 s) is kept as a voice note — on the PaperColor's TF
+card when one is in, otherwise in the device's own flash (the StopWatch has
+no TF slot; its flash holds about 1½ minutes of notes). The screen says
+"Saved offline". Once the device is back online and idle, the waiting notes
+go to Flight Deck, which transcribes them and gives the agent all of them as
+one message, oldest first, each with when it was recorded, marked as
+recorded offline. The agent handles them and answers once. A note is
+deleted from the device only after the deck has it; one Soniox couldn't
+transcribe stays for a later try. The status page shows how many are
+waiting. The notes are plain WAV files (16 kHz mono) in `/claw-notes/`, so
+a card read on a computer plays them.
+
+Without Wi-Fi at switch-on these two carry on offline (and keep looking for
+it) instead of opening the setup hotspot. Setup is a switch-on with the talk
+button held, or Menu → *Wi-Fi & settings*.
+
 ## Talk from sleep
 
 Asleep, hold the talk button and start speaking at once. The device records
 while it wakes up and reconnects (a few seconds), then sends all of it as if
-you had spoken just now. A short press only wakes it.
+you had spoken just now. A short press only wakes it. (On the StopWatch and
+PaperColor, a recording that can't reach Flight Deck is kept as an offline
+voice note.)
 
 ## PaperColor (colour e-paper)
 
