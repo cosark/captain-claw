@@ -19,6 +19,7 @@ import { ForgePage } from './pages/ForgePage'
 import { LibraryPage } from './pages/LibraryPage'
 import { LoginPage } from './pages/LoginPage'
 import { ChoosePasswordPage } from './pages/ChoosePasswordPage'
+import { AdminStartDialog } from './components/layout/AdminStartDialog'
 import { AcceptInvitePage, INVITE_PATH } from './pages/AcceptInvitePage'
 import { AdminPage } from './pages/AdminPage'
 import { UsersPage } from './pages/UsersPage'
@@ -588,7 +589,12 @@ function App() {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated)
   const mustChangePassword = useAuthStore((s) => s.user?.must_change_password === true)
   const instanceName = useAuthStore((s) => s.branding.name)
+  const adminStartPending = useAuthStore((s) => s.adminStartPending)
   const [authChecked, setAuthChecked] = useState(false)
+  // The signed-in user's settings are in (hydrateAllStores after sign-in):
+  // until then their saved layout could still land on top of a choice made
+  // in AdminStartDialog.
+  const [settingsLoaded, setSettingsLoaded] = useState(false)
   const [fdUnreachable, setFdUnreachable] = useState(false)
   // An invitation link (<deck>/invite#<token>): choose a password, get an account.
   const [onInvitePage, setOnInvitePage] = useState(() => window.location.pathname === INVITE_PATH)
@@ -636,7 +642,7 @@ function App() {
   const prevAuth = useRef(false)
   useEffect(() => {
     if (isAuthenticated && !prevAuth.current) {
-      hydrateAllStores()
+      hydrateAllStores().finally(() => setSettingsLoaded(true))
       // Tell Flight Deck the address this deck is reached at, so a public link
       // an agent makes points here rather than at the agent's internal FD URL.
       reportPublicOrigin()
@@ -671,8 +677,14 @@ function App() {
     return <ChoosePasswordPage />
   }
 
-  // Auth disabled or authenticated → show main app
-  return <AppContent />
+  // Auth disabled or authenticated → show main app (an admin who just signed
+  // in is asked where to start first)
+  return (
+    <>
+      <AppContent />
+      {adminStartPending && settingsLoaded && <AdminStartDialog />}
+    </>
+  )
 }
 
 export default App
