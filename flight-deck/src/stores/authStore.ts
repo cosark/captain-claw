@@ -50,6 +50,9 @@ export interface AuthStore {
   signingOut: boolean
   signUp: SignUp
   branding: Branding
+  // An admin just signed in (a form, not a reload): the app asks where to
+  // start — Settings, Users or the agent desktop (AdminStartDialog).
+  adminStartPending: boolean
 
   setAuth: (user: User, token: string) => void
   clearAuth: () => void
@@ -59,6 +62,7 @@ export interface AuthStore {
   setSimpleChatOnly: (v: boolean) => void
   setSignUp: (v: SignUp) => void
   setBranding: (v: Partial<Branding>) => void
+  setAdminStartPending: (v: boolean) => void
   setToken: (token: string) => void
 }
 
@@ -73,6 +77,7 @@ export const useAuthStore = create<AuthStore>((set) => ({
   signingOut: false,
   signUp: { mode: 'register', cohort: '' },
   branding: { name: DEFAULT_INSTANCE_NAME, description: '', logo: '', poweredBy: true },
+  adminStartPending: false,
 
   setAuth: (user, token) => set({ user, token, isAuthenticated: true }),
   clearAuth: () => set({ user: null, token: '', isAuthenticated: false }),
@@ -82,6 +87,7 @@ export const useAuthStore = create<AuthStore>((set) => ({
   setSimpleChatOnly: (v) => set({ simpleChatOnly: v }),
   setSignUp: (v) => set({ signUp: v }),
   setBranding: (v) => set((s) => ({ branding: { ...s.branding, ...v } })),
+  setAdminStartPending: (adminStartPending) => set({ adminStartPending }),
   setToken: (token) => set({ token }),
 }))
 
@@ -179,8 +185,15 @@ export async function loginUser(email: string, password: string): Promise<User> 
   }
   const data = await res.json()
   _signInPassword = data.user?.must_change_password ? password : ''
-  useAuthStore.getState().setAuth(data.user, data.access_token)
+  _signedIn(data.user, data.access_token)
   return data.user
+}
+
+// Signed in from a form — sign in, sign up, an invitation — rather than a
+// session refresh: an admin is asked where to start (AdminStartDialog).
+function _signedIn(user: User, token: string): void {
+  if (user?.role === 'admin') useAuthStore.getState().setAdminStartPending(true)
+  useAuthStore.getState().setAuth(user, token)
 }
 
 // The password a user whose password an admin set just signed in with — kept
@@ -208,7 +221,7 @@ export async function registerUser(email: string, password: string, displayName:
     throw new Error(body.detail || 'Registration failed')
   }
   const data = await res.json()
-  useAuthStore.getState().setAuth(data.user, data.access_token)
+  _signedIn(data.user, data.access_token)
   return data.user
 }
 
@@ -271,7 +284,7 @@ export function lookupInvite(token: string): Promise<InviteDetails> {
 export async function acceptInvite(token: string, password: string, displayName: string): Promise<User> {
   const data = await _inviteCall<{ user: User; access_token: string }>(
     'accept', { token, password, display_name: displayName }, 'Could not accept the invitation')
-  useAuthStore.getState().setAuth(data.user, data.access_token)
+  _signedIn(data.user, data.access_token)
   return data.user
 }
 
