@@ -1,0 +1,179 @@
+import { useEffect, useState } from 'react'
+import { Settings2, ClipboardList, MessageSquare, Boxes, Save } from 'lucide-react'
+import { useAuthStore } from '../../stores/authStore'
+import { useConsoleStore } from '../../stores/consoleStore'
+import { BrandingAdmin } from '../admin/BrandingAdmin'
+import { Switch } from '../admin/Switch'
+import { DeckProfileDefaults } from '../profile/DeckProfileDefaults'
+import {
+  CONFIG_DEFAULTS, fetchConfig, saveConfig, waitlistName, type KioskMode, type SystemConfig,
+} from '../admin/deckConfig'
+import { Page, PageHeader, Card, SettingRow, Segmented, Notice, Button, inputCls } from './parts'
+
+// Settings: how the deck looks and who gets in — branding, sign-up and the
+// waitlist, kiosk mode, how agents run, and what every agent knows about the
+// company. The same system config as Admin → Settings.
+
+const KIOSK_HINT: Record<KioskMode, string> = {
+  off: 'Everyone gets the normal layout.',
+  all: 'Every non-admin is locked to the simple chat.',
+  selected: 'Only the users marked on the Users page are locked.',
+}
+
+export function SettingsConsole() {
+  const go = useConsoleStore((s) => s.go)
+  const signUpMode = useAuthStore((s) => s.signUp.mode)
+  const [config, setConfig] = useState<SystemConfig>({ ...CONFIG_DEFAULTS })
+  const [loaded, setLoaded] = useState(false)
+  const [cohort, setCohort] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState('')
+
+  useEffect(() => {
+    fetchConfig()
+      .then((c) => { setConfig(c); setCohort(c.waitlist_cohort) })
+      .catch(() => setError("Couldn't load the deck's settings"))
+      .finally(() => setLoaded(true))
+  }, [])
+
+  // Save one change; what the app shows elsewhere follows it.
+  const save = async (key: string, patch: Partial<SystemConfig>) => {
+    setBusy(key); setError('')
+    try {
+      const next = await saveConfig(patch)
+      setConfig(next)
+      const auth = useAuthStore.getState()
+      if ('docker_spawn_enabled' in patch) auth.setDockerSpawnEnabled(next.docker_spawn_enabled)
+      if ('kiosk_mode' in patch) auth.setSimpleChatOnly(next.kiosk_mode === 'all')
+      if ('waitlist_enabled' in patch || 'waitlist_cohort' in patch) {
+        const mode = auth.signUp.mode === 'register' ? 'register' : next.waitlist_enabled ? 'waitlist' : 'closed'
+        auth.setSignUp({ mode, cohort: waitlistName(next) })
+      }
+      return next
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to save')
+      return null
+    } finally {
+      setBusy('')
+    }
+  }
+
+  return (
+    <Page>
+      <PageHeader
+        icon={Settings2}
+        title="Settings"
+        description="How the deck looks and who gets in: its name and logo, sign-up and the waitlist, kiosk mode, and what every agent knows about your company."
+      />
+
+      {error && <Notice tone="red">{error}</Notice>}
+
+      {loaded && (
+        <BrandingAdmin
+          name={config.instance_name}
+          description={config.instance_description}
+          poweredBy={config.show_powered_by}
+          onSave={async (patch) => {
+            const next = await saveConfig(patch)
+            setConfig(next)
+            const { signUp, setSignUp } = useAuthStore.getState()
+            setSignUp({ ...signUp, cohort: waitlistName(next) })
+            return next
+          }}
+        />
+      )}
+
+      <Card
+        icon={ClipboardList}
+        title="Sign-up"
+        hint={signUpMode === 'register'
+          ? 'Self-registration is open on this deck (FD_REGISTRATION_OPEN): anyone can create an account, so there is no waitlist.'
+          : 'Registration is closed. People apply on the waitlist, or you add and invite them on the Users page.'}
+        bodyClassName="divide-y divide-zinc-800/80 px-5 py-4"
+      >
+        <SettingRow
+          title="Take waitlist applications"
+          hint={<>The sign-up page takes applications: name, email, a password and who recommended them. You approve them on{' '}
+            <button onClick={() => go('users', { usersTab: 'waitlist' })} className="text-violet-600 underline underline-offset-2 hover:no-underline dark:text-violet-400">Users → Waitlist</button>.
+            Off: the sign-in page says an administrator creates accounts.</>}
+        >
+          <Switch
+            on={config.waitlist_enabled}
+            disabled={busy === 'waitlist'}
+            label="Take waitlist applications"
+            onToggle={() => save('waitlist', { waitlist_enabled: !config.waitlist_enabled })}
+          />
+        </SettingRow>
+        <div className="py-4 last:pb-0">
+          <div className="text-sm font-medium text-zinc-200">Waitlist name</div>
+          <div className="mt-0.5 text-xs text-zinc-500">
+            Shown on the sign-up page and saved with each application. Blank uses the deck's name ({config.instance_name}).
+          </div>
+          <form
+            className="mt-3 flex gap-2"
+            onSubmit={async (e) => {
+              e.preventDefault()
+              const next = await save('cohort', { waitlist_cohort: cohort })
+              if (next) setCohort(next.waitlist_cohort)
+            }}
+          >
+            <input value={cohort} onChange={(e) => setCohort(e.target.value)} maxLength={60} placeholder={config.instance_name} className={inputCls} />
+            <Button type="submit" icon={Save} busy={busy === 'cohort'} disabled={cohort.trim() === config.waitlist_cohort}>Save</Button>
+          </form>
+        </div>
+      </Card>
+
+      <Card
+        icon={MessageSquare}
+        title="Kiosk mode"
+        hint="Locks people to the simple, chat-first layout: they chat, start an agent from an archetype, manage their own connections and profile, and sign out. Admins are never locked; a change reaches people already signed in within about 15 minutes."
+        bodyClassName="divide-y divide-zinc-800/80 px-5 py-4"
+      >
+        <div className="pb-4">
+          <Segmented
+            value={config.kiosk_mode}
+            label="Kiosk mode"
+            onChange={(m) => { if (m !== config.kiosk_mode || config.kiosk_mode_from_env) save('kiosk', { kiosk_mode: m }) }}
+            options={[
+              { value: 'off', label: 'Off' },
+              { value: 'all', label: 'Everyone' },
+              { value: 'selected', label: 'Selected users' },
+            ]}
+          />
+          <p className="mt-2 text-xs text-zinc-500">
+            {KIOSK_HINT[config.kiosk_mode]}
+            {config.kiosk_mode_from_env && ' Set by --simple-chat until you pick a mode here.'}
+          </p>
+        </div>
+        <SettingRow
+          title="New users start in kiosk mode"
+          hint={'Marks accounts created from now on (added, invited, signed up or approved) — they count under "Selected users".'}
+        >
+          <Switch
+            on={config.kiosk_new_users}
+            disabled={busy === 'kiosk-new'}
+            label="New users start in kiosk mode"
+            onToggle={() => save('kiosk-new', { kiosk_new_users: !config.kiosk_new_users })}
+          />
+        </SettingRow>
+      </Card>
+
+      <Card icon={Boxes} title="Agents" bodyClassName="px-5 py-4">
+        <SettingRow
+          title="Docker containers"
+          hint="Let people start agents as Docker containers. Off: agents run as processes on this machine only."
+        >
+          <Switch
+            on={config.docker_spawn_enabled}
+            disabled={busy === 'docker'}
+            label="Docker containers"
+            onToggle={() => save('docker', { docker_spawn_enabled: !config.docker_spawn_enabled })}
+          />
+        </SettingRow>
+      </Card>
+
+      {/* What every user's agents know about the company — loads on its own. */}
+      <DeckProfileDefaults />
+    </Page>
+  )
+}

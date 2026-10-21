@@ -76,7 +76,7 @@ function OAuthClientRow({ provider, label, refreshTick }: {
   )
 }
 
-function JevTeamKey({ refreshTick }: { refreshTick: number }) {
+export function JevTeamKey({ refreshTick }: { refreshTick: number }) {
   const [state, setState] = useState<SharedJevKey | null>(null)
   const [key, setKey] = useState('')
   const [busy, setBusy] = useState(false)
@@ -174,7 +174,7 @@ function JevTeamKey({ refreshTick }: { refreshTick: number }) {
   )
 }
 
-function SonioxTeamKey({ refreshTick }: { refreshTick: number }) {
+export function SonioxTeamKey({ refreshTick }: { refreshTick: number }) {
   const [state, setState] = useState<SharedSonioxKey | null>(null)
   const [key, setKey] = useState('')
   const [busy, setBusy] = useState(false)
@@ -296,7 +296,9 @@ function mcpTarget(s: MCPServer): string {
   return s.transport === 'stdio' ? [s.command, ...(s.args || [])].join(' ') : s.url
 }
 
-function SharedMCPServers({ refreshTick }: { refreshTick: number }) {
+// `inline`: shown next to the MCP servers' own card (the Admin console), so
+// there is no "Add or edit" link to Connections.
+export function SharedMCPServers({ refreshTick, inline = false }: { refreshTick: number; inline?: boolean }) {
   const setView = useUIStore((s) => s.setView)
   const authEnabled = useAuthStore((s) => s.authEnabled)
   const { servers, error, refresh, setSharing } = useMCPStore()
@@ -380,12 +382,14 @@ function SharedMCPServers({ refreshTick }: { refreshTick: number }) {
           </div>
         </div>
         {shared.length > 0 && <Check className="h-4 w-4 text-emerald-500" />}
-        <button
-          onClick={open}
-          className="flex items-center gap-1 rounded-md border border-zinc-700 px-2.5 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
-        >
-          Add or edit <ArrowRight className="h-3 w-3" />
-        </button>
+        {!inline && (
+          <button
+            onClick={open}
+            className="flex items-center gap-1 rounded-md border border-zinc-700 px-2.5 py-1 text-xs text-zinc-300 hover:bg-zinc-800"
+          >
+            Add or edit <ArrowRight className="h-3 w-3" />
+          </button>
+        )}
       </div>
       {shared.map((s) => row(s, true))}
       {mine.length > 0 && (

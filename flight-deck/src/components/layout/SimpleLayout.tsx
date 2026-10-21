@@ -30,8 +30,10 @@ import {
   SlidersHorizontal,
   Trash2,
   BookOpen,
+  ShieldCheck,
 } from 'lucide-react'
 import { useUIStore } from '../../stores/uiStore'
+import { openConsole } from '../../stores/consoleStore'
 import { useAgentStore } from '../../stores/agentStore'
 import { useAuthStore, logoutUser } from '../../stores/authStore'
 import { useChatStore, parseLaneKey, clearAgentSlices } from '../../stores/chatStore'
@@ -1073,6 +1075,11 @@ function AgentsColumn({
               <LayoutDashboard className="h-4 w-4" />
             </button>
           )}
+          {authEnabled && authUser?.role === 'admin' && (
+            <button onClick={() => openConsole()} className={iconBtn} title="Admin console — models, archetypes, connections, users, settings">
+              <ShieldCheck className="h-4 w-4" />
+            </button>
+          )}
           {/* Bell lives at the TOP so its downward dropdown isn't clipped by
               the h-screen overflow-hidden root when the rail is collapsed. */}
           <NotificationBell align="left" />
@@ -1209,6 +1216,11 @@ function AgentsColumn({
           {!locked && (
             <button onClick={() => setLayoutMode('full')} className={iconBtn} title="Full view — all pages and panels">
               <LayoutDashboard className="h-4 w-4" />
+            </button>
+          )}
+          {authEnabled && authUser?.role === 'admin' && (
+            <button onClick={() => openConsole()} className={iconBtn} title="Admin console — models, archetypes, connections, users, settings">
+              <ShieldCheck className="h-4 w-4" />
             </button>
           )}
           <button onClick={() => setOpen(false)} className={iconBtn} title="Hide agents">

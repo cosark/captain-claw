@@ -1,0 +1,514 @@
+import { useMemo, useState } from 'react'
+import {
+  Library, Plus, Wand2, Search, Crown, Pencil, Trash2, Copy, Share2, Users, Sparkles,
+  Check, Wrench, Gauge, Lock,
+} from 'lucide-react'
+import { useTierConfig, TIER_ORDER, type Archetype, type ArchetypeRegistry } from '../../services/tierConfig'
+import {
+  createArchetype, updateArchetype, deleteArchetype, generateArchetype, type ArchetypeInput,
+} from '../../services/archetypes'
+import { MODES } from '../../services/cognitiveModes'
+import { ForgeArchetypesModal } from '../library/ForgeArchetypesModal'
+import { ShareModal } from '../common/ShareModal'
+import { Switch } from '../admin/Switch'
+import { matchesQuery } from '../admin/deckConfig'
+import {
+  Page, PageHeader, Pill, Button, Sheet, Field, Notice, Segmented, EmptyState, inputCls,
+} from './parts'
+
+// Archetypes: the ready-made agents people start from (the kiosk's "New
+// agent" picker lists the same gallery). Built-in ones come with Captain Claw;
+// yours can be edited, shared with other users, or forged in bulk from
+// documents. A built-in or shared one is copied before it's changed.
+
+type Source = 'all' | 'user' | 'base' | 'shared'
+
+function slugify(s: string): string {
+  return s.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+}
+
+function toInput(a: Archetype): ArchetypeInput {
+  return {
+    archetype_id: a.id, role: a.role, family: a.family || 'Custom', description: a.description || '',
+    cognitive_mode: a.cognitive_mode || 'neutra', tier: a.tier || 'balanced', tools: a.tools || [],
+    fleet_instructions: a.fleet_instructions || '', keywords: a.keywords || [], lead: !!a.lead,
+    reliability_seed: a.reliability_seed ?? 0.7, runtime: a.runtime || '',
+  }
+}
+
+function freeId(registry: ArchetypeRegistry | null, base: string): string {
+  const taken = new Set((registry?.archetypes || []).map((x) => x.id))
+  let id = `${base}-copy`
+  for (let n = 2; taken.has(id); n += 1) id = `${base}-copy-${n}`
+  return id
+}
+
+export function ArchetypesPage() {
+  const { registry, refreshRegistry, tiers, forgeTier } = useTierConfig()
+  const [query, setQuery] = useState('')
+  const [source, setSource] = useState<Source>('all')
+  const [family, setFamily] = useState('')
+  // The editor: a draft plus the id it saves over (null = a new archetype).
+  const [draft, setDraft] = useState<{ input: ArchetypeInput; id: string | null } | null>(null)
+  const [viewing, setViewing] = useState<Archetype | null>(null)
+  const [forgeOpen, setForgeOpen] = useState(false)
+  const [shareTarget, setShareTarget] = useState<Archetype | null>(null)
+  const [error, setError] = useState('')
+
+  const all = useMemo(() => registry?.archetypes || [], [registry])
+  const counts = useMemo(() => ({
+    all: all.length,
+    user: all.filter((a) => a.source === 'user').length,
+    base: all.filter((a) => (a.source || 'base') === 'base').length,
+    shared: all.filter((a) => a.source === 'shared').length,
+  }), [all])
+  const families = useMemo(() => [...new Set(all.map((a) => a.family || 'Custom'))].sort(), [all])
+
+  const shown = all.filter((a) =>
+    (source === 'all' || (a.source || 'base') === source)
+    && (!family || (a.family || 'Custom') === family)
+    && matchesQuery(query, a.role, a.id, a.description, a.family, (a.keywords || []).join(' ')),
+  )
+
+  // Every tool the gallery uses, for the editor's palette.
+  const toolPalette = useMemo(() => {
+    const s = new Set<string>(registry?.base_tools || [])
+    all.forEach((a) => a.tools?.forEach((t) => s.add(t)))
+    return [...s].sort()
+  }, [registry, all])
+
+  const blank = (): ArchetypeInput => ({
+    archetype_id: '', role: '', family: 'Custom', description: '', cognitive_mode: 'neutra', tier: 'balanced',
+    runtime: '', tools: registry?.base_tools ? [...registry.base_tools] : [], fleet_instructions: '',
+    keywords: [], lead: false, reliability_seed: 0.7,
+  })
+
+  const copyOf = (a: Archetype): ArchetypeInput => ({
+    ...toInput(a), archetype_id: freeId(registry, slugify(a.id || a.role || 'archetype')), role: `${a.role} (copy)`,
+  })
+
+  const remove = async (a: Archetype) => {
+    if (!confirm(`Delete the archetype "${a.role}"?${a.overrides ? ' The built-in version comes back.' : ''}`)) return
+    setError('')
+    try {
+      await deleteArchetype(a.id)
+      refreshRegistry()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  const open = (a: Archetype) => {
+    if (a.source === 'user') setDraft({ input: toInput(a), id: a.id })
+    else setViewing(a)
+  }
+
+  return (
+    <Page>
+      <PageHeader
+        icon={Library}
+        title="Archetypes"
+        description="Ready-made agents: a role, instructions, tools and a model tier. People pick one to start a new agent, so these are what your team can create."
+        actions={<>
+          <Button icon={Wand2} onClick={() => setForgeOpen(true)} title="Draft several archetypes from instructions and documents">Forge from documents</Button>
+          <Button variant="primary" icon={Plus} onClick={() => setDraft({ input: blank(), id: null })}>New archetype</Button>
+        </>}
+      />
+
+      {error && <Notice tone="red">{error}</Notice>}
+
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
+        <div className="relative flex-1">
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-zinc-500" />
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search by role, description or keyword…"
+            className={`${inputCls} pl-9`}
+          />
+        </div>
+        <Segmented
+          value={source}
+          onChange={setSource}
+          label="Which archetypes"
+          options={[
+            { value: 'all', label: 'All', count: counts.all },
+            { value: 'user', label: 'Yours', count: counts.user },
+            { value: 'base', label: 'Built-in', count: counts.base },
+            ...(counts.shared ? [{ value: 'shared' as const, label: 'Shared with you', count: counts.shared }] : []),
+          ]}
+        />
+      </div>
+
+      {families.length > 1 && (
+        <div className="-mt-2 flex flex-wrap gap-1.5">
+          {['', ...families].map((f) => (
+            <button
+              key={f || 'all'}
+              onClick={() => setFamily(f)}
+              className={`rounded-full border px-3 py-1 text-xs font-medium transition-colors ${
+                family === f
+                  ? 'border-violet-500/50 bg-violet-500/15 text-violet-700 dark:text-violet-200'
+                  : 'border-zinc-800 text-zinc-500 hover:border-zinc-600 hover:text-zinc-200'
+              }`}
+            >
+              {f || 'Every family'}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {!registry ? (
+        <p className="text-sm text-zinc-500">Loading archetypes…</p>
+      ) : shown.length === 0 ? (
+        <EmptyState icon={Library} title={all.length ? 'Nothing matches' : 'No archetypes yet'}>
+          {all.length ? 'Try another search or filter.' : 'Create one, or forge a set from your documents.'}
+        </EmptyState>
+      ) : (
+        <div className="grid grid-cols-1 gap-3 wide:grid-cols-2 lg:grid-cols-3">
+          {shown.map((a) => (
+            <ArchetypeCard
+              key={a.id}
+              a={a}
+              tierLabel={registry.tiers[a.tier]?.label || a.tier}
+              onOpen={() => open(a)}
+              onCopy={() => setDraft({ input: copyOf(a), id: null })}
+              onShare={() => setShareTarget(a)}
+              onDelete={() => remove(a)}
+            />
+          ))}
+        </div>
+      )}
+
+      {draft && (
+        <ArchetypeSheet
+          initial={draft.input}
+          editingId={draft.id}
+          registry={registry}
+          toolPalette={toolPalette}
+          generate={(prompt) => {
+            const ft = tiers[forgeTier]
+            return generateArchetype(prompt, ft?.provider || '', ft?.model || '', ft?.api_key || '', ft?.base_url || '', ft?.output_ctx || 0)
+          }}
+          onClose={() => setDraft(null)}
+          onSaved={() => { refreshRegistry(); setDraft(null) }}
+        />
+      )}
+
+      {viewing && (
+        <ArchetypeView
+          a={viewing}
+          tierLabel={registry?.tiers[viewing.tier]?.label || viewing.tier}
+          onClose={() => setViewing(null)}
+          onCopy={() => { setDraft({ input: copyOf(viewing), id: null }); setViewing(null) }}
+        />
+      )}
+
+      {forgeOpen && (
+        <ForgeArchetypesModal
+          tiers={tiers}
+          forgeTier={forgeTier}
+          existingIds={all.map((a) => a.id)}
+          toolPalette={toolPalette}
+          onClose={() => setForgeOpen(false)}
+          onSaved={() => refreshRegistry()}
+        />
+      )}
+
+      {shareTarget && (
+        <ShareModal
+          resourceType="archetype"
+          resourceId={shareTarget.id}
+          resourceName={shareTarget.role}
+          allowEdit={false}
+          onClose={() => setShareTarget(null)}
+        />
+      )}
+    </Page>
+  )
+}
+
+function ArchetypeCard({ a, tierLabel, onOpen, onCopy, onShare, onDelete }: {
+  a: Archetype
+  tierLabel: string
+  onOpen: () => void
+  onCopy: () => void
+  onShare: () => void
+  onDelete: () => void
+}) {
+  const mine = a.source === 'user'
+  const iconBtn = 'rounded-lg p-1.5 text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-200'
+  return (
+    <div className="group flex flex-col rounded-2xl border border-zinc-800 bg-zinc-900/40 transition-colors hover:border-zinc-700">
+      <button onClick={onOpen} className="flex flex-1 flex-col p-4 pb-2 text-left">
+        <div className="flex items-start justify-between gap-2">
+          <span className="flex min-w-0 items-center gap-1.5 text-sm font-semibold text-zinc-100">
+            {a.lead && <Crown className="h-3.5 w-3.5 shrink-0 text-amber-500" />}
+            <span className="truncate">{a.role}</span>
+          </span>
+          {mine
+            ? <Pill tone="violet">{a.overrides ? 'yours · replaces built-in' : 'yours'}</Pill>
+            : a.source === 'shared'
+              ? <Pill tone="sky" icon={Users} title={`Shared by ${a.shared_owner_name || a.shared_owner_email || 'another user'}`}>shared</Pill>
+              : <Pill icon={Lock}>built-in</Pill>}
+        </div>
+        <p className="mt-1.5 line-clamp-2 text-xs leading-relaxed text-zinc-500">{a.description || 'No description.'}</p>
+        <div className="mt-auto flex flex-wrap gap-1 pt-3">
+          <Pill tone="cyan" icon={Gauge}>{tierLabel}</Pill>
+          <Pill>{a.family || 'Custom'}</Pill>
+          <Pill icon={Wrench}>{a.tools.length} tools</Pill>
+          {a.runtime === 'mrav' && <Pill tone="amber">micro</Pill>}
+        </div>
+      </button>
+      <div className="flex items-center justify-end gap-0.5 px-3 pb-2.5">
+        {mine ? (
+          <>
+            <button onClick={onShare} className={iconBtn} title="Share with other users"><Share2 className="h-4 w-4" /></button>
+            <button onClick={onOpen} className={iconBtn} title="Edit"><Pencil className="h-4 w-4" /></button>
+            <button onClick={onDelete} className={`${iconBtn} hover:text-red-500`} title={a.overrides ? 'Delete (the built-in comes back)' : 'Delete'}><Trash2 className="h-4 w-4" /></button>
+          </>
+        ) : (
+          <button onClick={onCopy} className={`${iconBtn} flex items-center gap-1 text-xs`} title="An editable copy in your archetypes">
+            <Copy className="h-4 w-4" /> Make a copy
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ── Read-only: a built-in or shared archetype ──
+
+function ArchetypeView({ a, tierLabel, onClose, onCopy }: { a: Archetype; tierLabel: string; onClose: () => void; onCopy: () => void }) {
+  const mode = MODES.find((m) => m.id === a.cognitive_mode)
+  return (
+    <Sheet
+      title={a.role}
+      subtitle={a.source === 'shared' ? `Shared by ${a.shared_owner_name || a.shared_owner_email || 'another user'}` : 'Built-in — copy it to change it'}
+      icon={Library}
+      onClose={onClose}
+      wide
+      footer={<>
+        <Button variant="ghost" onClick={onClose}>Close</Button>
+        <Button variant="primary" icon={Copy} onClick={onCopy}>Make an editable copy</Button>
+      </>}
+    >
+      <div className="space-y-5">
+        <p className="text-sm leading-relaxed text-zinc-300">{a.description}</p>
+        <dl className="grid grid-cols-2 gap-4 text-sm">
+          <div><dt className="text-xs text-zinc-500">Model tier</dt><dd className="mt-0.5 text-zinc-200">{tierLabel}</dd></div>
+          <div><dt className="text-xs text-zinc-500">Thinking style</dt><dd className="mt-0.5 text-zinc-200">{mode ? `${mode.label} — ${mode.character}` : a.cognitive_mode}</dd></div>
+          <div><dt className="text-xs text-zinc-500">Family</dt><dd className="mt-0.5 text-zinc-200">{a.family}</dd></div>
+          <div><dt className="text-xs text-zinc-500">Runtime</dt><dd className="mt-0.5 text-zinc-200">{a.runtime === 'mrav' ? 'Micro (8k)' : 'Classic'}</dd></div>
+        </dl>
+        <div>
+          <div className="mb-1.5 text-xs text-zinc-500">Tools</div>
+          <div className="flex flex-wrap gap-1">{a.tools.map((t) => <Pill key={t}>{t}</Pill>)}</div>
+        </div>
+        {a.fleet_instructions && (
+          <div>
+            <div className="mb-1.5 text-xs text-zinc-500">Instructions</div>
+            <pre className="max-h-80 overflow-auto whitespace-pre-wrap rounded-xl border border-zinc-800 bg-zinc-900/60 p-3 font-sans text-xs leading-relaxed text-zinc-300">{a.fleet_instructions}</pre>
+          </div>
+        )}
+      </div>
+    </Sheet>
+  )
+}
+
+// ── The editor ──
+
+function ArchetypeSheet({ initial, editingId, registry, toolPalette, generate, onClose, onSaved }: {
+  initial: ArchetypeInput
+  editingId: string | null
+  registry: ArchetypeRegistry | null
+  toolPalette: string[]
+  generate: (prompt: string) => Promise<ArchetypeInput>
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const [d, setD] = useState<ArchetypeInput>(initial)
+  const [prompt, setPrompt] = useState('')
+  const [generating, setGenerating] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const [toolQuery, setToolQuery] = useState('')
+  const [keywords, setKeywords] = useState(initial.keywords.join(', '))
+
+  const set = (patch: Partial<ArchetypeInput>) => setD((prev) => ({ ...prev, ...patch }))
+  const tools = [...new Set([...toolPalette, ...d.tools])].sort()
+    .filter((t) => !toolQuery.trim() || t.toLowerCase().includes(toolQuery.trim().toLowerCase()))
+
+  const runGenerate = async () => {
+    if (!prompt.trim()) return
+    setGenerating(true); setError('')
+    try {
+      const out = await generate(prompt.trim())
+      // Editing keeps its id; a new one keeps an id typed already.
+      const id = editingId || d.archetype_id || out.archetype_id
+      setD({ ...out, archetype_id: id, runtime: out.runtime ?? d.runtime })
+      setKeywords(out.keywords.join(', '))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setGenerating(false)
+    }
+  }
+
+  const save = async () => {
+    const body: ArchetypeInput = {
+      ...d,
+      archetype_id: editingId || slugify(d.archetype_id || d.role),
+      keywords: keywords.split(',').map((s) => s.trim()).filter(Boolean),
+    }
+    if (!body.role.trim()) { setError('Give it a role — that is its name.'); return }
+    if (!body.archetype_id) { setError('An id (or a role) is needed.'); return }
+    setSaving(true); setError('')
+    try {
+      if (editingId) await updateArchetype(editingId, body)
+      else await createArchetype(body)
+      onSaved()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Sheet
+      title={editingId ? `Edit ${initial.role || 'archetype'}` : 'New archetype'}
+      subtitle={editingId ? `id: ${editingId}` : 'Describe it and let the model draft it, or fill it in.'}
+      icon={Library}
+      onClose={onClose}
+      wide
+      footer={<>
+        {error && <span className="mr-auto text-xs text-red-600 dark:text-red-400">{error}</span>}
+        <Button variant="ghost" onClick={onClose}>Cancel</Button>
+        <Button variant="primary" icon={Check} busy={saving} onClick={save}>{editingId ? 'Save changes' : 'Create archetype'}</Button>
+      </>}
+    >
+      <div className="space-y-7">
+        <section className="space-y-2 rounded-2xl border border-violet-500/20 bg-violet-500/[0.04] p-4">
+          <div className="flex items-center gap-2 text-sm font-medium text-zinc-200">
+            <Sparkles className="h-4 w-4 text-violet-600 dark:text-violet-400" /> Draft it from a description
+          </div>
+          <textarea
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            rows={2}
+            placeholder="e.g. A careful contract reviewer that flags risky clauses in vendor agreements"
+            className={inputCls}
+          />
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-[11px] text-zinc-500">Fills in the form below — check it before saving.</span>
+            <Button icon={generating ? undefined : Sparkles} busy={generating} disabled={!prompt.trim()} onClick={runGenerate}>
+              {generating ? 'Drafting…' : 'Draft'}
+            </Button>
+          </div>
+        </section>
+
+        <section className="space-y-4">
+          <h3 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Basics</h3>
+          <div className="grid grid-cols-1 gap-4 wide:grid-cols-2">
+            <Field label="Role" hint="Its name, as people see it.">
+              <input value={d.role} onChange={(e) => set({ role: e.target.value })} placeholder="Contract Reviewer" className={inputCls} />
+            </Field>
+            <Field label="Id" hint={editingId ? 'Fixed once created.' : 'Made from the role if left blank.'}>
+              <input
+                value={editingId || d.archetype_id}
+                disabled={!!editingId}
+                onChange={(e) => set({ archetype_id: e.target.value })}
+                placeholder={slugify(d.role) || 'contract-reviewer'}
+                className={`${inputCls} font-mono`}
+              />
+            </Field>
+          </div>
+          <Field label="Description" hint="One sentence on what it does — shown in the picker.">
+            <input value={d.description} onChange={(e) => set({ description: e.target.value })} className={inputCls} />
+          </Field>
+          <Field label="Family" hint="Groups archetypes in the picker.">
+            <input value={d.family} onChange={(e) => set({ family: e.target.value })} placeholder="Custom" className={inputCls} list="fd-console-families" />
+            <datalist id="fd-console-families">
+              {[...new Set((registry?.archetypes || []).map((a) => a.family))].map((f) => <option key={f} value={f} />)}
+            </datalist>
+          </Field>
+        </section>
+
+        <section className="space-y-4">
+          <h3 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">How it works</h3>
+          <div className="grid grid-cols-1 gap-4 wide:grid-cols-2">
+            <Field label="Model tier" hint="Which model of the tier set it runs on.">
+              <select value={d.tier} onChange={(e) => set({ tier: e.target.value })} className={inputCls}>
+                {TIER_ORDER.map((t) => <option key={t} value={t}>{registry?.tiers[t]?.label || t}</option>)}
+              </select>
+            </Field>
+            <Field label="Thinking style">
+              <select value={d.cognitive_mode} onChange={(e) => set({ cognitive_mode: e.target.value })} className={inputCls}>
+                {MODES.map((m) => <option key={m.id} value={m.id}>{m.label} — {m.character}</option>)}
+              </select>
+            </Field>
+            <Field label="Runtime" hint="Micro runs the whole loop in 8k tokens — for small local models.">
+              <select value={d.runtime || ''} onChange={(e) => set({ runtime: e.target.value })} className={inputCls}>
+                <option value="">Classic (default)</option>
+                <option value="mrav">Micro — 8k cap</option>
+              </select>
+            </Field>
+            <div className="flex items-start justify-between gap-4 rounded-xl border border-zinc-800 px-3 py-2.5">
+              <div>
+                <div className="text-sm font-medium text-zinc-200">Team lead</div>
+                <div className="mt-0.5 text-xs text-zinc-500">Coordinates the others in a multi-agent run.</div>
+              </div>
+              <Switch on={d.lead} onToggle={() => set({ lead: !d.lead })} label="Team lead" />
+            </div>
+          </div>
+        </section>
+
+        <section className="space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">
+              Tools <span className="normal-case tracking-normal text-zinc-600">— {d.tools.length} on</span>
+            </h3>
+            <input value={toolQuery} onChange={(e) => setToolQuery(e.target.value)} placeholder="Filter tools" className={`${inputCls} w-44 py-1.5 text-xs`} />
+          </div>
+          <div className="flex max-h-52 flex-wrap gap-1.5 overflow-y-auto rounded-xl border border-zinc-800 bg-zinc-900/40 p-2.5">
+            {tools.map((t) => {
+              const on = d.tools.includes(t)
+              return (
+                <button
+                  key={t}
+                  type="button"
+                  onClick={() => set({ tools: on ? d.tools.filter((x) => x !== t) : [...d.tools, t] })}
+                  className={`rounded-lg border px-2 py-0.5 font-mono text-[11px] transition-colors ${
+                    on
+                      ? 'border-violet-500/40 bg-violet-500/15 text-violet-700 dark:text-violet-200'
+                      : 'border-zinc-800 text-zinc-500 hover:border-zinc-600 hover:text-zinc-300'
+                  }`}
+                >
+                  {t}
+                </button>
+              )
+            })}
+            {tools.length === 0 && <span className="px-1 text-xs text-zinc-500">No tool matches.</span>}
+          </div>
+        </section>
+
+        <section className="space-y-4">
+          <h3 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Instructions</h3>
+          <Field label="Operating manual" hint="What it is, what it does, and how — every agent made from it starts with this.">
+            <textarea
+              value={d.fleet_instructions}
+              onChange={(e) => set({ fleet_instructions: e.target.value })}
+              rows={10}
+              placeholder="You are a … Your job is to … Work like this: 1) …"
+              className={`${inputCls} text-[13px] leading-relaxed`}
+            />
+          </Field>
+          <Field label="Keywords" hint="Comma-separated — they help route work to it in multi-agent runs.">
+            <input value={keywords} onChange={(e) => setKeywords(e.target.value)} placeholder="contracts, legal, risk" className={inputCls} />
+          </Field>
+        </section>
+      </div>
+    </Sheet>
+  )
+}

@@ -1,18 +1,20 @@
 import { useEffect } from 'react'
 import { createPortal } from 'react-dom'
-import { ChevronRight, Monitor, Settings2, UserCog, type LucideIcon } from 'lucide-react'
+import { ChevronRight, Monitor, Settings2, ShieldCheck, UserCog, type LucideIcon } from 'lucide-react'
 import { useAuthStore } from '../../stores/authStore'
 import { useUIStore } from '../../stores/uiStore'
 import { useChatStore } from '../../stores/chatStore'
 import { ADMIN_TAB_KEY } from '../../services/sharedIntegrations'
+import { openConsole } from '../../stores/consoleStore'
 
-// Right after an admin signs in (not on a reload): where to start — the deck's
-// settings (Admin → Settings), the Users page, or the agent desktop. Closing
-// it (Esc, outside, ✕) is the agent desktop too.
+// Right after an admin signs in (not on a reload): where to start — the Admin
+// console, the deck's settings (Admin → Settings), the Users page, or the
+// agent desktop. Closing it (Esc, outside, ✕) is the agent desktop too.
 
-type Start = 'settings' | 'users' | 'desktop'
+type Start = 'console' | 'settings' | 'users' | 'desktop'
 
 const STARTS: { id: Start; icon: LucideIcon; label: string; hint: string }[] = [
+  { id: 'console', icon: ShieldCheck, label: 'Admin console', hint: 'Models, archetypes, connections, users and settings — all in one place' },
   { id: 'settings', icon: Settings2, label: 'Settings', hint: 'Branding, kiosk mode, the waitlist, plans and integrations' },
   { id: 'users', icon: UserCog, label: 'Users', hint: 'Accounts, invitations and waitlist applications' },
   { id: 'desktop', icon: Monitor, label: 'Flight Deck', hint: 'The agent desktop' },
@@ -25,6 +27,10 @@ export function AdminStartDialog() {
 
   const go = (start: Start) => {
     close()
+    if (start === 'console') {
+      openConsole('overview')
+      return
+    }
     if (start === 'desktop') {
       useUIStore.getState().setView('desktop')
       return
@@ -58,7 +64,7 @@ export function AdminStartDialog() {
         </h2>
         <p className="mt-1 text-sm text-zinc-500">Where do you want to start?</p>
 
-        <div className="mt-5 grid gap-3 wide:grid-cols-3">
+        <div className="mt-5 grid gap-3 wide:grid-cols-2">
           {STARTS.map(({ id, icon: Icon, label, hint }, i) => (
             <button
               key={id}

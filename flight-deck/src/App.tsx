@@ -3,6 +3,7 @@ import { Sidebar } from './components/layout/Sidebar'
 import { TopBar } from './components/layout/TopBar'
 import { MobileNav } from './components/layout/MobileNav'
 import { SimpleLayout } from './components/layout/SimpleLayout'
+import { ConsoleLayout } from './components/console/ConsoleLayout'
 import { ChatPanel } from './components/agents/ChatPanel'
 import { DirectorPanel } from './components/agents/DirectorPanel'
 import { PinnedMessages } from './components/common/PinnedMessages'
@@ -51,6 +52,7 @@ import { BeingsPage } from './pages/BeingsPage'
 import { PaymentsPage, paymentIdFromPath, purchaseIdFromPath } from './pages/PaymentsPage'
 import { PublicBeingPage } from './pages/PublicBeingPage'
 import { useUIStore } from './stores/uiStore'
+import { useConsoleStore, syncConsoleFromUrl, dropConsoleRequest } from './stores/consoleStore'
 import { useAgentStore } from './stores/agentStore'
 import { useAuthStore, selectKioskLocked, awaitAuthStatus, refreshAccessToken, reloadAfterSessionEnd, DEFAULT_INSTANCE_NAME } from './stores/authStore'
 import { useChatStore } from './stores/chatStore'
@@ -166,6 +168,16 @@ function AppContent() {
   }, [])
   const layoutMode = useUIStore((s) => s.layoutMode)
   const kioskLocked = useAuthStore(selectKioskLocked)
+  // The Admin console: a signed-in admin who saved it as their layout or
+  // followed a <deck>/console address. Anyone else gets the usual layout.
+  const isAdmin = useAuthStore((s) => s.authEnabled && s.user?.role === 'admin')
+  const consoleRequested = useConsoleStore((s) => s.requested)
+  const inConsole = isAdmin && (layoutMode === 'console' || consoleRequested)
+  useEffect(() => {
+    window.addEventListener('popstate', syncConsoleFromUrl)
+    return () => window.removeEventListener('popstate', syncConsoleFromUrl)
+  }, [])
+  useEffect(() => { if (!isAdmin) dropConsoleRequest() }, [isAdmin])
   const chatOpen = useChatStore((s) => s.chatOpen)
   const chatFullscreen = useChatStore((s) => s.chatFullscreen)
   const { fetchInstances, fetchStats, fetchConcerns, setWsConnected, upsertInstance, removeInstance, updateInstanceActivity } = useAgentStore()
@@ -422,6 +434,9 @@ function AppContent() {
       </>
     )
   }
+
+  // ── Admin console ── (every form factor; admins are never kiosk-locked)
+  if (inConsole) return <ConsoleLayout />
 
   // ── Mobile layout ──
   if (isMobile) {

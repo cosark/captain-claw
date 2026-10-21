@@ -1,0 +1,209 @@
+import { useEffect, useState, type ComponentType, type ReactNode } from 'react'
+import {
+  Plug, Mail, LayoutGrid, Send, Scale, Mic, Sparkles, MessageCircle, Database, ChevronRight, ChevronLeft,
+} from 'lucide-react'
+import GoogleConnection from '../connections/GoogleConnection'
+import MicrosoftConnection from '../connections/MicrosoftConnection'
+import TelegramConnection from '../connections/TelegramConnection'
+import CodexConnection from '../connections/CodexConnection'
+import AntigravityConnection from '../connections/AntigravityConnection'
+import MCPConnection from '../connections/MCPConnection'
+import MCPAgentAccess from '../connections/MCPAgentAccess'
+import JevConnection from '../connections/JevConnection'
+import SonioxConnection from '../connections/SonioxConnection'
+import WhatsAppNudgeConnection from '../connections/WhatsAppNudgeConnection'
+import TypesenseConnection from '../connections/TypesenseConnection'
+import { SharedTelegramBotAdmin } from '../admin/SharedTelegramBotAdmin'
+import { JevTeamKey, SonioxTeamKey, SharedMCPServers } from '../admin/SharedCredentialsAdmin'
+import {
+  getOAuthClientConfig, getAdminTelegram, getSharedJevKey, getSharedSonioxKey,
+} from '../../services/sharedIntegrations'
+import { useMCPStore } from '../../stores/mcpStore'
+import { useCodexAuthStore } from '../../stores/codexAuthStore'
+import { useConsoleStore } from '../../stores/consoleStore'
+import { Page, PageHeader, Dot } from './parts'
+
+// Connections: the services agents reach, with the deck-wide part (the OAuth
+// client, the team bot, the team keys, shared MCP servers) next to the admin's
+// own connection. The same cards as Connections and Admin → Integrations; all
+// stay mounted so sign-in popups and half-typed forms survive switching.
+
+type ServiceId = 'google' | 'microsoft' | 'telegram' | 'mcp' | 'jev' | 'soniox' | 'codex' | 'antigravity' | 'whatsapp' | 'typesense'
+
+interface Service {
+  id: ServiceId
+  label: string
+  hint: string
+  icon: ComponentType<{ className?: string }>
+  // Set up once for everyone (vs. this deck's own engines).
+  everyone: boolean
+}
+
+const SERVICES: Service[] = [
+  { id: 'google', label: 'Google', hint: 'Gmail, Calendar and Drive — each person signs in with their own account', icon: Mail, everyone: true },
+  { id: 'microsoft', label: 'Microsoft 365', hint: 'Outlook, Calendar and OneDrive — each person signs in', icon: LayoutGrid, everyone: true },
+  { id: 'telegram', label: 'Telegram', hint: 'One team bot people talk to their agents through', icon: Send, everyone: true },
+  { id: 'mcp', label: 'MCP servers', hint: 'Extra tools for agents from MCP servers', icon: Plug, everyone: true },
+  { id: 'jev', label: 'Jev', hint: 'Legal research (TypeSafe) — a team key or each person\'s own', icon: Scale, everyone: true },
+  { id: 'soniox', label: 'Soniox', hint: 'Speech-to-text and voices — a team key or each person\'s own', icon: Mic, everyone: true },
+  { id: 'codex', label: 'ChatGPT', hint: 'A ChatGPT subscription as a model provider', icon: Sparkles, everyone: false },
+  { id: 'antigravity', label: 'Antigravity', hint: 'A Google subscription as a model provider', icon: Sparkles, everyone: false },
+  { id: 'whatsapp', label: 'WhatsApp', hint: 'Nudges from autonomous work over WhatsApp', icon: MessageCircle, everyone: false },
+  { id: 'typesense', label: 'Deep memory', hint: 'The search server behind agents\' long-term memory', icon: Database, everyone: false },
+]
+
+function serviceFor(id: string | undefined): ServiceId | undefined {
+  return SERVICES.find((s) => s.id === id)?.id
+}
+
+type Status = { tone: 'on' | 'pending' | 'off'; text: string }
+
+// What each row says: the deck-wide part where there is one.
+function useStatuses(): Partial<Record<ServiceId, Status>> {
+  const [out, setOut] = useState<Partial<Record<ServiceId, Status>>>({})
+  const mcpShared = useMCPStore((s) => s.servers.filter((x) => x.deck_wide).length)
+  const codex = useCodexAuthStore((s) => s.status)
+
+  useEffect(() => {
+    let cancelled = false
+    const put = (id: ServiceId, st: Status) => { if (!cancelled) setOut((o) => ({ ...o, [id]: st })) }
+    for (const p of ['google', 'microsoft'] as const) {
+      getOAuthClientConfig(p)
+        .then((c) => put(p, c.client_id_set && c.client_secret_set
+          ? { tone: 'on', text: 'Ready for everyone' }
+          : { tone: 'pending', text: 'Needs the OAuth client' }))
+        .catch(() => {})
+    }
+    getAdminTelegram()
+      .then((t) => put('telegram', !t.config.configured
+        ? { tone: 'off', text: 'No team bot' }
+        : !t.config.enabled
+          ? { tone: 'pending', text: 'Bot paused' }
+          : t.status.running ? { tone: 'on', text: `@${t.config.bot_username || 'bot'} running` } : { tone: 'pending', text: 'Bot not running' }))
+      .catch(() => {})
+    getSharedJevKey()
+      .then((k) => put('jev', k.key_set ? { tone: k.verified === false ? 'pending' : 'on', text: 'Team key shared' } : { tone: 'off', text: 'No team key' }))
+      .catch(() => {})
+    getSharedSonioxKey()
+      .then((k) => put('soniox', k.key_set
+        ? { tone: k.verified === false ? 'pending' : 'on', text: 'Team key shared' }
+        : k.env_key_set ? { tone: 'on', text: 'Server key' } : { tone: 'off', text: 'No team key' }))
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [])
+
+  return {
+    ...out,
+    mcp: mcpShared > 0 ? { tone: 'on', text: `${mcpShared} shared with everyone` } : { tone: 'off', text: 'None shared' },
+    ...(codex?.connected && !codex.stale ? { codex: { tone: 'on' as const, text: 'Connected' } } : {}),
+  }
+}
+
+export function ConnectionsConsole() {
+  // Sent here for one service (the Overview, a card's link): open on it.
+  const [active, setActive] = useState<ServiceId>(() => serviceFor(useConsoleStore.getState().intent.connection) ?? 'google')
+  // Phone: the list, or one service.
+  const [detail, setDetail] = useState(() => !!serviceFor(useConsoleStore.getState().intent.connection))
+  useEffect(() => {
+    useConsoleStore.getState().takeIntent()
+    // …or sent here while already on this page.
+    return useConsoleStore.subscribe((s) => {
+      const id = serviceFor(s.intent.connection)
+      if (!id) return
+      setActive(id)
+      setDetail(true)
+      useConsoleStore.getState().takeIntent()
+    })
+  }, [])
+  const statuses = useStatuses()
+  const current = SERVICES.find((s) => s.id === active)!
+
+  const pick = (id: ServiceId) => { setActive(id); setDetail(true) }
+
+  const panel = (id: ServiceId, team: ReactNode | null, own: ReactNode) => (
+    <div hidden={active !== id} className="space-y-6">
+      {team && (
+        <section className="space-y-3">
+          <h3 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">For everyone on this deck</h3>
+          {team}
+        </section>
+      )}
+      <section className="space-y-3">
+        {team && <h3 className="text-[11px] font-semibold uppercase tracking-wider text-zinc-500">Your own</h3>}
+        {own}
+      </section>
+    </div>
+  )
+
+  const row = (s: Service) => {
+    const st = statuses[s.id]
+    const on = s.id === active
+    return (
+      <button
+        key={s.id}
+        onClick={() => pick(s.id)}
+        className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition-colors ${
+          on ? 'bg-zinc-800/80 text-zinc-100 wide:bg-violet-500/10' : 'text-zinc-300 hover:bg-zinc-800/50'
+        }`}
+      >
+        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-zinc-800 text-zinc-300">
+          <s.icon className="h-4 w-4" />
+        </span>
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-sm font-medium">{s.label}</span>
+          {st && <span className="mt-0.5 flex items-center gap-1.5 truncate text-[11px] text-zinc-500"><Dot tone={st.tone} />{st.text}</span>}
+        </span>
+        <ChevronRight className="h-4 w-4 shrink-0 text-zinc-600 wide:hidden" />
+      </button>
+    )
+  }
+
+  return (
+    <Page>
+      <PageHeader
+        icon={Plug}
+        title="Connections"
+        description="The services agents reach. Most are set up once here for everyone — people then just press Connect with their own account."
+      />
+
+      <div className="flex flex-col gap-6 wide:flex-row wide:items-start">
+        <nav className={`${detail ? 'hidden' : 'block'} space-y-4 wide:sticky wide:top-0 wide:block wide:w-64 wide:shrink-0`} aria-label="Services">
+          <div className="space-y-0.5">
+            <div className="px-3 pb-1 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">For everyone</div>
+            {SERVICES.filter((s) => s.everyone).map(row)}
+          </div>
+          <div className="space-y-0.5">
+            <div className="px-3 pb-1 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">This deck</div>
+            {SERVICES.filter((s) => !s.everyone).map(row)}
+          </div>
+        </nav>
+
+        <div className={`${detail ? 'block' : 'hidden'} min-w-0 flex-1 wide:block`}>
+          <button onClick={() => setDetail(false)} className="mb-4 flex items-center gap-1 text-sm text-zinc-500 hover:text-zinc-200 wide:hidden">
+            <ChevronLeft className="h-4 w-4" /> All connections
+          </button>
+          <div className="mb-5 flex items-start gap-3">
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-violet-500/10 text-violet-600 dark:text-violet-400">
+              <current.icon className="h-5 w-5" />
+            </span>
+            <div>
+              <h2 className="text-lg font-semibold text-zinc-100">{current.label}</h2>
+              <p className="text-sm text-zinc-500">{current.hint}</p>
+            </div>
+          </div>
+
+          {panel('google', null, <GoogleConnection />)}
+          {panel('microsoft', null, <MicrosoftConnection />)}
+          {panel('telegram', <SharedTelegramBotAdmin />, <TelegramConnection />)}
+          {panel('mcp', <SharedMCPServers refreshTick={0} inline />, <><MCPConnection /><MCPAgentAccess /></>)}
+          {panel('jev', <JevTeamKey refreshTick={0} />, <JevConnection />)}
+          {panel('soniox', <SonioxTeamKey refreshTick={0} />, <SonioxConnection />)}
+          {panel('codex', null, <CodexConnection />)}
+          {panel('antigravity', null, <AntigravityConnection />)}
+          {panel('whatsapp', null, <WhatsAppNudgeConnection />)}
+          {panel('typesense', null, <TypesenseConnection />)}
+        </div>
+      </div>
+    </Page>
+  )
+}
