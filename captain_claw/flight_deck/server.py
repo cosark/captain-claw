@@ -8612,6 +8612,7 @@ async def auth_status():
         "instance_name": cfg.get("instance_name") or "Flight Deck",
         "instance_description": cfg.get("instance_description") or "",
         "instance_logo": logo,
+        "show_powered_by": cfg.get("show_powered_by") is not False,
     }
 
 

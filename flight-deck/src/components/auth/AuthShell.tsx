@@ -1,12 +1,15 @@
 import { useState, type InputHTMLAttributes, type ReactNode } from 'react'
 import { AlertCircle, Eye, EyeOff, Radio, type LucideIcon } from 'lucide-react'
-import { DEFAULT_INSTANCE_NAME, useAuthStore } from '../../stores/authStore'
+import { useAuthStore } from '../../stores/authStore'
 import { APP_VERSION, BUILD_DATE } from '../../version'
 
 // ── The frame of the screens before the app: sign in, sign up / waitlist,
 // and choosing your own password. The deck's branding (Admin → Settings →
 // Branding) on one side, the form card on the other; stacked on a phone.
 // Always the night palette — see `.fd-auth` in index.css.
+
+const CAPTAIN_SITE_URL = 'https://captain-claw.com'
+const CAPTAIN_REPO_URL = 'https://github.com/kstevica/captain-claw'
 
 /** The deck's logo, or the Flight Deck mark when there is none. */
 export function BrandLogo({ size }: { size: 'sm' | 'lg' }) {
@@ -27,12 +30,22 @@ export function BrandLogo({ size }: { size: 'sm' | 'lg' }) {
 }
 
 export function AuthShell({ children }: { children: ReactNode }) {
-  const { name, description } = useAuthStore((s) => s.branding)
-  const poweredBy = name !== DEFAULT_INSTANCE_NAME
+  const { name, description, poweredBy } = useAuthStore((s) => s.branding)
 
+  // "Powered by Captain" and its links: Admin → Settings → Branding can hide them.
+  const link = 'text-white/55 underline-offset-2 transition-colors hover:text-white/85 hover:underline'
   const footer = (
     <p className="text-[11px] text-white/35">
-      {poweredBy && <>Powered by Flight Deck &middot; </>}v{APP_VERSION} &middot; {BUILD_DATE}
+      {poweredBy && (
+        <>
+          Powered by{' '}
+          <a href={CAPTAIN_SITE_URL} target="_blank" rel="noopener noreferrer" className={link}>Captain</a>
+          {' '}&middot;{' '}
+          <a href={CAPTAIN_REPO_URL} target="_blank" rel="noopener noreferrer" className={link}>GitHub</a>
+          {' '}&middot;{' '}
+        </>
+      )}
+      v{APP_VERSION} &middot; {BUILD_DATE}
     </p>
   )
 

@@ -30,12 +30,15 @@ export interface SystemConfig {
   // Branding: the panels' title and the sign-in page (the logo: BrandingCard).
   instance_name: string
   instance_description: string
+  // "Powered by Captain" (captain-claw.com · GitHub) in the sign-in page's footer.
+  show_powered_by: boolean
 }
 
 export const CONFIG_DEFAULTS: SystemConfig = {
   docker_spawn_enabled: true, kiosk_mode: 'off', kiosk_new_users: false,
   waitlist_enabled: true, waitlist_cohort: '',
   instance_name: 'Flight Deck', instance_description: 'Agent Management Console',
+  show_powered_by: true,
 }
 
 // What applicants join: the waitlist name an admin set, else the instance name.
