@@ -12,8 +12,15 @@ type MobilePanel = 'none' | 'director' | 'chat' | 'tool'
  *  - `simple` — a chat-first three-column view: agents on the left, the
  *               chat in the middle, the active agent's files + datastore on
  *               the right. Both side columns collapse to a thin rail.
+ *  - `console` — the Admin console: the deck's admin work (models,
+ *               archetypes, connections, users, usage, settings) and
+ *               nothing else. Admins only; anyone else gets `full`.
  */
-export type LayoutMode = 'full' | 'simple'
+export type LayoutMode = 'full' | 'simple' | 'console'
+
+function asLayoutMode(v: string | null | undefined): LayoutMode {
+  return v === 'simple' || v === 'console' ? v : 'full'
+}
 
 const LAYOUT_MODE_KEY = 'fd:layout-mode'
 const SIMPLE_LEFT_OPEN_KEY = 'fd:simple-left-open'
@@ -22,8 +29,7 @@ const SIMPLE_QUEUE_OPEN_KEY = 'fd:simple-queue-open'
 
 function loadLayoutMode(): LayoutMode {
   try {
-    const v = localStorage.getItem(LAYOUT_MODE_KEY)
-    return v === 'simple' ? 'simple' : 'full'
+    return asLayoutMode(localStorage.getItem(LAYOUT_MODE_KEY))
   } catch { return 'full' }
 }
 function loadBool(key: string, fallback: boolean): boolean {
@@ -99,7 +105,9 @@ export const useUIStore = create<UIStore>((set, get) => ({
     set({ layoutMode })
   },
   toggleLayoutMode: () => {
-    get().setLayoutMode(get().layoutMode === 'simple' ? 'full' : 'simple')
+    const mode = get().layoutMode
+    if (mode === 'console') return  // left from the console's own sidebar
+    get().setLayoutMode(mode === 'simple' ? 'full' : 'simple')
   },
   setSimpleLeftOpen: (simpleLeftOpen) => {
     if (get().simpleLeftOpen === simpleLeftOpen) return
@@ -132,7 +140,7 @@ registerHydrator((settings) => {
     return v === 'true' ? true : v === 'false' ? false : dflt
   }
   const patch = {
-    layoutMode: (mode === 'simple' ? 'simple' : 'full') as LayoutMode,
+    layoutMode: asLayoutMode(mode),
     simpleLeftOpen: bool(SIMPLE_LEFT_OPEN_KEY, true),
     simpleRightOpen: bool(SIMPLE_RIGHT_OPEN_KEY, true),
     simpleQueueOpen: bool(SIMPLE_QUEUE_OPEN_KEY, true),

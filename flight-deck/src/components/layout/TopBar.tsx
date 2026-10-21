@@ -1,10 +1,11 @@
-import { RefreshCw, PanelLeft, Pin, FileText, ClipboardList, Sun, Moon, Keyboard, LogOut, Loader2, MessageSquare, Menu, Columns3 } from 'lucide-react'
+import { RefreshCw, PanelLeft, Pin, FileText, ClipboardList, Sun, Moon, Keyboard, LogOut, Loader2, MessageSquare, Menu, Columns3, ShieldCheck } from 'lucide-react'
 import { useAgentStore } from '../../stores/agentStore'
 import { useAuthStore, logoutUser } from '../../stores/authStore'
 import { useThemeStore } from '../../stores/themeStore'
 import { useUIStore } from '../../stores/uiStore'
 import { APP_VERSION } from '../../version'
 import { useChatStore } from '../../stores/chatStore'
+import { openConsole } from '../../stores/consoleStore'
 import { NotificationBell } from '../common/NotificationCenter'
 
 interface TopBarProps {
@@ -152,6 +153,17 @@ export function TopBar({
             title="Simple view — agents, chat, files"
           >
             <Columns3 className="h-3.5 w-3.5" />
+          </button>
+        )}
+
+        {/* The Admin console: the deck's admin work on pages of its own. */}
+        {authEnabled && authUser?.role === 'admin' && (
+          <button
+            onClick={() => openConsole()}
+            className="rounded p-1.5 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300 transition-colors"
+            title="Admin console — models, archetypes, connections, users, settings"
+          >
+            <ShieldCheck className="h-3.5 w-3.5" />
           </button>
         )}
 
