@@ -16,11 +16,13 @@ export interface User {
 
 // The deck's branding (Admin → Settings → Branding): the name in the panels'
 // title and on the sign-in page, a short description shown there, and a logo
-// ('' = none; a versioned /fd/branding/logo URL).
+// ('' = none; a versioned /fd/branding/logo URL). `poweredBy`: the sign-in
+// page's footer links to Captain (captain-claw.com · GitHub).
 export interface Branding {
   name: string
   description: string
   logo: string
+  poweredBy: boolean
 }
 
 export const DEFAULT_INSTANCE_NAME = 'Flight Deck'
@@ -70,7 +72,7 @@ export const useAuthStore = create<AuthStore>((set) => ({
   simpleChatOnly: false,
   signingOut: false,
   signUp: { mode: 'register', cohort: '' },
-  branding: { name: DEFAULT_INSTANCE_NAME, description: '', logo: '' },
+  branding: { name: DEFAULT_INSTANCE_NAME, description: '', logo: '', poweredBy: true },
 
   setAuth: (user, token) => set({ user, token, isAuthenticated: true }),
   clearAuth: () => set({ user: null, token: '', isAuthenticated: false }),
@@ -135,6 +137,7 @@ export async function checkAuthStatus(): Promise<boolean> {
       // A deck that predates branding: the sign-in page's old tagline.
       : 'Agent Management Console',
     logo: typeof data.instance_logo === 'string' ? data.instance_logo : '',
+    poweredBy: data.show_powered_by !== false,
   })
   return enabled
 }

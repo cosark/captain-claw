@@ -412,6 +412,7 @@ class UpdateConfigRequest(BaseModel):
     waitlist_cohort: str | None = None
     instance_name: str | None = None  # blank = back to the default
     instance_description: str | None = None
+    show_powered_by: bool | None = None
 
 
 class ProviderKeysRequest(BaseModel):
@@ -434,6 +435,8 @@ SYSTEM_CONFIG_DEFAULTS = {
     # short description under it there (the logo: branding_routes).
     "instance_name": "Flight Deck",
     "instance_description": "Agent Management Console",
+    # "Powered by Captain" (captain-claw.com · GitHub) in the sign-in page's footer.
+    "show_powered_by": True,
 }
 
 WAITLIST_COHORT_MAX = 60

@@ -168,6 +168,32 @@ async def test_instance_name_and_description(fd_db):
         assert r.status_code == 400
 
 
+async def test_powered_by_captain_switch(fd_db, monkeypatch):
+    from captain_claw.flight_deck import server
+
+    db, admin = fd_db
+    monkeypatch.setattr(server, "AUTH_ENABLED", True)
+    monkeypatch.setattr(server.app.state, "fd_db", db, raising=False)
+    app = _app(admin)
+    app.add_api_route("/fd/auth/status", server.auth_status)
+    async with _client(app) as c:
+        # On by default — a deck that never stored it shows the links.
+        assert (await c.get("/fd/admin/config")).json()["show_powered_by"] is True
+        assert (await c.get("/fd/auth/status")).json()["show_powered_by"] is True
+
+        r = await c.put("/fd/admin/config", json={"show_powered_by": False})
+        assert r.status_code == 200, r.text
+        assert r.json()["show_powered_by"] is False
+        assert (await c.get("/fd/auth/status")).json()["show_powered_by"] is False
+
+        # An unrelated save leaves it off.
+        r = await c.put("/fd/admin/config", json={"instance_name": "Acme"})
+        assert r.json()["show_powered_by"] is False
+
+        r = await c.put("/fd/admin/config", json={"show_powered_by": True})
+        assert (await c.get("/fd/auth/status")).json()["show_powered_by"] is True
+
+
 def _data_url(data: bytes, claimed: str = "image/png") -> str:
     return f"data:{claimed};base64,{base64.b64encode(data).decode()}"
 
