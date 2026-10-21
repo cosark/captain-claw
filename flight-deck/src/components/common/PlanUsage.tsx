@@ -1,7 +1,7 @@
-import { useEffect } from 'react'
-import { Gauge, Hourglass } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { Gauge, Hourglass, RotateCcw } from 'lucide-react'
 import type { QuotaAllowance, QuotaStatus } from '../../services/profile'
-import { quotaLimited, useQuotaStore } from '../../stores/quotaStore'
+import { canSpendReset, quotaLimited, useQuotaStore } from '../../stores/quotaStore'
 
 // ── Daily plan allowances, as the person sees them ──
 //
@@ -10,7 +10,8 @@ import { quotaLimited, useQuotaStore } from '../../stores/quotaStore'
 // full layout only once an allowance runs low. When one is spent the composer
 // is closed and the bar says why and when it comes back. PlanUsageMeters is the Info dialog's
 // detailed view. "Tokens" are "AI usage" here — a kiosk user needn't know
-// what a token is.
+// what a token is. Someone an admin gave free resets can spend one from the
+// bar (once spent or running low) or the Info dialog to start the day over.
 
 function fmtTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`
@@ -46,6 +47,68 @@ function quotaBlockedText(s: QuotaStatus): string {
   return `You've used ${what} on the ${s.plan_label} plan.`
 }
 
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
+
+/** "Use a free reset", then "Reset now" to confirm: they're scarce. *tone*
+ *  colours the buttons for the strip they sit on. */
+function FreeReset({ s, tone, compact = false }: { s: QuotaStatus; tone: string; compact?: boolean }) {
+  const spendReset = useQuotaStore((st) => st.spendReset)
+  const [asking, setAsking] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  if (!canSpendReset(s)) return null
+  const left = s.resets_left
+  const uses = left === 1 ? 'This uses your last free reset.' : `This uses 1 of your ${left} free resets.`
+  const btn =`inline-flex shrink-0 items-center gap-1 rounded-md border font-medium disabled:opacity-50 ${compact ? 'px-1.5 py-0.5 text-[11px]' : 'px-2.5 py-1 text-xs'}`
+
+  const spend = async () => {
+    setBusy(true); setErr('')
+    try {
+      await spendReset()
+      setAsking(false)
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Couldn't use the reset")
+    }
+    setBusy(false)
+  }
+
+  if (!asking) {
+    return (
+      <span className="inline-flex flex-wrap items-center gap-2">
+        <button
+          onClick={() => { setAsking(true); setErr('') }}
+          title={`Start today's messages and AI usage over. You have ${plural(left, 'free reset')}.`}
+          className={`${btn} ${tone}`}
+        >
+          <RotateCcw className="h-3 w-3" />
+          {compact ? `Free reset (${left})` : 'Use a free reset'}
+        </button>
+        {!compact && <span className="text-xs opacity-90">{left} left</span>}
+        {err && <span className="text-xs">{err}</span>}
+      </span>
+    )
+  }
+  return (
+    <span className="inline-flex flex-wrap items-center gap-2">
+      {compact ? (
+        <span className="text-[11px]" title={uses}>Start today over?</span>
+      ) : (
+        <span className="text-xs">Start today over? {uses}</span>
+      )}
+      <button
+        onClick={spend}
+        disabled={busy}
+        className={`${btn} border-violet-600 bg-violet-600 text-white hover:bg-violet-500`}
+      >
+        {busy ? 'Resetting…' : 'Reset now'}
+      </button>
+      <button onClick={() => setAsking(false)} disabled={busy} className={`${btn} ${tone}`}>
+        Cancel
+      </button>
+    </span>
+  )
+}
+
 /** Keeps the allowances fresh while they matter: on mount, and every minute
  *  (and on focus) while one is spent — an admin may give it back. */
 function useQuotaRefresh(): QuotaStatus | null {
@@ -75,8 +138,18 @@ export function PlanUsageBar({ simple }: { simple: boolean }) {
         <div className="min-w-0">
           <div className="font-medium">{quotaBlockedText(s)}</div>
           <div className="text-xs opacity-90">
-            You can chat again at {resetClock(s.resets_at)} (in {resetIn(s.resets_at)}). Ask your admin if you need a bigger plan.
+            You can chat again at {resetClock(s.resets_at)} (in {resetIn(s.resets_at)}).
+            {!canSpendReset(s)
+              ? ' Ask your admin if you need a bigger plan.'
+              : s.resets_left === 1
+                ? ' Or start over now with your free reset.'
+                : ` Or start over now with one of your ${s.resets_left} free resets.`}
           </div>
+          {canSpendReset(s) && (
+            <div className="mt-2">
+              <FreeReset s={s} tone="border-red-500/40 hover:bg-red-500/10" />
+            </div>
+          )}
         </div>
       </div>
     )
@@ -99,6 +172,7 @@ export function PlanUsageBar({ simple }: { simple: boolean }) {
     >
       <Gauge className="h-3.5 w-3.5 shrink-0" />
       <span className="min-w-0 flex-1 truncate">{parts.join(' · ')}</span>
+      {low && <FreeReset s={s} compact tone="border-amber-500/40 hover:bg-amber-500/10" />}
       <span className="shrink-0">Resets {resetClock(s.resets_at)}</span>
     </div>
   )
@@ -143,6 +217,13 @@ export function PlanUsageMeters({ initial }: { initial?: QuotaStatus }) {
             ? `${quotaBlockedText(s)} You can chat again at ${resetClock(s.resets_at)} (in ${resetIn(s.resets_at)}).`
             : `Resets every day at ${resetClock(s.resets_at)} your time (midnight UTC). A reply already under way always finishes.`}
       </p>
+      {!s.exempt && (s.resets_left ?? 0) > 0 && (
+        <div className="mt-2 flex flex-wrap items-center gap-2 text-[11px] text-zinc-400">
+          {canSpendReset(s)
+            ? <FreeReset s={s} tone="border-zinc-700 text-zinc-300 hover:border-violet-500/40 hover:text-zinc-100" />
+            : `You have ${plural(s.resets_left, 'free reset')} to start a day over once you've used some of it.`}
+        </div>
+      )}
     </div>
   )
 }

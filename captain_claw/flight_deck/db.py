@@ -331,6 +331,14 @@ class FlightDeckDB:
             CREATE INDEX IF NOT EXISTS idx_daily_usage_day
                 ON daily_usage(day);
 
+            -- Free resets an admin gave a user (usage_quota): spending one
+            -- zeroes the user's daily_usage for today.
+            CREATE TABLE IF NOT EXISTS usage_reset_credits (
+                user_id    TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                balance    INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS council_sessions (
                 id              TEXT PRIMARY KEY,
                 user_id         TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1859,6 +1867,91 @@ class FlightDeckDB:
         ) as cur:
             return {r["user_id"]: {"messages": int(r["messages"]), "tokens": int(r["tokens"])}
                     for r in await cur.fetchall()}
+
+    async def get_usage_resets(self, user_id: str) -> int:
+        """How many free resets of the day's allowances *user_id* holds."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT balance FROM usage_reset_credits WHERE user_id = ?", (user_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return int(row["balance"]) if row else 0
+
+    async def list_usage_resets(self) -> dict[str, int]:
+        """Every user holding free resets, by user id."""
+        assert self._db is not None
+        async with self._db.execute(
+            "SELECT user_id, balance FROM usage_reset_credits WHERE balance > 0",
+        ) as cur:
+            return {r["user_id"]: int(r["balance"]) for r in await cur.fetchall()}
+
+    async def grant_usage_resets(
+        self, user_ids: list[str] | None, count: int, cap: int,
+    ) -> dict[str, int]:
+        """Give each non-admin user in *user_ids* (None: every one) *count*
+        more free resets, up to *cap* held — a grant never takes resets away
+        from someone already over it. Returns each reached user's balance."""
+        assert self._db is not None
+        now = _utcnow()
+        count, cap = max(0, int(count)), max(0, int(cap))
+        chunks: list[list[str] | None] = [None] if user_ids is None else [
+            user_ids[i:i + 500] for i in range(0, len(user_ids), 500)]
+        reached: list[str] = []
+        for chunk in chunks:
+            where, params = "role != 'admin'", []
+            if chunk is not None:
+                if not chunk:
+                    continue
+                where += f" AND id IN ({','.join('?' * len(chunk))})"
+                params = list(chunk)
+            async with self._db.execute(f"SELECT id FROM users WHERE {where}", params) as cur:
+                ids = [r["id"] for r in await cur.fetchall()]
+            await self._db.executemany(
+                "INSERT INTO usage_reset_credits (user_id, balance, updated_at) VALUES (?, ?, ?)"
+                " ON CONFLICT(user_id) DO UPDATE SET"
+                " balance = MAX(balance, MIN(balance + ?, ?)), updated_at = excluded.updated_at",
+                [(uid, min(count, cap), now, count, cap) for uid in ids],
+            )
+            reached += ids
+        await self._db.commit()
+        balances: dict[str, int] = {}
+        for i in range(0, len(reached), 500):
+            chunk = reached[i:i + 500]
+            async with self._db.execute(
+                "SELECT user_id, balance FROM usage_reset_credits"
+                f" WHERE user_id IN ({','.join('?' * len(chunk))})", chunk,
+            ) as cur:
+                balances.update({r["user_id"]: int(r["balance"]) for r in await cur.fetchall()})
+        return balances
+
+    async def set_usage_resets(self, user_id: str, balance: int) -> int:
+        """Set *user_id*'s free resets to *balance* (an admin taking some back)."""
+        assert self._db is not None
+        balance = max(0, int(balance))
+        await self._db.execute(
+            "INSERT INTO usage_reset_credits (user_id, balance, updated_at) VALUES (?, ?, ?)"
+            " ON CONFLICT(user_id) DO UPDATE SET"
+            " balance = excluded.balance, updated_at = excluded.updated_at",
+            (user_id, balance, _utcnow()),
+        )
+        await self._db.commit()
+        return balance
+
+    async def use_usage_reset(self, user_id: str, day: str) -> bool:
+        """Spend one of *user_id*'s free resets on zeroing their counters for
+        *day* — both or neither. False when they hold none."""
+        assert self._db is not None
+        cur = await self._db.execute(
+            "UPDATE usage_reset_credits SET balance = balance - 1, updated_at = ?"
+            " WHERE user_id = ? AND balance > 0",
+            (_utcnow(), user_id),
+        )
+        if cur.rowcount != 1:  # nothing changed (no rollback: the connection is shared)
+            return False
+        await self._db.execute(
+            "DELETE FROM daily_usage WHERE user_id = ? AND day = ?", (user_id, day))
+        await self._db.commit()
+        return True
 
     async def get_usage_summary(
         self, user_id: str | None = None, since: str | None = None,

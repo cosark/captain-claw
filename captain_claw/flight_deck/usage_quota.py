@@ -16,6 +16,11 @@ like the other limits). What a user spent today lives in ``daily_usage``.
   refused and scheduled tasks skip their run (:func:`automation_blocked`). A
   turn already running when a limit is reached finishes.
 
+An admin can also give users **free resets** (``usage_reset_credits``): one,
+several or every user gets N more, but nobody holds more than the deck's cap
+(``fd:usage-reset-cap``), so repeated grants don't pile up. A user spends one
+(``POST /fd/quota/reset``) to start the day's allowances over.
+
 Admins, the standalone app and decks without sign-in are never held to these
 limits (their usage is still counted, so an admin can see it).
 """
@@ -59,6 +64,12 @@ _FREE_BARE_COMMANDS = frozenset({"/new", "/clear"})
 # One report never moves the counter by more than this (a garbled or hostile
 # report can't spend someone's whole month).
 _MAX_TOKENS_PER_REPORT = 5_000_000
+
+# The most free resets a user may hold, as an admin set it (system setting);
+# a grant never takes anyone past it. MAX_RESETS bounds the cap and a grant.
+RESET_CAP_SETTING = "fd:usage-reset-cap"
+DEFAULT_RESET_CAP = 3
+MAX_RESETS = 100
 
 
 def today() -> str:
@@ -127,6 +138,7 @@ async def status(db, user_or_id: dict | str) -> dict:
     limits = get_user_limits(user) if user else {}
     day = today()
     used = await db.get_daily_usage(uid, day)
+    resets_left = await db.get_usage_resets(uid)
     msg_limit = max(0, int(limits.get("messages_per_day") or 0))
     tok_limit = max(0, int(limits.get("tokens_per_day") or 0))
     free = exempt(user)
@@ -151,6 +163,7 @@ async def status(db, user_or_id: dict | str) -> dict:
         "tokens": _allowance(used["tokens"], tok_limit),
         "blocked": blocked,
         "warning": warning,
+        "resets_left": resets_left,  # free resets an admin gave them
     }
 
 
@@ -176,6 +189,10 @@ def _messages(n: int) -> str:
     return f"{n} message{'' if n == 1 else 's'}"
 
 
+def _resets(n: int) -> str:
+    return f"{n} free reset{'' if n == 1 else 's'}"
+
+
 def limit_text(st: dict) -> str:
     """What the person is told when a turn is refused: which allowance is
     spent, on which plan, and when it comes back."""
@@ -186,8 +203,11 @@ def limit_text(st: dict) -> str:
         what = f"today's {_messages(st['messages']['limit'])}"
     until = _until(st.get("resets_at") or "")
     when = f" It resets at midnight UTC, in {until}." if until else " It resets at midnight UTC."
-    return (f"You've used {what} on the {plan} plan.{when}"
-            " Ask your admin if you need a bigger plan.")
+    left = int(st.get("resets_left") or 0)
+    more = (f" You have {_resets(left)}: use {'it' if left == 1 else 'one'} from the usage bar"
+            " in the web chat to start today over." if left
+            else " Ask your admin if you need a bigger plan.")
+    return f"You've used {what} on the {plan} plan.{when}{more}"
 
 
 def short_limit_text(st: dict) -> str:
@@ -197,8 +217,10 @@ def short_limit_text(st: dict) -> str:
     else:
         what = _messages(st['messages']['limit'])
     until = _until(st.get("resets_at") or "")
+    left = int(st.get("resets_left") or 0)
     return (f"Daily limit reached ({what}, {st.get('plan_label')} plan)."
-            + (f" Resets in {until}." if until else ""))
+            + (f" Resets in {until}." if until else "")
+            + (f" {_resets(left).capitalize()} in the web chat." if left else ""))
 
 
 async def admit_message(user_or_id: dict | str, content: Any = "") -> tuple[bool, dict | None]:
@@ -301,6 +323,28 @@ async def my_quota(user: dict = Depends(get_current_user)) -> dict:
     return await status(db, row)
 
 
+@router.post("/quota/reset")
+async def use_reset(user: dict = Depends(get_current_user)) -> dict:
+    """Spend one of the caller's free resets: today's messages and tokens
+    start over. Returns the new allowances."""
+    db = get_db()
+    row = (await db.get_user_by_id(str(user["id"]))) or user
+    uid = str(row["id"])
+    st = await status(db, row)
+    if st["exempt"]:
+        raise HTTPException(400, "You have no daily limits to reset")
+    if not st["resets_left"]:
+        raise HTTPException(409, "You have no free resets left")
+    if not (st["messages"]["used"] or st["tokens"]["used"]):
+        raise HTTPException(409, "Nothing used today yet, so there's nothing to reset")
+    if not await db.use_usage_reset(uid, st["day"]):
+        raise HTTPException(409, "You have no free resets left")
+    await _log(db, uid, "usage_reset_used", {
+        "day": st["day"], "messages": st["messages"]["used"], "tokens": st["tokens"]["used"],
+        "left": st["resets_left"] - 1})
+    return await status(db, row)
+
+
 class AgentUsage(BaseModel):
     tokens: int = Field(ge=0)
 
@@ -329,10 +373,14 @@ async def agent_usage(body: AgentUsage, request: Request) -> dict:
 
 @router.get("/admin/usage/today")
 async def usage_today(_admin: dict = Depends(require_admin)) -> dict:
-    """Every user's messages and tokens today (admin only)."""
+    """Every user's messages and tokens today, the free resets each holds and
+    the deck's cap on them (admin only)."""
+    db = get_db()
     day = today()
     return {"day": day, "resets_at": resets_at().isoformat(),
-            "usage": await get_db().list_daily_usage(day)}
+            "usage": await db.list_daily_usage(day),
+            "resets": await db.list_usage_resets(),
+            "reset_cap": await reset_cap(db)}
 
 
 @router.delete("/admin/users/{user_id}/usage/today")
@@ -343,3 +391,65 @@ async def reset_usage_today(user_id: str, _admin: dict = Depends(require_admin))
         raise HTTPException(404, "User not found")
     await db.reset_daily_usage(user_id, today())
     return {"ok": True}
+
+
+# ── Free resets (admin) ──────────────────────────────────────────────
+
+
+async def reset_cap(db) -> int:
+    """The most free resets a user may hold on this deck."""
+    try:
+        raw = await db.get_system_setting(RESET_CAP_SETTING)
+        return max(1, min(MAX_RESETS, int(raw))) if raw else DEFAULT_RESET_CAP
+    except (TypeError, ValueError):
+        return DEFAULT_RESET_CAP
+
+
+async def _log(db, user_id: str, event: str, detail: dict) -> None:
+    try:
+        await db.log_usage(user_id, event, json.dumps(detail))
+    except Exception:
+        log.warning("Could not record a usage-reset event", event=event)
+
+
+class GrantResets(BaseModel):
+    count: int = Field(1, ge=1, le=MAX_RESETS)
+    # The most a user may hold; saved as the deck's cap. Omitted: the saved one.
+    cap: int | None = Field(None, ge=1, le=MAX_RESETS)
+    # Every non-admin user on the deck, else just these (admins are skipped).
+    all: bool = False
+    user_ids: list[str] = Field(default_factory=list, max_length=10_000)
+
+
+@router.post("/admin/usage/resets")
+async def grant_resets(body: GrantResets, admin: dict = Depends(require_admin)) -> dict:
+    """Give one, several or every user more free resets, up to the cap (admin only)."""
+    db = get_db()
+    ids = list(dict.fromkeys(str(u) for u in body.user_ids if u))
+    if not body.all and not ids:
+        raise HTTPException(400, "Pick the users to give resets to")
+    if body.cap is not None:
+        await db.set_system_setting(RESET_CAP_SETTING, str(body.cap))
+    cap = await reset_cap(db)
+    before = await db.list_usage_resets()
+    balances = await db.grant_usage_resets(None if body.all else ids, body.count, cap)
+    given = sum(1 for uid, n in balances.items() if n > before.get(uid, 0))
+    await _log(db, str(admin.get("id") or ""), "usage_resets_granted", {
+        "count": body.count, "cap": cap, "all": body.all, "users": len(balances), "given": given})
+    return {"ok": True, "cap": cap, "users": len(balances), "given": given, "balances": balances}
+
+
+class SetResets(BaseModel):
+    balance: int = Field(ge=0, le=MAX_RESETS)
+
+
+@router.put("/admin/users/{user_id}/usage/resets")
+async def set_resets(user_id: str, body: SetResets, admin: dict = Depends(require_admin)) -> dict:
+    """Set how many free resets a user holds, e.g. to take some back (admin only)."""
+    db = get_db()
+    if not await db.get_user_by_id(user_id):
+        raise HTTPException(404, "User not found")
+    balance = await db.set_usage_resets(user_id, body.balance)
+    await _log(db, str(admin.get("id") or ""), "usage_resets_set",
+               {"user_id": user_id, "balance": balance})
+    return {"ok": True, "balance": balance}

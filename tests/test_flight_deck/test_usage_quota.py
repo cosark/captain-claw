@@ -258,6 +258,101 @@ def speaker_grants_paths():
     return GRANT_AWARE_PATHS
 
 
+# ── Free resets ──────────────────────────────────────────────────────
+
+
+async def test_grants_add_up_to_the_cap_and_never_take_away(fd_db):
+    a, b = await _user(fd_db), await _user(fd_db)
+    admin = await _user(fd_db, role="admin")
+    assert await fd_db.grant_usage_resets([a["id"]], 2, 3) == {a["id"]: 2}
+    assert await fd_db.grant_usage_resets([a["id"], b["id"]], 2, 3) == {a["id"]: 3, b["id"]: 2}
+    # Over the cap already (the cap was lowered): a grant keeps what they hold.
+    await fd_db.set_usage_resets(b["id"], 5)
+    assert (await fd_db.grant_usage_resets(None, 1, 3))[b["id"]] == 5
+    # Everyone: admins are skipped, whether named or not.
+    assert admin["id"] not in await fd_db.grant_usage_resets(None, 1, 3)
+    assert await fd_db.grant_usage_resets([admin["id"]], 1, 3) == {}
+    assert await fd_db.list_usage_resets() == {a["id"]: 3, b["id"]: 5}
+
+
+async def test_spending_a_reset_starts_today_over(fd_db):
+    u = await _user(fd_db, messages_per_day=1, tokens_per_day=0)
+    await usage_quota.admit_message(u["id"], "hi")
+    ok, st = await usage_quota.admit_message(u["id"], "more")
+    assert not ok and st["resets_left"] == 0
+    assert "Ask your admin" in usage_quota.limit_text(st)
+    await fd_db.grant_usage_resets([u["id"]], 1, 3)
+    st = await usage_quota.status(fd_db, u["id"])
+    assert st["resets_left"] == 1 and st["blocked"] == "messages"
+    assert "1 free reset:" in usage_quota.limit_text(st)
+    assert "1 free reset in the web chat" in usage_quota.short_limit_text(st).lower()
+    async with _client(_app(u)) as c:
+        r = await c.post("/fd/quota/reset")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["blocked"] is None and body["resets_left"] == 0
+        assert body["messages"]["used"] == 0
+        # None left.
+        await usage_quota.admit_message(u["id"], "again")
+        assert (await c.post("/fd/quota/reset")).status_code == 409
+    ok, _ = await usage_quota.admit_message(u["id"], "and again")
+    assert not ok
+    logs = await fd_db.get_usage_logs(user_id=u["id"], event_type="usage_reset_used")
+    assert len(logs) == 1 and json.loads(logs[0]["detail"])["messages"] == 1
+
+
+async def test_a_reset_is_not_spent_on_an_unused_day_or_by_admins(fd_db):
+    u = await _user(fd_db)
+    admin = await _user(fd_db, role="admin")
+    await fd_db.grant_usage_resets([u["id"]], 2, 3)
+    async with _client(_app(u)) as c:
+        assert (await c.post("/fd/quota/reset")).status_code == 409
+    assert await fd_db.get_usage_resets(u["id"]) == 2
+    async with _client(_app(admin)) as c:
+        assert (await c.post("/fd/quota/reset")).status_code == 400
+
+
+async def test_admin_grant_routes(fd_db):
+    admin = await _user(fd_db, role="admin")
+    a, b, c_ = await _user(fd_db), await _user(fd_db), await _user(fd_db)
+    async with _client(_app(admin)) as c:
+        r = await c.get("/fd/admin/usage/today")
+        assert r.json()["resets"] == {} and r.json()["reset_cap"] == usage_quota.DEFAULT_RESET_CAP
+        assert (await c.post("/fd/admin/usage/resets", json={"count": 1})).status_code == 400
+        assert (await c.post("/fd/admin/usage/resets",
+                             json={"count": 0, "all": True})).status_code == 422
+        # Several users, with a new cap that the deck keeps.
+        r = await c.post("/fd/admin/usage/resets",
+                         json={"count": 5, "cap": 2, "user_ids": [a["id"], b["id"], "ghost"]})
+        assert r.status_code == 200, r.text
+        assert r.json() == {"ok": True, "cap": 2, "users": 2, "given": 2,
+                            "balances": {a["id"]: 2, b["id"]: 2}}
+        # Everyone: a and b are at the cap already.
+        r = await c.post("/fd/admin/usage/resets", json={"count": 1, "all": True})
+        assert r.json()["cap"] == 2 and r.json()["given"] == 1
+        assert r.json()["balances"] == {a["id"]: 2, b["id"]: 2, c_["id"]: 1}
+        r = await c.get("/fd/admin/usage/today")
+        assert r.json()["reset_cap"] == 2 and r.json()["resets"][c_["id"]] == 1
+        # Take one back.
+        r = await c.put(f"/fd/admin/users/{a['id']}/usage/resets", json={"balance": 1})
+        assert r.status_code == 200 and r.json()["balance"] == 1
+        assert (await c.put("/fd/admin/users/ghost/usage/resets",
+                            json={"balance": 1})).status_code == 404
+    assert await fd_db.get_usage_resets(a["id"]) == 1
+    async with _client(_app(a)) as c:
+        assert (await c.post("/fd/admin/usage/resets",
+                             json={"count": 1, "all": True})).status_code == 403
+        assert (await c.put(f"/fd/admin/users/{a['id']}/usage/resets",
+                            json={"balance": 9})).status_code == 403
+
+
+async def test_resets_go_with_a_deleted_user(fd_db):
+    u = await _user(fd_db)
+    await fd_db.grant_usage_resets([u["id"]], 1, 3)
+    await fd_db.delete_user(u["id"])
+    assert await fd_db.list_usage_resets() == {}
+
+
 # ── Scheduled tasks ──────────────────────────────────────────────────
 
 

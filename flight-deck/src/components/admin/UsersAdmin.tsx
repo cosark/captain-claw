@@ -9,6 +9,7 @@ import {
   Bot,
   MessageSquare,
   KeyRound,
+  RotateCcw,
 } from 'lucide-react'
 import { useAuthStore } from '../../stores/authStore'
 import { useUIStore } from '../../stores/uiStore'
@@ -20,8 +21,10 @@ import {
 import { FilterSelect, FilterSummary, SearchBox } from './ListFilters'
 
 // Users → Users: every account on the deck — add one, change a plan, role or
-// kiosk lock, set a password, manage their agents, delete them. Search and
-// filters narrow the list in the browser (the newest USERS_MAX accounts).
+// kiosk lock, set a password, manage their agents, delete them, give free
+// resets of the daily allowances (to one, the selected or every user, up to
+// the deck's cap). Search and filters narrow the list in the browser (the
+// newest USERS_MAX accounts).
 
 interface UserInfo {
   id: string
@@ -105,14 +108,48 @@ async function deleteUser(userId: string): Promise<void> {
   }
 }
 
-// What each user spent today against their plan's daily allowances.
+// What each user spent today against their plan's daily allowances, the free
+// resets each holds (spending one starts their day over) and the most a user
+// may hold.
 interface DayUsage { messages: number; tokens: number }
+interface UsageToday { usage: Record<string, DayUsage>; resets: Record<string, number>; reset_cap: number }
 
-async function fetchUsageToday(): Promise<Record<string, DayUsage>> {
+const NO_USAGE: UsageToday = { usage: {}, resets: {}, reset_cap: 3 }
+
+async function fetchUsageToday(): Promise<UsageToday> {
   const res = await fetch('/fd/admin/usage/today', { headers: adminHeaders(), credentials: 'include' })
   if (!res.ok) throw new Error("Failed to fetch today's usage")
-  return (await res.json()).usage
+  const body = await res.json()
+  return { usage: body.usage ?? {}, resets: body.resets ?? {}, reset_cap: body.reset_cap ?? NO_USAGE.reset_cap }
 }
+
+interface GrantResult { cap: number; users: number; given: number }
+
+/** Give users *count* more free resets, none past *cap* (saved as the deck's). */
+async function grantResets(payload: {
+  count: number; cap?: number; all?: boolean; user_ids?: string[]
+}): Promise<GrantResult> {
+  const res = await fetch('/fd/admin/usage/resets', {
+    method: 'POST', headers: adminHeaders(), credentials: 'include',
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(typeof data.detail === 'string' ? data.detail : 'Failed to give resets')
+  }
+  return res.json()
+}
+
+async function setResets(userId: string, balance: number): Promise<void> {
+  const res = await fetch(`/fd/admin/users/${userId}/usage/resets`, {
+    method: 'PUT', headers: adminHeaders(), credentials: 'include',
+    body: JSON.stringify({ balance }),
+  })
+  if (!res.ok) throw new Error('Failed to change resets')
+}
+
+const MAX_RESETS = 100  // usage_quota.MAX_RESETS
+const nResets = (n: number) => `${n} free reset${n === 1 ? '' : 's'}`
 
 async function resetUsageToday(userId: string): Promise<void> {
   const res = await fetch(`/fd/admin/users/${userId}/usage/today`, {
@@ -323,11 +360,15 @@ function MustChangeCheckbox({ checked, onChange, label, note }: {
 }
 
 function UserRow({
-  user, plans, usage, onUpdate, onDelete, currentUserId, kioskMode,
+  user, plans, usage, resets, resetCap, selected, onSelect, onUpdate, onDelete, currentUserId, kioskMode,
 }: {
   user: UserInfo
   plans: Record<string, PlanLimits>
   usage?: DayUsage
+  resets: number
+  resetCap: number
+  selected: boolean
+  onSelect: (on: boolean) => void
   onUpdate: () => void
   onDelete: (id: string) => void
   currentUserId: string
@@ -341,6 +382,7 @@ function UserRow({
   const [saveError, setSaveError] = useState('')
   const [agentsOpen, setAgentsOpen] = useState(false)
   const [resetting, setResetting] = useState(false)
+  const [changingResets, setChangingResets] = useState(false)
   const isSelf = user.id === currentUserId
   const { limits, custom } = effectiveLimits(plans[plan], user.metadata)
   const mark = (key: string) => (custom.has(key) ? ' (custom)' : '')
@@ -357,6 +399,19 @@ function UserRow({
     setResetting(false)
   }
 
+  // One more free reset (never past the cap), or one taken back.
+  const handleResets = async (delta: 1 | -1) => {
+    setChangingResets(true); setSaveError('')
+    try {
+      if (delta > 0) await grantResets({ count: 1, user_ids: [user.id] })
+      else await setResets(user.id, Math.max(0, resets - 1))
+      onUpdate()
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : 'Failed to change resets')
+    }
+    setChangingResets(false)
+  }
+
   const handleSave = async () => {
     setSaving(true); setSaveError('')
     try {
@@ -369,48 +424,73 @@ function UserRow({
   }
 
   return (
-    <div className="border border-zinc-800 rounded-lg overflow-hidden">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-3 px-4 py-3 hover:bg-zinc-800/50 transition-colors text-left"
-      >
-        {expanded ? <ChevronDown className="h-4 w-4 text-zinc-500 shrink-0" /> : <ChevronRight className="h-4 w-4 text-zinc-500 shrink-0" />}
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
-            <span className="text-sm font-medium text-zinc-200 truncate">{user.display_name || user.email}</span>
-            {user.role === 'admin' && <Crown className="h-3.5 w-3.5 text-amber-400" />}
-            {isSelf && <span className="text-xs text-zinc-500">(you)</span>}
+    <div className={`border rounded-lg overflow-hidden ${selected ? 'border-violet-500/50' : 'border-zinc-800'}`}>
+      <div className="flex items-stretch hover:bg-zinc-800/50 transition-colors">
+        {/* Admins have no daily limits, so nothing to give them. */}
+        <label
+          className={`flex items-center pl-4 ${user.role === 'admin' ? 'invisible' : 'cursor-pointer'}`}
+          title="Select to give free resets"
+        >
+          <input
+            type="checkbox"
+            checked={selected}
+            disabled={user.role === 'admin'}
+            onChange={(e) => onSelect(e.target.checked)}
+            aria-label={`Select ${user.display_name || user.email}`}
+            className="h-3.5 w-3.5 rounded border-zinc-600 bg-zinc-950 accent-violet-600"
+          />
+        </label>
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="flex-1 min-w-0 flex items-center gap-3 pl-3 pr-4 py-3 text-left"
+        >
+          {expanded ? <ChevronDown className="h-4 w-4 text-zinc-500 shrink-0" /> : <ChevronRight className="h-4 w-4 text-zinc-500 shrink-0" />}
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-medium text-zinc-200 truncate">{user.display_name || user.email}</span>
+              {user.role === 'admin' && <Crown className="h-3.5 w-3.5 text-amber-400" />}
+              {isSelf && <span className="text-xs text-zinc-500">(you)</span>}
+            </div>
+            <div className="text-xs text-zinc-500">{user.email}</div>
           </div>
-          <div className="text-xs text-zinc-500">{user.email}</div>
-        </div>
-        {userMustChangePassword(user) && (
-          <span
-            title="An admin set this password; they choose their own at their next sign-in"
-            className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-700 dark:text-amber-300"
-          >
-            <KeyRound className="h-3 w-3" />
-            temporary password
-          </span>
-        )}
-        {kioskEffective(user.role, userKioskFlag(user), kioskMode) && (
-          <span
-            title="Locked to the simple chat layout (kiosk mode)"
-            className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-violet-500/15 text-violet-300"
-          >
-            <MessageSquare className="h-3 w-3" />
-            kiosk
-          </span>
-        )}
-        {usage && (usage.messages > 0 || usage.tokens > 0) && (
-          <span
-            title={spent ? "Today's allowance is spent" : 'Used today'}
-            className={`hidden sm:inline text-xs px-2 py-0.5 rounded-full ${spent ? 'bg-red-500/15 text-red-700 dark:text-red-300' : 'bg-zinc-800 text-zinc-500'}`}
-          >
-            {usage.messages} msg · {fmtTok(usage.tokens)} tok today
-          </span>
-        )}
-        <span className="text-xs px-2 py-0.5 rounded-full bg-zinc-800 text-zinc-400 capitalize">{plan}</span>
-      </button>
+          {userMustChangePassword(user) && (
+            <span
+              title="An admin set this password; they choose their own at their next sign-in"
+              className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-700 dark:text-amber-300"
+            >
+              <KeyRound className="h-3 w-3" />
+              temporary password
+            </span>
+          )}
+          {kioskEffective(user.role, userKioskFlag(user), kioskMode) && (
+            <span
+              title="Locked to the simple chat layout (kiosk mode)"
+              className="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-violet-500/15 text-violet-300"
+            >
+              <MessageSquare className="h-3 w-3" />
+              kiosk
+            </span>
+          )}
+          {usage && (usage.messages > 0 || usage.tokens > 0) && (
+            <span
+              title={spent ? "Today's allowance is spent" : 'Used today'}
+              className={`hidden sm:inline text-xs px-2 py-0.5 rounded-full ${spent ? 'bg-red-500/15 text-red-700 dark:text-red-300' : 'bg-zinc-800 text-zinc-500'}`}
+            >
+              {usage.messages} msg · {fmtTok(usage.tokens)} tok today
+            </span>
+          )}
+          {resets > 0 && (
+            <span
+              title={`${nResets(resets)}: they can start a day over`}
+              className="hidden sm:flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
+            >
+              <RotateCcw className="h-3 w-3" />
+              {resets}
+            </span>
+          )}
+          <span className="text-xs px-2 py-0.5 rounded-full bg-zinc-800 text-zinc-400 capitalize">{plan}</span>
+        </button>
+      </div>
 
       {expanded && (
         <div className="border-t border-zinc-800 px-4 py-3 bg-zinc-900/50 space-y-3">
@@ -475,6 +555,34 @@ function UserRow({
               </button>
             )}
           </div>
+
+          {user.role !== 'admin' && (
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="text-zinc-400">
+                <RotateCcw className="h-3 w-3 inline mr-1" />
+                {resets > 0 ? nResets(resets) : 'No free resets'}
+                <span className="text-zinc-600"> · holds at most {resetCap}</span>
+              </span>
+              <button
+                onClick={() => handleResets(1)}
+                disabled={changingResets || resets >= resetCap}
+                title={resets >= resetCap ? `They hold the most a user can (${resetCap})` : 'Give them one more free reset'}
+                className="rounded-md border border-zinc-700 px-2 py-0.5 text-[11px] text-zinc-300 hover:border-violet-500/40 hover:text-zinc-100 disabled:opacity-50"
+              >
+                Give 1
+              </button>
+              {resets > 0 && (
+                <button
+                  onClick={() => handleResets(-1)}
+                  disabled={changingResets}
+                  title="Take one free reset back"
+                  className="rounded-md border border-zinc-700 px-2 py-0.5 text-[11px] text-zinc-300 hover:border-violet-500/40 hover:text-zinc-100 disabled:opacity-50"
+                >
+                  Take 1
+                </button>
+              )}
+            </div>
+          )}
 
           <div className="text-xs text-zinc-600">
             Joined: {new Date(user.created_at).toLocaleDateString()}
@@ -642,8 +750,108 @@ function SetPasswordSection({ userId, email, isSelf, onSet }: {
   )
 }
 
+// Give free resets to the selected users or to every user on the deck. Nobody
+// ends up holding more than the cap (set here, kept as the deck's), so repeated
+// grants don't pile up; someone already over a lowered cap keeps theirs.
+function GrantResetsPanel({ selected, everyone, cap, onDone, onClose }: {
+  selected: string[]
+  everyone: string
+  cap: number
+  onDone: (notice: string) => void
+  onClose: () => void
+}) {
+  const [count, setCount] = useState(1)
+  const [maxHeld, setMaxHeld] = useState(cap)
+  const [target, setTarget] = useState<'selected' | 'all'>(selected.length ? 'selected' : 'all')
+  const [saving, setSaving] = useState(false)
+  const [err, setErr] = useState('')
+  const valid = count >= 1 && count <= MAX_RESETS && maxHeld >= 1 && maxHeld <= MAX_RESETS
+    && (target === 'all' || selected.length > 0)
+
+  const handleGrant = async () => {
+    if (!valid) return
+    if (target === 'all' && !confirm(`Give ${nResets(count)} to ${everyone}?`)) return
+    setSaving(true); setErr('')
+    try {
+      const r = await grantResets({
+        count, cap: maxHeld,
+        ...(target === 'all' ? { all: true } : { user_ids: selected }),
+      })
+      const full = r.users - r.given
+      onDone([
+        r.given
+          ? `${r.given} user${r.given === 1 ? '' : 's'} got more free resets (each holds at most ${r.cap}).`
+          : 'Nobody got a reset.',
+        full > 0 && `${full} already held the most.`,
+      ].filter(Boolean).join(' '))
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Failed to give resets')
+      setSaving(false)
+    }
+  }
+
+  const num = 'w-16 rounded-md border border-zinc-700 bg-zinc-950 px-2 py-1 text-sm text-zinc-200 focus:border-violet-500/50 focus:outline-none'
+  const clamp = (v: string) => Math.max(0, Math.min(MAX_RESETS, Math.floor(Number(v) || 0)))
+
+  return (
+    <div className="rounded-lg border border-violet-800/40 bg-zinc-900/50 p-4 space-y-3">
+      <div className="flex items-center gap-2">
+        <RotateCcw className="h-4 w-4 text-violet-400" />
+        <h3 className="text-sm font-semibold text-zinc-200">Give free resets</h3>
+      </div>
+      <p className="text-xs text-zinc-500">
+        A user spends a free reset to start the day's messages and AI tokens over, from the chat's usage bar or their Info dialog.
+      </p>
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-zinc-300">
+        <label className="flex items-center gap-2">
+          Give
+          <input type="number" min={1} max={MAX_RESETS} value={count} aria-label="Resets to give"
+            onChange={(e) => setCount(clamp(e.target.value))} className={num} />
+          reset{count === 1 ? '' : 's'} to
+        </label>
+        <label className={`flex items-center gap-2 ${selected.length ? 'cursor-pointer' : 'opacity-50'}`}>
+          <input type="radio" name="grant-target" checked={target === 'selected'} disabled={!selected.length}
+            onChange={() => setTarget('selected')} className="accent-violet-600" />
+          {selected.length ? `the ${selected.length} selected user${selected.length === 1 ? '' : 's'}` : 'selected users (none yet)'}
+        </label>
+        <label className="flex items-center gap-2 cursor-pointer">
+          <input type="radio" name="grant-target" checked={target === 'all'}
+            onChange={() => setTarget('all')} className="accent-violet-600" />
+          {everyone}
+        </label>
+      </div>
+      <div>
+        <label className="flex flex-wrap items-center gap-2 text-sm text-zinc-300">
+          Most a user can hold
+          <input type="number" min={1} max={MAX_RESETS} value={maxHeld} aria-label="Most resets a user can hold"
+            onChange={(e) => setMaxHeld(clamp(e.target.value))} className={num} />
+        </label>
+        <p className="mt-1 text-[11px] text-zinc-500">
+          Applies to every grant on this deck: resets stop adding up there. Admins have no daily limits and get none.
+        </p>
+      </div>
+      {err && <p className="text-xs text-red-400">{err}</p>}
+      <div className="flex items-center gap-2 pt-1">
+        <button
+          onClick={handleGrant}
+          disabled={saving || !valid}
+          className="rounded-md bg-violet-600 px-3 py-1.5 text-xs text-white hover:bg-violet-500 disabled:opacity-50"
+        >
+          {saving ? 'Giving…' : 'Give resets'}
+        </button>
+        <button
+          onClick={onClose}
+          className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-400 hover:bg-zinc-800"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  )
+}
+
 type RoleFilter = 'all' | 'admin' | 'user'
-type StatusFilter = 'any' | 'kiosk' | 'not-kiosk' | 'temp-password' | 'used-today' | 'limit-reached'
+type StatusFilter = 'any' | 'kiosk' | 'not-kiosk' | 'temp-password' | 'used-today' | 'limit-reached' | 'has-resets'
 type SortKey = 'newest' | 'oldest' | 'name' | 'usage'
 
 const STATUS_LABEL: Record<StatusFilter, string> = {
@@ -653,6 +861,7 @@ const STATUS_LABEL: Record<StatusFilter, string> = {
   'temp-password': 'Temporary password',
   'used-today': 'Active today',
   'limit-reached': 'Daily limit reached',
+  'has-resets': 'Has free resets',
 }
 
 const SORT_LABEL: Record<SortKey, string> = {
@@ -672,6 +881,11 @@ export function UsersAdmin({ refreshTick, config, onTotal }: {
   const [total, setTotal] = useState(0)
   const [plans, setPlans] = useState<Record<string, PlanLimits>>({})
   const [usageToday, setUsageToday] = useState<Record<string, DayUsage>>({})
+  const [resets, setResetsMap] = useState<Record<string, number>>({})
+  const [resetCap, setResetCap] = useState(NO_USAGE.reset_cap)
+  const [selected, setSelected] = useState<Set<string>>(() => new Set())
+  const [granting, setGranting] = useState(false)
+  const [notice, setNotice] = useState('')
   const [error, setError] = useState('')
   const [adding, setAdding] = useState(false)
   const [query, setQuery] = useState('')
@@ -683,13 +897,18 @@ export function UsersAdmin({ refreshTick, config, onTotal }: {
   const load = useCallback(async () => {
     try {
       const [data, plansData, today] = await Promise.all([
-        fetchUsers(USERS_MAX), fetchPlans(), fetchUsageToday().catch(() => ({} as Record<string, DayUsage>)),
+        fetchUsers(USERS_MAX), fetchPlans(), fetchUsageToday().catch(() => NO_USAGE),
       ])
       setUsers(data.users)
       setTotal(data.total)
       onTotal(data.total)
       setPlans(plansData)
-      setUsageToday(today)
+      setUsageToday(today.usage)
+      setResetsMap(today.resets)
+      setResetCap(today.reset_cap)
+      // Selections of accounts that are gone (or became admins) drop out.
+      const selectable = new Set(data.users.filter((u) => u.role !== 'admin').map((u) => u.id))
+      setSelected((prev) => new Set([...prev].filter((id) => selectable.has(id))))
       setError('')
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Failed to load users')
@@ -726,6 +945,7 @@ export function UsersAdmin({ refreshTick, config, onTotal }: {
         case 'used-today': return !!usage && (usage.messages > 0 || usage.tokens > 0)
         case 'limit-reached':
           return limitReached(u.role, effectiveLimits(plans[userPlan(u)], u.metadata).limits, usage)
+        case 'has-resets': return (resets[u.id] ?? 0) > 0
         default: return true
       }
     })
@@ -737,10 +957,28 @@ export function UsersAdmin({ refreshTick, config, onTotal }: {
       if (sort === 'usage') return used(b).tokens - used(a).tokens || used(b).messages - used(a).messages
       return b.created_at.localeCompare(a.created_at)
     })
-  }, [users, query, role, plan, status, sort, usageToday, plans, config.kiosk_mode])
+  }, [users, query, role, plan, status, sort, usageToday, resets, plans, config.kiosk_mode])
 
   const filtered = query.trim() !== '' || role !== 'all' || plan !== 'all' || status !== 'any'
   const clearFilters = () => { setQuery(''); setRole('all'); setPlan('all'); setStatus('any') }
+
+  // Selecting is for free resets, so only users with daily limits (not admins).
+  const shownSelectable = shown.filter((u) => u.role !== 'admin')
+  const allShownSelected = shownSelectable.length > 0 && shownSelectable.every((u) => selected.has(u.id))
+  const selectShown = (on: boolean) => setSelected((prev) => {
+    const next = new Set(prev)
+    for (const u of shownSelectable) { if (on) next.add(u.id); else next.delete(u.id) }
+    return next
+  })
+  const selectOne = (id: string, on: boolean) => setSelected((prev) => {
+    const next = new Set(prev)
+    if (on) next.add(id); else next.delete(id)
+    return next
+  })
+  const nonAdmins = (users ?? []).filter((u) => u.role !== 'admin').length
+  const everyone = users && total <= users.length
+    ? `every user (all ${nonAdmins})`
+    : 'every user on the deck'
 
   return (
     <div className="space-y-2">
@@ -774,6 +1012,54 @@ export function UsersAdmin({ refreshTick, config, onTotal }: {
         </FilterSelect>
       </div>
 
+      {users && (shownSelectable.length > 0 || selected.size > 0) && (
+        <div className="flex flex-wrap items-center gap-3 px-1 text-xs text-zinc-400">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={allShownSelected}
+              disabled={shownSelectable.length === 0}
+              onChange={(e) => selectShown(e.target.checked)}
+              className="h-3.5 w-3.5 rounded border-zinc-600 bg-zinc-950 accent-violet-600"
+            />
+            Select all shown
+          </label>
+          {selected.size > 0 && (
+            <>
+              <span className="text-zinc-300">{selected.size} selected</span>
+              <button onClick={() => setSelected(new Set())} className="text-violet-400 underline underline-offset-2 hover:no-underline">
+                Clear
+              </button>
+            </>
+          )}
+          <span className="flex-1" />
+          <button
+            onClick={() => { setGranting(true); setNotice('') }}
+            disabled={granting}
+            className="flex items-center gap-1.5 rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-200 hover:border-violet-500/50 hover:bg-zinc-800 disabled:opacity-50"
+          >
+            <RotateCcw className="h-3.5 w-3.5" />
+            Give free resets…
+          </button>
+        </div>
+      )}
+
+      {granting && (
+        <GrantResetsPanel
+          selected={[...selected]}
+          everyone={everyone}
+          cap={resetCap}
+          onDone={(msg) => { setGranting(false); setNotice(msg); setSelected(new Set()); load() }}
+          onClose={() => setGranting(false)}
+        />
+      )}
+      {notice && (
+        <div className="flex items-center gap-2 rounded-md border border-emerald-700/40 bg-emerald-950/20 px-4 py-2 text-sm text-emerald-400">
+          <span className="flex-1">{notice}</span>
+          <button onClick={() => setNotice('')} className="text-xs text-zinc-500 hover:text-zinc-300">Dismiss</button>
+        </div>
+      )}
+
       {adding && <CreateUserForm config={config} onCreated={load} onClose={() => setAdding(false)} />}
 
       {error && (
@@ -796,6 +1082,10 @@ export function UsersAdmin({ refreshTick, config, onTotal }: {
           user={u}
           plans={plans}
           usage={usageToday[u.id]}
+          resets={resets[u.id] ?? 0}
+          resetCap={resetCap}
+          selected={selected.has(u.id)}
+          onSelect={(on) => selectOne(u.id, on)}
           onUpdate={load}
           onDelete={handleDelete}
           currentUserId={currentUserId}

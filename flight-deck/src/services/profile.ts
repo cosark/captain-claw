@@ -238,7 +238,8 @@ export const getMyInfo = () => fdFetch<MyInfo>('/info')
 
 // ── Daily plan allowances (/fd/quota) ──
 // Messages and AI tokens a user may spend per UTC day on their plan. A limit
-// of 0 is unlimited; admins are exempt (their usage is still counted).
+// of 0 is unlimited; admins are exempt (their usage is still counted). An
+// admin may give users free resets, each starting the day's allowances over.
 
 export type PlanLimitKey =
   | 'max_agents' | 'max_storage_mb' | 'requests_per_minute' | 'spawns_per_hour'
@@ -260,6 +261,10 @@ export interface QuotaStatus {
   tokens: QuotaAllowance
   blocked: 'messages' | 'tokens' | null
   warning: 'messages' | 'tokens' | null
+  resets_left: number       // free resets an admin gave them
 }
 
 export const getMyQuota = () => fdFetch<QuotaStatus>('/quota')
+
+/** Spend one free reset: today's messages and AI tokens start over. */
+export const spendFreeReset = () => fdFetch<QuotaStatus>('/quota/reset', { method: 'POST' })
