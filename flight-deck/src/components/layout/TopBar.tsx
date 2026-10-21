@@ -5,7 +5,7 @@ import { useThemeStore } from '../../stores/themeStore'
 import { useUIStore } from '../../stores/uiStore'
 import { APP_VERSION } from '../../version'
 import { useChatStore } from '../../stores/chatStore'
-import { openConsole } from '../../stores/consoleStore'
+import { openConsole, selectConsoleAdmin } from '../../stores/consoleStore'
 import { NotificationBell } from '../common/NotificationCenter'
 
 interface TopBarProps {
@@ -35,6 +35,7 @@ export function TopBar({
   const mobilePanel = useUIStore((s) => s.mobilePanel)
   const toggleMobilePanel = useUIStore((s) => s.toggleMobilePanel)
   const setLayoutMode = useUIStore((s) => s.setLayoutMode)
+  const consoleAdmin = useAuthStore(selectConsoleAdmin)
   const chatSessions = useChatStore((s) => s.sessions)
 
   const compact = isMobile || isTablet
@@ -157,7 +158,7 @@ export function TopBar({
         )}
 
         {/* The Admin console: the deck's admin work on pages of its own. */}
-        {authEnabled && authUser?.role === 'admin' && (
+        {consoleAdmin && (
           <button
             onClick={() => openConsole()}
             className="rounded p-1.5 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300 transition-colors"

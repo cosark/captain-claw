@@ -10,7 +10,9 @@ import {
   useConsoleStore, leaveConsole, pageFromPath, CONSOLE_PATH, type ConsolePage,
 } from '../../stores/consoleStore'
 import { APP_VERSION } from '../../version'
+import { isDesktopApp } from '../../services/desktopShell'
 import { fetchWaitlistPending } from './consoleApi'
+import { ShellModeSwitch } from './ShellModeSwitch'
 import { OverviewPage } from './OverviewPage'
 import { ModelsPage } from './ModelsPage'
 import { ArchetypesPage } from './ArchetypesPage'
@@ -23,14 +25,18 @@ import { SettingsConsole } from './SettingsConsole'
 // the page on the right. Everything an admin sets up for the deck and nothing
 // else — the agents and their chats stay in Flight Deck, one click away.
 
-const NAV: { id: ConsolePage; icon: LucideIcon; label: string; hint: string }[] = [
+// `accounts`: only on a deck with sign-in — without it (the desktop app)
+// there is one user, no plans and no one to invite.
+type NavItem = { id: ConsolePage; icon: LucideIcon; label: string; hint: string; accounts?: boolean; soloHint?: string }
+
+const NAV: NavItem[] = [
   { id: 'overview', icon: LayoutGrid, label: 'Overview', hint: 'How the deck is doing' },
   { id: 'models', icon: Gauge, label: 'Models', hint: 'Tier sets and team keys' },
   { id: 'archetypes', icon: Library, label: 'Archetypes', hint: 'Agents people start from' },
   { id: 'connections', icon: Plug, label: 'Connections', hint: 'Google, Telegram, MCP…' },
-  { id: 'users', icon: UserCog, label: 'Users', hint: 'Accounts, invitations, waitlist' },
-  { id: 'usage', icon: BarChart3, label: 'Usage & limits', hint: 'Today, spend and plans' },
-  { id: 'settings', icon: Settings2, label: 'Settings', hint: 'Branding, sign-up, kiosk' },
+  { id: 'users', icon: UserCog, label: 'Users', hint: 'Accounts, invitations, waitlist', accounts: true },
+  { id: 'usage', icon: BarChart3, label: 'Usage & limits', hint: 'Today, spend and plans', accounts: true },
+  { id: 'settings', icon: Settings2, label: 'Settings', hint: 'Branding, sign-up, kiosk', soloHint: 'Branding, agents, profile' },
 ]
 
 function initials(s: string): string {
@@ -39,11 +45,15 @@ function initials(s: string): string {
 }
 
 export function ConsoleLayout() {
-  const page = useConsoleStore((s) => s.page)
+  const asked = useConsoleStore((s) => s.page)
   const go = useConsoleStore((s) => s.go)
   const layoutMode = useUIStore((s) => s.layoutMode)
+  const accounts = useAuthStore((s) => s.authEnabled !== false)
   const [menuOpen, setMenuOpen] = useState(false)
   const [waitlist, setWaitlist] = useState(0)
+  const nav = NAV.filter((n) => accounts || !n.accounts).map((n) => (!accounts && n.soloHint ? { ...n, hint: n.soloHint } : n))
+  const current = nav.find((n) => n.id === asked) || nav[0]
+  const page = current.id
 
   // Opened from the address bar (or the saved layout): keep the layout saved as
   // the console, even if the signed-in settings land later with another one.
@@ -53,30 +63,29 @@ export function ConsoleLayout() {
 
   // The address shows the page (Back / Forward: syncConsoleFromUrl, in App).
   useEffect(() => {
-    if (!pageFromPath(window.location.pathname)) {
-      window.history.replaceState(null, '', `${CONSOLE_PATH}/${useConsoleStore.getState().page}`)
+    if (pageFromPath(window.location.pathname) !== page) {
+      window.history.replaceState(null, '', `${CONSOLE_PATH}/${page}`)
     }
-    // Already where they want to be: no "where to start?" after signing in.
-    useAuthStore.getState().setAdminStartPending(false)
-  }, [])
+  }, [page])
 
   // Applications waiting for approval, on the Users entry.
   useEffect(() => {
+    if (!accounts) return
     let cancelled = false
     fetchWaitlistPending().then((n) => { if (!cancelled) setWaitlist(n) }).catch(() => {})
     return () => { cancelled = true }
-  }, [page])
+  }, [page, accounts])
 
   useEffect(() => { document.querySelector('#fd-console-main')?.scrollTo(0, 0) }, [page])
 
-  const current = NAV.find((n) => n.id === page) || NAV[0]
   const open = (id: ConsolePage) => { setMenuOpen(false); go(id) }
 
   return (
     <div className="flex h-[100dvh] overflow-hidden bg-zinc-950 text-zinc-200">
       <aside className="hidden w-64 shrink-0 flex-col border-r border-zinc-800 bg-zinc-900/40 wide:flex">
         <Brand />
-        <Nav page={page} waitlist={waitlist} onOpen={open} />
+        <DesktopSwitch />
+        <Nav items={nav} page={page} waitlist={waitlist} onOpen={open} />
         <Footer />
       </aside>
 
@@ -115,7 +124,8 @@ export function ConsoleLayout() {
                 <X className="h-4 w-4" />
               </button>
             </div>
-            <Nav page={page} waitlist={waitlist} onOpen={open} />
+            <DesktopSwitch />
+            <Nav items={nav} page={page} waitlist={waitlist} onOpen={open} />
             <Footer />
           </div>
         </div>
@@ -144,10 +154,16 @@ function Brand() {
   )
 }
 
-function Nav({ page, waitlist, onOpen }: { page: ConsolePage; waitlist: number; onOpen: (p: ConsolePage) => void }) {
+// The desktop app: Admin console ⇄ the users' chat view, at the top.
+function DesktopSwitch() {
+  if (!isDesktopApp()) return null
+  return <div className="px-3 pb-3"><ShellModeSwitch current="admin" /></div>
+}
+
+function Nav({ items, page, waitlist, onOpen }: { items: NavItem[]; page: ConsolePage; waitlist: number; onOpen: (p: ConsolePage) => void }) {
   return (
     <nav className="flex-1 space-y-0.5 overflow-y-auto px-3 py-2" aria-label="Admin console">
-      {NAV.map(({ id, icon: Icon, label, hint }) => {
+      {items.map(({ id, icon: Icon, label, hint }) => {
         const on = id === page
         return (
           <button

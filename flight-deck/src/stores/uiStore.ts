@@ -76,6 +76,17 @@ interface UIStore {
   setSimpleQueueOpen: (v: boolean) => void
 }
 
+/**
+ * An admin who never picked a layout starts in the Admin console. The
+ * signed-in settings say so for an admin (the hydrator below); a deck without
+ * sign-in (the desktop app), whose user is its admin, asks this on start.
+ * Not saved: the first layout they pick is.
+ */
+export function startInConsoleUnlessChosen() {
+  try { if (localStorage.getItem(LAYOUT_MODE_KEY) !== null) return } catch { /* storage blocked */ }
+  useUIStore.setState({ layoutMode: 'console' })
+}
+
 export const useUIStore = create<UIStore>((set, get) => ({
   view: 'desktop',
   sidebarOpen: true,
@@ -128,7 +139,8 @@ export const useUIStore = create<UIStore>((set, get) => ({
 
 // Server-side settings win on login. The hydrator only runs when authenticated
 // (hydrateAllStores), so treat the server as authoritative: a key that's ABSENT
-// there resets the field to its default. Otherwise a previous user's mode/rails
+// there resets the field to its default (the layout's: the Admin console for
+// an admin, the full layout for anyone else). Otherwise a previous user's mode/rails
 // would survive in the module-level store on a shared browser whenever the tab
 // isn't reloaded between sessions (sign-out reloads — this is defense in
 // depth). hydrateAllStores() clears the localStorage mirror for absent
@@ -139,8 +151,9 @@ registerHydrator((settings) => {
     const v = settings[key]
     return v === 'true' ? true : v === 'false' ? false : dflt
   }
+  const admin = useAuthStore.getState().user?.role === 'admin'
   const patch = {
-    layoutMode: asLayoutMode(mode),
+    layoutMode: mode === undefined && admin ? 'console' as const : asLayoutMode(mode),
     simpleLeftOpen: bool(SIMPLE_LEFT_OPEN_KEY, true),
     simpleRightOpen: bool(SIMPLE_RIGHT_OPEN_KEY, true),
     simpleQueueOpen: bool(SIMPLE_QUEUE_OPEN_KEY, true),

@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { useUIStore } from './uiStore'
+import { useAuthStore } from './authStore'
 import type { ViewMode } from '../types'
 import { USERS_TAB_KEY, type UsersTab } from '../components/admin/deckConfig'
 import { ADMIN_TAB_KEY } from '../services/sharedIntegrations'
@@ -45,8 +46,8 @@ export interface ConsoleIntent {
 
 interface ConsoleStore {
   page: ConsolePage
-  // The address bar asked for the console (<deck>/console…): it opens for an
-  // admin whatever layout they had saved.
+  // The console was asked for — the address bar (<deck>/console…), a sign-in,
+  // a click: it shows for an admin whatever layout their saved settings bring.
   requested: boolean
   intent: ConsoleIntent
   go: (page: ConsolePage, intent?: ConsoleIntent) => void
@@ -75,17 +76,25 @@ export const useConsoleStore = create<ConsoleStore>((set, get) => ({
   },
 }))
 
+/** Who may use the console: a signed-in admin, or on a deck without sign-in
+ *  (the desktop app) whoever runs it — the server treats them as its admin. */
+export function selectConsoleAdmin(s: ReturnType<typeof useAuthStore.getState>): boolean {
+  return s.authEnabled === false || (s.authEnabled === true && s.user?.role === 'admin')
+}
+
 /** Open the Admin console (admins only — App falls back to the usual layout otherwise). */
 export function openConsole(page?: ConsolePage, intent?: ConsoleIntent) {
+  useConsoleStore.setState({ requested: true })
   useUIStore.getState().setLayoutMode('console')
   useConsoleStore.getState().go(page ?? useConsoleStore.getState().page, intent)
 }
 
-/** Back to Flight Deck's full layout, optionally on one of its pages. */
-export function leaveConsole(view?: ViewMode) {
+/** Back to Flight Deck — its full layout (optionally on one of its pages), or
+ *  the chat-first simple one (the desktop app's "User" view). */
+export function leaveConsole(view?: ViewMode, layout: 'full' | 'simple' = 'full') {
   useConsoleStore.setState({ requested: false })
   if (pageFromPath(window.location.pathname)) window.history.pushState(null, '', '/')
-  useUIStore.getState().setLayoutMode('full')
+  useUIStore.getState().setLayoutMode(layout)
   if (view) useUIStore.getState().setView(view)
 }
 

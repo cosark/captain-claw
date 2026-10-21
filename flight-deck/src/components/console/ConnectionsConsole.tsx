@@ -21,6 +21,7 @@ import {
 import { useMCPStore } from '../../stores/mcpStore'
 import { useCodexAuthStore } from '../../stores/codexAuthStore'
 import { useConsoleStore } from '../../stores/consoleStore'
+import { useAuthStore } from '../../stores/authStore'
 import { Page, PageHeader, Dot } from './parts'
 
 // Connections: the services agents reach, with the deck-wide part (the OAuth
@@ -59,7 +60,7 @@ function serviceFor(id: string | undefined): ServiceId | undefined {
 type Status = { tone: 'on' | 'pending' | 'off'; text: string }
 
 // What each row says: the deck-wide part where there is one.
-function useStatuses(): Partial<Record<ServiceId, Status>> {
+function useStatuses(accounts: boolean): Partial<Record<ServiceId, Status>> {
   const [out, setOut] = useState<Partial<Record<ServiceId, Status>>>({})
   const mcpShared = useMCPStore((s) => s.servers.filter((x) => x.deck_wide).length)
   const codex = useCodexAuthStore((s) => s.status)
@@ -70,10 +71,12 @@ function useStatuses(): Partial<Record<ServiceId, Status>> {
     for (const p of ['google', 'microsoft'] as const) {
       getOAuthClientConfig(p)
         .then((c) => put(p, c.client_id_set && c.client_secret_set
-          ? { tone: 'on', text: 'Ready for everyone' }
+          ? { tone: 'on', text: accounts ? 'Ready for everyone' : 'Ready' }
           : { tone: 'pending', text: 'Needs the OAuth client' }))
         .catch(() => {})
     }
+    // The team bot and the team keys come with accounts.
+    if (!accounts) return () => { cancelled = true }
     getAdminTelegram()
       .then((t) => put('telegram', !t.config.configured
         ? { tone: 'off', text: 'No team bot' }
@@ -90,11 +93,12 @@ function useStatuses(): Partial<Record<ServiceId, Status>> {
         : k.env_key_set ? { tone: 'on', text: 'Server key' } : { tone: 'off', text: 'No team key' }))
       .catch(() => {})
     return () => { cancelled = true }
-  }, [])
+  }, [accounts])
 
+  const mcp: Status = mcpShared > 0 ? { tone: 'on', text: `${mcpShared} shared with everyone` } : { tone: 'off', text: 'None shared' }
   return {
     ...out,
-    mcp: mcpShared > 0 ? { tone: 'on', text: `${mcpShared} shared with everyone` } : { tone: 'off', text: 'None shared' },
+    ...(accounts ? { mcp } : {}),
     ...(codex?.connected && !codex.stale ? { codex: { tone: 'on' as const, text: 'Connected' } } : {}),
   }
 }
@@ -115,7 +119,8 @@ export function ConnectionsConsole() {
       useConsoleStore.getState().takeIntent()
     })
   }, [])
-  const statuses = useStatuses()
+  const accounts = useAuthStore((s) => s.authEnabled !== false)
+  const statuses = useStatuses(accounts)
   const current = SERVICES.find((s) => s.id === active)!
 
   const pick = (id: ServiceId) => { setActive(id); setDetail(true) }
@@ -169,7 +174,7 @@ export function ConnectionsConsole() {
       <div className="flex flex-col gap-6 wide:flex-row wide:items-start">
         <nav className={`${detail ? 'hidden' : 'block'} space-y-4 wide:sticky wide:top-0 wide:block wide:w-64 wide:shrink-0`} aria-label="Services">
           <div className="space-y-0.5">
-            <div className="px-3 pb-1 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">For everyone</div>
+            <div className="px-3 pb-1 text-[11px] font-semibold uppercase tracking-wider text-zinc-500">{accounts ? 'For everyone' : 'Services'}</div>
             {SERVICES.filter((s) => s.everyone).map(row)}
           </div>
           <div className="space-y-0.5">
@@ -194,10 +199,10 @@ export function ConnectionsConsole() {
 
           {panel('google', null, <GoogleConnection />)}
           {panel('microsoft', null, <MicrosoftConnection />)}
-          {panel('telegram', <SharedTelegramBotAdmin />, <TelegramConnection />)}
-          {panel('mcp', <SharedMCPServers refreshTick={0} inline />, <><MCPConnection /><MCPAgentAccess /></>)}
-          {panel('jev', <JevTeamKey refreshTick={0} />, <JevConnection />)}
-          {panel('soniox', <SonioxTeamKey refreshTick={0} />, <SonioxConnection />)}
+          {panel('telegram', accounts ? <SharedTelegramBotAdmin /> : null, <TelegramConnection />)}
+          {panel('mcp', accounts ? <SharedMCPServers refreshTick={0} inline /> : null, <><MCPConnection /><MCPAgentAccess /></>)}
+          {panel('jev', accounts ? <JevTeamKey refreshTick={0} /> : null, <JevConnection />)}
+          {panel('soniox', accounts ? <SonioxTeamKey refreshTick={0} /> : null, <SonioxConnection />)}
           {panel('codex', null, <CodexConnection />)}
           {panel('antigravity', null, <AntigravityConnection />)}
           {panel('whatsapp', null, <WhatsAppNudgeConnection />)}
