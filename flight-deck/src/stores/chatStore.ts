@@ -1272,6 +1272,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     sessions.set(key, session)
     set({ sessions, activeChatId: key, chatOpen: true })
 
+    // The agent session a replay that arrived before the log belongs to: the
+    // one welcome named just before it on the same socket.
+    let replaySid = ''
+
     // Server-side chat persistence: upsert session & load history
     if (useAuthStore.getState().authEnabled) {
       serverUpsertSession(key, containerId, containerName).then(() =>
@@ -1295,8 +1299,22 @@ export const useChatStore = create<ChatStore>((set, get) => ({
             newSessions.set(key, updated)
             return { sessions: newSessions }
           })
-          if (pendingReplay.length) mergeReplay(key, pendingReplay)
+          // The lane moved to another session while the log loaded (a /new, a
+          // switch elsewhere, a reconnect): the replay is the earlier one's,
+          // so its turns go first and the new session's divider after them.
+          const sid = useChatStore.getState().sessions.get(key)?.agentSessionId ?? ''
+          if (pendingReplay.length && replaySid && replaySid !== sid) {
+            mergeReplay(key, pendingReplay, replaySid)
+            reconcileTopic(key)
+            return
+          }
+          // The replay is the agent's current session: when the log has no
+          // divider for it yet, the divider goes in first and the session's
+          // turns under it. (Merged first, they read as an earlier topic with
+          // an empty new one below.)
+          const replayTurns = pendingReplay.length ? replayTurnsToAdd(key, pendingReplay) : []
           reconcileTopic(key)
+          for (const m of replayTurns) addMessage(key, { ...m, replay: false })
         })
       )
     }
@@ -1351,15 +1369,24 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
     // The agent's session changed under this lane — a /new or /session
     // switch typed on another channel, a "new topic" cue — or just a
-    // rename/model change on the same one (then nothing to mark).
+    // rename/model change on the same one, or a turn's end (then nothing to
+    // mark).
     ws.on('session_info', (data) => {
       const id = String(data.id ?? '')
       if (!id) return
-      const count = Number(data.message_count ?? 0)
-      markTopic(key, {
-        id, name: String(data.name ?? ''),
-        action: count > 0 ? 'resume' : 'new', source: 'agent',
-      })
+      // A transcript with no divider at all on the session the lane already
+      // knows it is on is the agent's replay (no sign-in, or an unreadable
+      // log): that session, not a return to an earlier one. Marking it added
+      // "Back on an earlier topic" after every reload.
+      const s = useChatStore.getState().sessions.get(key)
+      const replayOnly = !!s && id === s.agentSessionId && lastTopicIndex(s.messages) < 0
+      if (!replayOnly) {
+        const count = Number(data.message_count ?? 0)
+        markTopic(key, {
+          id, name: String(data.name ?? ''),
+          action: count > 0 ? 'resume' : 'new', source: 'agent',
+        })
+      }
       if (data.title) applyTopicTitle(key, id, String(data.title))
     })
 
@@ -1521,10 +1548,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       // With the lane's log loaded, the log is the transcript: fold in only
       // what it is missing (a reply that finished while no tab was open, a
       // turn from another channel) instead of showing the session twice.
-      if (useChatStore.getState().sessions.get(key)?.historyLoaded) {
+      const cur = useChatStore.getState().sessions.get(key)
+      if (cur?.historyLoaded) {
         mergeReplay(key, replayed)
         return
       }
+      replaySid = cur?.agentSessionId ?? ''
       // Clear old replay messages before adding new batch (prevents piling on reconnect)
       useChatStore.setState((state) => {
         const s = state.sessions.get(key)
@@ -2792,29 +2821,37 @@ function turnKey(m: ChatMessage): string {
   return `${m.role}\n${text}`
 }
 
-/** Fold the agent's replay of its current session into the loaded log:
- *  user/assistant turns the log doesn't have since the session's divider
- *  (or anywhere in the window when it has none) are appended as persisted
- *  rows, so the log heals. Replays never add tool cards. */
-function mergeReplay(key: string, replayed: ChatMessage[]) {
+/** The turns of the agent's replay of a session (the lane's current one
+ *  unless `sid` names another) that the loaded log is missing: user/assistant
+ *  turns it doesn't have since that session's divider (or anywhere in the
+ *  window when it has none). Replays never add tool cards. */
+function replayTurnsToAdd(key: string, replayed: ChatMessage[], sid?: string): ChatMessage[] {
   const s = useChatStore.getState().sessions.get(key)
-  if (!s) return
+  if (!s) return []
   // A window into the past doesn't hold the current session: merging would
   // re-add (and re-persist) turns the log already has further down.
-  if (s.hasNewer) return
-  const start = lastTopicIndex(s.messages, s.agentSessionId || undefined)
+  if (s.hasNewer) return []
+  const start = lastTopicIndex(s.messages, (sid ?? s.agentSessionId) || undefined)
   const seen = new Set<string>()
   for (let i = start + 1; i < s.messages.length; i++) {
     const m = s.messages[i]
     if (m.role === 'user' || m.role === 'assistant') seen.add(turnKey(m))
   }
+  const out: ChatMessage[] = []
   for (const m of replayed) {
     if (m.role !== 'user' && m.role !== 'assistant') continue
     const k = turnKey(m)
     if (seen.has(k)) continue
     seen.add(k)
-    addMessage(key, { ...m, replay: false })
+    out.push(m)
   }
+  return out
+}
+
+/** Fold the agent's replay of its current session into the loaded log: the
+ *  turns it is missing are appended as persisted rows, so the log heals. */
+function mergeReplay(key: string, replayed: ChatMessage[], sid?: string) {
+  for (const m of replayTurnsToAdd(key, replayed, sid)) addMessage(key, { ...m, replay: false })
 }
 
 export interface TopicInfo {
