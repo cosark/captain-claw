@@ -57,6 +57,9 @@ bool animated() { return false; }
 void tick() {}
 void flush() {}
 bool busy() { return false; }
+void idleSince(uint32_t) {}
+void drawNow() {}
+bool waiting() { return false; }
 void setRotation(uint8_t) {}
 
 static void push() { canvas.pushSprite(0, 0); }

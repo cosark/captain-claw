@@ -54,6 +54,7 @@ void Settings::load() {
     asleepRefreshMin = 60;
   }
   speakMenu = p.getBool("saymenu", true);
+  if (board::kEpaper) speakMenu = true;  // the paper's menu is never drawn: it's read aloud
   if (board::kEpaper) iconMode = false;  // a character can't move on paper
   p.end();
 }

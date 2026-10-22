@@ -33,6 +33,15 @@ void tick();
 void flush();
 // The screen is redrawing (e-paper), for the status lights.
 bool busy();
+// When the device was last in use (millis(): a press, talking, an answer
+// playing). A slow screen (e-paper) holds its redraws until it has been
+// left alone for a while.
+void idleSince(uint32_t ms);
+// The user asked to see something (a page, the answer, the status): the
+// next screen asked for is drawn without waiting for a quiet spell.
+void drawNow();
+// A screen is waiting for the device to be left alone (e-paper).
+bool waiting();
 // Screen orientation 0..3 (e-paper; the others have one way up).
 void setRotation(uint8_t rotation);
 

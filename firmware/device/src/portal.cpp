@@ -159,21 +159,21 @@ static void handleRoot() {
       h += "<option value=" + String(k) + (settings.textSize == k ? " selected>" : ">") + sizes[k] + "</option>";
     }
   }
-  h += F("</select><label>Character</label><select name=char>");
-  for (int k = 0; k < face::KindCount; ++k) {
-    h += "<option value=" + String(k) + (settings.character == k ? " selected>" : ">") + face::name(k) + "</option>";
-  }
   h += F("</select>");
+  if (!board::kEpaper) {  // the paper is text only
+    h += F("<label>Character</label><select name=char>");
+    for (int k = 0; k < face::KindCount; ++k) {
+      h += "<option value=" + String(k) + (settings.character == k ? " selected>" : ">") + face::name(k) + "</option>";
+    }
+    h += F("</select>");
+  }
   if (board::kEpaper) {
-    h += F("<small>The home screen shows the character until there's an answer to keep.</small>"
-           "<label>Status lights</label><select name=leds>");
+    h += F("<label>Status lights</label><select name=leds>");
     const char* lv[] = {"Off", "Low", "Bright"};
     for (int k = 0; k < 3; ++k) h += option(String(k), lv[k], settings.ledLevel == k);
     h += F("</select><label>Key clicks</label><select name=clicks>");
     h += option("1", "On", settings.keyClicks) + option("0", "Off", !settings.keyClicks);
-    h += F("</select><label>Read the menu aloud</label><select name=saymenu>");
-    h += option("1", "On", settings.speakMenu) + option("0", "Off", !settings.speakMenu);
-    h += F("</select><small>The paper takes ~20 s to show a menu step; you hear each row at once.</small>");
+    h += F("</select>");
   }
   if (board::kRound || board::kEpaper) {  // these show the time
     h += F("<label>Time zone</label><input name=tz autocapitalize=none value=\"");
@@ -272,7 +272,7 @@ static void handleSave() {
     settings.tz = tz.length() ? tz : String(kDefaultTz);
   }
   settings.iconMode = !board::kEpaper && server.arg("display") == "icons";
-  settings.character = constrain(server.arg("char").toInt(), 0, face::KindCount - 1);
+  if (!board::kEpaper) settings.character = constrain(server.arg("char").toInt(), 0, face::KindCount - 1);
   settings.textSize = constrain(server.arg("tsize").toInt(), 0, 2);
   settings.save();
 
