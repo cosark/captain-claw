@@ -658,6 +658,10 @@ docker run -d -p 23080:23080 \
 
 See [README_DETAILED.md](README_DETAILED.md#docker) for Docker Compose and persistent data setup.
 
+## One-Click Deploy
+
+[![Deploy on RepoCloud](https://d16t0pc4846x52.cloudfront.net/deploylobe.svg)](https://repocloud.io/details/Captain%20Claw/)
+
 ## Configuration
 
 YAML-driven with environment variable overrides (`CLAW_` prefix).
