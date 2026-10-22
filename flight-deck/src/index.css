@@ -116,6 +116,13 @@ html.light .fd-file-markdown td { border-bottom-color: #e4e4e7; }
 html.light .fd-file-markdown tbody tr:nth-child(even) { background: rgba(244,244,245,0.5); }
 html.light .fd-file-markdown tbody tr:hover { background: rgba(228,228,231,0.4); }
 
+/* The File library's preview: the same markdown, smaller, starting at the
+   top, and a wide table scrolls inside the narrow pane. */
+.fd-file-markdown.fd-md-preview { font-size: 0.75rem; line-height: 1.6; overflow-wrap: anywhere; }
+.fd-md-preview > :first-child { margin-top: 0; }
+.fd-md-preview table { display: block; width: max-content; max-width: 100%; overflow-x: auto; }
+.fd-md-preview :is(th, td) { white-space: nowrap; overflow-wrap: normal; }
+
 /* ── FPV reading room markdown: always the game's warm night ──
    The first-person reader panel is dark whatever the app theme is, so it
    gets its own palette (cream on warm dark) with NO html.light override —

@@ -103,11 +103,16 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return (await r.json()) as T
 }
 
-/** A file URL a viewer or link can open directly: the FD token rides along. */
-function fileUrl(id: string, what: 'view' | 'download'): string {
+/** A file URL a viewer or link can open directly: the FD token rides along.
+ *  `version` (the file's change time) makes each version its own URL, so a
+ *  browser never shows a cached copy of an earlier one. */
+function fileUrl(id: string, what: 'view' | 'download' | 'thumb', version?: number): string {
   const { token, authEnabled } = useAuthStore.getState()
-  const qs = authEnabled && token ? `?fd_token=${encodeURIComponent(token)}` : ''
-  return `/fd/file-library/files/${encodeURIComponent(id)}/${what}${qs}`
+  const q = new URLSearchParams()
+  if (authEnabled && token) q.set('fd_token', token)
+  if (version !== undefined) q.set('v', String(version))
+  const qs = q.toString()
+  return `/fd/file-library/files/${encodeURIComponent(id)}/${what}${qs ? `?${qs}` : ''}`
 }
 
 export const fileLibraryApi = {
@@ -122,6 +127,8 @@ export const fileLibraryApi = {
   },
   resummarize: (id: string) =>
     api<LibraryItem>(`/fd/file-library/files/${encodeURIComponent(id)}/summarize`, { method: 'POST' }),
-  viewUrl: (id: string) => fileUrl(id, 'view'),
+  viewUrl: (id: string, version?: number) => fileUrl(id, 'view', version),
   downloadUrl: (id: string) => fileUrl(id, 'download'),
+  /** A PDF's first page as a PNG (404 where the deck can't render PDFs). */
+  thumbUrl: (id: string, version?: number) => fileUrl(id, 'thumb', version),
 }

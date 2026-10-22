@@ -29,12 +29,13 @@ import re
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 
 from captain_claw.flight_deck.auth import get_current_user
 from captain_claw.logging import get_logger
@@ -885,3 +886,133 @@ async def library_view(file_id: str, user: dict = Depends(get_current_user)):
 @router.get("/files/{file_id}/download")
 async def library_download(file_id: str, user: dict = Depends(get_current_user)):
     return _serve(file_id, user, inline=False)
+
+
+# ── Thumbnails (the library's preview of a PDF) ──
+#
+# The first page of a PDF as a PNG: a browser shows a PDF inline only with
+# its viewer plugin, which the desktop app (Electron) and most phones don't
+# have. Rendered with pypdfium2 (the payments extra) when it is installed —
+# without it the route says 404 and the preview offers Open instead. Kept
+# for a while per file version, so going back to a file doesn't render again.
+#
+# One thread draws them (pdfium is serialised anyway): requests waiting for it
+# queue as futures instead of each holding a thread of the shared pool, and
+# everyone asking for the same file version waits on the same render. A
+# preview gives up after _THUMB_TIMEOUT_S (a page can be built to take hours
+# to draw, and pdfium can't be interrupted); a version that failed or was too
+# slow is refused at once afterwards rather than queued again.
+
+_THUMB_WIDTH = 640
+_THUMB_TIMEOUT_S = 15.0
+_THUMB_FAILED_MAX = 200
+# A page longer (or wider) than this many times its other side shows only its
+# top (or left) part: a crafted page a million points tall would otherwise
+# render to gigabytes.
+_THUMB_MAX_ASPECT = 2.0
+_THUMB_CACHE_BYTES = 24 * 1024 * 1024
+_thumbs: dict[tuple[str, int, int], bytes] = {}
+_thumb_failed: dict[tuple[str, int, int], tuple[int, str]] = {}
+_thumb_inflight: dict[tuple[str, int, int], asyncio.Future] = {}
+_thumbs_lock = threading.Lock()
+_thumb_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="fd-pdf-thumb")
+_THUMB_SLOW = "This PDF takes too long to draw for a preview."
+
+
+def _pdf_first_page_png(path: Path) -> bytes | None:
+    try:
+        import pypdfium2 as pdfium
+    except ImportError:
+        return None
+    import io
+
+    from captain_claw.pdfium_lock import PDFIUM_LOCK
+
+    with PDFIUM_LOCK:
+        pdf = pdfium.PdfDocument(str(path))
+        try:
+            if len(pdf) == 0:
+                raise ValueError("it has no pages")
+            page = pdf[0]
+            width, height = page.get_size()
+            if width <= 0 or height <= 0:
+                raise ValueError("its first page has no size")
+            # Points to cut off the bottom / right so the page is at most
+            # _THUMB_MAX_ASPECT times as long as it is wide (and vice versa).
+            cut_bottom = max(0.0, height - width * _THUMB_MAX_ASPECT)
+            cut_right = max(0.0, width - height * _THUMB_MAX_ASPECT)
+            shown_width = width - cut_right
+            scale = min(2.0, _THUMB_WIDTH / shown_width)
+            image = page.render(scale=scale, crop=(0, cut_bottom, cut_right, 0)).to_pil()
+        finally:
+            pdf.close()
+    buf = io.BytesIO()
+    image.save(buf, "PNG")
+    return buf.getvalue()
+
+
+def _remember_failure(key: tuple[str, int, int], status: int, detail: str) -> None:
+    with _thumbs_lock:
+        _thumb_failed[key] = (status, detail)
+        while len(_thumb_failed) > _THUMB_FAILED_MAX:
+            _thumb_failed.pop(next(iter(_thumb_failed)))
+
+
+def _thumb_settled(key: tuple[str, int, int], fut: asyncio.Future) -> None:
+    """A render finished (perhaps after its requests gave up): keep the
+    picture, or remember why there is none."""
+    _thumb_inflight.pop(key, None)
+    if fut.cancelled():
+        return
+    exc = fut.exception()
+    if exc is not None:
+        _remember_failure(key, 422, f"Couldn't read the PDF: {str(exc)[:200]}")
+        return
+    png = fut.result()
+    if png is None:
+        _remember_failure(key, 404, "no PDF renderer on this install")
+        return
+    with _thumbs_lock:
+        _thumb_failed.pop(key, None)
+        _thumbs[key] = png
+        while len(_thumbs) > 1 and sum(len(v) for v in _thumbs.values()) > _THUMB_CACHE_BYTES:
+            _thumbs.pop(next(iter(_thumbs)))
+
+
+@router.get("/files/{file_id}/thumb")
+async def library_thumb(file_id: str, user: dict = Depends(get_current_user)):
+    """A PNG of a PDF's first page. 404 for anything else, when the file is
+    gone, or when this install has no PDF renderer; 422 for a PDF that won't
+    open (damaged, or locked with a password)."""
+    row, _agents = _owned_row(file_id, user)
+    if not row["filename"].lower().endswith(".pdf"):
+        raise HTTPException(404, "no thumbnail for this kind of file")
+    path = _resolve_path(row)
+    if path is None:
+        raise HTTPException(404, "file not found")
+    st = path.stat()
+    key = (file_id, int(st.st_mtime_ns), st.st_size)
+    with _thumbs_lock:
+        png = _thumbs.get(key)
+        failed = _thumb_failed.get(key)
+    if png is None and failed:
+        raise HTTPException(*failed)
+    if png is None:
+        fut = _thumb_inflight.get(key)
+        if fut is None:
+            fut = asyncio.wrap_future(_thumb_executor.submit(_pdf_first_page_png, path))
+            fut.add_done_callback(lambda f, k=key: _thumb_settled(k, f))
+            _thumb_inflight[key] = fut
+        try:
+            await asyncio.wait_for(asyncio.shield(fut), _THUMB_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            _remember_failure(key, 422, _THUMB_SLOW)
+            raise HTTPException(422, _THUMB_SLOW)
+        except Exception as e:  # noqa: BLE001 — pdfium raises its own errors for damaged or locked files
+            raise HTTPException(422, f"Couldn't read the PDF: {str(e)[:200]}")
+        png = fut.result()
+        if png is None:
+            raise HTTPException(404, "no PDF renderer on this install")
+    return Response(content=png, media_type="image/png", headers={
+        "X-Content-Type-Options": "nosniff", "Cache-Control": "private, max-age=300",
+    })

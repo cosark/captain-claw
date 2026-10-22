@@ -15,6 +15,7 @@ signed-in owner (``POST /fd/payments/{id}/ack``) — never by an agent.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import html
@@ -421,7 +422,8 @@ async def agent_prepare(req: PrepareRequest, request: Request):
             raise HTTPException(422, "The source file isn't valid base64")
         if len(data) > MAX_SOURCE_BYTES:
             raise HTTPException(413, "The invoice file is over 10 MB")
-    found, text = decode.read(data, req.source_name) if data else ([], "")
+    # Off the event loop: reading a PDF waits on the process-wide pdfium lock.
+    found, text = await asyncio.to_thread(decode.read, data, req.source_name) if data else ([], "")
     sha = hashlib.sha256(data).hexdigest() if data else ""
     hub = next((f for f in found if f.kind == "hub3"), None)
     barcode = hub or (found[0] if found else None)
