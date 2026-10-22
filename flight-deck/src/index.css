@@ -1,6 +1,9 @@
 @import "tailwindcss";
 @import "@xyflow/react/dist/style.css";
 
+/* The e2e scripts are tests, not UI: their strings must not become classes. */
+@source not "../e2e";
+
 /* Use class-based dark mode so `dark:` variants work with our
    manual html.light / html.dark switching (see themeStore.ts). */
 @custom-variant dark (&:where(html.dark, html.dark *));
