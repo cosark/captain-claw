@@ -758,6 +758,8 @@ async def _resolve_primary_owner(db) -> str:
     admin however many users exist — not the oldest of whichever page of
     users happened to be fetched.
     """
+    from captain_claw.flight_deck.auth import _LOCAL_USER
+
     try:
         total = await db.count_users()
         if not total:
@@ -769,7 +771,10 @@ async def _resolve_primary_owner(db) -> str:
         offset = max(0, total - page)
         oldest_user = ""
         while True:
-            users = await db.list_users(limit=page, offset=offset)
+            # Never the row the no-sign-in local user stands for (it owns
+            # nothing once sign-in is on; callers fall back to it without).
+            users = [u for u in await db.list_users(limit=page, offset=offset)
+                     if u.get("id") != _LOCAL_USER["id"]]
             if users and not oldest_user:
                 oldest_user = str(users[-1].get("id", ""))
             admins = [u for u in users if u.get("role") == "admin"]
@@ -798,6 +803,17 @@ async def _init_fd_db() -> FlightDeckDB:
     db = FlightDeckDB(DATA_DIR / "flight-deck.db")
     await db.init()
     set_auth_db(db)
+    # Without sign-in every request runs as the synthetic local user; give it
+    # the users row the per-user tables reference, or saving its settings
+    # (tier sets the archetype spawn reads), archetypes and shares fails.
+    from captain_claw.flight_deck import auth as _auth
+
+    if not _auth._fd_auth_enabled():
+        import secrets
+
+        await db.ensure_local_user(
+            _auth._LOCAL_USER["id"], _auth.hash_password(secrets.token_urlsafe(32)),
+        )
     # Prime the Typesense connection (Connections → Typesense) before any
     # request lands — an agent's proxied search may well be the first one.
     try:
@@ -1794,6 +1810,13 @@ async def _resolve_archetype(config: AgentConfig, request: Request, user: dict |
         uid = str(getattr(getattr(request, "state", None), "user_id", "") or "")
     if not uid:
         uid = config.owner_hint or os.environ.get("FD_OWNER_ID", "")
+    if not uid:
+        # Without sign-in (the desktop app) the deck's one user is the local
+        # user: its archetypes and tier sets are the ones to resolve against.
+        from captain_claw.flight_deck import auth as _auth
+
+        if not _auth._fd_auth_enabled():
+            uid = _auth._LOCAL_USER["id"]
 
     from captain_claw.flight_deck.archetypes import merged_archetypes
     from captain_claw.flight_deck.archetype_compose import resolve_pair
@@ -8609,7 +8632,7 @@ async def auth_status():
         "waitlist_open": AUTH_ENABLED and not registration_open and bool(cfg.get("waitlist_enabled")),
         "waitlist_cohort": waitlist_cohort(cfg),
         # Branding (Admin → Settings): the sign-in page and the panels' title.
-        "instance_name": cfg.get("instance_name") or "Flight Deck",
+        "instance_name": cfg.get("instance_name") or "Captain",
         "instance_description": cfg.get("instance_description") or "",
         "instance_logo": logo,
         "show_powered_by": cfg.get("show_powered_by") is not False,

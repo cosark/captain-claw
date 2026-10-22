@@ -37,13 +37,13 @@ export interface SystemConfig {
 export const CONFIG_DEFAULTS: SystemConfig = {
   docker_spawn_enabled: true, kiosk_mode: 'off', kiosk_new_users: false,
   waitlist_enabled: true, waitlist_cohort: '',
-  instance_name: 'Flight Deck', instance_description: 'Agent Management Console',
+  instance_name: 'Captain', instance_description: 'Agent Management Console',
   show_powered_by: true,
 }
 
 // What applicants join: the waitlist name an admin set, else the instance name.
 export function waitlistName(cfg: SystemConfig): string {
-  return cfg.waitlist_cohort || cfg.instance_name || 'Flight Deck'
+  return cfg.waitlist_cohort || cfg.instance_name || 'Captain'
 }
 
 export function kioskModeNote(mode: KioskMode): string | null {

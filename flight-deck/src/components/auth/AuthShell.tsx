@@ -1,6 +1,6 @@
 import { useState, type InputHTMLAttributes, type ReactNode } from 'react'
-import { AlertCircle, Eye, EyeOff, Radio, type LucideIcon } from 'lucide-react'
-import { useAuthStore } from '../../stores/authStore'
+import { AlertCircle, Eye, EyeOff, type LucideIcon } from 'lucide-react'
+import { useAuthStore, DEFAULT_LOGO } from '../../stores/authStore'
 import { APP_VERSION, BUILD_DATE } from '../../version'
 
 // ── The frame of the screens before the app: sign in, sign up / waitlist,
@@ -11,20 +11,13 @@ import { APP_VERSION, BUILD_DATE } from '../../version'
 const CAPTAIN_SITE_URL = 'https://captain-claw.com'
 const CAPTAIN_REPO_URL = 'https://github.com/kstevica/captain-claw'
 
-/** The deck's logo, or the Flight Deck mark when there is none. */
+/** The deck's logo, or the Captain icon when there is none. */
 export function BrandLogo({ size }: { size: 'sm' | 'lg' }) {
   const logo = useAuthStore((s) => s.branding.logo)
   const box = size === 'lg' ? 'h-20 w-20 rounded-2xl' : 'h-12 w-12 rounded-xl'
-  if (logo) {
-    return (
-      <div className={`${box} shrink-0 overflow-hidden bg-white/[0.06] p-1.5 ring-1 ring-white/10`}>
-        <img src={logo} alt="" className="h-full w-full object-contain" />
-      </div>
-    )
-  }
   return (
-    <div className={`${box} flex shrink-0 items-center justify-center bg-gradient-to-br from-violet-500 to-indigo-600 shadow-lg shadow-violet-900/50 ring-1 ring-white/20`}>
-      <Radio className={size === 'lg' ? 'h-9 w-9 text-white' : 'h-6 w-6 text-white'} />
+    <div className={`${box} shrink-0 overflow-hidden ${logo ? 'bg-white/[0.06] p-1.5 ring-1 ring-white/10' : 'shadow-lg shadow-violet-900/40 ring-1 ring-white/10'}`}>
+      <img src={logo || DEFAULT_LOGO} alt="" className="h-full w-full object-contain" />
     </div>
   )
 }

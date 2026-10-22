@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { useNotificationStore } from './notificationStore'
+import { isDesktopApp } from '../services/desktopShell'
 
 export interface User {
   id: string
@@ -25,7 +26,9 @@ export interface Branding {
   poweredBy: boolean
 }
 
-export const DEFAULT_INSTANCE_NAME = 'Flight Deck'
+export const DEFAULT_INSTANCE_NAME = 'Captain'
+// The deck's mark when Branding has no logo: the Captain icon.
+export const DEFAULT_LOGO = '/icon-96.png'
 
 // What "No account?" on the sign-in page leads to: creating an account
 // (registration open), applying on the waitlist for `cohort` (an admin
@@ -53,6 +56,11 @@ export interface AuthStore {
   // An admin just signed in (a form, not a reload): the app opens the Admin
   // console on its Overview (App).
   adminStartPending: boolean
+  // The desktop app's admin switched to the users' kiosk (Admin | User): they
+  // are held to it like a locked user — selectKioskLocked — until they switch
+  // back. This window only: a reload keeps it, a new launch starts in the
+  // Admin console.
+  kioskView: boolean
 
   setAuth: (user: User, token: string) => void
   clearAuth: () => void
@@ -63,7 +71,14 @@ export interface AuthStore {
   setSignUp: (v: SignUp) => void
   setBranding: (v: Partial<Branding>) => void
   setAdminStartPending: (v: boolean) => void
+  setKioskView: (v: boolean) => void
   setToken: (token: string) => void
+}
+
+const KIOSK_VIEW_KEY = 'fd:kiosk-view'
+
+function readKioskView(): boolean {
+  try { return isDesktopApp() && sessionStorage.getItem(KIOSK_VIEW_KEY) === '1' } catch { return false }
 }
 
 export const useAuthStore = create<AuthStore>((set) => ({
@@ -78,6 +93,7 @@ export const useAuthStore = create<AuthStore>((set) => ({
   signUp: { mode: 'register', cohort: '' },
   branding: { name: DEFAULT_INSTANCE_NAME, description: '', logo: '', poweredBy: true },
   adminStartPending: false,
+  kioskView: readKioskView(),
 
   setAuth: (user, token) => set({ user, token, isAuthenticated: true }),
   clearAuth: () => set({ user: null, token: '', isAuthenticated: false }),
@@ -88,6 +104,13 @@ export const useAuthStore = create<AuthStore>((set) => ({
   setSignUp: (v) => set({ signUp: v }),
   setBranding: (v) => set((s) => ({ branding: { ...s.branding, ...v } })),
   setAdminStartPending: (adminStartPending) => set({ adminStartPending }),
+  setKioskView: (kioskView) => {
+    try {
+      if (kioskView) sessionStorage.setItem(KIOSK_VIEW_KEY, '1')
+      else sessionStorage.removeItem(KIOSK_VIEW_KEY)
+    } catch { /* storage blocked: this page load only */ }
+    set({ kioskView })
+  },
   setToken: (token) => set({ token }),
 }))
 
@@ -99,16 +122,21 @@ export const useAuthStore = create<AuthStore>((set) => ({
  * users. A locked user stays in the chat-only Simple layout, keeping only
  * sign-out, the archetype picker, their own connections (Google, Microsoft,
  * MCP, Jev) and their owner profile. An auth-off deck has no users: there the
- * deck-wide flag (`--simple-chat`) decides.
+ * deck-wide flag (`--simple-chat`) decides. The desktop app's admin who
+ * switched to the users' view (`kioskView`) is held to it too.
  *
  * Use this instead of reading `simpleChatOnly` / `user.kiosk` directly wherever
  * the lock is enforced. Reactive: it re-derives when the user signs in or their
  * session refreshes.
  */
 export const selectKioskLocked = (s: AuthStore): boolean =>
-  s.authEnabled === false
-    ? s.simpleChatOnly
-    : s.user?.role !== 'admin' && s.user?.kiosk === true
+  // The desktop admin's own view — never whoever signs in after them.
+  (s.kioskView && (s.authEnabled === false || s.user?.role === 'admin'))
+  || (s.authEnabled === false
+    // The desktop app keeps its admin's way to the console (its kiosk is kioskView).
+    ? s.simpleChatOnly && !isDesktopApp()
+    // The desktop app has no full Flight Deck: anyone but an admin gets the kiosk.
+    : s.user?.role !== 'admin' && (s.user?.kiosk === true || isDesktopApp()))
 
 // ── Auth API calls ──
 
@@ -192,6 +220,8 @@ export async function loginUser(email: string, password: string): Promise<User> 
 // Signed in from a form — sign in, sign up, an invitation — rather than a
 // session refresh: an admin lands in the Admin console (App).
 function _signedIn(user: User, token: string): void {
+  // A new session picks its own view (startDesktop), not the last person's.
+  useAuthStore.getState().setKioskView(false)
   if (user?.role === 'admin') useAuthStore.getState().setAdminStartPending(true)
   useAuthStore.getState().setAuth(user, token)
 }
@@ -420,6 +450,8 @@ function _handOverTab(): void {
     // between here and the unload — purge once more on the way out.
     window.addEventListener('pagehide', _purgeBrowserLocalState, { once: true })
   }
+  // The desktop admin's kiosk view ends with their session (it outlives a reload).
+  useAuthStore.getState().setKioskView(false)
   useAuthStore.getState().clearAuth()
   window.location.reload()
 }
@@ -559,6 +591,8 @@ const _SESSION_END_RELOAD_WINDOW_MS = 30_000
 export function reloadAfterSessionEnd(): void {
   if (!useAuthStore.getState().authEnabled) return
   if (_signOut) return  // logoutUser() reloads (or stays signed in) itself
+  // The desktop admin's kiosk view ends with their session (it outlives a reload).
+  useAuthStore.getState().setKioskView(false)
   // Whether or not the loop guard lets this reload through, the session is
   // over — don't leave e.g. its Google OAuth popup for the next person.
   _runSignOutTeardowns()

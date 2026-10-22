@@ -231,6 +231,11 @@ function clearPlanSlice(containerId: string): void {
 interface PersistedQueueSlice {
   queue: QueuedMessage[]
   queueAutoMode: boolean
+  // Held by the user (Pause); nothing dispatches until they resume.
+  queuePaused?: boolean
+  // Auto was switched off because the agent was powered off, so the queue
+  // can say why it stopped and offer to switch Auto back on.
+  parked?: boolean
 }
 
 function _queueLSKey(containerId: string): string {
@@ -239,7 +244,7 @@ function _queueLSKey(containerId: string): string {
 
 function saveQueueSlice(containerId: string, slice: PersistedQueueSlice): void {
   try {
-    if (slice.queue.length === 0 && !slice.queueAutoMode) {
+    if (slice.queue.length === 0 && !slice.queueAutoMode && !slice.queuePaused && !slice.parked) {
       window.localStorage.removeItem(_queueLSKey(containerId))
       return
     }
@@ -247,7 +252,11 @@ function saveQueueSlice(containerId: string, slice: PersistedQueueSlice): void {
   } catch { /* quota / private mode — ignore */ }
 }
 
-function loadQueueSlice(containerId: string): PersistedQueueSlice | null {
+/** A loaded slice, plus the task that was in flight and is now pending again
+ *  (its turn may still be running on the agent: see SentFrame.resumed). */
+type LoadedQueueSlice = PersistedQueueSlice & { resumedId?: string }
+
+function loadQueueSlice(containerId: string): LoadedQueueSlice | null {
   try {
     const raw = window.localStorage.getItem(_queueLSKey(containerId))
     if (!raw) return null
@@ -255,11 +264,28 @@ function loadQueueSlice(containerId: string): PersistedQueueSlice | null {
     if (!parsed || !Array.isArray(parsed.queue)) return null
     // Downgrade any in-flight items back to pending — after a refresh we
     // have no reliable signal that the agent's reply was received, so
-    // re-dispatch is safer than abandoning the task.
-    parsed.queue = parsed.queue.map((q) =>
-      q.status === 'dispatched' ? { ...q, status: 'pending', dispatchedAt: undefined } : q,
-    )
-    return parsed
+    // re-dispatch is safer than abandoning the task. Message ids are
+    // regenerated on load, so no item keeps its bubble.
+    // Except a task the queue was HOLDING on (you stopped it, it errored, the
+    // allowance refused it, the agent gave up on every try): nothing was
+    // running, and re-sending it by itself would undo your Stop or step past
+    // "nothing runs until you decide". It comes back still held, as the
+    // lane's in-flight item (_openSession picks it up).
+    let held = false
+    let resumedId: string | undefined
+    parsed.queue = parsed.queue.map((q) => {
+      if (q.status !== 'dispatched') return { ...q, messageId: undefined }
+      if (!held && (q.halted || q.stuck)) {
+        held = true
+        return { ...q, awaitingAnswer: undefined, awaitingSince: undefined, messageId: undefined }
+      }
+      resumedId ??= q.id
+      return {
+        ...q, status: 'pending', dispatchedAt: undefined, awaitingAnswer: undefined,
+        awaitingSince: undefined, halted: undefined, repliedAt: undefined, messageId: undefined,
+      }
+    })
+    return { ...parsed, resumedId }
   } catch {
     return null
   }
@@ -429,8 +455,10 @@ export interface QueuedMessage {
   // Auto-mode is holding this item because the agent asked something. The row
   // shows it, and the hold expires (see armQuestionWatch).
   awaitingAnswer?: boolean
-  // Times this item has been sent (1 = the original dispatch). >1 means the
-  // agent gave up and the queue re-ran it.
+  // When the hold above began (ms): the queue counts down from it.
+  awaitingSince?: number
+  // Re-runs after the agent gave up (1 = the first re-run, so the try in
+  // flight is attempts + 1). Unset while the original dispatch runs.
   attempts?: number
   // The agent gave up as often as we're willing to retry, so the queue is
   // holding here rather than advancing past unfinished work.
@@ -439,6 +467,19 @@ export interface QueuedMessage {
   // twice reports what it actually spent, not just the last attempt.
   usage?: TokenUsage
   toolCount?: number
+  // How a finished item ended when it wasn't simply done: skipped by the
+  // user, or moved on from when a question went unanswered.
+  endedHow?: 'skipped' | 'no-answer'
+  // The queue holds on this item, and this says why: the turn errored, the
+  // daily allowance refused it, or the user stopped it. `refused`: the agent
+  // (or Flight Deck) never took the item's frame, so no reply that comes in
+  // afterwards is the item's — none credits it or lifts the hold.
+  halted?: { kind: 'error' | 'quota' | 'stopped'; message?: string; at: number; refused?: boolean }
+  // A (non-replay) assistant reply arrived while this item was dispatched.
+  repliedAt?: number
+  // The user bubble its latest dispatch created ("Show in chat"). Session
+  // lifetime only: message ids are regenerated on reload.
+  messageId?: string
 }
 
 let _queueCounter = 0
@@ -502,6 +543,8 @@ function cancelAutoCompleteWatch(containerId: string) {
 // within seconds of a turn ending and would otherwise cut the wait short.
 const _questionWatches = new Map<string, ReturnType<typeof setTimeout>>()
 const QUESTION_HOLD_MS = 180000   // 3 min
+/** How long the queue waits on an unanswered question (the panel counts it down). */
+export const QUEUE_QUESTION_HOLD_MS = QUESTION_HOLD_MS
 
 function armQuestionWatch(containerId: string, itemId: string) {
   cancelQuestionWatch(containerId)
@@ -515,7 +558,7 @@ function armQuestionWatch(containerId: string, itemId: string) {
     if (session.busy) return          // the user answered and it's working
     state.addLocalNote(containerId,
       'Queue moved on: the agent ended with a question and no answer arrived in 3 minutes.')
-    state.markQueueItemDone(containerId, itemId)
+    state.markQueueItemDone(containerId, itemId, { how: 'no-answer' })
   }, QUESTION_HOLD_MS))
 }
 
@@ -528,7 +571,8 @@ function cancelQuestionWatch(containerId: string) {
   const session = useChatStore.getState().sessions.get(containerId)
   if (session?.queue.some((q) => q.awaitingAnswer)) {
     updateSession(containerId, {
-      queue: session.queue.map((q) => (q.awaitingAnswer ? { ...q, awaitingAnswer: false } : q)),
+      queue: session.queue.map((q) => (q.awaitingAnswer
+        ? { ...q, awaitingAnswer: false, awaitingSince: undefined } : q)),
     })
   }
 }
@@ -537,7 +581,8 @@ function _setAwaitingAnswer(containerId: string, itemId: string, value: boolean)
   const session = useChatStore.getState().sessions.get(containerId)
   if (!session) return
   updateSession(containerId, {
-    queue: session.queue.map((q) => (q.id === itemId ? { ...q, awaitingAnswer: value } : q)),
+    queue: session.queue.map((q) => (q.id === itemId
+      ? { ...q, awaitingAnswer: value, awaitingSince: value ? Date.now() : undefined } : q)),
   })
 }
 
@@ -553,6 +598,362 @@ function creditDispatchedItem(
   updateSession(key, {
     queue: session.queue.map((q) => (q.id === id ? { ...q, ...patch(q) } : q)),
   })
+}
+
+// ── Whose turn is it? ──
+//
+// One lane carries turns from several senders: the queue, what you type, other
+// surfaces (WhatsApp, another tab). The agent runs one turn at a time and
+// refuses a frame that arrives meanwhile ("busy", `retryable`); Flight Deck
+// refuses one over the day's allowance. So each frame this tab sends is noted
+// until the agent takes it (the turn's opening "thinking" echoes its
+// client_msg_id) or refuses it (a busy refusal echoes the id too). That tells
+// which item a refusal belongs to, and which item a reply is for.
+interface SentFrame {
+  /** client_msg_id ('' when the socket gave none). */
+  id: string
+  /** The queued item it was sent for; null when you typed it. */
+  itemId: string | null
+  /** A forced start (Run now, Try again): it may run on a paused lane. */
+  forced: boolean
+  /** A slash command: a command_result answers it, not a turn. */
+  cmd: boolean
+  /** A turn was already running when it went out. */
+  wasBusy: boolean
+  /** The first send of a task that was in flight when the page loaded (a
+   *  reload, the chat opened again): that task's run may still be going. */
+  resumed: boolean
+  at: number
+}
+/** Frames sent and not yet taken or refused, oldest first. */
+const _sent = new Map<string, SentFrame[]>()
+/** The last frame sent on each lane, taken or not (for errors that name none). */
+const _lastFrame = new Map<string, SentFrame>()
+/** When the turn running on each lane began, as far as we know: when its
+ *  frame went out (one of ours), or when the agent said it started. */
+const _turns = new Map<string, number>()
+/** When each lane last went idle by the agent's word (its "ready"). */
+const _idleAt = new Map<string, number>()
+/** The task each lane had in flight when the page loaded, until the lane's
+ *  first connection sends it again (loadQueueSlice turned it back to waiting). */
+const _resumed = new Map<string, string>()
+/** Lanes whose agent echoes our frame ids (it said so once). */
+const _echoes = new Set<string>()
+// An answer comes back in moments: a frame unanswered this long was taken.
+const FRAME_TTL_MS = 60000
+const MAX_SENT = 20
+
+function noteSent(key: string, frame: SentFrame) {
+  const list = (_sent.get(key) ?? []).filter((f) => frame.at - f.at < FRAME_TTL_MS)
+  list.push(frame)
+  _sent.set(key, list.slice(-MAX_SENT))
+  _lastFrame.set(key, frame)
+}
+
+/** Take a frame off the unanswered list: the one with this id (null when it
+ *  isn't one of ours), or, with no id to go by, the oldest or the newest. */
+function takeFrame(key: string, id: string, pick: 'oldest' | 'newest' = 'oldest'): SentFrame | null {
+  const list = _sent.get(key)
+  if (!list?.length) return null
+  const i = id ? list.findIndex((f) => f.id === id) : pick === 'oldest' ? 0 : list.length - 1
+  return i < 0 ? null : list.splice(i, 1)[0]
+}
+
+/** A command_result answered the oldest command still unanswered. */
+function takeCommandFrame(key: string) {
+  const list = _sent.get(key)
+  const i = list ? list.findIndex((f) => f.cmd) : -1
+  if (list && i >= 0) list.splice(i, 1)
+}
+
+/** A turn began (status "thinking"). Its id names the frame it took. Without
+ *  one (older agents, shared chats) it took the oldest frame still unanswered,
+ *  unless a turn is already running (then it is a later "thinking" of that one).
+ *  An agent that echoes ids sends a "thinking" without one only mid-turn or for
+ *  another surface's turn: that takes none of our frames. */
+function noteTurnStart(key: string, id: string) {
+  if (!id && _turns.has(key)) return
+  if (id) _echoes.add(key)
+  const frame = !id && _echoes.has(key) ? null : takeFrame(key, id)
+  _turns.set(key, frame?.at ?? Date.now())
+  // The agent says a turn runs: its end frees the lane, not our fallback.
+  releaseBusyHold(key)
+  // The agent took a message you typed here: it resumes a task the queue is
+  // holding on (stopped, errored), since you are dealing with it in the chat.
+  // Only now, not when you sent it: a message refused while a Stop was still
+  // landing never ran, and the stopped turn's reply is no answer to it.
+  if (frame && frame.itemId === null && !frame.cmd) {
+    const s = useChatStore.getState().sessions.get(key)
+    if (s?.queue.find((q) => q.id === s.queueDispatchedId)?.halted) {
+      creditDispatchedItem(key, () => ({ halted: undefined }))
+    }
+  }
+}
+
+/** The agent said the lane is free ("ready"): the turn is over. */
+function noteTurnEnd(key: string) {
+  _turns.delete(key)
+  _idleAt.set(key, Date.now())
+  _holdRefusals.delete(key)
+}
+
+function forgetFrames(key: string) {
+  _sent.delete(key)
+  _turns.delete(key)
+  _idleAt.delete(key)
+  _holdRefusals.delete(key)
+  _refusalReadies.delete(key)
+}
+
+/** The queued item the lane's running turn counts for: the one in flight,
+ *  unless the agent never took its frame, or the turn began before it went
+ *  out (the turn you stopped, a message you sent earlier). A turn that began
+ *  after it does count, typed ones too: that is you working on it in the chat. */
+function turnItemId(key: string): string | null {
+  const s = useChatStore.getState().sessions.get(key)
+  const d = s?.queueDispatchedId ? s.queue.find((q) => q.id === s.queueDispatchedId) : undefined
+  if (!d || d.halted?.refused) return null
+  const startedAt = _turns.get(key)
+  if (startedAt !== undefined && d.dispatchedAt && startedAt < d.dispatchedAt) return null
+  return d.id
+}
+
+/** creditDispatchedItem for what a turn did (a reply, tools, tokens): only
+ *  when the turn is the item's. */
+function creditTurnItem(key: string, patch: (prev: QueuedMessage) => Partial<QueuedMessage>) {
+  if (turnItemId(key)) creditDispatchedItem(key, patch)
+}
+
+/** The agent refused the in-flight item's frame as busy, so the task never
+ *  ran: it goes back to waiting, first in line, and starts once the agent is
+ *  free (on a paused lane only when you had forced it). */
+function requeueRefused(key: string, frame: SentFrame) {
+  cancelAutoCompleteWatch(key)
+  cancelCommandWatch(key)
+  cancelQuestionWatch(key)
+  resetStallNudges(key)
+  const s = useChatStore.getState().sessions.get(key)
+  const d = s?.queue.find((q) => q.id === s.queueDispatchedId)
+  if (!s || !d) return
+  const back: QueuedMessage = {
+    ...d, status: 'pending', dispatchedAt: undefined, halted: undefined, awaitingAnswer: undefined,
+    awaitingSince: undefined, repliedAt: undefined, messageId: undefined,
+  }
+  const rest = s.queue.filter((q) => q.id !== d.id)
+  const firstPending = rest.findIndex((q) => q.status === 'pending')
+  const at = firstPending >= 0 ? firstPending : Math.min(s.queue.indexOf(d), rest.length)
+  updateSession(key, {
+    queue: [...rest.slice(0, at), back, ...rest.slice(at)],
+    queueDispatchedId: null,
+    queueStartWhenFree: !s.queuePaused || frame.forced,
+  })
+}
+
+// A task the agent keeps refusing as busy (another surface keeps it busy, or
+// something answers our frames oddly) is not sent again and again: every try
+// counts against today's allowance. The third refusal in a minute holds it.
+const _taskRefusals = new Map<string, { itemId: string; at: number[] }>()
+const MAX_TASK_REFUSALS = 3
+const TASK_REFUSALS_MS = 60000
+
+function refusedTooOften(key: string, itemId: string): boolean {
+  const now = Date.now()
+  const prev = _taskRefusals.get(key)
+  const at = (prev?.itemId === itemId ? prev.at : []).filter((t) => now - t < TASK_REFUSALS_MS)
+  at.push(now)
+  _taskRefusals.set(key, { itemId, at })
+  return at.length >= MAX_TASK_REFUSALS
+}
+
+// Shared chats: Flight Deck and the member's agent end EVERY chat frame with
+// one "ready", a refused frame too (right after the refusal). While a turn
+// still runs, that "ready" ends the refused frame, not the turn, so the status
+// handler lets it pass. It follows within moments, so the wait is short.
+const _refusalReadies = new Map<string, { n: number; until: number }>()
+const REFUSAL_READY_MS = 5000
+
+function expectRefusalReady(key: string) {
+  const now = Date.now()
+  const prev = _refusalReadies.get(key)
+  _refusalReadies.set(key, { n: (prev && prev.until > now ? prev.n : 0) + 1, until: now + REFUSAL_READY_MS })
+}
+
+/** This "ready" is the one a refused frame was owed (not the turn's end). */
+function takeRefusalReady(key: string): boolean {
+  const owed = _refusalReadies.get(key)
+  if (!owed) return false
+  if (owed.until <= Date.now()) {
+    _refusalReadies.delete(key)
+    return false
+  }
+  owed.n -= 1
+  if (owed.n <= 0) _refusalReadies.delete(key)
+  return true
+}
+
+/** What an error frame means for the lane: which frame it refused (or whose
+ *  turn failed), what that does to the queue, and whether the agent is free. */
+function settleError(key: string, data: Record<string, unknown>) {
+  const s = useChatStore.getState().sessions.get(key)
+  if (!s) return
+  const quota = data.code === 'quota_exceeded'
+  if (data.client_msg_id) _echoes.add(key)
+  // "Busy": the agent is on another turn and never took the frame. The agent
+  // says so with `retryable`; in a shared chat Flight Deck and the member's
+  // own agent say it with code "busy". It is never the running turn failing.
+  const busy = data.retryable === true || data.code === 'busy'
+  const id = String(data.client_msg_id || '')
+  const message = String(data.message || '')
+  const turnKnown = _turns.has(key)
+  const d = s.queueDispatchedId ? s.queue.find((q) => q.id === s.queueDispatchedId) : undefined
+  // Naming no frame while a turn we know of runs: that turn failed (its
+  // "Error: …"). The queue holds on the item it counts for.
+  if (!id && !quota && !busy && turnKnown) {
+    if (turnItemId(key)) {
+      cancelAutoCompleteWatch(key)
+      cancelQuestionWatch(key)
+      creditDispatchedItem(key, () => ({ halted: { kind: 'error', message, at: Date.now() } }))
+    }
+    updateSession(key, { busy: false })
+    return
+  }
+  // Otherwise it refuses a frame of ours. A busy refusal names it; Flight
+  // Deck's allowance refusal (and older agents, and shared chats) don't, so it
+  // is the newest one still unanswered — or, with none and a turn still on,
+  // the last one sent (an error after the turn ended is about none of them).
+  let frame = id ? takeFrame(key, id) : takeFrame(key, '', 'newest')
+  if (!frame && !id && !busy && s.busy) frame = _lastFrame.get(key) ?? null
+  const mine = !!d && !!frame && frame.itemId === d.id
+  // In a shared chat a refused chat frame is owed its own "ready" next.
+  const owesReady = !!s.shared && !!frame
+  if (busy) {
+    // A shared chat also says "busy" to a note (`btw`) sent too soon. No chat
+    // frame of ours is waiting for an answer then, and nothing changes.
+    if (!frame && data.retryable !== true) return
+    // The turn that refused it ended since (its "ready" came after the frame
+    // went out, and no turn began after): the agent is free now.
+    const ended = !!frame && !turnKnown && (_idleAt.get(key) ?? 0) > frame.at
+    // Sent again as the page loaded, and refused while a turn we never saw
+    // start runs: most likely this task's own run from before the reload. It
+    // stays in flight, and that run's reply counts for it (sending it again
+    // later would run it twice).
+    const ownRun = mine && !!frame?.resumed && !turnKnown && !ended
+    // Otherwise the queue's own task never ran, so it waits for the agent
+    // rather than holding as an error (a task you stopped stays stopped, one
+    // refused again and again holds). A typed message is yours to send again.
+    if (mine && frame && !ownRun) {
+      if (d.halted?.kind === 'stopped') {
+        creditDispatchedItem(key, (prev) => ({ halted: prev.halted && { ...prev.halted, refused: true } }))
+      } else if (refusedTooOften(key, d.id)) {
+        cancelAutoCompleteWatch(key)
+        cancelQuestionWatch(key)
+        creditDispatchedItem(key, () => ({ halted: { kind: 'error', message, at: Date.now(), refused: true } }))
+      } else {
+        requeueRefused(key, frame)
+      }
+    }
+    if (ended) {
+      scheduleQueueKick(key)
+      return
+    }
+    // Either way the agent is busy, whatever we thought: the lane waits for
+    // that turn to end. Its reply and "ready" reach this socket too.
+    heardFrom(key)
+    _holdRefusals.set(key, (_holdRefusals.get(key) ?? 0) + 1)
+    if (!s.busy) {
+      updateSession(key, {
+        busy: true, statusText: ownRun ? 'Thinking...' : 'Busy with another request…', _busyStartedAt: Date.now(),
+      })
+    }
+    if (owesReady) expectRefusalReady(key)
+    // Only when we never saw that turn start (or a Stop is still landing) is
+    // there a fallback, and each refusal makes its quiet stretch longer.
+    if (!turnKnown || _busyHolds.has(key)) holdBusy(key)
+    return
+  }
+  // Refused outright (over the allowance, or the agent couldn't open the
+  // turn): the queue's own task holds here, and no reply that comes in later
+  // is its. A typed message refused is not the task failing.
+  if (mine) {
+    cancelAutoCompleteWatch(key)
+    cancelQuestionWatch(key)
+    creditDispatchedItem(key, () => ({
+      halted: { kind: quota ? 'quota' : 'error', message, at: Date.now(), refused: true },
+    }))
+  }
+  // Sent on top of a running turn (a frame sent after Stop is too, the lane
+  // stays busy until the stopped turn ends): that turn still runs, so the
+  // agent isn't free.
+  if (frame ? frame.wasBusy : turnKnown || s.stopping) {
+    if (owesReady) expectRefusalReady(key)
+    return
+  }
+  updateSession(key, { busy: false })
+}
+
+// ── Busy on our word ──
+//
+// Twice the lane counts as busy without the agent saying so: after Stop (the
+// agent only notices it at its next step, and refuses a frame sent before
+// then), and after a busy refusal of a turn we never saw start. That turn's
+// reply or "ready" frees the lane; this is the fallback when neither comes.
+// While the agent shows signs of work (statuses, tool output, its thinking
+// and streamed text) it keeps waiting; after a quiet stretch the lane counts
+// as free again. A frame sent then may be refused once more: each busy
+// refusal makes the next quiet stretch four times longer, since a frame sent
+// into a busy agent is only refused again and still counts against today's
+// allowance.
+const BUSY_HOLD_MS = 30000
+const BUSY_HOLD_MAX_MS = 30 * 60000
+const _busyHolds = new Map<string, ReturnType<typeof setTimeout>>()
+/** When each lane last showed a sign of a running turn. */
+const _heardAt = new Map<string, number>()
+/** Busy refusals since the agent last said the lane is free. */
+const _holdRefusals = new Map<string, number>()
+
+function heardFrom(key: string) {
+  _heardAt.set(key, Date.now())
+}
+
+/** How long the lane must stay quiet before it counts as free on our word. */
+function holdWindow(key: string): number {
+  return Math.min(BUSY_HOLD_MS * 4 ** (_holdRefusals.get(key) ?? 0), BUSY_HOLD_MAX_MS)
+}
+
+function holdBusy(key: string, ms = holdWindow(key)) {
+  releaseBusyHold(key)
+  _busyHolds.set(key, setTimeout(() => {
+    _busyHolds.delete(key)
+    const s = useChatStore.getState().sessions.get(key)
+    if (!s?.busy) return
+    const need = holdWindow(key)
+    const quiet = Date.now() - (_heardAt.get(key) ?? 0)
+    if (quiet < need) {
+      holdBusy(key, need - quiet)
+      return
+    }
+    _turns.delete(key)
+    updateSession(key, { busy: false, statusText: '' })
+  }, ms))
+}
+
+function releaseBusyHold(key: string) {
+  const t = _busyHolds.get(key)
+  if (!t) return
+  clearTimeout(t)
+  _busyHolds.delete(key)
+}
+
+/** A task the allowance refused, now that the allowance reads as back: it
+ *  goes again. Callers decide when that's wanted (an Auto lane that isn't
+ *  paused, or you carrying on). */
+function retryQuotaHold(key: string) {
+  const s = useChatStore.getState().sessions.get(key)
+  const d = s?.queueDispatchedId ? s.queue.find((q) => q.id === s.queueDispatchedId) : undefined
+  if (!d || d.halted?.kind !== 'quota') return
+  const q = useQuotaStore.getState().status
+  if (q?.blocked && !q.exempt) return
+  useChatStore.getState().retryQueueItem(key, d.id)
 }
 
 // ── Give-up detection ──
@@ -593,6 +994,8 @@ function isStuckReply(text: string): boolean {
 // the item is real work, and silently advancing past it loses it.
 const _stuckRetries = new Map<string, { itemId: string; count: number }>()
 const MAX_STUCK_RETRIES = 3
+/** Every try a task gets: the original dispatch plus the re-runs. */
+export const QUEUE_MAX_TRIES = MAX_STUCK_RETRIES + 1
 
 // Escalation. The first re-run sends the task VERBATIM: give-ups are often
 // transient (a failed fetch, one bad tool call), and the plain task is the
@@ -656,6 +1059,8 @@ function retryStuckItem(containerId: string, itemId: string, reply: string): boo
   setTimeout(() => {
     const s = useChatStore.getState().sessions.get(containerId)
     if (!s || s.queueDispatchedId !== itemId || s.busy) return
+    // Stopped or errored meanwhile: the queue holds, it doesn't re-send.
+    if (s.queue.find((q) => q.id === itemId)?.halted) return
     useChatStore.getState().sendMessage(containerId, content, { fromQueue: true })
   }, 800)
   return true
@@ -737,6 +1142,9 @@ function isSlashCommand(text: string): boolean {
   return /^\//.test((text || '').trim())
 }
 
+/** A queued step that is a slash command (the planner's `/new`), not a task. */
+export function isQueueCommand(text: string): boolean { return isSlashCommand(text) }
+
 function completeDispatchedCommand(containerId: string) {
   const state = useChatStore.getState()
   const session = state.sessions.get(containerId)
@@ -745,7 +1153,11 @@ function completeDispatchedCommand(containerId: string) {
   const item = session.queue.find((q) => q.id === dispatchedId)
   if (!item || !isSlashCommand(item.content)) return
   cancelCommandWatch(containerId)
+  const force = _forceThrough.delete(containerId)
+  if (force) updateSession(containerId, { queueForceThrough: false })
   state.markQueueItemDone(containerId, dispatchedId)
+  // A forced run's step is done: its task runs too, even on a paused lane.
+  if (force) tryDispatchNext(containerId, { force: true })
 }
 
 // Safety net for the handful of commands that answer out-of-band instead of
@@ -1024,6 +1436,11 @@ interface ChatSession {
   messages: ChatMessage[]
   connected: boolean
   busy: boolean // agent is processing
+  /** Runtime only: you pressed Stop and the agent hasn't ended that turn yet
+   *  (it notices Stop at its next step). `busy` stays true meanwhile, so
+   *  nothing is sent into the lane; the stopped turn's reply or "ready" ends
+   *  both (or 30s without a sign of work). Never true while `busy` is false. */
+  stopping: boolean
   statusText: string
   models: AgentModelInfo[]
   personalities: AgentPersonalityInfo[]
@@ -1050,6 +1467,18 @@ interface ChatSession {
   queue: QueuedMessage[]
   queueAutoMode: boolean
   queueDispatchedId: string | null
+  /** The user paused the queue: nothing new dispatches until they resume
+   *  (the task in flight finishes). Persisted with the queue. */
+  queuePaused: boolean
+  /** Auto was switched off because the agent was powered off (parkQueues).
+   *  Persisted; cleared when Auto goes back on or a task starts. */
+  queueParked: boolean
+  /** Runtime only: something the user did wanted a task to start, but the
+   *  agent was busy, offline or out of allowance — start it once it can. */
+  queueStartWhenFree: boolean
+  /** Runtime only: a forced run (Run now, Try again) began with a step (the
+   *  fresh start), so the task behind it follows even on a paused lane. */
+  queueForceThrough?: boolean
   /** An agent another deck user shared with you (containerId `shared:<ref>`):
    *  reached through Flight Deck's member route, chat only. */
   shared?: { agentRef: string; ownerName: string }
@@ -1122,8 +1551,10 @@ interface ChatStore {
   /** Tell every open chat with this agent who it is again — after its
    *  instructions (or name) changed, so they apply without a reconnect. */
   resendFleetIdentity: (agentId: string) => void
-  /** `fromQueue` marks a turn the queue dispatched: no next-step suggestions. */
-  sendMessage: (containerId: string, content: string, opts?: { fromQueue?: boolean }) => void
+  /** `fromQueue` marks a turn the queue dispatched: no next-step suggestions
+   *  (`forced`: a start you forced, Run now / Try again). Returns the user
+   *  bubble's message id (undefined when nothing was sent). */
+  sendMessage: (containerId: string, content: string, opts?: { fromQueue?: boolean; forced?: boolean }) => string | undefined
   sendBtw: (containerId: string, content: string) => void
   /** Start a new topic on this lane (the agent's /new): the agent's context
    *  starts fresh; the transcript keeps going, with a divider. */
@@ -1157,8 +1588,25 @@ interface ChatStore {
   toggleChatFullscreen: () => void
   enqueueQueueMessage: (containerId: string, content: string) => void
   removeQueueItem: (containerId: string, id: string) => void
-  markQueueItemDone: (containerId: string, id: string) => void
+  /** `how` records a Skip, or moving on from an unanswered question. Skipping
+   *  a waiting item never starts the queue. */
+  markQueueItemDone: (containerId: string, id: string, opts?: { how?: 'skipped' | 'no-answer' }) => void
   toggleQueueAutoMode: (containerId: string) => void
+  /** Run the next pending item now, even while the queue is paused (once the
+   *  agent is free, when it is busy). */
+  runQueueNext: (key: string) => void
+  setQueuePaused: (key: string, paused: boolean) => void
+  setQueueAutoMode: (key: string, on: boolean) => void
+  /** Put an item back to run next — with new content when given — and start it. */
+  retryQueueItem: (key: string, id: string, content?: string) => void
+  /** Replace a WAITING item's content. False when it already started (or is gone). */
+  editQueueItem: (key: string, id: string, content: string) => boolean
+  /** Move a waiting item before another waiting one (null: to the end). */
+  moveQueueItem: (key: string, id: string, beforeId: string | null) => void
+  /** Undo: put saved copies back where they were. */
+  restoreQueueItems: (key: string, entries: { item: QueuedMessage; index: number }[]) => void
+  /** Restart the 3-minute wait on an unanswered question. */
+  extendQueueAnswerWait: (key: string) => void
   /** Switch Auto off on every lane of an AGENT whose queue still has items —
    *  open in this tab or only persisted — so nothing re-runs by itself when
    *  its chat next connects. With `check`, only report whether any would be.
@@ -1246,6 +1694,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       holdScrollUntil: 0,
       connected: false,
       busy: false,
+      stopping: false,
       statusText: '',
       models: [],
       personalities: [],
@@ -1264,13 +1713,22 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       nextStepOptions: [],
       queue: persistedQueue?.queue ?? [],
       queueAutoMode: persistedQueue?.queueAutoMode ?? sibling?.queueAutoMode ?? false,
-      queueDispatchedId: null,
+      // Only a held task stays in flight across a reload (loadQueueSlice).
+      queueDispatchedId: persistedQueue?.queue.find((q) => q.status === 'dispatched')?.id ?? null,
+      // Pause is a hold on this one lane, so it isn't inherited from a sibling.
+      queuePaused: persistedQueue?.queuePaused ?? false,
+      queueParked: persistedQueue?.parked ?? false,
+      queueStartWhenFree: false,
       ...(shared ? { shared: { ...shared }, closed: null, speaker: null } : {}),
     }
 
     const sessions = new Map(get().sessions)
     sessions.set(key, session)
     set({ sessions, activeChatId: key, chatOpen: true })
+    // A task that was in flight goes again on the first connection, and its
+    // run may still be going on the agent (see settleError).
+    if (persistedQueue?.resumedId) _resumed.set(key, persistedQueue.resumedId)
+    else _resumed.delete(key)
 
     // The agent session a replay that arrived before the log belongs to: the
     // one welcome named just before it on the same socket.
@@ -1325,16 +1783,32 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
     // Wire up event handlers
     ws.on('_connected', () => {
+      // A fresh socket: nothing sent before it will be answered on it.
+      forgetFrames(key)
       updateSession(key, shared ? { connected: true, closed: null } : { connected: true, unreachable: null })
       // If we hydrated a queue with pending items and auto-mode is on, kick
-      // off the first dispatch now that the socket is live.
+      // off the first dispatch now that the socket is live — and the same
+      // for a task the user asked to start while the agent was away.
+      // (A start the user asked for while paused is a Run now: it still runs.)
       const cur = useChatStore.getState().sessions.get(key)
-      if (cur && cur.queueAutoMode && !cur.queueDispatchedId) {
-        tryDispatchNext(key)
+      if (cur && !cur.queueDispatchedId && (cur.queueAutoMode || cur.queueStartWhenFree)) {
+        tryDispatchNext(key, { force: cur.queueStartWhenFree })
       }
+      // A task the allowance refused (held across a reload, or the reset came
+      // while the socket was down): an Auto lane runs it again once the
+      // allowance reads as back. Unknown yet: the quota subscriber does it.
+      if (cur?.queueDispatchedId && cur.queueAutoMode && !cur.queuePaused && useQuotaStore.getState().status) {
+        retryQuotaHold(key)
+      }
+      // Only the send just above can be a copy of a run still going from
+      // before the page loaded; a later start is a start.
+      _resumed.delete(key)
     })
 
     ws.on('_disconnected', () => {
+      // Frames still unanswered won't be now, and the turn we knew of is out
+      // of sight.
+      forgetFrames(key)
       updateSession(key, { connected: false, busy: false, statusText: '' })
       // A dropped socket means we won't see the next_steps event. Cancel
       // any pending auto-mark — when the agent reconnects, replay or fresh
@@ -1484,10 +1958,23 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       // of this lane and is no queued item's reply.
       if (data.automation_lane) return
       if (data.role === 'assistant' && !data.replay) {
+        // Whose reply this is, read before anything moves on. Not the queued
+        // task's when the agent refused its frame, or when the turn began
+        // before the task went out (the turn you stopped ends with "Request
+        // cancelled by user."; a message you sent earlier gets its answer).
+        const own = turnItemId(key)
         const onScreen = useChatStore.getState().activeChatId === key
         updateSession(key, {
           busy: false, statusText: '', ...(onScreen ? {} : { unread: true }),
         })
+        // The dispatched item got a reply ("Your turn" in step-by-step). A
+        // reply also means an errored turn went through after all.
+        if (own) {
+          creditDispatchedItem(key, (prev) => ({
+            repliedAt: Date.now(),
+            ...(prev.halted?.kind === 'error' ? { halted: undefined } : {}),
+          }))
+        }
         // Queue auto-mode: decide what this reply means for the dispatched
         // queue item.
         //
@@ -1500,7 +1987,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         //       on the next_steps event or a fallback timer) so we don't
         //       race the agent's post-turn work.
         const cur = useChatStore.getState().sessions.get(key)
-        if (cur && cur.queueAutoMode && cur.queueDispatchedId) {
+        // A task the user stopped holds: its trailing reply isn't judged.
+        const stopped = cur?.queue.find((q) => q.id === cur.queueDispatchedId)?.halted?.kind === 'stopped'
+        if (cur && cur.queueAutoMode && own && cur.queueDispatchedId === own && !stopped) {
           const dispatchedId = cur.queueDispatchedId
           if (isStuckReply(cleanContent)) {
             // The agent gave up. This item is NOT done — re-run it rather
@@ -1522,6 +2011,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
                 if (!s || !s.queueAutoMode) return
                 if (s.queueDispatchedId !== dispatchedId) return
                 if (s.busy) return
+                // Stopped or errored meanwhile: the queue holds, no nudge.
+                if (s.queue.find((q) => q.id === dispatchedId)?.halted) return
                 useChatStore.getState().sendMessage(key, 'Continue the task.', { fromQueue: true })
               }, 800)
             } else {
@@ -1574,20 +2065,39 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       const text = data.text as string || data.status as string || ''
       // "ready", "idle", or empty status means agent is done
       const idle = !text || /^(ready|idle|done|completed)$/i.test(text)
-      const patch: Partial<ChatSession> = { busy: !idle, statusText: idle ? '' : text }
+      // Shared chats: the "ready" owed to a frame refused while a turn runs
+      // ends that frame, not the turn (see expectRefusalReady).
+      if (idle && data.turn_end !== undefined && takeRefusalReady(key)) return
+      // A turn began: the frame it took (the agent echoes its id). The end
+      // of a turn forgets it.
+      if (data.status === 'thinking') noteTurnStart(key, String(data.client_msg_id || ''))
+      if (idle) noteTurnEnd(key)
+      else heardFrom(key)
+      const s = useChatStore.getState().sessions.get(key)
+      // After Stop the line keeps saying so until the turn ends.
+      const patch: Partial<ChatSession> = { busy: !idle, statusText: idle ? '' : s?.stopping ? 'Stopping…' : text }
       // Record when agent first becomes busy (for tok/s calculation)
-      if (!idle) {
-        const s = useChatStore.getState().sessions.get(key)
-        if (s && !s.busy) patch._busyStartedAt = Date.now()
-      }
+      if (!idle && s && !s.busy) patch._busyStartedAt = Date.now()
       updateSession(key, patch)
+      // "ready" is the turn's last frame (its usage and session_info came
+      // first): the queue goes on now rather than on the kick's timer, which
+      // a page in the background may run late.
+      if (idle) startQueueNow(key)
     })
+
+    // The thinking console's lines, streamed text and tool output: the chat
+    // doesn't show them, but they say a turn is at work (a stopped one too),
+    // so the lane isn't counted free on a timer meanwhile.
+    for (const sign of ['thinking', 'response_stream', 'tool_stream']) {
+      ws.on(sign, () => heardFrom(key))
+    }
 
     ws.on('narration', (data) => {
       // Live between-step narration — show it in the flow as a subtle blurb
       // while a long task runs (same as WhatsApp/glasses).
       const text = String(data.text || '').trim()
       if (!text) return
+      heardFrom(key)
       addMessage(key, {
         id: nextId(),
         role: 'system',
@@ -1601,8 +2111,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       const toolName = data.tool_name as string || ''
       const output = data.output as string || ''
       if (toolName && !data.replay) {
+        heardFrom(key)
         // Attribute the call to the queued task that is running it.
-        creditDispatchedItem(key, (prev) => ({ toolCount: (prev.toolCount ?? 0) + 1 }))
+        creditTurnItem(key, (prev) => ({ toolCount: (prev.toolCount ?? 0) + 1 }))
         const msg: ChatMessage = {
           id: nextId(),
           role: 'tool',
@@ -1678,7 +2189,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         timestamp: new Date().toISOString(),
       }
       addMessage(key, msg)
-      updateSession(key, { busy: false })
+      // A frame that isn't a turn was refused (session settings, a model
+      // change): nothing about the turn or the queue changes.
+      if (data.code === 'not_allowed') return
+      // The queued task's turn failed, or a frame was refused: hold the queue
+      // on the task when it was the queue's own (and say why), put a task the
+      // busy agent never took back to wait, and keep the lane busy while a
+      // turn still runs (see settleError).
+      settleError(key, data)
     })
 
     ws.on('command_result', (data) => {
@@ -1716,6 +2234,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       // the "Thinking..." spinner stays pinned after `/plan`, `/help`,
       // `/clear`, etc., because no later token/usage event clears busy.
       updateSession(key, { busy: false, statusText: '' })
+      // The command's frame is answered (no "thinking" ever takes it).
+      takeCommandFrame(key)
       // …and if the command came from the queue, retire it so the row stops
       // spinning and the next item can go out. Must run after busy is cleared
       // — tryDispatchNext refuses to send while the session is busy.
@@ -2052,6 +2572,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     // Live cumulative token usage for the in-flight turn — drives the
     // input/output/cache counts in the activity-panel header.
     ws.on('turn_usage', (data) => {
+      heardFrom(key)
       updateSession(key, {
         liveTurnUsage: {
           prompt_tokens: (data.prompt_tokens as number) || 0,
@@ -2073,15 +2594,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       useQuotaStore.getState().refreshSoon()
       const last = data.last as Record<string, number> | undefined
       if (!last) return
-      // Turn-final usage lands exactly where next_steps would have. A
-      // queue-dispatched turn suppresses next_steps, so this is what tells
-      // the queue the turn is over — without it, every queued item would
-      // wait out the 6s fallback timer instead.
-      fireAutoCompleteWatch(key)
-      // Same numbers onto the queued item, ADDED to what it already spent —
-      // a task that gave up twice should report its true cost, not just the
-      // cost of the attempt that finally worked.
-      creditDispatchedItem(key, (prev) => {
+      // The turn's numbers onto the queued item, ADDED to what it already
+      // spent — a task that gave up twice should report its true cost, not
+      // just the cost of the attempt that finally worked. Credited BEFORE the
+      // auto-complete below: that can mark the item done and dispatch the
+      // next one synchronously, which would hand it this turn's tokens. Only
+      // when the turn is the item's (not one it was refused behind).
+      creditTurnItem(key, (prev) => {
         const p = prev.usage || {}
         return {
           usage: {
@@ -2095,6 +2614,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           },
         }
       })
+      // Turn-final usage lands exactly where next_steps would have. A
+      // queue-dispatched turn suppresses next_steps, so this is what tells
+      // the queue the turn is over — without it, every queued item would
+      // wait out the 6s fallback timer instead.
+      fireAutoCompleteWatch(key)
       // Freeze the turn's final usage onto the most recent tool message so the
       // activity group keeps showing its own token counts after it collapses
       // (and old groups don't all show the latest turn's numbers). Then clear
@@ -2209,12 +2733,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   sendMessage: (containerId, content, opts) => {
     const session = get().sessions.get(containerId)
-    if (!session) return
+    if (!session) return undefined
     // A card number / CVV never reaches the bubble, Flight Deck's chat log or
     // the agent (utils/cardScrub — Captain never needs one).
     content = scrubUserText(content)
     // An answer ends the hold — the agent's next reply is re-evaluated fresh.
     cancelQuestionWatch(containerId)
+    // (A message typed in the chat also resumes a task the queue is holding
+    // on, once the agent takes it: noteTurnStart.)
     // Add user message to local state
     const msg: ChatMessage = {
       id: nextId(),
@@ -2225,14 +2751,29 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     addMessage(containerId, msg)
     updateSession(containerId, {
       busy: true,
-      statusText: 'Thinking...',
+      statusText: session.stopping ? 'Stopping…' : 'Thinking...',
       _busyStartedAt: Date.now(),
       nextStepOptions: [],
       liveTurnUsage: null,
     })
     // Attached pictures go as image_paths; the bubble above keeps their refs.
     const frame = splitImageRefs(content)
-    session.ws.send(frame.text, { noNextSteps: !!opts?.fromQueue, imagePaths: frame.imagePaths })
+    const clientMsgId = session.ws.send(frame.text, { noNextSteps: !!opts?.fromQueue, imagePaths: frame.imagePaths })
+    // Whose frame this is (the queue's, for the item in flight, or yours),
+    // for the agent's answer to it: taken, or refused.
+    const itemId = opts?.fromQueue ? get().sessions.get(containerId)?.queueDispatchedId ?? null : null
+    const resumed = !!itemId && _resumed.get(containerId) === itemId
+    if (resumed) _resumed.delete(containerId)
+    noteSent(containerId, {
+      id: clientMsgId ?? '',
+      itemId,
+      forced: !!opts?.forced,
+      cmd: isSlashCommand(content),
+      wasBusy: session.busy,
+      resumed,
+      at: Date.now(),
+    })
+    return msg.id
   },
 
   sendBtw: (containerId, content) => {
@@ -2371,9 +2912,27 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   cancelTask: (containerId) => {
     const session = get().sessions.get(containerId)
-    if (session) {
-      session.ws.cancel()
-      updateSession(containerId, { busy: false, statusText: 'Cancelled' })
+    // Stopping a queued task's turn holds the queue on it ("Stopped") — no
+    // auto-complete, nudge or retry may send it on by itself afterwards.
+    if (session?.queueDispatchedId && session.busy) {
+      creditDispatchedItem(containerId, (prev) => (prev.halted?.kind === 'stopped'
+        ? {} : { halted: { kind: 'stopped', at: Date.now() } }))
+      cancelAutoCompleteWatch(containerId)
+      cancelQuestionWatch(containerId)
+      resetStallNudges(containerId)
+    }
+    if (!session) return
+    session.ws.cancel()
+    if (session.busy) {
+      // The agent only notices Stop at its next step and refuses a frame
+      // sent before then, so the lane stays busy until the stopped turn ends
+      // (its reply or "ready"): the next task, Skip & continue and Run it
+      // again all wait for that. With no sign of it for a while, the lane
+      // counts as free (holdBusy).
+      updateSession(containerId, { stopping: true, statusText: 'Stopping…' })
+      holdBusy(containerId)
+    } else {
+      updateSession(containerId, { statusText: 'Cancelled' })
     }
   },
 
@@ -2473,12 +3032,15 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     if (session.queueDispatchedId === id) tryDispatchNext(containerId)
   },
 
-  markQueueItemDone: (containerId, id) => {
+  markQueueItemDone: (containerId, id, opts) => {
     const session = get().sessions.get(containerId)
     if (!session) return
     const queue = session.queue.map((q) =>
       q.id === id && q.status !== 'done'
-        ? { ...q, status: 'done' as const, completedAt: Date.now() }
+        ? {
+          ...q, status: 'done' as const, completedAt: Date.now(), endedHow: opts?.how,
+          halted: undefined, awaitingAnswer: undefined, awaitingSince: undefined,
+        }
         : q,
     )
     const patch: Partial<ChatSession> = { queue }
@@ -2490,6 +3052,9 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       resetStallNudges(containerId)
     }
     updateSession(containerId, patch)
+    // Skipping a task that is only waiting tidies the list; it is not a
+    // reason to start whatever comes next.
+    if (opts?.how === 'skipped' && session.queueDispatchedId !== id) return
     tryDispatchNext(containerId)
   },
 
@@ -2497,12 +3062,17 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const session = get().sessions.get(containerId)
     if (!session) return
     const next = !session.queueAutoMode
-    updateSession(containerId, { queueAutoMode: next })
+    // Auto back on answers the power-off park.
+    updateSession(containerId, next ? { queueAutoMode: true, queueParked: false } : { queueAutoMode: false })
     // Turning auto-mode off cancels any pending watch so it doesn't fire
     // after the user has switched to manual.
     if (!next) { cancelAutoCompleteWatch(containerId); cancelQuestionWatch(containerId) }
-    // Turning auto-mode on while idle should kick the queue.
-    if (next) tryDispatchNext(containerId)
+    // Turning auto-mode on while idle should kick the queue — and a task the
+    // allowance refused goes again if the allowance came back meanwhile.
+    if (next) {
+      if (!session.queuePaused) retryQuotaHold(containerId)
+      tryDispatchNext(containerId)
+    }
   },
 
   parkQueues: (agentId, check = false) => {
@@ -2513,7 +3083,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       if (session) {
         if (!session.queueAutoMode || !session.queue.some((q) => q.status !== 'done')) continue
         parked = true
-        if (!check) get().toggleQueueAutoMode(key)
+        if (!check) {
+          get().toggleQueueAutoMode(key)
+          updateSession(key, { queueParked: true })
+        }
         continue
       }
       // Not open here: the queue a reopened chat would pick up from storage.
@@ -2523,7 +3096,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         if (!slice?.queueAutoMode || !Array.isArray(slice.queue)
           || !slice.queue.some((q) => q.status !== 'done')) continue
         parked = true
-        if (!check) saveQueueSlice(key, { queue: slice.queue, queueAutoMode: false })
+        if (!check) saveQueueSlice(key, { ...slice, queueAutoMode: false, parked: true })
       } catch { /* unreadable storage — nothing to park */ }
     }
     return parked
@@ -2546,6 +3119,116 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const queue = session.queue.filter((q) => q.status !== 'pending')
     updateSession(containerId, { queue })
   },
+
+  runQueueNext: (key) => tryDispatchNext(key, { force: true }),
+
+  setQueuePaused: (key, paused) => {
+    if (!get().sessions.get(key)) return
+    // Pausing also forgets a start the user asked for earlier: paused wins.
+    if (paused) _forceThrough.delete(key)
+    updateSession(key, { queuePaused: paused, ...(paused ? { queueStartWhenFree: false, queueForceThrough: false } : {}) })
+    if (paused) return
+    // Resuming carries on, with a task the allowance refused too when the
+    // allowance came back while the lane was paused.
+    retryQuotaHold(key)
+    tryDispatchNext(key)
+  },
+
+  setQueueAutoMode: (key, on) => {
+    const session = get().sessions.get(key)
+    if (!session || session.queueAutoMode === on) return
+    get().toggleQueueAutoMode(key)
+    // Step by step's reply was already in, waiting on the user's "mark done":
+    // Auto now means "carry on" — nothing would judge that reply any more.
+    const d = on && session.queueDispatchedId
+      ? session.queue.find((q) => q.id === session.queueDispatchedId)
+      : undefined
+    if (d && d.repliedAt && !session.busy && !d.halted && !d.stuck && !d.awaitingAnswer && !isSlashCommand(d.content)) {
+      get().markQueueItemDone(key, d.id)
+    }
+  },
+
+  retryQueueItem: (key, id, content) => {
+    const session = get().sessions.get(key)
+    const item = session?.queue.find((q) => q.id === id)
+    if (!session || !item || item.status === 'done') return
+    const text = content?.trim()
+    // A fresh run: what it cost so far (usage, tools) keeps adding up.
+    const fresh: QueuedMessage = {
+      ...item, ...(text ? { content: text } : {}), status: 'pending',
+      dispatchedAt: undefined, completedAt: undefined, stuck: undefined, attempts: undefined,
+      halted: undefined, awaitingAnswer: undefined, awaitingSince: undefined,
+      repliedAt: undefined, messageId: undefined,
+    }
+    // It runs next: just before the first waiting item, else where it was.
+    const oldIndex = session.queue.findIndex((q) => q.id === id)
+    const rest = session.queue.filter((q) => q.id !== id)
+    const firstPending = rest.findIndex((q) => q.status === 'pending')
+    const at = firstPending >= 0 ? firstPending : Math.min(oldIndex, rest.length)
+    const queue = [...rest.slice(0, at), fresh, ...rest.slice(at)]
+    const patch: Partial<ChatSession> = { queue }
+    if (session.queueDispatchedId === id) {
+      patch.queueDispatchedId = null
+      cancelAutoCompleteWatch(key)
+      cancelCommandWatch(key)
+      cancelQuestionWatch(key)
+      resetStallNudges(key)
+      resetStuckRetries(key)
+    }
+    updateSession(key, patch)
+    // Still busy on the old turn: start-when-free sends it once it's over.
+    tryDispatchNext(key, { force: true })
+  },
+
+  editQueueItem: (key, id, content) => {
+    const session = get().sessions.get(key)
+    const text = content.trim()
+    const item = session?.queue.find((q) => q.id === id)
+    // Only a waiting item: once it's sent, the agent already has the old text.
+    if (!session || !item || item.status !== 'pending' || !text) return false
+    updateSession(key, { queue: session.queue.map((q) => (q.id === id ? { ...q, content: text } : q)) })
+    return true
+  },
+
+  moveQueueItem: (key, id, beforeId) => {
+    const session = get().sessions.get(key)
+    if (!session || id === beforeId) return
+    const item = session.queue.find((q) => q.id === id)
+    if (!item || item.status !== 'pending') return
+    if (beforeId !== null && session.queue.find((q) => q.id === beforeId)?.status !== 'pending') return
+    // Array order IS run order for waiting items, so a move is a splice.
+    const rest = session.queue.filter((q) => q.id !== id)
+    const at = beforeId === null ? rest.length : rest.findIndex((q) => q.id === beforeId)
+    updateSession(key, { queue: [...rest.slice(0, at), item, ...rest.slice(at)] })
+  },
+
+  restoreQueueItems: (key, entries) => {
+    const session = get().sessions.get(key)
+    if (!session || entries.length === 0) return
+    const queue = [...session.queue]
+    for (const { item, index } of [...entries].sort((a, b) => a.index - b.index)) {
+      // A saved copy of an item that was in flight comes back waiting.
+      const copy: QueuedMessage = item.status === 'dispatched'
+        ? { ...item, status: 'pending', dispatchedAt: undefined }
+        : item
+      const at = queue.findIndex((q) => q.id === item.id)
+      if (at >= 0) {
+        // Still there (a Skip): put the saved copy back in place — unless it
+        // started meanwhile, which the undo must not take back.
+        if (queue[at].status !== 'dispatched') queue[at] = copy
+      } else {
+        queue.splice(Math.max(0, Math.min(index, queue.length)), 0, copy)
+      }
+    }
+    updateSession(key, { queue })
+    if (session.queueAutoMode && !session.queuePaused) tryDispatchNext(key)
+  },
+
+  extendQueueAnswerWait: (key) => {
+    const session = get().sessions.get(key)
+    const item = session?.queue.find((q) => q.id === session.queueDispatchedId)
+    if (item?.awaitingAnswer) armQuestionWatch(key, item.id)
+  },
 }))
 
 // ── Queue dispatch ──
@@ -2553,35 +3236,115 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 // Pulls the next pending item and pushes it through sendMessage so it appears
 // in chat history exactly like a user-typed message. Guarded by:
 //  - no item currently dispatched (queueDispatchedId === null)
-//  - session not busy (don't pile prompts on top of an in-flight one)
 //  - at least one pending item to send
-function tryDispatchNext(containerId: string) {
+//  - the queue not paused (`force` — Run next — runs one anyway)
+//  - session not busy (don't pile prompts on top of an in-flight one), the
+//    socket up, and today's allowance not spent. Any of those only DEFERS:
+//    `queueStartWhenFree` remembers the start was wanted, and it happens as
+//    soon as the agent is free, back, or allowed again — never a silent stall.
+function tryDispatchNext(containerId: string, opts?: { force?: boolean }) {
   const state = useChatStore.getState()
   const session = state.sessions.get(containerId)
   if (!session) return
   if (session.queueDispatchedId) return
-  if (session.busy) return
-  if (!session.connected) return
   const next = session.queue.find((q) => q.status === 'pending')
-  if (!next) return
+  if (!next) {
+    if (session.queueStartWhenFree) updateSession(containerId, { queueStartWhenFree: false })
+    return
+  }
+  if (session.queuePaused && !opts?.force) return
+  const quota = useQuotaStore.getState().status
+  const blocked = !!quota?.blocked && !quota.exempt
+  // (`stopping` keeps `busy` on already; named so a stop still landing is
+  // plainly a reason to wait.)
+  if (session.busy || session.stopping || !session.connected || blocked) {
+    if (!session.queueStartWhenFree) updateSession(containerId, { queueStartWhenFree: true })
+    // Busy with no turn known to run (a stray status or tool frame after the
+    // turn's "ready"): nothing would ever free the lane, so the fallback that
+    // counts it free after a quiet stretch does.
+    if (session.busy && !_turns.has(containerId) && !_busyHolds.has(containerId)) holdBusy(containerId)
+    return
+  }
   const queue = session.queue.map((q) =>
     q.id === next.id
-      ? { ...q, status: 'dispatched' as const, dispatchedAt: Date.now() }
+      ? {
+        ...q, status: 'dispatched' as const, dispatchedAt: Date.now(), completedAt: undefined,
+        stuck: undefined, attempts: undefined, halted: undefined, awaitingAnswer: undefined,
+        awaitingSince: undefined, repliedAt: undefined, endedHow: undefined,
+      }
       : q,
   )
-  updateSession(containerId, { queue, queueDispatchedId: next.id })
+  // A forced run (Run now, Try again) that begins with a step (the fresh
+  // start) carries through to the task behind it, paused or not.
+  const through = !!opts?.force && isSlashCommand(next.content)
+  updateSession(containerId, {
+    queue, queueDispatchedId: next.id, queueStartWhenFree: false, queueParked: false, queueForceThrough: through,
+  })
+  if (through) _forceThrough.add(containerId)
+  else _forceThrough.delete(containerId)
   // A new item starts with a fresh retry budget.
   resetStuckRetries(containerId)
   if (isSlashCommand(next.content)) armCommandWatch(containerId)
-  state.sendMessage(containerId, next.content, { fromQueue: true })
+  const mid = state.sendMessage(containerId, next.content, { fromQueue: true, forced: !!opts?.force })
+  // Remember its bubble, for "Show in chat".
+  if (mid) creditDispatchedItem(containerId, () => ({ messageId: mid }))
 }
+
+// Start-when-free: shortly after the agent goes idle with nothing dispatched,
+// try the queue again — on Auto, or when the user had asked for a start. The
+// short delay lets the turn's trailing events (status, usage) land first.
+// Pausing clears `queueStartWhenFree`, and an unforced try never sets it on a
+// paused lane — so on a paused lane it can only be a forced start (Run now,
+// Try again) and goes through as one.
+const _queueKicks = new Map<string, ReturnType<typeof setTimeout>>()
+
+/** The agent said it is free: the queue's next task goes now when it would
+ *  go on the kick (Auto, or a start you asked for), and the kick is dropped. */
+function startQueueNow(key: string) {
+  const s = useChatStore.getState().sessions.get(key)
+  if (!s || !s.connected || s.busy || s.queueDispatchedId) return
+  if (!(s.queueStartWhenFree || (!s.queuePaused && s.queueAutoMode))) return
+  const t = _queueKicks.get(key)
+  if (t) {
+    clearTimeout(t)
+    _queueKicks.delete(key)
+  }
+  tryDispatchNext(key, { force: s.queueStartWhenFree })
+}
+
+function scheduleQueueKick(key: string) {
+  const prev = _queueKicks.get(key)
+  if (prev) clearTimeout(prev)
+  _queueKicks.set(key, setTimeout(() => {
+    _queueKicks.delete(key)
+    const s = useChatStore.getState().sessions.get(key)
+    // Offline: the reconnect (`_connected`) picks it up instead.
+    if (s && s.connected && !s.queueDispatchedId && (s.queueStartWhenFree || (!s.queuePaused && s.queueAutoMode))) {
+      tryDispatchNext(key, { force: s.queueStartWhenFree })
+    }
+  }, 800))
+}
+
+/** Lanes whose forced run began with a step (a fresh start): when the step
+ *  completes, the task behind it is forced through too. */
+const _forceThrough = new Set<string>()
 
 // Helpers that update a session inside the map
 function updateSession(containerId: string, patch: Partial<ChatSession>) {
+  let kick = false
+  let freed = false
   useChatStore.setState((state) => {
     const session = state.sessions.get(containerId)
     if (!session) return state
     const updated = { ...session, ...patch }
+    // Whatever frees the agent (the stopped turn's reply, "ready", a dropped
+    // socket) also ends a Stop that was still landing.
+    if (!updated.busy && updated.stopping) updated.stopping = false
+    // The one place every "agent is free again" passes through (status idle,
+    // a reply, an error, a stop that landed, a command result): the queue
+    // may go on.
+    freed = session.busy && updated.busy === false
+    kick = freed && !updated.queueDispatchedId && (updated.queueAutoMode || updated.queueStartWhenFree)
     const sessions = new Map(state.sessions)
     sessions.set(containerId, updated)
     // If any persisted-plan field changed, mirror to localStorage.
@@ -2599,16 +3362,56 @@ function updateSession(containerId: string, patch: Partial<ChatSession>) {
       })
     }
     // Mirror queue changes so they survive a page refresh. Auto-mode flag
-    // travels with the queue since it changes the UX meaningfully.
-    if ('queue' in patch || 'queueAutoMode' in patch) {
+    // travels with the queue since it changes the UX meaningfully, and so do
+    // Pause and the power-off park.
+    if ('queue' in patch || 'queueAutoMode' in patch || 'queuePaused' in patch || 'queueParked' in patch) {
       saveQueueSlice(containerId, {
         queue: updated.queue,
         queueAutoMode: updated.queueAutoMode,
+        queuePaused: updated.queuePaused,
+        parked: updated.queueParked,
       })
     }
     return { sessions }
   })
+  // Free by the agent's word: the fallback for "busy on our word" is moot.
+  if (freed) releaseBusyHold(containerId)
+  if (kick) scheduleQueueKick(containerId)
 }
+
+// Today's allowance came back (the day turned over, a free reset): queues the
+// refusal held go on — Auto lanes by themselves, step-by-step lanes only with
+// what the user had asked to start.
+let _quotaWasBlocked = (() => {
+  const q = useQuotaStore.getState().status
+  return !!q?.blocked && !q.exempt
+})()
+useQuotaStore.subscribe((st) => {
+  // Signing out clears the status (quotaStore's teardown) while the agent
+  // sockets are still open: that is no allowance coming back, and nothing may
+  // go out as the user leaves.
+  if (!st.status || useAuthStore.getState().signingOut) {
+    _quotaWasBlocked = false
+    return
+  }
+  const blocked = !!st.status.blocked && !st.status.exempt
+  const lifted = _quotaWasBlocked && !blocked
+  _quotaWasBlocked = blocked
+  if (blocked) return
+  for (const [key, s] of useChatStore.getState().sessions) {
+    if (!s.queueDispatchedId) {
+      if (lifted && (s.queueStartWhenFree || (!s.queuePaused && s.queueAutoMode))) {
+        tryDispatchNext(key, { force: s.queueStartWhenFree })
+      }
+      continue
+    }
+    // A task the allowance refused, on an Auto lane: it goes again whenever
+    // the allowance reads as back — not only at the moment it lifts, which
+    // may have passed while the page was closed. (Paused or step by step:
+    // when you resume or switch Auto on.)
+    if (s.queueAutoMode && !s.queuePaused) retryQuotaHold(key)
+  }
+})
 
 function updatePlan(
   containerId: string,

@@ -1,13 +1,15 @@
 import { useEffect, useState } from 'react'
 import {
   LayoutGrid, Users, ClipboardList, Boxes, MessageSquare, DollarSign, CheckCircle2, Circle,
-  ChevronRight, Send, Server, LayoutDashboard, UserPlus, Library, Gauge,
+  ChevronRight, Send, Server, LayoutDashboard, UserPlus, Library, Gauge, MessagesSquare, Layers,
 } from 'lucide-react'
 import { useAuthStore, DEFAULT_INSTANCE_NAME } from '../../stores/authStore'
-import { useConsoleStore, leaveConsole, type ConsolePage, type ConsoleIntent } from '../../stores/consoleStore'
+import { useConsoleStore, leaveConsole, enterKioskView, type ConsolePage, type ConsoleIntent } from '../../stores/consoleStore'
+import { hasTierSets, TIER_SETS_EVENT } from '../../services/tierConfig'
 import { fetchSharedTierSets } from '../../services/sharedTierSets'
 import { getOAuthClientConfig, getAdminTelegram } from '../../services/sharedIntegrations'
 import { getSystemProcesses, type SystemProcessResponse } from '../../services/system'
+import { isDesktopApp } from '../../services/desktopShell'
 import {
   fetchAllUsers, fetchWaitlistPending, fetchOpenInvites, fetchUsageToday, fetchCosts, fetchProviderKeys,
 } from './consoleApi'
@@ -45,6 +47,13 @@ export function OverviewPage() {
   const accounts = useAuthStore((s) => s.authEnabled !== false)
   const [f, setF] = useState<Facts>({})
   const [loading, setLoading] = useState(true)
+  // No tier set yet: nothing else works until there is one.
+  const [models, setModels] = useState(hasTierSets)
+  useEffect(() => {
+    const check = () => setModels(hasTierSets())
+    window.addEventListener(TIER_SETS_EVENT, check)
+    return () => window.removeEventListener(TIER_SETS_EVENT, check)
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -56,6 +65,7 @@ export function OverviewPage() {
       fetchOpenInvites().then((n) => put({ invites: n })),
       fetchSharedTierSets().then((r) => put({ teamModels: r.sets[0]?.name ?? null })),
       getAdminTelegram().then((t) => put({ telegramRequests: t.links.filter((l) => l.status === 'pending').length })),
+      getOAuthClientConfig('google').then((c) => put({ googleReady: !!c.client_id_set && !!c.client_secret_set })),
     ] : []
     Promise.allSettled([
       ...team,
@@ -65,7 +75,6 @@ export function OverviewPage() {
       }),
       fetchCosts(month).then((c) => put({ spend30: c.total_usd })),
       fetchProviderKeys().then((k) => put({ teamKeys: Object.values(k).filter(Boolean).length })),
-      getOAuthClientConfig('google').then((c) => put({ googleReady: !!c.client_id_set && !!c.client_secret_set })),
       getSystemProcesses().then((s) => put({ system: s })).catch(() => put({ system: null })),
     ]).finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
@@ -73,6 +82,11 @@ export function OverviewPage() {
 
   const named = branding.name !== DEFAULT_INSTANCE_NAME || !!branding.logo
   const allSteps: { done: boolean; title: string; detail: string; page: ConsolePage; intent?: ConsoleIntent; team?: boolean }[] = [
+    {
+      done: models, page: 'models', intent: models ? undefined : { createSet: true },
+      title: 'Create your models',
+      detail: models ? 'A tier set gives each kind of work its model.' : 'Agents need a tier set — a model for each kind of work — before they can run.',
+    },
     {
       done: !!f.teamModels, page: 'models', team: true,
       title: 'Give the team its models',
@@ -85,8 +99,9 @@ export function OverviewPage() {
         : accounts ? 'One key per provider, so people never handle keys themselves.' : 'One key per provider, for every agent you start.',
     },
     {
-      done: !!f.googleReady, page: 'connections', intent: { connection: 'google' },
-      title: accounts ? 'Let people connect Google' : 'Connect Google',
+      // Google sign-in needs accounts (a deck without sign-in can't connect it).
+      done: !!f.googleReady, page: 'connections', intent: { connection: 'google' }, team: true,
+      title: 'Let people connect Google',
       detail: f.googleReady ? 'Gmail, Calendar and Drive are one click away.' : 'Add the deck\'s Google OAuth client once.',
     },
     {
@@ -114,8 +129,25 @@ export function OverviewPage() {
         icon={LayoutGrid}
         title={`${greeting()}${user?.display_name ? `, ${user.display_name.split(' ')[0]}` : ''}`}
         description={<>Here's how <b className="font-medium text-zinc-300">{branding.name}</b> is doing.</>}
-        actions={<Button icon={LayoutDashboard} onClick={() => leaveConsole('desktop')}>Open Flight Deck</Button>}
+        actions={isDesktopApp()
+          ? <Button icon={MessagesSquare} onClick={enterKioskView}>Switch to user view</Button>
+          : <Button icon={LayoutDashboard} onClick={() => leaveConsole('desktop')}>Open Flight Deck</Button>}
       />
+
+      {!models && (
+        <div className="flex flex-col gap-4 rounded-2xl border border-violet-500/40 bg-violet-500/[0.07] p-5 wide:flex-row wide:items-center">
+          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-violet-500/15 text-violet-600 dark:text-violet-300">
+            <Layers className="h-5 w-5" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="text-[15px] font-semibold text-zinc-100">Start by creating your models</div>
+            <div className="mt-0.5 text-sm text-zinc-500">
+              There's no tier set yet. Agents need one — a model for each kind of work — before they can do anything.
+            </div>
+          </div>
+          <Button variant="primary" icon={Gauge} onClick={() => go('models', { createSet: true })}>Create a tier set</Button>
+        </div>
+      )}
 
       {((f.waitlist ?? 0) > 0 || (f.telegramRequests ?? 0) > 0) && (
         <div className="space-y-2">

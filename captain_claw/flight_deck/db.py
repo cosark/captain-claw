@@ -1025,6 +1025,21 @@ class FlightDeckDB:
         return {"id": uid, "email": email.lower().strip(), "display_name": display_name,
                 "role": role, "created_at": now}
 
+    async def ensure_local_user(self, user_id: str, password_hash: str) -> None:
+        """A row for the synthetic local user of a deck without sign-in, so
+        what it keeps per user (settings, archetypes, shares…) can be stored:
+        those tables reference users(id). Nothing reads its role or password
+        while sign-in is off; it is a "user" with a random password, so turning
+        sign-in on later leaves no dormant admin and no way to sign in as it."""
+        now = _utcnow()
+        assert self._db is not None
+        await self._db.execute(
+            "INSERT OR IGNORE INTO users (id, email, password_hash, display_name, role, created_at, updated_at, metadata)"
+            " VALUES (?, ?, ?, ?, 'user', ?, ?, ?)",
+            (user_id, user_id, password_hash, "Local", now, now, json.dumps({"local": True})),
+        )
+        await self._db.commit()
+
     async def get_user_by_email(self, email: str) -> dict | None:
         assert self._db is not None
         async with self._db.execute(

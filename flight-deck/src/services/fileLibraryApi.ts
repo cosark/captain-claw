@@ -16,6 +16,11 @@ export interface LibraryItem {
   agent_name: string
   agent_running: boolean
   rel_path: string
+  /** The file on disk, named as the agent's Files panel names it — what the
+   *  agent's view, save, deck and public-link routes take. */
+  physical: string
+  /** `workspace/<rel_path>`, the panel's name for it. */
+  logical: string
   filename: string
   extension: string
   kind: string

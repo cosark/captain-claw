@@ -355,8 +355,10 @@ export class AgentChatWS {
     return this.sentIds.includes(clientMsgId)
   }
 
-  send(content: string, opts?: { noNextSteps?: boolean; imagePaths?: string[] }) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
+  /** Returns the frame's client_msg_id (the agent echoes it when it takes or
+   *  refuses the turn), or undefined when the socket wasn't open. */
+  send(content: string, opts?: { noNextSteps?: boolean; imagePaths?: string[] }): string | undefined {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return undefined
     const clientMsgId = `web_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
     this.sentIds.push(clientMsgId)
     if (this.sentIds.length > 200) this.sentIds.splice(0, this.sentIds.length - 200)
@@ -371,6 +373,7 @@ export class AgentChatWS {
       ...(opts?.noNextSteps ? { no_next_steps: true, no_rephrase: true } : {}),
       ...(opts?.imagePaths?.length ? { image_paths: opts.imagePaths } : {}),
     }))
+    return clientMsgId
   }
 
   sendBtw(content: string) {

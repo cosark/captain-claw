@@ -84,10 +84,31 @@ export interface DataQuery {
   offset?: number
 }
 
+export type ExportFormat = 'csv' | 'json' | 'xlsx'
+
 function qs(params: Record<string, unknown>): string {
   const p = new URLSearchParams()
   for (const [k, v] of Object.entries(params)) if (v !== undefined && v !== '') p.set(k, String(v))
   return p.toString()
+}
+
+/** The name a download asked to be saved as: `filename*` (UTF-8, for names
+ *  beyond ASCII) before plain `filename`. */
+function dispositionName(header: string | null): string {
+  if (!header) return ''
+  const star = /filename\*\s*=\s*UTF-8''([^;]+)/i.exec(header)
+  if (star) {
+    try { return decodeURIComponent(star[1].trim().replace(/^"|"$/g, '')) } catch { /* malformed — try the plain one */ }
+  }
+  return /filename\s*=\s*"?([^";]+)"?/i.exec(header)?.[1]?.trim() || ''
+}
+
+/** The whole table as CSV, JSON or an Excel workbook; the FD token rides
+ *  along for a plain link. */
+function exportUrl(id: string, format: ExportFormat = 'csv'): string {
+  const { token, authEnabled } = useAuthStore.getState()
+  const t = authEnabled && token ? `&fd_token=${encodeURIComponent(token)}` : ''
+  return `/fd/data-library/tables/${encodeURIComponent(id)}/export?format=${format}${t}`
 }
 
 export const dataLibraryApi = {
@@ -101,10 +122,28 @@ export const dataLibraryApi = {
     api<RowsPage>(`/fd/data-library/tables/${encodeURIComponent(id)}/rows?${qs(opts)}`),
   resummarize: (id: string) =>
     api<DataTable>(`/fd/data-library/tables/${encodeURIComponent(id)}/summarize`, { method: 'POST' }),
-  /** The whole table as CSV; the FD token rides along for a plain link. */
-  exportUrl: (id: string) => {
-    const { token, authEnabled } = useAuthStore.getState()
-    const t = authEnabled && token ? `?fd_token=${encodeURIComponent(token)}` : ''
-    return `/fd/data-library/tables/${encodeURIComponent(id)}/export${t}`
+  exportUrl,
+  /** Save the table as a file. Fetched rather than linked, so a refusal (the
+   *  datastore can't be read, the table is gone) throws with its reason
+   *  instead of being saved as the "export". */
+  download: async (id: string, format: ExportFormat, fallbackName: string) => {
+    const jwt = useAuthStore.getState().token
+    const r = await fetch(exportUrl(id, format), {
+      cache: 'no-store',
+      credentials: 'include',
+      headers: jwt ? { Authorization: `Bearer ${jwt}` } : {},
+    })
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}))
+      throw new Error((typeof body?.detail === 'string' && body.detail) || `${r.status} ${r.statusText}`)
+    }
+    const url = URL.createObjectURL(await r.blob())
+    const a = document.createElement('a')
+    a.href = url
+    a.download = dispositionName(r.headers.get('content-disposition')) || `${fallbackName}.${format}`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
   },
 }

@@ -28,3 +28,9 @@ export function useIsMobile() {
   // A landscape phone is a phone, whatever its width says.
   return { isMobile, isTablet: tablet && !isMobile, isDesktop: desktop && !isMobile }
 }
+
+// A phone or tablet's on-screen keyboard: Enter there starts a new line (the
+// Send button sends), as in any messaging app.
+export function touchKeyboard(): boolean {
+  return typeof window !== 'undefined' && window.matchMedia('(pointer: coarse) and (hover: none)').matches
+}

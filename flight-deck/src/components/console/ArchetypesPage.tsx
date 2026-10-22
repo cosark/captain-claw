@@ -45,7 +45,9 @@ function freeId(registry: ArchetypeRegistry | null, base: string): string {
 }
 
 export function ArchetypesPage() {
-  const { registry, refreshRegistry, tiers, forgeTier } = useTierConfig()
+  // No starting set here either (see ModelsPage); drafting needs one.
+  const { registry, refreshRegistry, tiers, forgeTier, sets, bootstrapped } = useTierConfig({ seed: false })
+  const noModels = bootstrapped && sets.length === 0
   const [query, setQuery] = useState('')
   const [source, setSource] = useState<Source>('all')
   const [family, setFamily] = useState('')
@@ -113,7 +115,7 @@ export function ArchetypesPage() {
         title="Archetypes"
         description="Ready-made agents: a role, instructions, tools and a model tier. People pick one to start a new agent, so these are what your team can create."
         actions={<>
-          <Button icon={Wand2} onClick={() => setForgeOpen(true)} title="Draft several archetypes from instructions and documents">Forge from documents</Button>
+          <Button icon={Wand2} onClick={() => setForgeOpen(true)} disabled={noModels} title={noModels ? 'Create a tier set on Models first — forging uses its model' : 'Draft several archetypes from instructions and documents'}>Forge from documents</Button>
           <Button variant="primary" icon={Plus} onClick={() => setDraft({ input: blank(), id: null })}>New archetype</Button>
         </>}
       />
@@ -189,6 +191,7 @@ export function ArchetypesPage() {
           editingId={draft.id}
           registry={registry}
           toolPalette={toolPalette}
+          canDraft={!noModels}
           generate={(prompt) => {
             const ft = tiers[forgeTier]
             return generateArchetype(prompt, ft?.provider || '', ft?.model || '', ft?.api_key || '', ft?.base_url || '', ft?.output_ctx || 0)
@@ -321,11 +324,13 @@ function ArchetypeView({ a, tierLabel, onClose, onCopy }: { a: Archetype; tierLa
 
 // ── The editor ──
 
-function ArchetypeSheet({ initial, editingId, registry, toolPalette, generate, onClose, onSaved }: {
+function ArchetypeSheet({ initial, editingId, registry, toolPalette, canDraft, generate, onClose, onSaved }: {
   initial: ArchetypeInput
   editingId: string | null
   registry: ArchetypeRegistry | null
   toolPalette: string[]
+  // A tier set exists to draft with.
+  canDraft: boolean
   generate: (prompt: string) => Promise<ArchetypeInput>
   onClose: () => void
   onSaved: () => void
@@ -404,8 +409,10 @@ function ArchetypeSheet({ initial, editingId, registry, toolPalette, generate, o
             className={inputCls}
           />
           <div className="flex items-center justify-between gap-3">
-            <span className="text-[11px] text-zinc-500">Fills in the form below — check it before saving.</span>
-            <Button icon={generating ? undefined : Sparkles} busy={generating} disabled={!prompt.trim()} onClick={runGenerate}>
+            <span className="text-[11px] text-zinc-500">
+              {canDraft ? 'Fills in the form below — check it before saving.' : 'Create a tier set on Models first — the draft is written by its model.'}
+            </span>
+            <Button icon={generating ? undefined : Sparkles} busy={generating} disabled={!prompt.trim() || !canDraft} onClick={runGenerate}>
               {generating ? 'Drafting…' : 'Draft'}
             </Button>
           </div>

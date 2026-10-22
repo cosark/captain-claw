@@ -50,8 +50,9 @@ import { BrowserLLMPage } from './pages/BrowserLLMPage'
 import { BeingsPage } from './pages/BeingsPage'
 import { PaymentsPage, paymentIdFromPath, purchaseIdFromPath } from './pages/PaymentsPage'
 import { PublicBeingPage } from './pages/PublicBeingPage'
-import { useUIStore, startInConsoleUnlessChosen } from './stores/uiStore'
-import { useConsoleStore, syncConsoleFromUrl, dropConsoleRequest, selectConsoleAdmin, openConsole } from './stores/consoleStore'
+import { useUIStore, startInConsoleUnlessChosen, beginLayoutHydrate } from './stores/uiStore'
+import { useConsoleStore, syncConsoleFromUrl, dropConsoleRequest, selectConsoleAdmin, openConsole, startDesktop, consoleHome, pageFromPath } from './stores/consoleStore'
+import { isDesktopApp } from './services/desktopShell'
 import { useAgentStore } from './stores/agentStore'
 import { useAuthStore, selectKioskLocked, awaitAuthStatus, refreshAccessToken, reloadAfterSessionEnd, DEFAULT_INSTANCE_NAME } from './stores/authStore'
 import { useChatStore } from './stores/chatStore'
@@ -169,23 +170,20 @@ function AppContent() {
   const kioskLocked = useAuthStore(selectKioskLocked)
   // The Admin console: an admin (the user of a deck without sign-in included)
   // who just signed in, has it as their layout — the default until they pick
-  // another — or followed a <deck>/console address. Anyone else gets the
-  // usual layout.
+  // another — or followed a <deck>/console address. In the desktop app an
+  // admin is always in the console or, by its Admin | User switch, the users'
+  // kiosk (kioskView — part of kioskLocked). Anyone else gets the usual layout.
   const consoleAdmin = useAuthStore(selectConsoleAdmin)
+  const kioskView = useAuthStore((s) => s.kioskView)
   const consoleRequested = useConsoleStore((s) => s.requested)
   const adminSignedIn = useAuthStore((s) => s.adminStartPending)
-  const inConsole = consoleAdmin && (layoutMode === 'console' || consoleRequested || adminSignedIn)
+  const inConsole = consoleAdmin && (isDesktopApp() || consoleRequested
+    || ((layoutMode === 'console' || adminSignedIn) && !PAYMENTS_LINK))
   useEffect(() => {
     window.addEventListener('popstate', syncConsoleFromUrl)
     return () => window.removeEventListener('popstate', syncConsoleFromUrl)
   }, [])
   useEffect(() => { if (!consoleAdmin) dropConsoleRequest() }, [consoleAdmin])
-  // Signing in lands an admin on the console's Overview.
-  useEffect(() => {
-    if (!adminSignedIn) return
-    useAuthStore.getState().setAdminStartPending(false)
-    if (consoleAdmin) openConsole('overview')
-  }, [adminSignedIn, consoleAdmin])
   const chatOpen = useChatStore((s) => s.chatOpen)
   const chatFullscreen = useChatStore((s) => s.chatFullscreen)
   const { fetchInstances, fetchStats, fetchConcerns, setWsConnected, upsertInstance, removeInstance, updateInstanceActivity } = useAgentStore()
@@ -433,15 +431,21 @@ function AppContent() {
   // only chat, create an agent from a Library archetype, manage their Google /
   // MCP connections, edit their profile, or sign out — nothing else is
   // reachable. Placed before the mobile/tablet/full branches so it always wins.
-  // Admins are exempt (selectKioskLocked) — they keep full access even here.
+  // Admins are exempt (selectKioskLocked) — they keep full access even here —
+  // except the desktop app's admin who switched to it: the switch
+  // (`adminSwitch`) is their one way back to the Admin console.
   if (kioskLocked) {
     return (
       <>
-        <SimpleLayout locked />
+        <SimpleLayout locked adminSwitch={kioskView && consoleAdmin} />
         {shortcutsOpen && <ShortcutsOverlay onClose={() => setShortcutsOpen(false)} />}
       </>
     )
   }
+
+  // The desktop app decides between the kiosk and the console after a sign-in
+  // (startDesktop): nothing to show until it has.
+  if (adminSignedIn && consoleAdmin && isDesktopApp()) return <div className="h-screen bg-zinc-950" />
 
   // ── Admin console ── (every form factor; admins are never kiosk-locked)
   if (inConsole) return <ConsoleLayout />
@@ -607,6 +611,31 @@ function AppContent() {
   )
 }
 
+// A link to a payment (its phone page's "Open in Flight Deck") opens that page:
+// it wins over the console an admin would otherwise start in. Read at load.
+const PAYMENTS_LINK = window.location.pathname === '/payments' || !!paymentIdFromPath() || !!purchaseIdFromPath()
+
+// An admin who signed in from a form: the desktop app's launch choice, or the
+// Admin console — on Models while they have no tier set.
+async function landAdminAfterSignIn() {
+  const auth = useAuthStore.getState()
+  if (!auth.adminStartPending) return
+  try {
+    if (!selectConsoleAdmin(auth) || (PAYMENTS_LINK && !isDesktopApp())) return
+    if (isDesktopApp()) {
+      await startDesktop({ signedIn: true })
+      return
+    }
+    auth.setKioskView(false)
+    // A console address (a bookmark, the page a session expired on) says where.
+    openConsole(pageFromPath(window.location.pathname) ?? consoleHome())
+  } finally {
+    // Until here the pending sign-in kept the console (or, in the desktop
+    // app, a blank screen) up, so nothing flashes before the landing.
+    useAuthStore.getState().setAdminStartPending(false)
+  }
+}
+
 function App() {
   const authEnabled = useAuthStore((s) => s.authEnabled)
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated)
@@ -639,11 +668,15 @@ function App() {
         const ok = await refreshAccessToken()
         if (ok) {
           // Hydrate stores from server-side settings
+          beginLayoutHydrate()
           await hydrateAllStores()
+          // The desktop app: the users' kiosk or the Admin console (startDesktop).
+          if (isDesktopApp() && selectConsoleAdmin(useAuthStore.getState())) await startDesktop()
         }
       } else {
         reportPublicOrigin()   // auth-off deck: no login to wait for
         startInConsoleUnlessChosen()   // its user is its admin
+        if (isDesktopApp()) await startDesktop()
       }
       setAuthChecked(true)
     }
@@ -661,7 +694,10 @@ function App() {
   const prevAuth = useRef(false)
   useEffect(() => {
     if (isAuthenticated && !prevAuth.current) {
-      hydrateAllStores()
+      // Once the signed-in settings are in, an admin who just signed in lands
+      // (they decide whether a tier set exists).
+      beginLayoutHydrate()
+      hydrateAllStores().finally(landAdminAfterSignIn)
       // Tell Flight Deck the address this deck is reached at, so a public link
       // an agent makes points here rather than at the agent's internal FD URL.
       reportPublicOrigin()

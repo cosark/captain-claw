@@ -1,5 +1,6 @@
 import { useAuthStore, refreshAccessToken } from '../stores/authStore'
 import type { Creator } from '../utils/sharedWorkspace'
+import type { ProcessInfo } from './docker'
 
 const BASE = '/fd'
 
@@ -47,6 +48,13 @@ export interface AgentEndpoint {
   host: string
   port: number
   auth: string
+}
+
+/** A process agent's endpoint, keyed `proc-<slug>` like its chat and panels
+ *  (null until it has a web port). */
+export function processEndpoint(proc: ProcessInfo): AgentEndpoint | null {
+  if (!proc.web_port) return null
+  return { id: `proc-${proc.slug}`, name: proc.name, host: 'localhost', port: proc.web_port, auth: proc.web_auth }
 }
 
 export async function listAgentFiles(host: string, port: number, auth: string): Promise<AgentFile[]> {
@@ -198,4 +206,18 @@ export function getFileTypeGroup(file: AgentFile): string {
 export function isViewable(file: AgentFile): boolean {
   const group = getFileTypeGroup(file)
   return ['html', 'markdown', 'text', 'code', 'data', 'image', 'pdf', 'audio', 'video'].includes(group)
+}
+
+// File groups whose text content can be edited in place (mirrors FileViewer).
+const EDITABLE_GROUPS = new Set(['markdown', 'code', 'data', 'text', 'html'])
+
+/** Whether the viewer can open the file straight into edit mode. */
+export function isEditable(file: AgentFile): boolean {
+  return EDITABLE_GROUPS.has(getFileTypeGroup(file))
+}
+
+/** Flight Deck's slide-deck view of an agent's HTML file, for a new tab. */
+export function getDeckUrl(host: string, port: number, path: string, auth: string): string {
+  const q = new URLSearchParams({ c: 'deck', path, host, port: String(port), auth: auth || '' })
+  return `${window.location.origin}/deck/view?${q.toString()}`
 }

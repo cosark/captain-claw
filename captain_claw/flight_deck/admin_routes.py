@@ -433,7 +433,7 @@ SYSTEM_CONFIG_DEFAULTS = {
     "waitlist_cohort": "",
     # Branding: the name in the panels' title and on the sign-in page, and the
     # short description under it there (the logo: branding_routes).
-    "instance_name": "Flight Deck",
+    "instance_name": "Captain",
     "instance_description": "Agent Management Console",
     # "Powered by Captain" (captain-claw.com · GitHub) in the sign-in page's footer.
     "show_powered_by": True,

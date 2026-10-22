@@ -62,7 +62,9 @@ export async function fetchSettings(): Promise<Record<string, string>> {
   return res.json()
 }
 
-async function _fetchSettingsOrNull(): Promise<Record<string, string> | null> {
+/** The signed-in user's settings, or null when they could not be read (unlike
+ *  fetchSettings, a failure never looks like "no settings"). */
+export async function fetchSettingsOrNull(): Promise<Record<string, string> | null> {
   try {
     const res = await fetch(`${FD}/settings`, {
       headers: _headers(),
@@ -170,13 +172,13 @@ export async function hydrateAllStores(): Promise<void> {
   // load they start from this browser's localStorage (normally nothing), not
   // the server, so until a hydrate succeeds the first add still saves that
   // list over the server's copy.
-  let settings = await _fetchSettingsOrNull()
+  let settings = await fetchSettingsOrNull()
   if (settings === null) return
 
   // If server has no settings, try migrating from localStorage
   if (Object.keys(settings).length === 0) {
     await migrateFromLocalStorage()
-    settings = await _fetchSettingsOrNull()
+    settings = await fetchSettingsOrNull()
     if (settings === null) return
   }
 

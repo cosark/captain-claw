@@ -33,9 +33,8 @@ import {
   ShieldCheck,
 } from 'lucide-react'
 import { useUIStore } from '../../stores/uiStore'
-import { openConsole, selectConsoleAdmin } from '../../stores/consoleStore'
+import { openConsole, leaveKioskView, selectConsoleAdmin } from '../../stores/consoleStore'
 import { isDesktopApp } from '../../services/desktopShell'
-import { ShellModeSwitch } from '../console/ShellModeSwitch'
 import { useAgentStore } from '../../stores/agentStore'
 import { useAuthStore, logoutUser } from '../../stores/authStore'
 import { useChatStore, parseLaneKey, clearAgentSlices } from '../../stores/chatStore'
@@ -46,6 +45,7 @@ import { useProcessStore } from '../../stores/processStore'
 import { useThemeStore } from '../../stores/themeStore'
 import { useOnboardingStore } from '../../stores/onboardingStore'
 import { useSharedAgentStore } from '../../stores/sharedAgentStore'
+import type { SharedAgent } from '../../services/sharedAgents'
 import { useScheduledStore } from '../../stores/scheduledStore'
 import { ScheduledTasks } from '../scheduler/ScheduledTasks'
 import { useFileLibraryStore } from '../../stores/fileLibraryStore'
@@ -70,7 +70,7 @@ import { BrandMark } from '../common/BrandMark'
 import { KioskInfoDialog, type InfoAgent } from './KioskInfoDialog'
 import { KioskOnboardingDialog, type OnboardingAction } from './KioskOnboardingDialog'
 import {
-  AgentMenu, KioskAgentInfoDialog, KioskAgentInstructionsDialog, KioskAgentSettingsDialog, KioskRemoveAgentDialog,
+  AgentDialog, AgentMenu, KioskAgentInfoDialog, KioskAgentInstructionsDialog, KioskAgentSettingsDialog, KioskRemoveAgentDialog,
   type AgentMenuItem,
 } from './KioskAgentDialogs'
 import { useIsMobile } from '../../hooks/useMediaQuery'
@@ -79,7 +79,8 @@ import { useIsMobile } from '../../hooks/useMediaQuery'
 //
 // A chat-first arrangement of the same Flight Deck: agents on the left, the
 // conversation in the middle, the active agent's files and datastore on the
-// right. No nav, no pages, no director — those all live in the full layout,
+// right (the kiosk has the File and Data libraries, and each agent's "⋯",
+// instead). No nav, no pages, no director — those all live in the full layout,
 // one click away. Both side columns collapse to a thin rail and remember
 // their state.
 
@@ -130,9 +131,44 @@ function initials(name: string): string {
   return name.trim().slice(0, 2).toUpperCase() || '?'
 }
 
+/** The File and Data libraries index the user's own process agents — from
+ *  their folder on disk, so stopped ones too — not one Flight Deck runs itself. */
+function inLibraries(a: SimpleAgent): boolean {
+  return a.kind === 'process' && !a.managed
+}
+
+/** What an agent's files-and-data view holds: its own files and datastore;
+ *  for one shared with the user, the member panels — only on a deck that
+ *  serves them and only those the agent offers (a process agent); chat only
+ *  for a shared agent with none (a Docker agent, an older Flight Deck, a row
+ *  not listed yet). */
+type AgentPanels =
+  | { region: 'own' }
+  | { region: 'member'; row: SharedAgent; files: boolean; datastore: boolean }
+  | { region: 'chat' }
+
+function agentPanels(agentId: string, memberWorkspace: boolean, sharedAgents: SharedAgent[]): AgentPanels {
+  if (!agentId.startsWith(SHARED_PREFIX)) return { region: 'own' }
+  const row = sharedAgents.find((a) => sharedContainerId(a.agent_ref) === agentId)
+  const vis = workspaceVisible(memberWorkspace, sharedCaps(row))
+  return row && (vis.files || vis.datastore) ? { region: 'member', row, ...vis } : { region: 'chat' }
+}
+
+function useAgentPanels(agentId: string): AgentPanels {
+  const memberWorkspace = useSharedAgentStore((s) => s.memberWorkspace)
+  const sharedAgents = useSharedAgentStore((s) => s.agents)
+  return agentPanels(agentId, memberWorkspace, sharedAgents)
+}
+
 const iconBtn = 'rounded p-1.5 text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-300'
 
-export function SimpleLayout({ locked = false }: { locked?: boolean }) {
+// The Getting started guide opened by itself this page load (the desktop
+// admin comes back to the kiosk without a reload: it doesn't open again).
+let guideAutoShown = false
+
+// `adminSwitch`: the desktop app's admin in the users' kiosk (locked) — the
+// Admin | User switch takes them back to the Admin console.
+export function SimpleLayout({ locked = false, adminSwitch = false }: { locked?: boolean; adminSwitch?: boolean }) {
   const {
     containers, fetchContainers, checkHealth, startContainer, stopContainer, restartContainer, removeContainer,
     descriptionOverrides: dockerDesc,
@@ -159,6 +195,7 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
   // Narrow selectors: the list keeps its identity across polls when nothing changed.
   const sharingEnabled = useSharedAgentStore((s) => s.enabled)
   const sharedAgents = useSharedAgentStore((s) => s.agents)
+  const memberWorkspace = useSharedAgentStore((s) => s.memberWorkspace)
   const fetchShared = useSharedAgentStore((s) => s.fetch)
   const leaveShared = useSharedAgentStore((s) => s.leave)
   const setLayoutMode = useUIStore((s) => s.setLayoutMode)
@@ -198,6 +235,8 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
   const [agentInstructionsId, setAgentInstructionsId] = useState<string | null>(null)
   const [agentSettingsId, setAgentSettingsId] = useState<string | null>(null)
   const [agentRemoveId, setAgentRemoveId] = useState<string | null>(null)
+  // …and its files and data, read live from the agent (see agentMenuItems).
+  const [filesDataId, setFilesDataId] = useState<string | null>(null)
   // Kiosk Getting started guide. It opens by itself once per page load (so
   // once per person on a shared kiosk: sign-out reloads) until its "Do not
   // show again" is ticked — which is per user, so it waits for their settings.
@@ -207,8 +246,9 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
   const guideOptedOut = useOnboardingStore((s) => s.completed.kiosk)
   if (locked && settingsHydrated && !guideDecided) {
     setGuideDecided(true)
-    if (!guideOptedOut) setGuideOpen(true)
+    if (!guideOptedOut && !guideAutoShown) setGuideOpen(true)
   }
+  useEffect(() => { if (guideOpen) guideAutoShown = true }, [guideOpen])
   // A phone gets its own layout: the agent list, or one chat, full screen.
   const { isMobile } = useIsMobile()
   // Scheduled tasks: the dialog (opened from the agent column, Settings, or a
@@ -222,13 +262,14 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
   const scheduledCount = useScheduledStore((s) => s.jobs.filter((j) => j.enabled === 1).length)
   const scheduledRunning = useScheduledStore((s) => s.jobs.some((j) => j.running))
   // File library: every file the agents made, summarised (agent column,
-  // Settings, the phone header).
+  // Settings, the phone header) — or one agent's (its "⋯", its phone chat).
   const libraryOpen = useFileLibraryStore((s) => s.open)
   const libraryAgent = useFileLibraryStore((s) => s.agentFilter)
   const openLibrary = useFileLibraryStore((s) => s.openLibrary)
   const closeLibrary = useFileLibraryStore((s) => s.close)
   // Data library: every datastore table the agents keep, summarised.
   const dataOpen = useDataLibraryStore((s) => s.open)
+  const dataAgent = useDataLibraryStore((s) => s.agentFilter)
   const openData = useDataLibraryStore((s) => s.openData)
   const closeData = useDataLibraryStore((s) => s.close)
   useEffect(() => {
@@ -329,10 +370,14 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
     }
   }), [agents, processes])
 
+  // Chats opened so far: a phone shows the chat for each, even the one it
+  // left for the list (its id doesn't change then).
+  const [chatOpens, setChatOpens] = useState(0)
   const handleOpen = (a: SimpleAgent) => {
     // An existing session survives the agent stopping; openChat just
     // re-activates it (stale host/port are ignored for a known key).
     if (!a.reachable && !useChatStore.getState().sessions.has(a.id)) return
+    setChatOpens((n) => n + 1)
     if (a.kind === 'shared') { openSharedChat(a.sharedRef!, a.name, a.ownerName || ''); return }
     openChat(a.id, a.name, a.host, a.port, a.auth)
   }
@@ -475,16 +520,38 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
     }
   }
 
-  // The kiosk's "⋯" on an agent. Instructions, Settings and Remove are for the
-  // user's own agents only — not one shared with them, a local one, or one
-  // Flight Deck runs itself.
+  // The kiosk's "⋯" on an agent. Its files and data, as the kiosk has no right
+  // column: an agent the libraries index opens in them, filtered to it. Every
+  // agent also has the column's panels in a dialog ("Files & data"): what the
+  // agent itself lists, which can be more than the library has — a type it
+  // doesn't index, a file in a VFS or linked folder (a shared agent only when
+  // its owner's deck gives members some). Instructions, Settings and Remove
+  // are for the user's own agents only — not one shared with them, a local
+  // one, or one Flight Deck runs itself.
   const agentMenuItems = (a: SimpleAgent): AgentMenuItem[] => {
-    if (a.kind === 'shared') return []
+    if (a.kind === 'shared') {
+      return agentPanels(a.id, memberWorkspace, sharedAgents).region === 'member'
+        ? [{ icon: FolderOpen, label: 'Files & data', hint: 'What everyone who uses it can open', onSelect: () => setFilesDataId(a.id) }]
+        : []
+    }
     const up = a.reachable && !booting.has(a.id) && !switching.has(a.id)
     const items: AgentMenuItem[] = [{
       icon: Info, label: 'Info', hint: up ? 'Its intentions and topics' : 'Power it on to see its intentions and topics',
       onSelect: () => setAgentInfoId(a.id), disabled: !up,
     }]
+    const indexed = inLibraries(a)
+    if (indexed) {
+      items.push(
+        { icon: LibraryBig, label: 'Files', hint: 'Its files in the File library', onSelect: () => openLibrary(a.startKey) },
+        { icon: Database, label: 'Data', hint: 'Its tables in the Data library', onSelect: () => openData(a.startKey) },
+      )
+    }
+    // Read from the agent itself: a stopped one has none to show.
+    items.push({
+      icon: FolderOpen, label: 'Files & data',
+      hint: !up ? 'Its files and tables show while it runs' : indexed ? 'Everything it keeps, live' : 'Its files and datastore tables',
+      onSelect: () => setFilesDataId(a.id), disabled: !up,
+    })
     if ((a.kind === 'docker' || a.kind === 'process') && !a.managed) {
       items.push(
         { icon: BookOpen, label: 'Instructions', hint: 'What it should always keep in mind', onSelect: () => setAgentInstructionsId(a.id) },
@@ -500,6 +567,7 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
   const agentInstructions = agentInstructionsId ? agents.find((a) => a.id === agentInstructionsId) : undefined
   const agentSettings = agentSettingsId ? agents.find((a) => a.id === agentSettingsId) : undefined
   const agentRemove = agentRemoveId ? agents.find((a) => a.id === agentRemoveId) : undefined
+  const filesData = filesDataId ? agents.find((a) => a.id === filesDataId) : undefined
 
   const refresh = () => { fetchContainers(); fetchProcesses(); fetchShared(); probeAll() }
 
@@ -532,6 +600,25 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
     closeData()
     handleOpen(a)
   }
+  // The library's "Everything it keeps": the agent's own files and data
+  // (its "⋯" → Files & data), in place of the library.
+  const openLibraryLive = (slug: string) => {
+    const a = agents.find((x) => x.id === `proc-${slug}`)
+    const notify = useNotificationStore.getState().add
+    if (!a || !a.reachable) { notify('warning', 'Agent is off', 'Power the agent on to see everything it keeps.'); return }
+    if (booting.has(a.id)) { notify('info', 'Agent is starting', `${a.name} is still starting. Try again once it's up.`); return }
+    if (switching.has(a.id)) { notify('info', 'One moment', `${a.name} is being switched on or off. Try again in a moment.`); return }
+    closeLibrary()
+    setFilesDataId(a.id)
+  }
+  // Whether that opens now — the library offers it only then.
+  const libraryLiveReady = (slug: string) => {
+    const a = agents.find((x) => x.id === `proc-${slug}`)
+    return !!a && a.reachable && !booting.has(a.id) && !switching.has(a.id)
+  }
+  // What a phone's Back closes before it leaves a chat (or Flight Deck).
+  const phoneOverlayOpen = libraryOpen || dataOpen || !!filesData
+  const closePhoneOverlays = () => { closeLibrary(); closeData(); setFilesDataId(null) }
   const scheduledConnections = () => {
     closeScheduled()
     if (locked) { openConnections(); return }
@@ -608,6 +695,7 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
 
       {locked && settingsOpen && (
         <KioskSettingsDialog
+          onAdmin={adminSwitch ? () => { setSettingsOpen(false); leaveKioskView() } : undefined}
           onClose={() => setSettingsOpen(false)}
           onRefresh={() => { refresh(); setSettingsOpen(false) }}
           onConnections={() => { setSettingsOpen(false); openConnections() }}
@@ -645,12 +733,19 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
       )}
       {libraryOpen && (
         <KioskWideDialog label="File library" phone={isMobile} onClose={closeLibrary} widest>
-          <FileLibrary phone={isMobile} initialAgent={libraryAgent} onClose={closeLibrary} onOpenAgent={openLibraryAgent} />
+          <FileLibrary
+            phone={isMobile}
+            initialAgent={libraryAgent}
+            onClose={closeLibrary}
+            onOpenAgent={openLibraryAgent}
+            onOpenLive={locked ? openLibraryLive : undefined}
+            liveReady={locked ? libraryLiveReady : undefined}
+          />
         </KioskWideDialog>
       )}
       {dataOpen && (
         <KioskWideDialog label="Data library" phone={isMobile} onClose={closeData} widest>
-          <DataLibrary phone={isMobile} onClose={closeData} onOpenAgent={openLibraryAgent} />
+          <DataLibrary phone={isMobile} initialAgent={dataAgent} onClose={closeData} onOpenAgent={openLibraryAgent} />
         </KioskWideDialog>
       )}
       {locked && agentInfo && (
@@ -675,12 +770,19 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
           agent={agentRemove}
           busy={!!sessionInfo.get(agentRemove.id)?.busy}
           onRemove={() => handleRemove(agentRemove)}
-          onOpenLibrary={agentRemove.kind === 'process'
+          onOpenLibrary={inLibraries(agentRemove)
             ? () => { setAgentRemoveId(null); openLibrary(agentRemove.startKey) }
+            : undefined}
+          onOpenData={inLibraries(agentRemove)
+            ? () => { setAgentRemoveId(null); openData(agentRemove.startKey) }
             : undefined}
           onClose={() => setAgentRemoveId(null)}
         />
       )}
+      {/* A phone has the full-screen sheet its chat header opens. */}
+      {locked && filesData && (isMobile
+        ? <PhoneFilesSheet agentId={filesData.id} agentName={filesData.name} onClose={() => setFilesDataId(null)} />
+        : <KioskFilesDataDialog agentId={filesData.id} agentName={filesData.name} onClose={() => setFilesDataId(null)} />)}
       {locked && connectionsOpen && <KioskConnectionsDialog initialTab={connectionsTab} onClose={() => setConnectionsOpen(false)} />}
       {locked && profileOpen && <KioskProfileDialog onClose={() => setProfileOpen(false)} />}
 
@@ -719,6 +821,10 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
           onData={() => openData()}
           menuFor={menuFor}
           locked={locked}
+          adminSwitch={adminSwitch}
+          overlayOpen={phoneOverlayOpen}
+          onCloseOverlays={closePhoneOverlays}
+          chatOpens={chatOpens}
         />
         {dialogs}
       </>
@@ -748,6 +854,7 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
         onData={() => openData()}
         menuFor={menuFor}
         locked={locked}
+        adminSwitch={adminSwitch}
       />
 
       <main className="flex min-w-0 flex-1 flex-col overflow-hidden" style={{ minWidth: 320 }}>
@@ -756,14 +863,17 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
           : <EmptyChat hasAgents={agents.length > 0} onSpawn={goSpawn} locked={locked} onGuide={locked ? () => setGuideOpen(true) : undefined} />}
       </main>
 
-      <ContextColumn
-        agentId={activeAgentId}
-        agentName={activeSessionName}
-        onOptions={!locked && activeAgent && activeAgent.kind !== 'shared' ? () => setOptionsAgent(activeAgent) : undefined}
-        menu={menuFor && activeAgent && menuFor(activeAgent).length > 0
-          ? <AgentMenu agentName={activeAgent.name} items={menuFor(activeAgent)} shown />
-          : undefined}
-      />
+      {/* The kiosk's files and data are the left column's Library and Data —
+          the agents they index, with the same actions — and an agent's "⋯"
+          (the libraries filtered to it, and this column's panels in a
+          dialog), so it has no right column. */}
+      {!locked && (
+        <ContextColumn
+          agentId={activeAgentId}
+          agentName={activeSessionName}
+          onOptions={activeAgent && activeAgent.kind !== 'shared' ? () => setOptionsAgent(activeAgent) : undefined}
+        />
+      )}
 
       {dialogs}
     </div>
@@ -777,7 +887,9 @@ export function SimpleLayout({ locked = false }: { locked?: boolean }) {
 // the Getting started guide, and sign-out (how a shared kiosk hands the
 // screen to the next person).
 
-function KioskSettingsDialog({ onClose, onRefresh, onConnections, onProfile, onGuide, onScheduled, onLibrary, onData }: {
+function KioskSettingsDialog({ onAdmin, onClose, onRefresh, onConnections, onProfile, onGuide, onScheduled, onLibrary, onData }: {
+  /** The desktop app's admin in the users' kiosk: back to the Admin console. */
+  onAdmin?: () => void
   onClose: () => void
   onRefresh: () => void
   onConnections: () => void
@@ -800,6 +912,7 @@ function KioskSettingsDialog({ onClose, onRefresh, onConnections, onProfile, onG
 
   const dark = theme === 'dark'
   const tiles: { icon: typeof Plug; title: string; detail: string; onClick: () => void }[] = [
+    ...(onAdmin ? [{ icon: ShieldCheck, title: 'Switch to admin view', detail: 'Models, archetypes, connections and settings', onClick: onAdmin }] : []),
     { icon: dark ? Sun : Moon, title: dark ? 'Light theme' : 'Dark theme', detail: `Switch to the ${dark ? 'light' : 'dark'} look`, onClick: toggleTheme },
     { icon: Plug, title: 'Connections', detail: 'Google, Microsoft, MCP and Jev', onClick: onConnections },
     { icon: AlarmClock, title: 'Scheduled tasks', detail: 'Your agents on a timer — results by chat or email', onClick: onScheduled },
@@ -1014,7 +1127,7 @@ function ToolTiles({ onScheduled, scheduledCount, scheduledRunning, onLibrary, o
 
 function AgentsColumn({
   agents, activeAgentId, sessionInfo, switching, booting, onOpen, onPower, onLeave, onRefresh, onSpawn, onOptions, onSettings, onInfo,
-  onScheduled, scheduledCount = 0, scheduledRunning = false, onLibrary, onData, menuFor, locked = false,
+  onScheduled, scheduledCount = 0, scheduledRunning = false, onLibrary, onData, menuFor, locked = false, adminSwitch = false,
 }: {
   agents: SimpleAgent[]
   activeAgentId: string | null
@@ -1045,6 +1158,8 @@ function AgentsColumn({
   /** Kiosk only: what an agent's "⋯" offers (Info, Settings, Remove). */
   menuFor?: (a: SimpleAgent) => AgentMenuItem[]
   locked?: boolean
+  /** The desktop app's admin in the kiosk: the way back to Admin. */
+  adminSwitch?: boolean
 }) {
   const open = useUIStore((s) => s.simpleLeftOpen)
   const setOpen = useUIStore((s) => s.setSimpleLeftOpen)
@@ -1079,8 +1194,8 @@ function AgentsColumn({
               <LayoutDashboard className="h-4 w-4" />
             </button>
           )}
-          {consoleAdmin && (
-            <button onClick={() => openConsole()} className={iconBtn} title="Admin console — models, archetypes, connections, users, settings">
+          {(consoleAdmin || adminSwitch) && (
+            <button onClick={adminSwitch ? leaveKioskView : () => openConsole()} className={iconBtn} title={adminSwitch ? 'Switch to admin view' : 'Admin console — models, archetypes, connections, users, settings'}>
               <ShieldCheck className="h-4 w-4" />
             </button>
           )}
@@ -1214,7 +1329,7 @@ function AgentsColumn({
     >
       {/* Header */}
       <div className="flex h-14 items-center justify-between border-b border-zinc-800 px-3">
-        <BrandMark connected={wsConnected} />
+        <BrandMark connected={wsConnected} caption={adminSwitch ? 'User view' : undefined} />
         <div className="flex items-center gap-0.5">
           <NotificationBell align="left" />
           {!locked && (
@@ -1232,13 +1347,6 @@ function AgentsColumn({
           </button>
         </div>
       </div>
-
-      {/* The desktop app: this view ⇄ the Admin console */}
-      {consoleAdmin && desktopApp && (
-        <div className="border-b border-zinc-800 p-2">
-          <ShellModeSwitch current="user" />
-        </div>
-      )}
 
       {/* List header */}
       <div className="flex items-center justify-between px-3 pt-3 pb-1">
@@ -1432,6 +1540,16 @@ function AgentsColumn({
               <Info className="h-[18px] w-[18px]" />
             </button>
           )}
+          {adminSwitch && (
+            <button
+              onClick={leaveKioskView}
+              title="Switch to admin view — models, archetypes, connections, settings"
+              aria-label="Switch to admin view"
+              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-violet-600 transition-colors hover:bg-violet-500/10 dark:text-violet-400"
+            >
+              <ShieldCheck className="h-[18px] w-[18px]" />
+            </button>
+          )}
         </div>
       ) : (
         <div className="flex items-center justify-between gap-2 border-t border-zinc-800 px-2 py-1.5">
@@ -1495,7 +1613,9 @@ function EmptyChat({ hasAgents, onSpawn, locked = false, onGuide }: {
         </h2>
         <p className="text-sm text-zinc-400">
           {hasAgents
-            ? 'Choose an agent on the left to start a conversation. Its files and data show up on the right.'
+            ? locked
+              ? 'Choose an agent on the left to start a conversation. What it saves for you lands in Library and Data, bottom left, and under the agent’s ⋯ → Files & data.'
+              : 'Choose an agent on the left to start a conversation. Its files and data show up on the right.'
             : locked
               ? 'Create an agent from an archetype to start chatting.'
               : 'Spawn your first agent to start chatting.'}
@@ -1531,38 +1651,11 @@ function ContextColumn({ agentId, agentName, onOptions, menu }: {
   /** Kiosk only: the active agent's "⋯". */
   menu?: ReactNode
 }) {
-  // A shared agent: on a process agent, on a deck that serves them, the
-  // member's commons panels (the agent's saved/ files and datastore, read
-  // through Flight Deck's member routes); otherwise chat only — a Docker
-  // agent, an older Flight Deck.
-  const shared = !!agentId && agentId.startsWith(SHARED_PREFIX)
-  const memberWorkspace = useSharedAgentStore((s) => s.memberWorkspace)
-  const sharedRow = useSharedAgentStore((s) =>
-    shared ? s.agents.find((a) => sharedContainerId(a.agent_ref) === agentId) : undefined)
-  const vis = workspaceVisible(memberWorkspace, sharedCaps(sharedRow))
   const open = useUIStore((s) => s.simpleRightOpen)
   const setOpen = useUIStore((s) => s.setSimpleRightOpen)
   // The handle is on the LEFT edge of a right-docked column, so dragging left
   // makes it wider.
   const width = usePersistedSize('fd:simple-right-width', 320, 240, 640, 'x', 'backward')
-  // Measure the height available to the files+datastore split so the files
-  // pane can never be taller than (region − a datastore minimum).
-  const regionRef = useRef<HTMLDivElement>(null)
-  const [regionH, setRegionH] = useState(0)
-  // Which region is mounted (own split, a member's panels, chat-only): the
-  // observer follows it when the chat or the member panels change.
-  const region = !agentId ? '' : !shared ? 'own' : sharedRow && (vis.files || vis.datastore) ? 'member' : 'chat'
-  useEffect(() => {
-    const el = regionRef.current
-    if (!el || typeof ResizeObserver === 'undefined') return
-    const ro = new ResizeObserver(() => setRegionH(el.clientHeight))
-    ro.observe(el)
-    setRegionH(el.clientHeight)
-    return () => ro.disconnect()
-  }, [open, region])
-  const DATASTORE_MIN = 140
-  const filesLiveMax = regionH > 0 ? Math.max(120, regionH - DATASTORE_MIN) : undefined
-  const filesH = usePersistedSize('fd:simple-right-files-height', 360, 120, 1400, 'y', 'forward', filesLiveMax)
 
   if (!open) {
     return (
@@ -1615,75 +1708,8 @@ function ContextColumn({ agentId, agentName, onOptions, menu }: {
         </div>
       </div>
 
-      {agentId && shared && sharedRow && (vis.files || vis.datastore) ? (
-        <div ref={regionRef} className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          {vis.files && vis.datastore ? (
-            <>
-              {/* Same split as the owner's: files on top, datastore below. */}
-              <div className="min-h-[120px] overflow-hidden" style={{ height: filesH.size }}>
-                <SharedFilesPanel
-                  key={agentId}
-                  agentRef={sharedRow.agent_ref}
-                  agentName={agentName}
-                  ownerName={sharedRow.owner_name || sharedRow.owner_email}
-                />
-              </div>
-              <div
-                onMouseDown={filesH.onResizeStart}
-                title="Drag to resize"
-                className="h-1 shrink-0 cursor-row-resize border-y border-zinc-800 bg-zinc-900 transition-colors hover:bg-violet-500/40"
-              />
-              <div className="min-h-[120px] flex-1 overflow-hidden">
-                <SharedDatastorePanel
-                  key={agentId}
-                  agentRef={sharedRow.agent_ref}
-                  agentName={agentName}
-                  ownerName={sharedRow.owner_name || sharedRow.owner_email}
-                />
-              </div>
-            </>
-          ) : vis.files ? (
-            <div className="min-h-0 flex-1 overflow-hidden">
-              <SharedFilesPanel
-                key={agentId}
-                agentRef={sharedRow.agent_ref}
-                agentName={agentName}
-                ownerName={sharedRow.owner_name || sharedRow.owner_email}
-              />
-            </div>
-          ) : (
-            <div className="min-h-0 flex-1 overflow-hidden">
-              <SharedDatastorePanel
-                key={agentId}
-                agentRef={sharedRow.agent_ref}
-                agentName={agentName}
-                ownerName={sharedRow.owner_name || sharedRow.owner_email}
-              />
-            </div>
-          )}
-        </div>
-      ) : agentId && shared ? (
-        <div className="flex flex-1 items-center justify-center px-6 text-center text-xs text-zinc-500">
-          {CHAT_ONLY_TEXT}
-        </div>
-      ) : agentId ? (
-        <div ref={regionRef} className="flex min-h-0 flex-1 flex-col overflow-hidden">
-          {/* Top: files. Shrinkable with a floor so a stale oversized height
-              can't push the datastore off-screen. */}
-          <div className="min-h-[120px] overflow-hidden" style={{ height: filesH.size }}>
-            <AgentFilesPanel key={agentId} containerId={agentId} />
-          </div>
-          {/* Divider (drag to resize files vs datastore) */}
-          <div
-            onMouseDown={filesH.onResizeStart}
-            title="Drag to resize"
-            className="h-1 shrink-0 cursor-row-resize border-y border-zinc-800 bg-zinc-900 transition-colors hover:bg-violet-500/40"
-          />
-          {/* Bottom: datastore tables — keeps a floor so it never hits 0. */}
-          <div className="min-h-[120px] flex-1 overflow-hidden">
-            <AgentDatastorePanel key={agentId} containerId={agentId} />
-          </div>
-        </div>
+      {agentId ? (
+        <FilesDataPanels agentId={agentId} agentName={agentName} />
       ) : (
         <div className="flex flex-1 items-center justify-center px-6 text-center text-xs text-zinc-500">
           Open a chat to see that agent's files and datastore here.
@@ -1693,17 +1719,123 @@ function ContextColumn({ agentId, agentName, onOptions, menu }: {
   )
 }
 
+// One agent's files over its datastore — the right column's body, and the
+// kiosk's "Files & data" dialog. A shared agent: on a process agent, on a deck
+// that serves them, the member's commons panels (the agent's saved/ files and
+// datastore, read through Flight Deck's member routes); otherwise chat only —
+// a Docker agent, an older Flight Deck.
+function FilesDataPanels({ agentId, agentName }: { agentId: string; agentName: string }) {
+  const panels = useAgentPanels(agentId)
+  // Measure the height available to the files+datastore split so the files
+  // pane can never be taller than (region − a datastore minimum).
+  const regionRef = useRef<HTMLDivElement>(null)
+  const [regionH, setRegionH] = useState(0)
+  // Which region is mounted (own split, a member's panels, chat-only): the
+  // observer follows it when the chat or the member panels change.
+  useEffect(() => {
+    const el = regionRef.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => setRegionH(el.clientHeight))
+    ro.observe(el)
+    setRegionH(el.clientHeight)
+    return () => ro.disconnect()
+  }, [panels.region])
+  const DATASTORE_MIN = 140
+  const filesLiveMax = regionH > 0 ? Math.max(120, regionH - DATASTORE_MIN) : undefined
+  const filesH = usePersistedSize('fd:simple-right-files-height', 360, 120, 1400, 'y', 'forward', filesLiveMax)
+
+  if (panels.region === 'chat') {
+    return (
+      <div className="flex flex-1 items-center justify-center px-6 text-center text-xs text-zinc-500">
+        {CHAT_ONLY_TEXT}
+      </div>
+    )
+  }
+
+  if (panels.region === 'member') {
+    const { row, files, datastore } = panels
+    const owner = row.owner_name || row.owner_email
+    return (
+      <div ref={regionRef} className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {files && datastore ? (
+          <>
+            {/* Same split as the owner's: files on top, datastore below. */}
+            <div className="min-h-[120px] overflow-hidden" style={{ height: filesH.size }}>
+              <SharedFilesPanel key={agentId} agentRef={row.agent_ref} agentName={agentName} ownerName={owner} />
+            </div>
+            <div
+              onMouseDown={filesH.onResizeStart}
+              title="Drag to resize"
+              className="h-1 shrink-0 cursor-row-resize border-y border-zinc-800 bg-zinc-900 transition-colors hover:bg-violet-500/40"
+            />
+            <div className="min-h-[120px] flex-1 overflow-hidden">
+              <SharedDatastorePanel key={agentId} agentRef={row.agent_ref} agentName={agentName} ownerName={owner} />
+            </div>
+          </>
+        ) : files ? (
+          <div className="min-h-0 flex-1 overflow-hidden">
+            <SharedFilesPanel key={agentId} agentRef={row.agent_ref} agentName={agentName} ownerName={owner} />
+          </div>
+        ) : (
+          <div className="min-h-0 flex-1 overflow-hidden">
+            <SharedDatastorePanel key={agentId} agentRef={row.agent_ref} agentName={agentName} ownerName={owner} />
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  return (
+    <div ref={regionRef} className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      {/* Top: files. Shrinkable with a floor so a stale oversized height
+          can't push the datastore off-screen. */}
+      <div className="min-h-[120px] overflow-hidden" style={{ height: filesH.size }}>
+        <AgentFilesPanel key={agentId} containerId={agentId} />
+      </div>
+      {/* Divider (drag to resize files vs datastore) */}
+      <div
+        onMouseDown={filesH.onResizeStart}
+        title="Drag to resize"
+        className="h-1 shrink-0 cursor-row-resize border-y border-zinc-800 bg-zinc-900 transition-colors hover:bg-violet-500/40"
+      />
+      {/* Bottom: datastore tables — keeps a floor so it never hits 0. */}
+      <div className="min-h-[120px] flex-1 overflow-hidden">
+        <AgentDatastorePanel key={agentId} containerId={agentId} />
+      </div>
+    </div>
+  )
+}
+
+// ── Kiosk: an agent's files and data in a dialog ─────────────────────
+//
+// The kiosk has no right column: any agent's "⋯" → Files & data shows the
+// column's panels here instead. They read the agent itself, so they hold
+// what the File and Data libraries don't: the agents they don't index (a
+// Docker or local one, one Flight Deck runs itself, one shared with the
+// user) and, for one they do, the files they leave out.
+
+function KioskFilesDataDialog({ agentId, agentName, onClose }: { agentId: string; agentName: string; onClose: () => void }) {
+  return (
+    <AgentDialog title="Files & data" icon={FolderOpen} agentName={agentName} size="md" onClose={onClose}>
+      <FilesDataPanels agentId={agentId} agentName={agentName} />
+    </AgentDialog>
+  )
+}
+
 // ── Phone ────────────────────────────────────────────────────────────
 //
 // One screen at a time: the agent list, or one chat filling the screen with a
 // back arrow to the list (the phone's own Back gesture does the same). The
-// active agent's files and datastore open as a full-screen sheet. Touch
-// targets are at least 40px, the layout follows the visible viewport (dvh),
-// and the bottom bar keeps clear of the home indicator.
+// active agent's files and datastore open as a full-screen sheet (in the
+// kiosk, the File library for an agent it indexes). The phone's Back closes a
+// files view first (the sheet, a library, an agent's Files & data), then the
+// chat. Touch targets are at least 40px, the layout follows the visible
+// viewport (dvh), and the bottom bar keeps clear of the home indicator.
 
 function PhoneLayout({
   agents, activeAgent, activeAgentId, activeSessionName, sessionInfo, switching, booting,
-  onOpen, onPower, onLeave, onSpawn, onSettings, onInfo, onScheduled, scheduledRunning = false, onLibrary, onData, menuFor, locked,
+  onOpen, onPower, onLeave, onSpawn, onSettings, onInfo, onScheduled, scheduledRunning = false, onLibrary, onData, menuFor, locked, adminSwitch = false,
+  overlayOpen = false, onCloseOverlays, chatOpens = 0,
 }: {
   agents: SimpleAgent[]
   activeAgent: SimpleAgent | null
@@ -1725,45 +1857,91 @@ function PhoneLayout({
   /** Kiosk only: what an agent's "⋯" offers (Info, Settings, Remove). */
   menuFor?: (a: SimpleAgent) => AgentMenuItem[]
   locked: boolean
+  adminSwitch?: boolean
+  /** The File or Data library, or an agent's Files & data, is open (they
+   *  live a level up): Back closes them before anything else. */
+  overlayOpen?: boolean
+  onCloseOverlays?: () => void
+  /** Counts the chats opened (see SimpleLayout's handleOpen). */
+  chatOpens?: number
 }) {
   const wsConnected = useAgentStore((s) => s.wsConnected)
   const activeChatId = useChatStore((s) => s.activeChatId)
   const [search, setSearch] = useState('')
   const [filesOpen, setFilesOpen] = useState(false)
-  // Back to the list keeps the chat open; opening any chat (a tap, or a new
-  // agent that just came up) shows it again.
+  // Back to the list keeps the chat open; opening any chat shows it again: a
+  // tap, a new agent that just came up, a library's "Agent chat" — also the
+  // one left for the list, whose id stays the same (`chatOpens` still
+  // counts it). Set while rendering, not in an effect after: a library that
+  // closes as the chat opens leaves no render with neither in front, which
+  // would give up the Back entry and set it again at once.
   const [atList, setAtList] = useState(false)
-  useEffect(() => { setAtList(false) }, [activeChatId])
-  const showChat = !!activeAgentId && !atList
-  // A tap shows the chat even when it is the one already open: then
-  // activeChatId doesn't change, so the effect above never fires.
-  const openAgent = (a: SimpleAgent) => {
-    onOpen(a)
+  const [opened, setOpened] = useState({ chat: activeChatId, n: chatOpens })
+  if (opened.chat !== activeChatId || opened.n !== chatOpens) {
+    setOpened({ chat: activeChatId, n: chatOpens })
     setAtList(false)
   }
+  const showChat = !!activeAgentId && !atList
 
-  // The phone's Back: while a chat is open it returns to the list instead of
-  // leaving Flight Deck.
+  // The phone's Back: a files view in front closes first (staying in the
+  // chat), then an open chat returns to the list — instead of leaving Flight
+  // Deck. One history entry stands for both; it is set again when Back has
+  // closed a files view and the chat is still there to go back from.
+  const overlay = filesOpen || overlayOpen
+  const layered = showChat || overlay
   const pushed = useRef(false)
-  useEffect(() => {
-    if (showChat && !pushed.current) {
+  // Our own Back is on its way (the entry given up once nothing is in front;
+  // the timer stands in should no popstate come): that popstate isn't the
+  // user's, and an entry needed again meanwhile waits for it — pushed before
+  // that Back lands, the browser takes it away too.
+  const unwinding = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const popRef = useRef({ layered, overlay, showChat, onCloseOverlays })
+  useEffect(() => { popRef.current = { layered, overlay, showChat, onCloseOverlays } })
+  // Our Back has landed: whatever came to the front meanwhile gets its entry.
+  const unwound = useCallback(() => {
+    if (unwinding.current) clearTimeout(unwinding.current)
+    unwinding.current = null
+    if (popRef.current.layered && !pushed.current) {
       window.history.pushState({ fdPhoneChat: true }, '')
       pushed.current = true
-    } else if (!showChat && pushed.current) {
-      pushed.current = false
-      if (window.history.state?.fdPhoneChat) window.history.back()
     }
-  }, [showChat])
+  }, [])
+  useEffect(() => {
+    if (unwinding.current) return
+    if (layered && !pushed.current) {
+      window.history.pushState({ fdPhoneChat: true }, '')
+      pushed.current = true
+    } else if (!layered && pushed.current) {
+      pushed.current = false
+      if (window.history.state?.fdPhoneChat) {
+        unwinding.current = setTimeout(unwound, 1500)
+        window.history.back()
+      }
+    }
+  }, [layered, unwound])
   useEffect(() => {
     const onPop = () => {
+      if (unwinding.current) { unwound(); return }
       if (!pushed.current) return
       pushed.current = false
-      setFilesOpen(false)
+      const cur = popRef.current
+      if (cur.overlay) {
+        setFilesOpen(false)
+        cur.onCloseOverlays?.()
+        if (cur.showChat) {
+          window.history.pushState({ fdPhoneChat: true }, '')
+          pushed.current = true
+        }
+        return
+      }
       setAtList(true)
     }
     window.addEventListener('popstate', onPop)
-    return () => window.removeEventListener('popstate', onPop)
-  }, [])
+    return () => {
+      window.removeEventListener('popstate', onPop)
+      if (unwinding.current) clearTimeout(unwinding.current)
+    }
+  }, [unwound])
 
   const searchable = agents.length > 6
   const shown = useMemo(() => {
@@ -1778,6 +1956,15 @@ function PhoneLayout({
     const a = activeAgent
     const info = activeAgentId ? sessionInfo.get(activeAgentId) : undefined
     const menu = a && menuFor ? menuFor(a) : []
+    // The kiosk keeps an agent's files in the File library when it indexes
+    // that agent: the folder opens there, filtered to it (its "Everything it
+    // keeps" and the "⋯" → Files & data open the sheet). Any other agent
+    // (and every one outside the kiosk) keeps the sheet.
+    const filesInLibrary = locked && !!a && inLibraries(a)
+    const openFiles = () => {
+      if (filesInLibrary) useFileLibraryStore.getState().openLibrary(a.startKey)
+      else setFilesOpen(true)
+    }
     return (
       <div className="flex h-[100dvh] flex-col overflow-hidden bg-zinc-950">
         <header className="flex h-14 shrink-0 items-center gap-1 border-b border-zinc-800 px-1.5">
@@ -1793,7 +1980,12 @@ function PhoneLayout({
               </div>
             </div>
           </div>
-          <button onClick={() => setFilesOpen(true)} className={phoneBtn} aria-label="Files and data" title="Files and data">
+          <button
+            onClick={openFiles}
+            className={phoneBtn}
+            aria-label={filesInLibrary ? 'Files in the File library' : 'Files and data'}
+            title={filesInLibrary ? 'Files in the File library' : 'Files and data'}
+          >
             <FolderOpen className="h-5 w-5" />
           </button>
           {a && menu.length > 0 && <AgentMenu agentName={a.name} items={menu} phone />}
@@ -1811,7 +2003,12 @@ function PhoneLayout({
   return (
     <div className="flex h-[100dvh] flex-col overflow-hidden bg-zinc-950">
       <header className="flex h-14 shrink-0 items-center gap-1 border-b border-zinc-800 pl-3 pr-1.5">
-        <div className="min-w-0 flex-1"><BrandMark connected={wsConnected} /></div>
+        <div className="min-w-0 flex-1"><BrandMark connected={wsConnected} caption={adminSwitch ? 'User view' : undefined} /></div>
+        {adminSwitch && (
+          <button onClick={leaveKioskView} className={phoneBtn} aria-label="Switch to admin view" title="Switch to admin view">
+            <ShieldCheck className="h-5 w-5 text-violet-600 dark:text-violet-400" />
+          </button>
+        )}
         <NotificationBell />
         {onScheduled && (
           <button onClick={onScheduled} className={`${phoneBtn} relative`} aria-label="Scheduled tasks" title="Scheduled tasks">
@@ -1892,7 +2089,7 @@ function PhoneLayout({
                 }`}
               >
                 <button
-                  onClick={() => openAgent(a)}
+                  onClick={() => onOpen(a)}
                   disabled={!openable}
                   className="flex min-w-0 flex-1 items-center gap-3 py-3.5 pl-3.5 text-left disabled:opacity-60"
                 >
@@ -1962,18 +2159,19 @@ function PhoneLayout({
 // The active agent's files and datastore, full screen, one at a time.
 function PhoneFilesSheet({ agentId, agentName, onClose }: { agentId: string; agentName: string; onClose: () => void }) {
   const [tab, setTab] = useState<'files' | 'data'>('files')
-  const shared = agentId.startsWith(SHARED_PREFIX)
-  const memberWorkspace = useSharedAgentStore((s) => s.memberWorkspace)
-  const sharedRow = useSharedAgentStore((s) =>
-    shared ? s.agents.find((a) => sharedContainerId(a.agent_ref) === agentId) : undefined)
-  const vis = workspaceVisible(memberWorkspace, sharedCaps(sharedRow))
-  const hasFiles = !shared || (!!sharedRow && vis.files)
-  const hasData = !shared || (!!sharedRow && vis.datastore)
+  const panels = useAgentPanels(agentId)
+  const hasFiles = panels.region === 'own' || (panels.region === 'member' && panels.files)
+  const hasData = panels.region === 'own' || (panels.region === 'member' && panels.datastore)
   const current = tab === 'files' ? (hasFiles ? 'files' : 'data') : (hasData ? 'data' : 'files')
-  const owner = sharedRow ? sharedRow.owner_name || sharedRow.owner_email : ''
+  const owner = panels.region === 'member' ? panels.row.owner_name || panels.row.owner_email : ''
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      // As AgentDialog: a viewer, link dialog or table open inside marks the
+      // Esc it used to close itself.
+      setTimeout(() => { if (!e.defaultPrevented) onClose() }, 0)
+    }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
@@ -2012,10 +2210,10 @@ function PhoneFilesSheet({ agentId, agentName, onClose }: { agentId: string; age
       <div className="min-h-0 flex-1 overflow-hidden pb-[env(safe-area-inset-bottom)]">
         {!hasFiles && !hasData ? (
           <div className="flex h-full items-center justify-center px-8 text-center text-sm text-zinc-500">{CHAT_ONLY_TEXT}</div>
-        ) : shared && sharedRow ? (
+        ) : panels.region === 'member' ? (
           current === 'files'
-            ? <SharedFilesPanel key={agentId} agentRef={sharedRow.agent_ref} agentName={agentName} ownerName={owner} />
-            : <SharedDatastorePanel key={agentId} agentRef={sharedRow.agent_ref} agentName={agentName} ownerName={owner} />
+            ? <SharedFilesPanel key={agentId} agentRef={panels.row.agent_ref} agentName={agentName} ownerName={owner} />
+            : <SharedDatastorePanel key={agentId} agentRef={panels.row.agent_ref} agentName={agentName} ownerName={owner} />
         ) : current === 'files' ? (
           <AgentFilesPanel key={agentId} containerId={agentId} />
         ) : (

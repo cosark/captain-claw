@@ -584,11 +584,11 @@ def _build_subprocess_env(*, slug: str) -> dict[str, str]:
     env["FD_APP_SLUG"] = slug
     # Cross-app SDK bootstrap. If FD itself was started with
     # FD_INTERNAL_URL set, honor that — multi-host deployments would
-    # need it. Otherwise assume same-host loopback on the standard FD
-    # port. The subprocess only needs to *reach* FD, not match the
-    # public URL.
-    env["FD_INTERNAL_URL"] = os.environ.get(
-        "FD_INTERNAL_URL", "http://127.0.0.1:25080",
+    # need it. Otherwise same-host loopback on the port this FD bound
+    # (server.main sets FD_PORT; the desktop app's FD is not on 25080).
+    # The subprocess only needs to *reach* FD, not match the public URL.
+    env["FD_INTERNAL_URL"] = os.environ.get("FD_INTERNAL_URL") or (
+        f"http://127.0.0.1:{os.environ.get('FD_PORT') or '25080'}"
     )
     try:
         # Deferred import so a stripped-down test environment without

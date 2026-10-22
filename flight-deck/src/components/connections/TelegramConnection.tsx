@@ -20,7 +20,8 @@ import TelegramInbox from './TelegramInbox'
 // Agents with a Telegram bot of their own keep it (agent settings); this card
 // is only the shared one.
 export default function TelegramConnection({ onStatus }: { onStatus?: (s: MyTelegram | null) => void }) {
-  const isAdmin = useAuthStore((s) => s.user?.role === 'admin')
+  // Not in the desktop app's users' kiosk (kioskView): the kiosk user is no admin.
+  const isAdmin = useAuthStore((s) => s.user?.role === 'admin' && !s.kioskView)
   const setView = useUIStore((s) => s.setView)
   const [me, setMe] = useState<MyTelegram | null>(null)
   const [agent, setAgent] = useState('')

@@ -10,6 +10,7 @@ import {
   AlertCircle,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   Minus,
   Forward,
   Paperclip,
@@ -22,12 +23,8 @@ import {
   ListChecks,
   Maximize2,
   Minimize2,
-  Play,
-  Trash2,
   AlertTriangle,
   CircleDot,
-  HelpCircle,
-  Wand2,
   Workflow,
   ListTodo,
   Users,
@@ -53,7 +50,7 @@ import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import { useShallow } from 'zustand/react/shallow'
-import { useChatStore, PLAN_LEVELS, LANE_MAIN, LANE_AUTO, LANES, laneKey, type PlanLevel, type NextStepOption, type QueuedMessage } from '../../stores/chatStore'
+import { useChatStore, PLAN_LEVELS, LANE_MAIN, LANE_AUTO, LANES, laneKey, type PlanLevel, type NextStepOption } from '../../stores/chatStore'
 import { useLocalAgentStore } from '../../stores/localAgentStore'
 import { useContainerStore } from '../../stores/containerStore'
 import { useProcessStore } from '../../stores/processStore'
@@ -78,9 +75,14 @@ import { paymentIntentOf, purchaseIntentOf } from '../../services/payments'
 import TraceTimeline from '../observability/TraceTimeline'
 import { AgentFilesPanel } from './AgentFilesPanel'
 import { AgentDatastorePanel } from './AgentDatastorePanel'
-import { QueuePlannerModal } from './QueuePlannerModal'
+import { QueuePanel, type QueueVariant } from './queue/QueuePanel'
+import { useQueueProgress, useQueueSignal } from './queue/queueHooks'
+import type { SignalTone } from './queue/queueModel'
+import { FOCUS } from './queue/QueueButton'
 import { usePersistedSize } from '../../hooks/usePersistedSize'
-import { useIsMobile } from '../../hooks/useMediaQuery'
+import { touchKeyboard, useIsMobile } from '../../hooks/useMediaQuery'
+import { fmtTokens } from '../../utils/format'
+import { agentFileViewUrl } from '../../utils/agentFileUrl'
 import { useQuotaStore } from '../../stores/quotaStore'
 import { PlanUsageBar } from '../common/PlanUsage'
 import type { ChatMessage, TokenUsage } from '../../services/agentChat'
@@ -194,6 +196,48 @@ export function ChatPanel({ variant = 'default' }: { variant?: 'default' | 'simp
   }, [planLevelMenuOpen])
   const activeId = activeChatId || ''
   const traceSpanCount = useTraceStore((s) => selectSpanCount(s, activeId))
+  // The queue toggle's badge: tasks left, and whether the queue needs you.
+  const queueSignal = useQueueSignal(activeId)
+
+  // The queue's "Show in chat" / "Answer in chat": scroll (and focus) inside
+  // THIS chat panel only — a phone first leaves the queue view, so the chat
+  // can mount before it is scrolled.
+  const rootRef = useRef<HTMLDivElement>(null)
+  const goToChat = useCallback((o: { messageId?: string; focusComposer?: boolean }) => {
+    // On a phone (either layout) the queue is a view of its own.
+    const phoneView = isMobile
+    if (phoneView) setPhoneQueueOpen(false)
+    window.setTimeout(() => {
+      const root = rootRef.current
+      const el = o.messageId ? root?.querySelector<HTMLElement>(`#${CSS.escape(`fd-msg-${o.messageId}`)}`) : null
+      if (o.messageId && el) {
+        scrollToMessage(o.messageId)
+        if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+          const bubble = (el.firstElementChild as HTMLElement | null) ?? el
+          bubble.animate?.(
+            [{ boxShadow: '0 0 0 2px rgb(139 92 246 / .6)' }, { boxShadow: '0 0 0 2px rgb(139 92 246 / 0)' }],
+            { duration: 1200 },
+          )
+        }
+      } else {
+        root?.querySelector('[data-fd-chat-end]')?.scrollIntoView({ behavior: 'smooth' })
+      }
+      // iOS may not raise its keyboard for a focus it didn't see a tap for.
+      if (o.focusComposer) root?.querySelector<HTMLTextAreaElement>('[data-fd-chat-input]')?.focus()
+    }, phoneView ? 120 : 0)
+  }, [isMobile])
+  // Stable, so the memoized queue doesn't re-render with every streamed token.
+  // Hiding the column hands the focus to the toggle that brings it back.
+  const hideQueue = useCallback(() => {
+    setDesktopQueueOpen(false)
+    requestAnimationFrame(() => {
+      const a = document.activeElement
+      if (!a || a === document.body || !a.isConnected) {
+        rootRef.current?.querySelector<HTMLElement>('[data-fd-queue-toggle]')?.focus()
+      }
+    })
+  }, [setDesktopQueueOpen])
+  const backToChat = useCallback(() => setPhoneQueueOpen(false), [])
 
   // The active session, keyed — its object identity changes only when THIS
   // session mutates, so other agents' events don't re-render the transcript.
@@ -257,25 +301,32 @@ export function ChatPanel({ variant = 'default' }: { variant?: 'default' | 'simp
   ]
 
   // On a phone the simple layout's own header names the agent: the tab bar
-  // goes, and its queue button moves onto the lane row.
+  // goes. On a phone in either layout the queue button sits on the lane row
+  // and the queue opens as a view of its own.
   const phoneSimple = simple && isMobile
+  const queueTitle = simpleQueueOpen
+    ? 'Hide queue'
+    : `Show queue${queueSignal.left ? ` · ${queueSignal.left} left` : ''}${queueSignal.tone === 'needs' ? ' · needs you' : ''}`
   const queueToggle = (
     <button
       onClick={() => setSimpleQueueOpen(!simpleQueueOpen)}
-      title={simpleQueueOpen ? 'Hide queue' : 'Show queue'}
-      aria-label={simpleQueueOpen ? 'Hide queue' : 'Show queue'}
-      className={`mr-1 shrink-0 rounded transition-colors ${phoneSimple ? 'p-2' : 'p-1'} ${
+      title={queueTitle}
+      aria-label={queueTitle}
+      aria-pressed={simpleQueueOpen}
+      data-fd-queue-toggle
+      className={`relative mr-1 shrink-0 rounded transition-colors ${FOCUS} ${isMobile ? 'p-2' : 'p-1'} ${
         simpleQueueOpen
           ? 'bg-violet-600/20 text-violet-400'
           : 'text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300'
       }`}
     >
       <ListTodo className="h-4 w-4" />
+      {!simpleQueueOpen && <QueueBadge signal={queueSignal} />}
     </button>
   )
 
   return (
-    <div className={`flex h-full flex-col bg-zinc-950/80 ${simple ? '' : 'border-l border-zinc-800'}`}>
+    <div ref={rootRef} className={`flex h-full flex-col bg-zinc-950/80 ${simple ? '' : 'border-l border-zinc-800'}`}>
       {/* Tab bar */}
       {!phoneSimple && (
       <div className="flex items-center border-b border-zinc-800 bg-zinc-900/60">
@@ -466,7 +517,7 @@ export function ChatPanel({ variant = 'default' }: { variant?: 'default' | 'simp
         agentId={session.containerId}
         activeLane={session.lane}
         agentName={session.containerName}
-        trailing={phoneSimple ? queueToggle : undefined}
+        trailing={isMobile ? queueToggle : undefined}
       />
 
       {/* Today's plan allowance; when it's spent the composer stays closed */}
@@ -547,11 +598,22 @@ export function ChatPanel({ variant = 'default' }: { variant?: 'default' | 'simp
       ) : (
         /* Chat content (optionally with queue panel on the left in fullscreen) */
         <div className="flex flex-1 overflow-hidden">
-          {(simple ? simpleQueueOpen : chatFullscreen) && (
-            <QueueSidebar sessionKey={session.key} agentId={session.containerId} queueOnly={simple || !!shared} shared={!!shared}
-              fill={simple && isMobile} />
+          {/* Simple layout: the column (desktop) or its own view (phone). Full
+              layout: the fullscreen sidebar — and on a phone, the same phone
+              view from the lane row's queue button. */}
+          {((simple || isMobile) ? simpleQueueOpen : chatFullscreen) && (
+            <QueueSidebar
+              sessionKey={session.key}
+              agentId={session.containerId}
+              queueOnly={simple || isMobile || !!shared}
+              shared={!!shared}
+              variant={isMobile ? 'phone' : simple ? 'column' : 'sidebar'}
+              onGoToChat={goToChat}
+              onHide={hideQueue}
+              onBack={backToChat}
+            />
           )}
-          {!(simple && isMobile && simpleQueueOpen) && (
+          {!(isMobile && simpleQueueOpen) && (
             <ChatContent
               session={session}
               sessionKey={session.key}
@@ -588,11 +650,12 @@ export function ChatPanel({ variant = 'default' }: { variant?: 'default' | 'simp
 }
 
 // Resolve the agent connection info for the current session
-function useAgentConnection(containerId: string) {
-  const containers = useContainerStore((s) => s.containers)
-  const localAgents = useLocalAgentStore((s) => s.agents)
-  const processes = useProcessStore((s) => s.processes)
-
+function resolveAgentConnection(
+  containerId: string,
+  containers: ReturnType<typeof useContainerStore.getState>['containers'],
+  localAgents: ReturnType<typeof useLocalAgentStore.getState>['agents'],
+  processes: ReturnType<typeof useProcessStore.getState>['processes'],
+) {
   const container = containers.find((c) => c.id === containerId)
   if (container && container.web_port) {
     return { host: 'localhost', port: container.web_port, auth: container.web_auth }
@@ -607,6 +670,18 @@ function useAgentConnection(containerId: string) {
     return { host: 'localhost', port: proc.web_port, auth: proc.web_auth }
   }
   return null
+}
+
+// The same object for as long as host, port and auth stay the same — a fresh
+// one per render would bust every memo (and upload callback) that depends on it.
+function useAgentConnection(containerId: string) {
+  const containers = useContainerStore((s) => s.containers)
+  const localAgents = useLocalAgentStore((s) => s.agents)
+  const processes = useProcessStore((s) => s.processes)
+  const conn = resolveAgentConnection(containerId, containers, localAgents, processes)
+  const sig = conn ? JSON.stringify([conn.host, conn.port, conn.auth]) : ''
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  return useMemo(() => conn, [sig])
 }
 
 function ChatContent({
@@ -867,7 +942,7 @@ function ChatContent({
           </div>
         )}
 
-        <div ref={messagesEndRef} />
+        <div ref={messagesEndRef} data-fd-chat-end />
         </div>
       </div>
 
@@ -934,6 +1009,7 @@ function ChatContent({
           <div className="relative mx-auto w-full max-w-4xl rounded-2xl border border-zinc-700 bg-zinc-900 shadow-sm transition-colors focus-within:border-violet-500/50">
             <textarea
               ref={inputRef}
+              data-fd-chat-input
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
@@ -1025,6 +1101,7 @@ function ChatContent({
           </div>}
           <textarea
             ref={inputRef}
+            data-fd-chat-input
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
@@ -1065,12 +1142,6 @@ function ChatContent({
   )
 }
 
-// A phone or tablet's on-screen keyboard: Enter there starts a new line (the
-// Send button sends), as in any messaging app.
-function touchKeyboard(): boolean {
-  return typeof window !== 'undefined' && window.matchMedia('(pointer: coarse) and (hover: none)').matches
-}
-
 function NextStepsBar({
   options,
   disabled,
@@ -1101,10 +1172,6 @@ function NextStepsBar({
   )
 }
 
-// The chat's left sidebar: an agent files view on top, the run queue on the
-// bottom, with a draggable divider between them and a draggable right edge for
-// the whole column. Both sizes persist to localStorage.
-
 // ── Lanes ────────────────────────────────────────────────────────────
 //
 // Three parallel contexts on ONE agent (docs/queue-lanes-plan.md). Lane A is
@@ -1126,7 +1193,10 @@ function LaneStrip({ agentId, activeLane, agentName, trailing }: {
   const lanes = shared ? LANES.filter((l) => l !== LANE_AUTO) : LANES
 
   return (
-    <div className="flex items-center gap-1 overflow-x-auto border-b border-zinc-800 bg-zinc-900/40 px-2 py-1">
+    <div className="flex items-center gap-1 border-b border-zinc-800 bg-zinc-900/40 px-2 py-1">
+      {/* The lanes scroll (without a bar); New topic and Topics stay in view
+          on the right. */}
+      <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
       {lanes.map((lane) => {
         const s = sessions.get(laneKey(agentId, lane))
         const isActive = lane === activeLane
@@ -1170,21 +1240,26 @@ function LaneStrip({ agentId, activeLane, agentName, trailing }: {
           </button>
         )
       })}
+      </div>
       {/* A fresh topic on the lane you're looking at (the agent's /new): its
           context starts over, the transcript keeps going with a divider. */}
       {!shared && <button
         onClick={() => activeSession && newSession(activeSession.key)}
         disabled={!activeSession || activeSession.busy}
         title="Start a new topic — the agent begins with a fresh context; earlier messages stay"
-        className="ml-auto shrink-0 whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs font-medium text-zinc-500 transition-colors hover:bg-zinc-800/60 hover:text-zinc-300 disabled:opacity-40 disabled:hover:bg-transparent wide:px-2 wide:py-1 wide:text-[11px]"
+        className={`${TOPIC_BTN} disabled:opacity-40 disabled:hover:border-zinc-700 disabled:hover:bg-transparent`}
       >
-        + New<span className="hidden wide:inline"> topic</span>
+        <Plus className="h-4 w-4" />
+        New<span className="hidden wide:inline"> topic</span>
       </button>}
       {!shared && activeSession && <TopicsButton sessionKey={activeSession.key} />}
       {trailing}
     </div>
   )
 }
+
+// New topic and Topics on the lane row: buttons, a size up from the lane tabs.
+const TOPIC_BTN = 'flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-zinc-700 px-3 py-1.5 text-sm font-medium text-zinc-300 transition-colors hover:border-zinc-600 hover:bg-zinc-800 hover:text-zinc-100'
 
 /** Opens the lane's Topics list: one row per divider in its transcript,
  *  newest first. A row jumps to its divider; Resume puts the agent's
@@ -1202,9 +1277,10 @@ function TopicsButton({ sessionKey }: { sessionKey: string }) {
         }}
         title="Topics — jump back to or resume an earlier topic"
         aria-label="Topics"
-        className={`shrink-0 rounded-md p-1.5 transition-colors hover:bg-zinc-800/60 hover:text-zinc-300 wide:p-1 ${open ? 'bg-zinc-800/60 text-zinc-300' : 'text-zinc-500'}`}
+        className={`${TOPIC_BTN} ${open ? 'border-violet-500/50 bg-zinc-800 text-zinc-100' : ''}`}
       >
         <History className="h-4 w-4" />
+        <span className="hidden wide:inline">Topics</span>
       </button>
       {open && <TopicsMenu sessionKey={sessionKey} anchor={anchor} onClose={() => setOpen(false)} />}
     </>
@@ -1393,24 +1469,122 @@ function scrollToMessage(id: string) {
   }, 60)
 }
 
-// `queueOnly` (simple layout): skip the files + datastore sections — the
-// layout shows them in its own right-hand column — and keep just the queue.
-function QueueSidebar({ sessionKey, agentId, queueOnly = false, shared = false, fill = false }: {
+// The queue beside the chat, in one of three shapes:
+//  - 'column'  (simple layout): a column left of the chat, resizable from its
+//              right edge; the layout shows files and datastore elsewhere.
+//  - 'phone'   (simple layout on a phone): a view of its own, in place of the chat.
+//  - 'sidebar' (full layout, fullscreen chat): the agent's files and datastore
+//              above the queue (unless queueOnly), with draggable dividers
+//              that never squeeze the queue under its minimum. The queue
+//              collapses to a one-line bar under them (to a slim rail when
+//              it's alone). Every size persists to localStorage.
+// It lives here, not in queue/, to reach useAgentConnection. Memoized: the
+// chat around it re-renders with every streamed token, and its props (ids,
+// flags, stable callbacks) don't change with them.
+const QueueSidebar = memo(function QueueSidebar({ sessionKey, agentId, queueOnly = false, shared = false, variant, onGoToChat, onHide, onBack }: {
   sessionKey: string
   agentId: string
   queueOnly?: boolean
   shared?: boolean
-  /** Phone: the queue takes the whole chat area instead of a column. */
-  fill?: boolean
+  variant: QueueVariant
+  onGoToChat: (o: { messageId?: string; focusComposer?: boolean }) => void
+  onHide: () => void
+  onBack: () => void
 }) {
+  const conn = useAgentConnection(agentId)
   const width = usePersistedSize('fd:queue-sidebar-width', 288, 220, 640, 'x')
-  const filesH = usePersistedSize('fd:queue-sidebar-files-height', 260, 96, 900, 'y')
-  const dsH = usePersistedSize('fd:queue-sidebar-datastore-height', 200, 96, 900, 'y')
+  const fsWidth = usePersistedSize('fd:queue-fullscreen-width', fullscreenQueueWidthDefault(), 240, 640, 'x')
+  const [collapsed, setCollapsed] = useState(() => {
+    try { return localStorage.getItem(QUEUE_COLLAPSED_KEY) === '1' } catch { return false }
+  })
+  const setRail = (v: boolean) => {
+    setCollapsed(v)
+    try { localStorage.setItem(QUEUE_COLLAPSED_KEY, v ? '1' : '0') } catch { /* private mode */ }
+  }
+  // The files and datastore panes give way before the queue drops under
+  // ~320px: they share what the column has left over (each keeps 96px).
+  const asideRef = useRef<HTMLElement>(null)
+  const [asideH, setAsideH] = useState(0)
+  const rail = variant === 'sidebar' && collapsed && queueOnly
+  const sidebarOpen = variant === 'sidebar' && !rail
+  useEffect(() => {
+    const el = asideRef.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(([entry]) => setAsideH(entry.contentRect.height))
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [sidebarOpen])
+  // A collapsed queue leaves the panes all but its one-line bar.
+  const avail = Math.max(192, asideH - (collapsed ? 48 : 328))
+  const filesH = usePersistedSize('fd:queue-sidebar-files-height', 260, 96, 900, 'y', 'forward', asideH ? avail - 96 : undefined)
+  const dsH = usePersistedSize('fd:queue-sidebar-datastore-height', 200, 96, 900, 'y', 'forward', asideH ? avail - filesH.size : undefined)
+  const signal = useQueueSignal(sessionKey)
+  const progress = useQueueProgress(sessionKey)
+
+  const panel = (
+    <QueuePanel
+      sessionKey={sessionKey}
+      agentId={agentId}
+      shared={shared}
+      conn={conn}
+      variant={variant}
+      onGoToChat={onGoToChat}
+      onHide={variant === 'column' ? onHide : undefined}
+      onBack={variant === 'phone' ? onBack : undefined}
+      onCollapse={variant === 'sidebar' ? () => setRail(true) : undefined}
+    />
+  )
+
+  if (variant === 'phone') {
+    return <aside className="relative flex w-full flex-1 flex-col bg-zinc-950/40">{panel}</aside>
+  }
+
+  if (variant === 'column') {
+    return (
+      <aside
+        className="relative flex min-w-[180px] shrink flex-col border-r border-zinc-800 bg-zinc-950/40"
+        style={{ width: width.size }}
+      >
+        {panel}
+        <ColResizeHandle size={width} label="Resize the queue" />
+      </aside>
+    )
+  }
+
+  const pct = progress.total ? (progress.done / progress.total) * 100 : 0
+  // Folded away, the queue still says when it needs you (as the toggle does).
+  const expandLabel = `Expand queue · ${signal.left} left${signal.tone === 'needs' ? ' · needs you' : ''}`
+
+  // Fullscreen, collapsed, queue alone: a rail that keeps the badge and the progress.
+  if (rail) {
+    const label = expandLabel
+    return (
+      <aside
+        onClick={() => setRail(false)}
+        className="flex w-11 shrink-0 cursor-pointer flex-col items-center gap-3 border-r border-zinc-800 bg-zinc-950/40 py-3"
+      >
+        <button
+          type="button"
+          aria-label={label}
+          title={label}
+          className={`relative rounded-lg p-1.5 text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-100 ${FOCUS}`}
+        >
+          <ListTodo className="h-4 w-4" />
+          <QueueBadge signal={signal} />
+        </button>
+        <div className="relative h-24 w-1 overflow-hidden rounded-full bg-zinc-800" aria-hidden>
+          <div className="absolute bottom-0 left-0 w-full rounded-full bg-emerald-500" style={{ height: `${pct}%` }} />
+        </div>
+        {progress.working && <Loader2 className="h-3.5 w-3.5 text-violet-600 motion-safe:animate-spin dark:text-violet-400" />}
+      </aside>
+    )
+  }
 
   return (
     <aside
-      className={`relative flex flex-col bg-zinc-950/40 ${fill ? 'w-full flex-1' : `border-r border-zinc-800 ${queueOnly ? 'min-w-[180px] shrink' : 'shrink-0'}`}`}
-      style={fill ? undefined : { width: width.size }}
+      ref={asideRef}
+      className="relative flex shrink-0 flex-col border-r border-zinc-800 bg-zinc-950/40"
+      style={{ width: fsWidth.size }}
     >
       {!queueOnly && (
         <>
@@ -1418,433 +1592,129 @@ function QueueSidebar({ sessionKey, agentId, queueOnly = false, shared = false, 
           <div className="min-h-0 shrink-0 overflow-hidden" style={{ height: filesH.size }}>
             <AgentFilesPanel containerId={agentId} />
           </div>
-          {/* Vertical divider (drag to resize files vs datastore) */}
+          <RowResizeHandle size={filesH} label="Resize the files pane" />
+          {/* Middle: datastore tables (the rest, while the queue is folded) */}
           <div
-            onMouseDown={filesH.onResizeStart}
-            title="Drag to resize"
-            className="h-1 shrink-0 cursor-row-resize border-y border-zinc-800 bg-zinc-900 transition-colors hover:bg-violet-500/40"
-          />
-          {/* Middle: datastore tables */}
-          <div className="min-h-0 shrink-0 overflow-hidden" style={{ height: dsH.size }}>
+            className={`min-h-0 overflow-hidden ${collapsed ? 'flex-1' : 'shrink-0'}`}
+            style={collapsed ? undefined : { height: dsH.size }}
+          >
             <AgentDatastorePanel containerId={agentId} />
           </div>
-          {/* Vertical divider (drag to resize datastore vs queue) */}
-          <div
-            onMouseDown={dsH.onResizeStart}
-            title="Drag to resize"
-            className="h-1 shrink-0 cursor-row-resize border-y border-zinc-800 bg-zinc-900 transition-colors hover:bg-violet-500/40"
-          />
+          {!collapsed && <RowResizeHandle size={dsH} label="Resize the datastore pane" />}
         </>
       )}
-      {/* Bottom: queue */}
-      <div className="min-h-0 flex-1">
-        <QueuePanel sessionKey={sessionKey} agentId={agentId} shared={shared} />
-      </div>
-      {/* Right edge (drag to resize the whole column) */}
-      {!fill && (
-        <div
-          onMouseDown={width.onResizeStart}
-          title="Drag to resize"
-          className="absolute right-0 top-0 z-20 h-full w-1.5 cursor-col-resize transition-colors hover:bg-violet-500/30 active:bg-violet-500/40"
-        />
+      {/* Bottom: queue, or its one-line bar */}
+      {collapsed ? (
+        <button
+          type="button"
+          onClick={() => setRail(false)}
+          aria-label={expandLabel}
+          title={expandLabel}
+          className={`flex h-12 shrink-0 items-center gap-2.5 border-t border-zinc-800 px-3 text-left text-zinc-300 transition-colors hover:bg-zinc-800/60 hover:text-zinc-100 ${FOCUS}`}
+        >
+          <span className="relative">
+            <ListTodo className="h-4 w-4" />
+            <QueueBadge signal={signal} />
+          </span>
+          <span className="text-sm font-semibold">Queue</span>
+          {progress.total > 0 && (
+            <span className="relative h-1 min-w-0 flex-1 overflow-hidden rounded-full bg-zinc-800" aria-hidden>
+              <span className="absolute inset-y-0 left-0 rounded-full bg-emerald-500" style={{ width: `${pct}%` }} />
+            </span>
+          )}
+          {progress.working && <Loader2 className="h-3.5 w-3.5 shrink-0 text-violet-600 motion-safe:animate-spin dark:text-violet-400" />}
+          <ChevronUp className="ml-auto h-4 w-4 shrink-0 text-zinc-500" />
+        </button>
+      ) : (
+        <div className="min-h-0 flex-1">{panel}</div>
       )}
+      <ColResizeHandle size={fsWidth} label="Resize the queue" />
     </aside>
   )
+})
+
+const QUEUE_COLLAPSED_KEY = 'fd:fullscreen-queue-collapsed'
+
+// The fullscreen queue's own width starts from the simple column's, once.
+let _fsQueueWidth: number | null = null
+function fullscreenQueueWidthDefault(): number {
+  if (_fsQueueWidth === null) {
+    let v = NaN
+    try { v = Number(localStorage.getItem('fd:queue-sidebar-width')) } catch { /* private mode */ }
+    _fsQueueWidth = v >= 240 && v <= 640 ? v : 320
+  }
+  return _fsQueueWidth
 }
 
-// `shared`: an agent shared with you — text items only, no task planner.
-function QueuePanel({ sessionKey, agentId, shared = false }: { sessionKey: string; agentId: string; shared?: boolean }) {
-  // Queue state is per lane; uploads go to the agent that owns every lane.
-  const containerId = sessionKey
-  const session = useChatStore((s) => s.sessions.get(containerId))
-  const enqueue = useChatStore((s) => s.enqueueQueueMessage)
-  const removeItem = useChatStore((s) => s.removeQueueItem)
-  const markDone = useChatStore((s) => s.markQueueItemDone)
-  const toggleAuto = useChatStore((s) => s.toggleQueueAutoMode)
-  const clearQueue = useChatStore((s) => s.clearQueue)
-  const clearFinished = useChatStore((s) => s.clearQueueFinished)
-  const [draft, setDraft] = useState('')
-  const [dragOver, setDragOver] = useState(false)
-  const [showPlanner, setShowPlanner] = useState(false)
-  const taRef = useRef<HTMLTextAreaElement>(null)
-  const fileInputRef = useRef<HTMLInputElement>(null)
-  const conn = useAgentConnection(agentId)
-  const { attachments, addFiles, removeAttachment, clearAttachments, handlePasteEvent, pasteFromClipboard } = useFileAttachments(conn)
+type PersistedSize = ReturnType<typeof usePersistedSize>
 
-  const pasteText = useCallback((text: string) => {
-    setDraft((prev) => prev + text)
-    taRef.current?.focus()
-  }, [])
-
-  // Queued items are long instructions, so the box starts at 5 rows and grows
-  // with the draft up to ~40% of the panel before handing over to its own
-  // scrollbar — the list above keeps the rest of the height.
-  const QUEUE_INPUT_MIN_PX = 92
-  useEffect(() => {
-    const ta = taRef.current
-    if (!ta) return
-    ta.style.height = 'auto'
-    const cap = Math.max(QUEUE_INPUT_MIN_PX, Math.round((ta.closest('.flex.h-full')?.clientHeight ?? 600) * 0.4))
-    ta.style.height = `${Math.min(Math.max(ta.scrollHeight, QUEUE_INPUT_MIN_PX), cap)}px`
-  }, [draft])
-
-  if (!session) return null
-  const queue = session.queue
-  const auto = session.queueAutoMode
-  const pendingCount = queue.filter((q) => q.status === 'pending').length
-  const dispatchedCount = queue.filter((q) => q.status === 'dispatched').length
-  const doneCount = queue.filter((q) => q.status === 'done').length
-  const pendingUploads = attachments.filter((a) => a.status === 'uploading').length
-  const uploadedFiles = attachments.filter((a) => a.status === 'uploaded' && a.uploadedPath)
-  const canAdd = (draft.trim() || uploadedFiles.length > 0) && pendingUploads === 0
-
-  const handleAdd = () => {
-    const text = draft.trim()
-    if (!text && uploadedFiles.length === 0) return
-    if (pendingUploads > 0) return
-    enqueue(containerId, appendAttachmentRefs(text, uploadedFiles))
-    setDraft('')
-    clearAttachments()
-    taRef.current?.focus()
-  }
-
-  const handleKey = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      handleAdd()
-    }
-  }
-
-  const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault()
-    e.stopPropagation()
-    setDragOver(false)
-    if (e.dataTransfer.files.length > 0) addFiles(e.dataTransfer.files)
-  }
-  const dropHandlers = shared ? { onDragOver: swallowDrop, onDrop: swallowDrop } : {
-    onDragOver: (e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); setDragOver(true) },
-    onDragLeave: (e: React.DragEvent) => { e.preventDefault(); e.stopPropagation(); setDragOver(false) },
-    onDrop: handleDrop,
-  }
-
+/** The right-edge handle: drag (mouse, touch, pen) or arrow keys (Shift: ×4). */
+function ColResizeHandle({ size, label }: { size: PersistedSize; label: string }) {
   return (
-    <div className="flex h-full min-h-0 flex-col">
-      {/* Header */}
-      <div className="flex items-center justify-between border-b border-zinc-800 px-3 py-2">
-        <div className="flex items-center gap-2">
-          <ListChecks className="h-3.5 w-3.5 text-violet-400" />
-          <span className="text-xs font-semibold uppercase tracking-wider text-zinc-300">Queue</span>
-          {queue.length > 0 && (
-            <span className="rounded-full bg-violet-500/20 px-1.5 py-0.5 text-[10px] font-medium text-violet-300">
-              {pendingCount + dispatchedCount}/{queue.length}
-            </span>
-          )}
-        </div>
-        <div className="flex items-center gap-1">
-        {!shared && <button
-          onClick={() => setShowPlanner(true)}
-          title="Plan tasks — turn one description into a batched queue"
-          className="flex items-center gap-1 rounded-md border border-zinc-700 bg-zinc-900 px-1.5 py-0.5 text-[10px] font-medium text-zinc-400 transition-colors hover:border-violet-500/40 hover:text-violet-300"
-        >
-          <Wand2 className="h-3 w-3" />
-          Plan
-        </button>}
-        <button
-          onClick={() => toggleAuto(containerId)}
-          title={auto ? 'Auto-progress: ON — items marked done when agent replies' : 'Auto-progress: OFF — mark items done manually'}
-          className={`rounded-md border px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider transition-colors ${
-            auto
-              ? 'border-emerald-500/40 bg-emerald-500/20 text-emerald-700 dark:text-emerald-200'
-              : 'border-zinc-700 bg-zinc-900 text-zinc-400 hover:border-zinc-600'
-          }`}
-        >
-          {auto ? 'Auto' : 'Manual'}
-        </button>
-        </div>
-      </div>
-
-      {showPlanner && conn && !shared && (
-        <QueuePlannerModal
-          agentId={agentId}
-          agentName={session.containerName}
-          host={conn.host}
-          port={conn.port}
-          auth={conn.auth}
-          onClose={() => setShowPlanner(false)}
-        />
-      )}
-
-      {/* Items — min-h-0 so this is the column's scroll region: cards keep
-          their full height and the list scrolls past them. */}
-      <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
-        {queue.length === 0 ? (
-          <p className="px-2 py-6 text-center text-[11px] text-zinc-500">
-            Add a message below to queue it. Items dispatch one at a time after the previous finishes.
-          </p>
-        ) : (
-          <ul className="flex flex-col gap-1.5">
-            {queue.map((item) => (
-              <QueueItemRow
-                key={item.id}
-                item={item}
-                onRemove={() => removeItem(containerId, item.id)}
-                onMarkDone={() => markDone(containerId, item.id)}
-                autoMode={auto}
-              />
-            ))}
-          </ul>
-        )}
-      </div>
-
-      {/* Status + clear */}
-      {(doneCount > 0 || queue.length > 0) && (
-        <div className="flex items-center justify-between border-t border-zinc-800 px-3 py-1.5 text-[10px] text-zinc-500">
-          <span>{doneCount} done · {pendingCount} pending</span>
-          <div className="flex items-center gap-0.5">
-            {doneCount > 0 && (
-              <button
-                onClick={() => clearFinished(containerId)}
-                className="rounded px-1.5 py-0.5 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300"
-                title={`Remove ${doneCount} finished item${doneCount === 1 ? '' : 's'} — pending and in-flight stay`}
-              >
-                Clear finished
-              </button>
-            )}
-            {pendingCount > 0 && (
-              <button
-                onClick={() => clearQueue(containerId)}
-                className="rounded px-1.5 py-0.5 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300"
-                title="Clear pending items"
-              >
-                Clear pending
-              </button>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* Input */}
-      <div
-        className={`border-t border-zinc-800 p-2 ${dragOver ? 'bg-violet-500/10 ring-1 ring-inset ring-violet-500/50' : ''}`}
-        {...dropHandlers}
-      >
-        {/* Attachment chips */}
-        {attachments.length > 0 && !shared && (
-          <div className="mb-1.5 flex flex-wrap gap-1.5">
-            {attachments.map((att) => (
-              <AttachmentChip key={att.id} attachment={att} onRemove={removeAttachment} />
-            ))}
-          </div>
-        )}
-        <textarea
-          ref={taRef}
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onKeyDown={handleKey}
-          onPaste={shared ? undefined : handlePasteEvent}
-          rows={5}
-          placeholder={shared ? 'Queue a message…' : 'Queue a message, paste image, or drop files…'}
-          className="w-full resize-y overflow-y-auto rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1.5 text-base leading-relaxed wide:text-xs text-zinc-200 placeholder-zinc-600 focus:border-violet-500/60 focus:outline-none"
-          style={{ minHeight: QUEUE_INPUT_MIN_PX }}
-        />
-        {!shared && <input
-          ref={fileInputRef}
-          type="file"
-          multiple
-          className="hidden"
-          onChange={(e) => {
-            if (e.target.files && e.target.files.length > 0) {
-              addFiles(e.target.files)
-              e.target.value = ''
-            }
-          }}
-        />}
-        <div className="mt-1.5 flex items-center justify-between">
-          <div className="flex items-center gap-0.5">
-            {!shared && <>
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              disabled={!conn}
-              className="rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300 disabled:opacity-40"
-              title="Attach file"
-            >
-              <Paperclip className="h-3.5 w-3.5" />
-            </button>
-            <button
-              onClick={() => pasteFromClipboard(pasteText)}
-              disabled={!conn}
-              className="rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300 disabled:opacity-40"
-              title="Paste from clipboard"
-            >
-              <Clipboard className="h-3.5 w-3.5" />
-            </button>
-            </>}
-          </div>
-          <button
-            onClick={handleAdd}
-            disabled={!canAdd}
-            className="flex items-center gap-1 rounded-md bg-violet-600 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-violet-500 disabled:opacity-40"
-            title={pendingUploads > 0 ? 'Waiting for uploads…' : 'Add to queue'}
-          >
-            {pendingUploads > 0 && <Loader2 className="h-3 w-3 animate-spin" />}
-            Add
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-
-// ── Queue item run stats ──
-
-/** "14:32:07" on the same day, "Jul 21 14:32:07" otherwise. */
-function fmtClock(ms?: number): string {
-  if (!ms) return ''
-  const d = new Date(ms)
-  const time = d.toLocaleTimeString(undefined, { hour12: false })
-  const sameDay = new Date().toDateString() === d.toDateString()
-  return sameDay
-    ? time
-    : `${d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} ${time}`
-}
-
-/** Elapsed as 42s / 3m 07s / 1h 04m. */
-function fmtElapsed(from?: number, to?: number): string {
-  if (!from || !to || to < from) return ''
-  const secs = Math.round((to - from) / 1000)
-  if (secs < 60) return `${secs}s`
-  const m = Math.floor(secs / 60)
-  const rest = secs % 60
-  if (m < 60) return `${m}m ${String(rest).padStart(2, '0')}s`
-  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`
-}
-
-function QueueItemRow({
-  item,
-  onRemove,
-  onMarkDone,
-  autoMode,
-}: {
-  item: QueuedMessage
-  onRemove: () => void
-  onMarkDone: () => void
-  autoMode: boolean
-}) {
-  const isPending = item.status === 'pending'
-  const isDispatched = item.status === 'dispatched'
-  const isDone = item.status === 'done'
-
-  return (
-    <li
-      className={`group rounded-md border px-2 py-1.5 text-xs transition-colors ${
-        isDispatched
-          ? 'border-violet-500/40 bg-violet-500/10'
-          : isDone
-            ? 'border-zinc-800 bg-zinc-900/40 text-zinc-600'
-            : 'border-zinc-800 bg-zinc-900/60 hover:border-zinc-700'
-      }`}
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={label}
+      aria-valuenow={Math.round(size.size)}
+      aria-valuemin={size.min}
+      aria-valuemax={size.max}
+      tabIndex={0}
+      title="Drag to resize"
+      onPointerDown={size.onResizeStart}
+      onKeyDown={(e) => {
+        const step = e.shiftKey ? 64 : 16
+        if (e.key === 'ArrowLeft') { e.preventDefault(); size.nudge(-step) }
+        else if (e.key === 'ArrowRight') { e.preventDefault(); size.nudge(step) }
+      }}
+      className="group absolute right-0 top-0 z-20 -mr-1 h-full w-2 cursor-col-resize touch-none focus-visible:outline-none"
     >
-      <div className="flex items-start gap-1.5">
-        <span
-          className="mt-0.5 shrink-0"
-          title={item.stuck
-            ? `The agent gave up ${item.attempts ?? 0} times — the queue is holding here`
-            : item.awaitingAnswer
-              ? 'The agent asked a question — answer it in chat, or the queue moves on in 3 min'
-              : item.attempts && item.attempts > 1
-                ? `Attempt ${item.attempts} — the agent got stuck on the previous try`
-                : item.status}
-        >
-          {isDispatched && item.stuck && <AlertTriangle className="h-3 w-3 text-red-400" />}
-          {isDispatched && !item.stuck && item.awaitingAnswer && <HelpCircle className="h-3 w-3 text-amber-400" />}
-          {isDispatched && !item.stuck && !item.awaitingAnswer && <Loader2 className="h-3 w-3 animate-spin text-violet-300" />}
-          {isPending && <CircleDot className="h-3 w-3 text-zinc-500" />}
-          {isDone && <Check className="h-3 w-3 text-emerald-400" />}
-        </span>
-        <span
-          className={`flex-1 whitespace-pre-wrap break-words ${
-            isDone ? 'line-through' : ''
-          } ${isDispatched ? 'text-violet-700 dark:text-violet-200' : 'text-zinc-300'}`}
-        >
-          {/* Full text: a queued task is an instruction the user needs to read
-              back before it runs. The card grows to fit; the list scrolls. */}
-          {item.content}
-          {(item.attempts ?? 0) > 1 && (
-            <span className={`ml-1.5 rounded px-1 py-0.5 text-[9px] font-medium ${
-              item.stuck ? 'bg-red-500/20 text-red-300' : 'bg-amber-500/20 text-amber-300'
-            }`}>
-              {item.stuck ? `gave up ×${item.attempts}` : `attempt ${item.attempts}`}
-            </span>
-          )}
-        </span>
-        <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
-          {isDispatched && !autoMode && (
-            <button
-              onClick={onMarkDone}
-              title="Mark done & dispatch next"
-              className="rounded p-0.5 text-zinc-500 hover:bg-emerald-500/20 hover:text-emerald-300"
-            >
-              <Check className="h-3 w-3" />
-            </button>
-          )}
-          {isPending && (
-            <button
-              onClick={onMarkDone}
-              title="Skip (mark done without dispatching)"
-              className="rounded p-0.5 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200"
-            >
-              <Play className="h-3 w-3" />
-            </button>
-          )}
-          <button
-            onClick={onRemove}
-            title="Remove"
-            className="rounded p-0.5 text-zinc-500 hover:bg-red-500/20 hover:text-red-300"
-          >
-            <Trash2 className="h-3 w-3" />
-          </button>
-        </div>
-      </div>
-
-      {/* What the run cost. Only once it has actually started. */}
-      {item.dispatchedAt && <QueueItemStats item={item} />}
-    </li>
+      <div className="mx-auto h-full w-px bg-transparent transition-colors group-hover:bg-violet-500/50 group-focus-visible:bg-violet-500" />
+    </div>
   )
 }
 
-function QueueItemStats({ item }: { item: QueuedMessage }) {
-  const started = fmtClock(item.dispatchedAt)
-  // A finished item is fixed in time; a running one ticks against now.
-  const [, force] = useState(0)
-  const running = item.status === 'dispatched'
-  useEffect(() => {
-    if (!running) return
-    const t = setInterval(() => force((n) => n + 1), 1000)
-    return () => clearInterval(t)
-  }, [running])
-
-  const ended = item.completedAt
-  const elapsed = fmtElapsed(item.dispatchedAt, ended ?? Date.now())
-  const u = item.usage
-  const cached = (u?.cache_read_input_tokens || 0) + (u?.cache_creation_input_tokens || 0)
-
+/** A divider between the sidebar's panes: drag, or arrow keys up/down. */
+function RowResizeHandle({ size, label }: { size: PersistedSize; label: string }) {
   return (
-    <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 border-t border-zinc-800/60 pt-1 pl-[18px] text-[9px] text-zinc-500">
-      <span title={`Started ${new Date(item.dispatchedAt!).toLocaleString()}`}>▶ {started}</span>
-      {ended ? (
-        <span title={`Finished ${new Date(ended).toLocaleString()}`}>■ {fmtClock(ended)}</span>
-      ) : null}
-      {elapsed && (
-        <span className={running ? 'text-violet-400' : 'text-zinc-400'}>{elapsed}</span>
-      )}
-      {!!item.toolCount && <span title="Tool calls">{item.toolCount} tools</span>}
-      {u && (
-        <span title={`In ${u.prompt_tokens || 0} · cached ${cached} · out ${u.completion_tokens || 0} tokens`}>
-          {fmtTokens(u.prompt_tokens)}↑ {fmtTokens(cached)}⚡ {fmtTokens(u.completion_tokens)}↓
-        </span>
-      )}
+    <div
+      role="separator"
+      aria-orientation="horizontal"
+      aria-label={label}
+      aria-valuenow={Math.round(size.size)}
+      aria-valuemin={size.min}
+      aria-valuemax={size.max}
+      tabIndex={0}
+      title="Drag to resize"
+      onPointerDown={size.onResizeStart}
+      onKeyDown={(e) => {
+        const step = e.shiftKey ? 64 : 16
+        if (e.key === 'ArrowUp') { e.preventDefault(); size.nudge(-step) }
+        else if (e.key === 'ArrowDown') { e.preventDefault(); size.nudge(step) }
+      }}
+      className="group relative z-10 -my-[3px] h-2 shrink-0 cursor-row-resize touch-none focus-visible:outline-none"
+    >
+      <div className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-zinc-800 transition-colors group-hover:bg-violet-500/50 group-focus-visible:bg-violet-500" />
     </div>
+  )
+}
+
+/** The queue toggle's (and the rail's) count: amber when the queue needs
+ *  you, violet while a task runs, grey while tasks wait. */
+function QueueBadge({ signal }: { signal: { left: number; tone: SignalTone } }) {
+  if (signal.tone === 'none') return null
+  const cls = signal.tone === 'needs' ? 'bg-amber-500 text-amber-950'
+    : signal.tone === 'running' ? 'bg-violet-600 text-white'
+    : 'bg-zinc-700 text-zinc-200'
+  const text = signal.left > 99 ? '99+' : signal.left > 0 ? String(signal.left) : signal.tone === 'needs' ? '!' : ''
+  return (
+    <span
+      aria-hidden
+      className={`pointer-events-none absolute -right-1 -top-1 flex items-center justify-center rounded-full font-semibold tabular-nums ring-2 ring-zinc-950 ${
+        text ? 'h-4 min-w-4 px-1 text-[10px]' : 'h-2 w-2'
+      } ${cls}`}
+    >
+      {text}
+    </span>
   )
 }
 
@@ -1852,11 +1722,7 @@ function QueueItemStats({ item }: { item: QueuedMessage }) {
 function processImagePaths(content: string, agentHost?: string, agentPort?: number, agentAuth?: string): string {
   if (!agentPort) return content
 
-  const proxyUrl = (filePath: string): string => {
-    const params = new URLSearchParams({ path: filePath })
-    if (agentAuth) params.set('token', agentAuth)
-    return `/fd/agent-file-view/${encodeURIComponent(agentHost || 'localhost')}/${agentPort}?${params}`
-  }
+  const proxyUrl = (filePath: string): string => agentFileViewUrl(filePath, agentHost, agentPort, agentAuth)
 
   // Rewrite agent-local paths inside markdown image syntax: ![alt](path)
   // Mirrors captain-claw/computer.js: handles file:///, saved/, output/, and absolute /paths.
@@ -2036,7 +1902,7 @@ const MessageBubble = memo(function MessageBubble({ message, sourceName, agentId
 
   if (message.role === 'user') {
     return (
-      <div className="group mb-3 flex flex-col items-end gap-0.5">
+      <div id={`fd-msg-${message.id}`} className="group mb-3 flex flex-col items-end gap-0.5">
         <div className={`max-w-[85%] rounded-br-sm bg-violet-600/20 ${large ? 'rounded-2xl px-4 py-3' : 'rounded-xl px-3.5 py-2.5'}`}>
           <div className={`fd-markdown ${bodyText} text-zinc-200`}>
             <MarkdownMessage content={processImagePaths(message.content, agentConn?.host, agentConn?.port, agentConn?.auth)} />
@@ -2163,7 +2029,7 @@ const MessageBubble = memo(function MessageBubble({ message, sourceName, agentId
   const cleanContent = stripSuggestions(message.content)
 
   return (
-    <div className="group mb-3 flex flex-col items-start gap-0.5">
+    <div id={`fd-msg-${message.id}`} className="group mb-3 flex flex-col items-start gap-0.5">
       <div className={`max-w-[85%] rounded-bl-sm bg-zinc-800/60 ${large ? 'rounded-2xl px-4 py-3' : 'rounded-xl px-3.5 py-2.5'} ${message.replay ? 'opacity-60' : ''} ${message.task ? 'border-l-2 border-amber-500/60' : ''}`}>
         {message.task && (
           <button
@@ -2227,12 +2093,6 @@ function groupActivity(msgs: ChatMessage[]): ChatGroup[] {
     }
   }
   return groups
-}
-
-function fmtTokens(n?: number): string {
-  const v = n || 0
-  if (v >= 1000) return `${(v / 1000).toFixed(v >= 10000 ? 0 : 1)}k`
-  return String(v)
 }
 
 // memo: `items` is a stable array as long as the message list is unchanged
