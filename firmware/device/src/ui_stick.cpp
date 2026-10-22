@@ -60,6 +60,7 @@ bool busy() { return false; }
 void idleSince(uint32_t) {}
 void drawNow() {}
 bool waiting() { return false; }
+void showSpeaking(int) {}
 void setRotation(uint8_t) {}
 
 static void push() { canvas.pushSprite(0, 0); }
@@ -378,6 +379,11 @@ bool prevPage() {
   return true;
 }
 
+bool onLastPage() {
+  int per = linesPerPage();
+  return page + 1 >= max(1, ((int)lines.size() + per - 1) / per);
+}
+
 // Panels (status page, idle health) follow the text size too: compact rows
 // with the label beside the value for small/medium, label above the value
 // for large. Values wrap; a row never splits across pages.
@@ -528,5 +534,12 @@ void flashFrame(bool on) {
     push();
   }
 }
+
+void showAsk(const char* title, const String& body, const char* yes, const char* no) {
+  showMessage(title, body + "  Front: " + yes + " · side: " + no, TFT_WHITE);
+}
+
+void setTapButton(TapButton) {}  // no touch screen
+bool tapButtonHit(int, int) { return false; }
 
 }  // namespace ui

@@ -9,8 +9,11 @@
 //             double-click on an answer = hear it again (also Menu → Replay answer)
 //   Button C  (PaperColor only)
 //             click = previous page / previous row / back · hold = home screen
+//   PaperColor: its talk button (C, on top) isn't held — a press starts the
+//   recording and the next press sends it; a quick double press replays.
 //   Hold the talk button while switching on (or no Wi-Fi saved) = setup hotspot
 //   Asleep: hold the talk button and talk at once — it records while it reconnects
+//   (PaperColor: press it and talk)
 //
 // Talks to Flight Deck's /device/ws (captain_claw/flight_deck/device_bridge.py):
 // 16 kHz PCM up, with the device's readings (telemetry.h) on each turn; reply
@@ -41,7 +44,7 @@
 #include <M5PM1.h>
 #endif
 
-#define FW_VERSION "0.11.5"
+#define FW_VERSION "0.12.0"
 
 // The loop task's stack (Arduino's default is 8 KB). The smooth fonts on the
 // round and paper screens draw each glyph through a stack buffer — a timer
@@ -49,10 +52,12 @@
 // library's nested callbacks, already deep: 8 KB overflowed on the StopWatch.
 SET_LOOP_TASK_STACK_SIZE(20 * 1024);
 
-// The talk button and the other one (the PaperColor talks on B, the easier
-// press; the others on A).
-static m5::Button_Class& talkBtn() { return board::kTalkOnB ? M5.BtnB : M5.BtnA; }
-static m5::Button_Class& sideBtn() { return board::kTalkOnB ? M5.BtnA : M5.BtnB; }
+// The talk, next and back buttons (board.h: the PaperColor talks on its top
+// button, C; the others on A).
+static m5::Button_Class& m5Button(char k) { return k == 'C' ? M5.BtnC : k == 'B' ? M5.BtnB : M5.BtnA; }
+static m5::Button_Class& talkBtn() { return m5Button(board::kTalkM5); }
+static m5::Button_Class& sideBtn() { return m5Button(board::kSideM5); }
+static m5::Button_Class& backBtn() { return m5Button(board::kBackM5); }  // only where kBackPin >= 0
 
 // Least time between two frames of an animation. The round screen's frames
 // cost ~50 ms each: at the stick's pace the loop would only ever draw, and
@@ -102,7 +107,8 @@ static void perfReport(uint32_t loopUs) {
 
 // Home: the PaperColor's home screen even while there's an answer (C hold).
 // Link: the "settings on your phone" address.
-enum class Mode { Idle, Listening, Waiting, Reply, Image, Menu, Agents, CharPick, Status, Notice, Home, Link };
+// Ask: a yes/no question (send the voice notes kept offline?).
+enum class Mode { Idle, Listening, Waiting, Reply, Image, Menu, Agents, CharPick, Status, Notice, Home, Link, Ask };
 
 static WebSocketsClient ws;
 static WiFiMulti wifiMulti;
@@ -134,6 +140,7 @@ static int rttMs = -1;
 static uint32_t lastPingMs = 0, lastReplyMs = 0, turns = 0;
 static uint8_t* imgPart = nullptr;  // a picture arriving in parts (PSRAM)
 static size_t imgPartLen = 0;
+static uint32_t talkTapMs = 0;      // when the talk button was last tapped (double-click = replay)
 static uint32_t buzzOffMs = 0;       // vibration motor runs until then (0 = off)
 static uint32_t turnBusyMs = 0;      // last moment a turn was under way (Wi-Fi stays fully awake)
 static bool wifiAwake = false;
@@ -160,6 +167,20 @@ static uint32_t prerollStartMs = 0;
 static volatile uint32_t prerollEndMs = 0;     // when the button was let go (0 = still held)
 static bool prerollOn = false, prerollStreaming = false, prerollChecked = false;
 static bool prerollEndSounded = false;  // its "let go" blip has played
+
+// Tap to talk: the recording going on was started on the screen (or, where
+// the talk button toggles, by a press of it), so it ends with a second tap
+// or press, not by letting go of a button.
+static volatile bool tapRec = false;
+static volatile bool talkWasDown = true;  // the button sampler's last look at the talk button
+
+// Voice notes kept offline are asked about once the deck is back (aloud and
+// on the screen) and go up on a yes. A no holds until there are more notes
+// or a cold start; Menu → Send voice notes still sends them.
+static bool upAllowed = false;  // said yes, on this link
+static bool upAsked = false;    // asked, on this link
+static uint32_t askedMs = 0;
+RTC_DATA_ATTR static int notesDeclined = -1;  // how many were waiting at the no
 
 // A menu row to read aloud (e-paper), once the presses settle.
 static String sayText;
@@ -307,6 +328,26 @@ static void setBarState() {
 
 // ── status page / idle panel ─────────────────────────────────────────
 
+// "1:24"
+static String clockLength(uint32_t secs) {
+  char len[12];
+  snprintf(len, sizeof(len), "%lu:%02lu", (unsigned long)(secs / 60), (unsigned long)(secs % 60));
+  return len;
+}
+
+// "3 voice notes"
+static String notesCount() {
+  const int n = notes::count();
+  return String(n) + (n == 1 ? " voice note" : " voice notes");
+}
+
+// The tap button the screens draw: none, record, or stop (a tapped recording).
+static void syncTapButton() {
+  ui::setTapButton(!board::kHasTouch || !settings.tapTalk ? ui::TapButton::Off
+                   : tapRec                               ? ui::TapButton::Stop
+                                                          : ui::TapButton::Talk);
+}
+
 static std::vector<ui::Row> statusRows() {
   std::vector<ui::Row> rows;
   bool wifiOk = WiFi.status() == WL_CONNECTED;
@@ -337,11 +378,9 @@ static std::vector<ui::Row> statusRows() {
                   kText});
   rows.push_back({"Device", deviceId() + "  fw " FW_VERSION "  " + String(ESP.getFreePsram() / 1024) + "k free", kText});
   if (board::kOfflineNotes && notes::count()) {
-    uint32_t secs = notes::seconds();
-    char len[12];
-    snprintf(len, sizeof(len), "%lu:%02lu", (unsigned long)(secs / 60), (unsigned long)(secs % 60));
-    rows.push_back({"Offline notes", String(notes::count()) + " waiting  " + len + "  on " + notes::where() +
-                                         (wsUp ? "  sending…" : ""),
+    rows.push_back({"Offline notes", String(notes::count()) + " waiting  " + clockLength(notes::seconds()) + "  room " +
+                                         String(notes::room(audio::kMicRate) / audio::kMicRate / 60) + " min" +
+                                         (upAllowed && wsUp ? "  sending…" : ""),
                     kYellow});
   }
   if (offer.valid()) rows.push_back({"Update", offer.version + " available (menu → Software update)", kCyan});
@@ -360,14 +399,15 @@ static void showIdle() {
   home.title = ok ? "All good" : "Getting ready";
   home.color = ok ? kGreen : kYellow;
   // Offline, a device that keeps notes still takes one.
-  const bool keeps = board::kOfflineNotes && *notes::where();
-  home.hint = ok        ? String("Hold the ") + board::kTalkButton + " to talk"
-              : !wifiOk ? (keeps ? String("Offline · hold to keep a note") : String("No Wi-Fi"))
+  const bool keeps = board::kOfflineNotes && notes::ready();
+  home.hint = ok        ? String(board::kTalkHint)
+              : !wifiOk ? (keeps ? String("Offline · talk to keep a note") : String("No Wi-Fi"))
               : !wsUp   ? String("Connecting to Flight Deck…")
                         : String("Waiting for the agent");
   String noun = board::kNoun;
   noun.setCharAt(0, toupper(noun[0]));
-  home.rows.push_back({noun, ok ? String("ready — hold ") + board::kTalkButton : String("not ready"), ok ? kGreen : kYellow});
+  home.rows.push_back({noun, ok ? String(board::kTalkToggles ? "ready — press " : "ready — hold ") + board::kTalkButton
+                               : String("not ready"), ok ? kGreen : kYellow});
   home.rows.push_back({"Wi-Fi", wifiOk ? WiFi.SSID() : String("not connected"), wifiOk ? kGreen : kRed});
   home.rows.push_back({"Deck", wsUp ? serverHost() : String("connecting…"), wsUp ? kGreen : kRed});
   home.rows.push_back({"Agent", agentLinked ? agentName : (wsUp ? String("waiting for agent") : String("-")),
@@ -378,9 +418,9 @@ static void showIdle() {
 
 // ── menu ─────────────────────────────────────────────────────────────
 
-enum MenuRow { MReplay, MPin, MStatus, MAgent, MVolume, MBoost, MVoice, MDisplay, MTextSize, MCharacter, MBeep,
-               MTalkSnd, MFlash, MBuzz, MLead, MScreenOff, MPowerOff, MRotation, MLeds, MClicks, MSayMenu, MAsleep, MPhone,
-               MUpdate, MAutoUpdate, MSetup, MCount };
+enum MenuRow { MReplay, MPin, MStatus, MNotes, MAgent, MVolume, MBoost, MVoice, MDisplay, MTapTalk, MTextSize,
+               MCharacter, MBeep, MTalkSnd, MFlash, MBuzz, MLead, MScreenOff, MPowerOff, MRotation, MLeds, MClicks,
+               MSayMenu, MAsleep, MPhone, MUpdate, MAutoUpdate, MSetup, MCount };
 
 // The last answer can be heard again: from memory, or (part of it never
 // arrived) from the deck.
@@ -398,6 +438,8 @@ static bool rowShown(int row) {
     case MReplay: return canReplay();
     case MPin: return ui::canPin();
     case MBuzz: return board::kHasMotor;
+    case MNotes: return board::kOfflineNotes && notes::count() > 0;  // kept offline: send them now
+    case MTapTalk: return board::kHasTouch;
     case MDisplay:
     case MCharacter:  // the paper is text only
     case MScreenOff: return !board::kEpaper;
@@ -431,6 +473,8 @@ static String menuLabel(int row) {
     case MReplay: return "Replay answer";
     case MPin: return ui::pinned() ? "Unpin answer" : "Pin answer to home";
     case MStatus: return "Status";
+    case MNotes: return "Send voice notes (" + String(notes::count()) + ")";
+    case MTapTalk: return String("Tap to talk: ") + (settings.tapTalk ? "on" : "off");
     case MAgent: return "Agent: " + (agentName.length() ? agentName : String("none")) + " »";
     case MVolume: return "Volume " + String((settings.volume * 100 + 127) / 255) + "%";
     case MBoost: return settings.boostDb ? "Boost +" + String(settings.boostDb) + " dB" : String("Boost off");
@@ -476,6 +520,17 @@ static ui::Item menuItem(int row) {
       it.note = ui::pinned() ? "the home screen shows the newest again" : "keeps it on the home screen, asleep too";
       break;
     case MStatus: it.title = "Status"; it.glyph = ui::Glyph::Info; it.note = "Wi-Fi, deck, battery…"; break;
+    case MNotes:
+      it.title = "Send voice notes";
+      it.badge = String(notes::count());
+      it.note = clockLength(notes::seconds()) + " kept offline · yellow = send";
+      break;
+    case MTapTalk:
+      it.title = "Tap to talk";
+      it.badge = onOff(settings.tapTalk);
+      it.on = settings.tapTalk;
+      it.note = "a record button on the screen";
+      break;
     case MAgent:
       it.title = "Agent";
       it.badge = agentName.length() ? agentName : String("?");
@@ -522,7 +577,7 @@ static ui::Item menuItem(int row) {
       it.title = "Status lights";
       it.badge = kLedLevels[settings.ledLevel % 3];
       it.on = settings.ledLevel > 0;
-      it.note = "red listens, amber works, cyan speaks";
+      it.note = "red records, blue works, green speaks";
       break;
     case MClicks: it.title = "Key clicks"; it.badge = onOff(settings.keyClicks); it.on = settings.keyClicks; break;
     case MSayMenu:
@@ -620,11 +675,13 @@ static void sayRow() {
 static void backToMain();
 static void startInstall();
 static void connectServer();
+static void sendNotesNow();
 static void replayAnswer();
 static String phoneUrl;  // "settings on phone" address while it's open
 
 static void redraw() {
   setBarState();
+  syncTapButton();
   switch (mode) {
     case Mode::Listening:
       if (settings.iconMode) ui::showFace(settings.character, face::Pose::Listening, 0);
@@ -679,6 +736,12 @@ static void redraw() {
       }
       break;
     case Mode::Home: showIdle(); break;
+    case Mode::Ask:
+      ui::showAsk("Saved voice notes",
+                  notesCount() + " recorded offline (" + clockLength(notes::seconds()) + "). Send " +
+                      (notes::count() == 1 ? "it" : "them") + " to the agent?",
+                  "send", "later");
+      break;
     case Mode::Idle:
       if (ui::hasReply()) ui::showReply();
       else showIdle();
@@ -828,6 +891,10 @@ static void chooseMenuRow() {
       updateSoftware();
       return;
     case MAutoUpdate: settings.autoUpdate = !settings.autoUpdate; break;
+    case MNotes:
+      sendNotesNow();
+      return;
+    case MTapTalk: settings.tapTalk = !settings.tapTalk; break;
   }
   settings.save();
   redraw();
@@ -899,6 +966,7 @@ static void sendRecEnd() {
 }
 
 static void stopTalking(bool send) {
+  tapRec = false;
   audio::micStop(send ? micSink : [](const int16_t*, size_t) {});
   if (send) sendRecEnd();
   else sendType("rec_cancel");
@@ -937,11 +1005,12 @@ static void startSpeech(uint32_t rate) {
 // ── talking from sleep ───────────────────────────────────────────────
 
 // Woken by the talk button, and it's still held: they're talking already.
+// (Where the button toggles, its press is enough.)
 static bool wokenToTalk() {
   esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
   bool byTalk = cause == ESP_SLEEP_WAKEUP_EXT0 ||
                 (cause == ESP_SLEEP_WAKEUP_EXT1 && (esp_sleep_get_ext1_wakeup_status() & (1ULL << board::kTalkPin)));
-  return byTalk && gpio_get_level(board::kTalkPin) == 0;
+  return byTalk && (board::kTalkToggles || gpio_get_level(board::kTalkPin) == 0);
 }
 
 static void startPreroll(uint32_t maxMs = kPrerollMaxMs) {
@@ -974,6 +1043,7 @@ static void stopPreroll() {
   free(preroll);
   preroll = nullptr;
   prerollOn = prerollStreaming = prerollOffline = false;
+  tapRec = false;
 }
 
 static size_t prerollReady(uint32_t atMs);
@@ -1024,12 +1094,13 @@ static void keepOffline(uint32_t stopAt) {
   time_t when = telemetry::clockSet() ? time(nullptr) - (time_t)((millis() - prerollStartMs) / 1000) : 0;
   if (!board::kEpaper) ui::showMessage("Saving", "Keeping the voice note offline…", kText);
   bool kept = board::kOfflineNotes && n >= audio::kMicRate && notes::save(preroll, n, audio::kMicRate, when);
+  if (kept) notesDeclined = -1;  // something new to ask about
   bool knewOffline = prerollOffline;
   stopPreroll();
   if (kept) {
     String waiting = notes::count() > 1 ? " (" + String(notes::count()) + " waiting)" : String("");
-    notice("Saved offline", "Kept on the " + String(notes::where()) + waiting + ". It goes to the agent when the " +
-                                String(board::kNoun) + " is back online.", kGreen);
+    notice("Saved offline", "Kept on the " + String(board::kNoun) + waiting + ". Back online, it asks to send " +
+                                (notes::count() > 1 ? "them" : "it") + " to the agent.", kGreen);
   } else if (board::kOfflineNotes) {
     notice("Not kept", knewOffline ? "Offline, and no room left to keep it." : "Couldn't reach Flight Deck, and no room to keep it.", kRed);
   } else {
@@ -1056,10 +1127,10 @@ static void prerollSend(size_t upTo) {
 
 // A press that only woke it: too little recorded, or a short stretch that
 // never got louder than the room (the press itself began before the mic).
-static bool prerollWokeOnly(uint32_t end) {
+static bool prerollWokeOnly(uint32_t end, bool wholeCap = false) {
   uint32_t ms = end - prerollStartMs;
   if (ms < kPrerollMinMs) return true;
-  if (ms > 4000) return false;
+  if (ms > 4000 && !wholeCap) return false;  // (ran to the cap untouched: silent all along?)
   size_t n = prerollReady(end);
   int peak = 0;
   for (size_t i = audio::kMicRate / 10; i < n; i += 2) peak = max(peak, abs((int)preroll[i]));  // past the mic's start
@@ -1081,27 +1152,28 @@ static void pumpPreroll() {
   if (!prerollOn) return;
   const uint32_t end = prerollEndMs;  // before `now`: the sampler may set it any moment
   const uint32_t now = millis();
-  if (end && !prerollChecked && (int32_t)(now - end) >= 150) {
+  const bool full = (int32_t)(now - prerollStartMs) >= (int32_t)prerollMaxMs;
+  const uint32_t stopAt = end ? end : full ? prerollStartMs + prerollMaxMs : 0;  // 0 = still talking
+  // Let go, or full (a press that only woke a toggling button runs to the cap).
+  if (stopAt && !prerollChecked && (int32_t)(now - stopAt) >= 150) {
     prerollChecked = true;  // once: it reads the whole recording
     // Pressed on purpose (awake, offline): only too short counts as nothing.
-    bool nothing = prerollOffline ? end - prerollStartMs < kPrerollMinMs : prerollWokeOnly(end);
+    bool nothing = prerollOffline ? stopAt - prerollStartMs < kPrerollMinMs : prerollWokeOnly(stopAt, !end);
     if (nothing) {
       bool sent = prerollStreaming, offline = prerollOffline;
       stopPreroll();
       if (sent) sendType("rec_cancel");  // nothing worth hearing went up after all
-      if (offline) notice("Too short", "Hold the button while you talk.", kOrange);
+      if (offline) notice("Too short", "Nothing kept: talk a little longer.", kOrange);
       else if (sent || mode == Mode::Listening) backToMain();
       return;
     }
     prerollEndSound();  // a real recording: let go is heard at once, whatever the link does
   }
-  const bool full = (int32_t)(now - prerollStartMs) >= (int32_t)prerollMaxMs;
-  const uint32_t stopAt = end ? end : full ? prerollStartMs + prerollMaxMs : 0;  // 0 = still talking
   if (!wsUp) {
     // Let go and still no deck: keep it offline. A wake on Wi-Fi expects the
     // link any moment; without Wi-Fi (or recorded offline) there's no point waiting.
     bool noLink = prerollOffline || WiFi.status() != WL_CONNECTED;
-    if (stopAt && (int32_t)(now - stopAt) > (noLink ? 1500 : 25000) && !ui::busy()) {
+    if (stopAt && (int32_t)(now - stopAt) > (noLink ? 1500 : 25000)) {
       prerollEndSound();  // (full while held: no release played it)
       keepOffline(stopAt);
     }
@@ -1137,23 +1209,58 @@ static void pumpPreroll() {
 
 // ── offline voice notes → Flight Deck ─────────────────────────────────
 
-// Once the deck is back and the device is idle, the waiting notes go up
-// (oldest first, up to 10 a time): notes_begin, then each as note_start +
-// PCM + note_end, then notes_end with the readings. The deck transcribes
-// them into one turn for the agent, marked as recorded offline, and answers
-// notes_done with the ids it has; only those are deleted here.
+// Once the deck is back, the device is idle and the user said yes, the
+// waiting notes go up (oldest first, up to 10 a time): notes_begin, then each
+// as note_start + PCM + note_end, then notes_end with the readings. The deck
+// transcribes them into one turn for the agent, marked as recorded offline,
+// and answers notes_done with the ids it has; only those are deleted here.
 static std::vector<notes::Note> upNotes;  // the batch going up
 static size_t upIndex = 0;
 static bool upOpen = false;               // the current note's file is open, its note_start sent
 static bool upAwaitAck = false;           // all sent: waiting for notes_done
 static uint32_t upAtMs = 0, upRetryAtMs = 0;
-static std::vector<String> upDelivered;   // acknowledged: deleted once the card's bus is free
 static bool upSentAny = false;            // this batch has a note the deck took
-static bool upCloseLater = false;         // the file is to be closed once the card's bus is free
+
+// The question, spoken by the deck and shown here; the talk button says yes.
+static void askNotes() {
+  upAsked = true;
+  askedMs = millis();
+  touch();
+  buzz(60);
+  mode = Mode::Ask;
+  ui::drawNow();  // the e-paper too: a question waits for nobody
+  redraw();
+  JsonDocument d;
+  d["type"] = "say";
+  d["text"] = "There are saved voice notes. Would you like to send them to the agent?";
+  sendJson(d);
+}
+
+// A yes (here, or Menu → Send voice notes): they go up from the next pass.
+static void sendNotesNow() {
+  if (!wsUp || !agentLinked) {
+    notice("Offline", "The notes go up once the " + String(board::kNoun) + " reaches the agent.", kRed);
+    return;
+  }
+  upAllowed = upAsked = true;
+  notesDeclined = -1;
+  upRetryAtMs = millis();
+  notice("Sending voice notes", notesCount() + " going to the agent. Its answer comes as usual.", kGreen);
+}
+
+static void answerAsk(bool yes) {
+  ui::drawNow();
+  if (yes) {
+    sendNotesNow();
+  } else {
+    notesDeclined = notes::count();
+    backToMain();
+  }
+}
 
 static void abortUpload(bool tellDeck) {
   if (upNotes.empty() && !upAwaitAck) return;
-  if (upOpen) upCloseLater = true;  // closing touches the card: not during a redraw
+  if (upOpen) notes::closeRead();
   if (tellDeck && wsUp && !upAwaitAck) sendType("notes_cancel");
   upNotes.clear();
   upIndex = 0;
@@ -1181,14 +1288,7 @@ static void finishBatch(uint32_t now) {
 static void pumpUpload() {
   if (!board::kOfflineNotes) return;
   const uint32_t now = millis();
-  if (!ui::busy()) {  // card chores wait for the panel to let go of the bus
-    if (upCloseLater) {
-      notes::closeRead();
-      upCloseLater = false;
-    }
-    for (auto& id : upDelivered) notes::remove(id);
-    upDelivered.clear();
-  }
+  if (mode == Mode::Ask && now - askedMs > 60000) backToMain();  // no answer: asked again on the next link
   if (upAwaitAck) {
     if (now - upAtMs > 300000) {  // no answer (a deck that doesn't know notes): try much later
       upAwaitAck = false;
@@ -1205,13 +1305,17 @@ static void pumpUpload() {
     abortUpload(true);  // they're talking: the notes wait
     return;
   }
-  // The card shares the panel's bus (a redraw holds it); and never over a voice.
-  if (ui::busy() || audio::playing() || upCloseLater) return;
+  if (audio::playing()) return;  // never over a voice
   // Every send below can find the link gone: onWs → abortUpload runs inside
   // it and clears the batch, so each one is followed by a check.
   if (upNotes.empty()) {
-    bool idle = mode == Mode::Idle || mode == Mode::Reply || mode == Mode::Home || mode == Mode::Image;
-    if (!notes::count() || !upDelivered.empty() || !agentLinked || !idle || (int32_t)(now - upRetryAtMs) < 0) return;
+    bool idle = mode == Mode::Idle || mode == Mode::Reply || mode == Mode::Home || mode == Mode::Image ||
+                mode == Mode::Notice;
+    if (!notes::count() || !agentLinked || !idle || (int32_t)(now - upRetryAtMs) < 0) return;
+    if (!upAllowed) {
+      if (!upAsked && notes::count() != notesDeclined) askNotes();
+      return;
+    }
     upNotes = notes::list(10);
     if (upNotes.empty()) return;
     upIndex = 0;
@@ -1352,8 +1456,10 @@ static void onText(const char* payload, size_t len) {
       agentLinked = false;
     } else if (st == "transcribing") {
       statusLine = "Transcribing…";
+      leds::action(leds::Step::Model);  // speech to text
     } else if (st == "thinking") {
       statusLine = "Thinking…";
+      leds::action(leds::Step::Model);
       if (mode != Mode::Waiting && mode != Mode::Listening) {
         startWork();  // a typed or resent turn: no recording came first
         mode = Mode::Waiting;
@@ -1367,17 +1473,21 @@ static void onText(const char* payload, size_t len) {
     ui::setQuestion(heard);
     statusLine = "Thinking…";
     workDirty = true;
+    leds::action(leds::Step::Narration);  // what it heard
   } else if (type == "status") {
     statusLine = doc["text"] | "";
     workDirty = true;
+    leds::action(leds::Step::Narration);
   } else if (type == "activity") {
     String line = doc["text"] | "";
     String tool = doc["tool"] | "";
     if (line.length()) {
       activity.push_back(line);
       if (activity.size() > 8) activity.erase(activity.begin());
-      if (tool.length() && tool != "progress") ++toolSteps;
+      bool isTool = tool.length() && tool != "progress";
+      if (isTool) ++toolSteps;
       workDirty = true;
+      leds::action(isTool ? leds::Step::Tool : leds::Step::Narration);
     }
   } else if (type == "reply") {
     touch();
@@ -1438,8 +1548,7 @@ static void onText(const char* payload, size_t len) {
     }
   } else if (type == "notes_done") {
     // The deck has these (and has sent them to the agent): gone from here.
-    // (a redraw may hold the card's bus right now: pumpUpload deletes them)
-    for (JsonVariant id : doc["ids"].as<JsonArray>()) upDelivered.push_back(id.as<String>());
+    for (JsonVariant id : doc["ids"].as<JsonArray>()) notes::remove(id.as<String>());
     upAwaitAck = false;
     upNotes.clear();
     upRetryAtMs = millis() + 3000;  // more waiting: the next batch shortly
@@ -1529,8 +1638,12 @@ static void onWs(WStype_t type, uint8_t* payload, size_t length) {
           prerollStreaming = false;
           prerollSent = 0;
         }
-        abortUpload(false);  // the notes go up again next time
-        if (mode == Mode::Listening || mode == Mode::Waiting) mode = ui::hasReply() ? Mode::Reply : Mode::Idle;
+        abortUpload(false);  // the notes go up again next time — asked first
+        upAllowed = upAsked = false;
+        if (!prerollOn) tapRec = false;  // a tapped recording that streamed: gone with the mic
+        if (mode == Mode::Listening || mode == Mode::Waiting || mode == Mode::Ask) {
+          mode = ui::hasReply() ? Mode::Reply : Mode::Idle;
+        }
         redraw();
       }
       break;
@@ -1646,13 +1759,29 @@ static void startInstall() {
 static volatile uint32_t buttonSeenMs = 0;
 
 static String sleepHint() {
-  return board::kEpaper ? String("Asleep · hold ") + board::kTalkKey + " and talk" : String("Press the talk button to wake.");
+  return board::kEpaper ? String(board::kTalkHint) : String("Press the talk button to wake.");
 }
+
+#if defined(BOARD_PAPERCOLOR)
+// The PaperColor's power chip (charging, and the status lights' supply).
+static M5PM1 pm1;
+static bool pm1Up = false;
+
+// The two RGB lights run off the PMIC's 5 V boost converter (M5Stack's own
+// PaperColor firmware switches it on at start), which starts off: without it
+// the lights get their colours but no power.
+static void paperLights(bool on) {
+  if (pm1Up) pm1.setBoostEnable(on);
+}
+#endif
 
 // Deep sleep. The talk button wakes it (on the paper any button does, and
 // a timer redraws the sleeping screen now and then).
 [[noreturn]] static void sleepNow() {
   leds::off();
+#if defined(BOARD_PAPERCOLOR)
+  paperLights(false);  // nothing to show asleep
+#endif
   ui::brightness(0);
   // The paper's panel powers itself down after every redraw and keeps its
   // picture; its controller's deep sleep would need a reset pulse to wake,
@@ -1731,10 +1860,17 @@ static void sampleButtons(void*) {
   if (talk || gpio_get_level(board::kSidePin) == 0 || (board::kBackPin >= 0 && gpio_get_level(board::kBackPin) == 0)) {
     buttonSeenMs = millis();
   }
-  if (prerollOn && !talk && !prerollEndMs) {
-    uint32_t t = millis();
-    prerollEndMs = t ? t : 1;
+  if (prerollOn && !prerollEndMs) {
+    // Let go (held to talk), or pressed again (a toggled recording — which
+    // talk-from-sleep is too, before the loop runs).
+    bool ends = tapRec ? board::kTalkToggles && talk && !talkWasDown : !talk;
+    if (ends) {
+      uint32_t t = millis();
+      prerollEndMs = t ? t : 1;
+      tapRec = false;
+    }
   }
+  talkWasDown = talk;
 }
 
 static void noteButtonActivity() {
@@ -1764,7 +1900,9 @@ static void noteSideClick(bool wokeOnly) {
 // One side click: next row / page, or back to the main screen.
 static void sideClick() {
   ui::drawNow();  // a page, the status: asked to see it (the e-paper draws it now)
-  if (mode == Mode::Menu) {
+  if (mode == Mode::Ask) {
+    answerAsk(false);
+  } else if (mode == Mode::Menu) {
     do menuSel = (menuSel + 1) % MCount;
     while (!rowShown(menuSel));
     menuOpenedMs = millis();
@@ -1808,7 +1946,9 @@ static void sideClick() {
 // out to the main screen; from the home screen, to the answer.
 static void backClick() {
   ui::drawNow();  // back, the answer, the home screen: asked to see it
-  if (mode == Mode::Menu) {
+  if (mode == Mode::Ask) {
+    answerAsk(false);
+  } else if (mode == Mode::Menu) {
     do menuSel = (menuSel + MCount - 1) % MCount;
     while (!rowShown(menuSel));
     menuOpenedMs = millis();
@@ -1878,8 +2018,9 @@ static void updateLeds() {
 // battery leaves "charge me" on the paper — which costs nothing to keep —
 // and switches off.
 static void paperPower() {
-  static M5PM1 pm1;
-  if (pm1.begin(&M5.In_I2C, M5PM1_DEFAULT_ADDR, M5PM1_I2C_FREQ_100K) == M5PM1_OK) pm1.setChargeEnable(true);
+  pm1Up = pm1.begin(&M5.In_I2C, M5PM1_DEFAULT_ADDR, M5PM1_I2C_FREQ_100K) == M5PM1_OK;
+  if (pm1Up) pm1.setChargeEnable(true);
+  paperLights(settings.ledLevel > 0);
   int mv = M5.Power.getBatteryVoltage();
   if (mv > 0 && mv < 3300 && !telemetry::onUsbPower()) {
     ui::showMessage("Battery empty", "Charge it over USB-C, then press the power button.", kRed);
@@ -1948,9 +2089,12 @@ void setup() {
   // Woken by holding the talk button: they're speaking already, so the mic
   // starts before anything slow (it records while Wi-Fi connects).
   bool talking = settings.configured() && wokenToTalk();
-  if (talking) startPreroll();
+  if (talking) {
+    tapRec = board::kTalkToggles;  // ends with the next press, not on letting go
+    startPreroll();
+  }
   sideBtn().setHoldThresh(800);
-  M5.BtnC.setHoldThresh(800);
+  if (board::kBackPin >= 0) backBtn().setHoldThresh(800);
   esp_timer_create_args_t sampler = {};
   sampler.callback = sampleButtons;
   sampler.name = "buttons";
@@ -1969,8 +2113,10 @@ void setup() {
 #endif
   if (board::kEpaper && esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
     asleepRedraw();  // returns only when a button was pressed meanwhile
-    if (settings.configured() && gpio_get_level(board::kTalkPin) == 0) {
-      talking = true;  // "hold B and talk", as the paper says
+    // Pressed during the redraw: awake, and the next press talks (a recording
+    // started now would begin long after that press).
+    if (settings.configured() && !board::kTalkToggles && gpio_get_level(board::kTalkPin) == 0) {
+      talking = true;
       startPreroll();
     }
   }
@@ -2000,7 +2146,7 @@ void setup() {
   // A device that keeps voice notes carries on offline when no Wi-Fi is in
   // reach (it keeps looking); the others open setup. Setup stays a cold
   // power-on with the talk button held, or Menu → Wi-Fi & settings.
-  const bool goesOffline = board::kOfflineNotes && *notes::where();
+  const bool goesOffline = board::kOfflineNotes && notes::ready();
   bool offline = false;
   uint32_t t0 = millis();
   while (wifiMulti.run(5000) != WL_CONNECTED) {
@@ -2030,7 +2176,108 @@ void setup() {
   configTzTime(settings.tz.c_str(), "pool.ntp.org", "time.google.com");  // clocks; the RTC follows
   connectServer();  // it connects by itself once Wi-Fi is back
   lastActivityMs = millis();
-  if (offline) redraw();  // "Offline · hold to keep a note"
+  if (offline) redraw();  // "Offline · talk to keep a note"
+}
+
+// A tapped (or toggled) recording dropped: a double press.
+static void cancelTapRecording() {
+  tapRec = false;
+  if (prerollOn) {
+    stopPreroll();
+    backToMain();
+  } else {
+    stopTalking(false);
+  }
+}
+
+// A recording that was tapped on ends: a second tap (or the talk button).
+static void endTapRecording() {
+  if (prerollOn) {  // offline: pumpPreroll keeps it
+    uint32_t t = millis();
+    prerollEndMs = t ? t : 1;
+    tapRec = false;
+  } else if (mode == Mode::Listening) {
+    stopTalking(true);
+  }
+}
+
+// A swipe on an answer: the next (forward) or previous screen of it — the
+// picture, if it came with one, then the text's pages. No wrapping round.
+static void swipeAnswer(bool forward) {
+  if (mode == Mode::Image) {
+    if (forward) backToMain();  // on to the text
+    return;
+  }
+  if (settings.iconMode && audio::playing()) {  // the character speaking: the text, as a side click does
+    sideClick();
+    return;
+  }
+  if (forward) {
+    if (!ui::onLastPage()) ui::nextPage();
+  } else if (!ui::prevPage() && ui::hasImage()) {  // before the first page: the picture
+    mode = Mode::Image;
+    redraw();
+  }
+}
+
+// A double tap off the tap button: the home screen, from an answer, a
+// picture, the menu or a notice (not while it records or the agent works).
+static void goHome() {
+  if (mode == Mode::Home || mode == Mode::Listening || mode == Mode::Waiting || mode == Mode::Ask) return;
+  if (mode == Mode::Idle && !ui::hasReply()) return;  // there already
+  mode = Mode::Home;
+  redraw();
+}
+
+// The touch screen (StopWatch). Swipes page an answer: left or up goes on,
+// right or down goes back (on the home screen, back to the answer). A double
+// tap goes home. With Tap to talk on, a tap on the button on the screen
+// starts a recording and a second tap sends it. A touch on a dark screen
+// only wakes it.
+static void pollTouch(bool dark) {
+  if (!M5.Touch.isEnabled()) return;
+  static bool woke = false;  // this touch began on a dark screen
+  auto t = M5.Touch.getDetail();
+  if (t.wasPressed()) {
+    woke = dark;
+    touch();
+  }
+  if (!t.wasReleased() || woke) return;
+  const int dx = t.distanceX(), dy = t.distanceY();
+  const int dist = max(abs(dx), abs(dy));
+  if (dist >= 45) {
+    if (mode == Mode::Reply || mode == Mode::Image) {
+      swipeAnswer(abs(dx) > abs(dy) ? dx < 0 : dy < 0);
+    } else if (mode == Mode::Home && ui::hasReply()) {
+      backToMain();  // home → the answer again
+    }
+    return;
+  }
+  if (dist > 25) return;
+  if (!settings.tapTalk || !ui::tapButtonHit(t.base_x, t.base_y)) {
+    static uint32_t lastTapMs = 0;  // taps on the button act at once, so only these count
+    if (lastTapMs && millis() - lastTapMs < kDoubleMs + 100) {
+      lastTapMs = 0;
+      goHome();
+    } else {
+      lastTapMs = millis();
+      if (!lastTapMs) lastTapMs = 1;
+    }
+    return;
+  }
+  if (tapRec) {
+    endTapRecording();
+    return;
+  }
+  if (mode != Mode::Idle && mode != Mode::Home && mode != Mode::Reply) return;
+  bool wasSpeaking = audio::playing();
+  tapRec = true;  // before it starts: the button sampler would end an offline recording at once
+  startTalking();
+  if (mode != Mode::Listening) {  // offline with no room, say
+    tapRec = false;
+    return;
+  }
+  if (wasSpeaking) sendType("stop");
 }
 
 void loop() {
@@ -2064,12 +2311,15 @@ void loop() {
 
   // The paper changes slowly: a click says the press was heard.
   if (board::kEpaper && settings.keyClicks && !prerollOn &&
-      (sideBtn().wasPressed() || M5.BtnC.wasPressed() || (talkBtn().wasPressed() && (inMenu || mode == Mode::Link)))) {
+      (sideBtn().wasPressed() || backBtn().wasPressed() ||
+       (talkBtn().wasPressed() && (inMenu || mode == Mode::Link || mode == Mode::Ask)))) {
     audio::click();
   }
 
   // Front button: hold to talk, tap for quick actions; in the menu, choose.
-  // (Not while a talk-from-sleep recording holds it.)
+  // (Not while a talk-from-sleep recording holds it — but a press ends one
+  // that was tapped on or toggled; looked at first, as a press below may start one.)
+  const bool endsPreroll = talkBtn().wasPressed() && prerollOn && tapRec;
   if (talkBtn().wasPressed() && !prerollOn) {
     touch();
     if (dark && inMenu) {
@@ -2087,17 +2337,35 @@ void loop() {
     } else if (mode == Mode::Status) {
       openMenu();
     } else if (mode == Mode::Link) {
-      if (board::kEpaper) updateSoftware();  // the Options screen: B updates
+      if (board::kEpaper) updateSoftware();  // the Options screen: the talk button updates
       else backToMain();
+    } else if (mode == Mode::Ask) {
+      answerAsk(true);
+    } else if (tapRec && board::kTalkToggles && millis() - recStartMs < kDoubleMs + 100) {
+      cancelTapRecording();  // a double press: no recording — the last answer again
+      if (canReplay()) replayAnswer();
+    } else if (tapRec) {
+      endTapRecording();  // the second press (or, tapped on the screen, the button too)
+    } else if (talkTapMs && millis() - talkTapMs < kDoubleMs + 100 && canReplay()) {
+      talkTapMs = 0;  // a double-click on the talk button: hear the last answer again
+      replayAnswer();
+    } else if (board::kTalkToggles && audio::playing()) {
+      audio::playStop();  // a press while it speaks only stops it; the next one talks
+      sendType("stop");
+      talkTapMs = millis();  // (or, straight after, replays it)
     } else {
       bool wasSpeaking = audio::playing();
+      tapRec = board::kTalkToggles;  // before it starts: the sampler would end an offline one on letting go
       startTalking();
+      if (mode != Mode::Listening) tapRec = false;
       if (wasSpeaking) sendType("stop");
     }
   }
-  if (talkBtn().wasReleased() && mode == Mode::Listening && !prerollOn) {
+  if (endsPreroll && tapRec) endTapRecording();  // (unless the sampler saw the press first)
+  if (talkBtn().wasReleased() && mode == Mode::Listening && !prerollOn && !tapRec) {
     bool tap = millis() - recStartMs < kTapMs;
     stopTalking(!tap);
+    talkTapMs = tap ? millis() : 0;  // a second press soon after is a double-click
     if (tap) {
       sendType("stop");  // a tap also silences the rest of the answer
       if (ui::hasImage() && mode == Mode::Reply) {
@@ -2107,13 +2375,17 @@ void loop() {
     }
   }
 
+  if (board::kHasTouch) pollTouch(dark);
+
   // Side button: page / next row · hold = menu (hold again = close).
   if (dark && (sideBtn().wasHold() || sideBtn().wasClicked())) {
     touch();  // woken only — though a second click makes it a double-click
     if (sideBtn().wasClicked() && onAnswer()) noteSideClick(true);
   } else if (sideBtn().wasHold()) {
     touch();
-    if (mode == Mode::CharPick) {  // back to the menu, keeping the old character
+    if (mode == Mode::Ask) {
+      answerAsk(false);
+    } else if (mode == Mode::CharPick) {  // back to the menu, keeping the old character
       mode = Mode::Menu;
       menuOpenedMs = millis();
       redraw();
@@ -2141,16 +2413,18 @@ void loop() {
 
   // Third button (PaperColor C): back · hold = the home screen.
   if (board::kBackPin >= 0) {
-    if (M5.BtnC.wasHold()) {
+    if (backBtn().wasHold()) {
       touch();
-      if (inMenu || mode == Mode::Link) {
+      if (mode == Mode::Ask) {
+        answerAsk(false);
+      } else if (inMenu || mode == Mode::Link) {
         backToMain();
       } else if (mode != Mode::Listening) {
         mode = Mode::Home;
         ui::drawNow();
         redraw();
       }
-    } else if (M5.BtnC.wasClicked()) {
+    } else if (backBtn().wasClicked()) {
       touch();
       backClick();
     }
@@ -2197,6 +2471,7 @@ void loop() {
     if (millis() - lastDrawMs > frameGap(80)) {
       lastDrawMs = millis();
       setBarState();
+      syncTapButton();
       if (settings.iconMode) ui::showFace(settings.character, face::Pose::Listening, level);
       else ui::showListening(level, millis() - recStartMs);
     }
@@ -2253,9 +2528,9 @@ void loop() {
       lastDrawMs = millis();
       setBarState();
       ui::showFace(settings.character, face::Pose::Speaking, audio::outputLevel());
-    } else if (!settings.iconMode && ui::animated() && mode == Mode::Reply && audio::playing() && since > frameGap(60)) {
-      lastDrawMs = millis();  // the speaking ring follows the voice
-      redraw();
+    } else if (!settings.iconMode && ui::animated() && mode == Mode::Reply && audio::playing() && since > 80) {
+      lastDrawMs = millis();  // the speaking line follows the voice (its strip only)
+      ui::showSpeaking(audio::sounding() ? audio::outputLevel() : 0);
     } else if (settings.iconMode && mode == Mode::Idle && !ui::hasReply() && since > frameGap(face::frameMs(settings.character))) {
       lastDrawMs = millis();  // blinking, rain, bouncing…
       redraw();

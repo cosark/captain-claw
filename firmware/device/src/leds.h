@@ -1,7 +1,9 @@
 // Status lights (PaperColor: two RGB LEDs). The paper takes ~20 s to redraw,
-// so the lights say what's happening now: red while it listens (brighter
-// when you're louder), amber breathing while the agent works, cyan with the
-// voice while it speaks, a slow blue glow while the paper redraws. Devices
+// so the lights say what's happening now: red blinking while it records you
+// (like a REC light, brighter when you're louder), a blink for every step
+// the deck reports while the agent works — light blue for a tool, dark blue
+// for narration and progress, purple for the model thinking — green with the voice
+// while it speaks, a soft white glow while the paper redraws. Devices
 // without lights ignore all of it.
 #pragma once
 
@@ -18,6 +20,9 @@ void setLevel(uint8_t level);
 void set(State state, int level = 0);
 // The cue before speech: three quick white blinks.
 void flash();
+// The deck reported a step of the work: one blink, coloured by what it was.
+enum class Step : uint8_t { Tool, Narration, Model };
+void action(Step step);
 // Something went wrong: two red blinks.
 void alert();
 // From loop(): animates the lights (at most ~30 times a second).
