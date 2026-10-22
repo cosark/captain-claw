@@ -1,16 +1,17 @@
 // Captain Claw voice client for the M5Stack StickS3, StopWatch and PaperColor
 // (board.h).
 //
-//   Button A  (StickS3 front, StopWatch yellow, PaperColor A)
+//   Talk      (StickS3 front, StopWatch yellow, PaperColor C on top)
 //             hold = talk, release = send · tap = stop speaking / flip picture↔text
 //             in the menu: choose / change the row
-//   Button B  (StickS3 side, StopWatch the other one, PaperColor B)
+//   Side      (StickS3 side, StopWatch the other one, PaperColor A)
 //             click = next page / next row · hold = menu (hold again = close)
 //             double-click on an answer = hear it again (also Menu → Replay answer)
-//   Button C  (PaperColor only)
-//             click = previous page / previous row / back · hold = home screen
-//   PaperColor: its talk button (C, on top) isn't held — a press starts the
-//   recording and the next press sends it; a quick double press replays.
+//   Back      (PaperColor B only)
+//             click = an answer: the home screen · home: the answer · else back
+//             hold = home screen
+//   PaperColor: its talk button isn't held — a press starts the recording
+//   and the next press sends it; a quick double press replays.
 //   Hold the talk button while switching on (or no Wi-Fi saved) = setup hotspot
 //   Asleep: hold the talk button and talk at once — it records while it reconnects
 //   (PaperColor: press it and talk)
@@ -44,7 +45,7 @@
 #include <M5PM1.h>
 #endif
 
-#define FW_VERSION "0.12.0"
+#define FW_VERSION "0.12.1"
 
 // The loop task's stack (Arduino's default is 8 KB). The smooth fonts on the
 // round and paper screens draw each glyph through a stack buffer — a timer
@@ -1971,13 +1972,11 @@ static void backClick() {
     } else {
       backToMain();
     }
-  } else if (mode == Mode::Reply && ui::waiting()) {
-    redraw();  // the e-paper was holding the answer for a quiet spell: show it now
   } else if (mode == Mode::Reply) {
-    if (!ui::prevPage()) {  // on its first page: the home screen
-      mode = Mode::Home;
-      redraw();
-    }
+    // The home screen, from any page (A pages on); it shows the newest
+    // answer too, so one still waiting for a quiet spell is drawn now.
+    mode = Mode::Home;
+    redraw();
   } else if (mode == Mode::Home || (mode == Mode::Idle && !ui::hasReply())) {
     if (ui::hasReply() || ui::restoreAnswer()) {  // the answer from before a sleep, too
       mode = Mode::Reply;

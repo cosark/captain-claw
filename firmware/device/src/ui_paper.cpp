@@ -1252,7 +1252,7 @@ void showReply() {
     drawPageDots(pages, page, H - kFootH - 18);
     char when[16] = "";
     clockText(when, sizeof(when), "%H:%M", replyWhen);
-    if (pages > 1) drawFooter({{board::kTalkKey, "talk"}, {board::kSideKey, "next"}, {board::kBackKey, "back"}}, when);
+    if (pages > 1) drawFooter({{board::kTalkKey, "talk"}, {board::kSideKey, "next"}, {board::kBackKey, "home"}}, when);
     else drawFooter({{board::kTalkKey, "talk"}, {board::kBackKey, "home"}}, when);
   }, answerId(replyWhen, imgLen));
 }

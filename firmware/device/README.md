@@ -77,7 +77,7 @@ at all. So it's voice-first and redraws when you put it down:
   button, C, talk, press it again — no holding on), hear the answer, and the status lights show what's happening. About 30 s after you
   stop, the paper draws the newest answer once. Waking up and falling asleep
   don't redraw when it already shows that answer. Pages, the status page and
-  B (show the waiting answer now) draw at once.
+  B (the home screen, with an answer still waiting) draw at once.
 - **Black and white, text only:** the black settles in the first seconds of a
   redraw and the colours come last, so a black-and-white page reads as done
   much sooner. Pictures are dithered to grey.
@@ -101,7 +101,7 @@ at all. So it's voice-first and redraws when you put it down:
 
 | | C (top) | A | B |
 |---|---|---|---|
-| click | talk, click again to send · while it speaks: stop · on Options: update | home: status · answer: next page · Options: done | previous page / back · a waiting answer: show it now |
+| click | talk, click again to send · while it speaks: stop · on Options: update | home: status · answer: next page (after the last, the first) · Options: done | answer: home screen · home: the answer · back |
 | hold | | Options (QR code; hold again closes) | home screen |
 | double-click | hear the last answer again | (on an answer) hear it again | |
 
