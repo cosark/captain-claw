@@ -20,7 +20,6 @@ import { ForgePage } from './pages/ForgePage'
 import { LibraryPage } from './pages/LibraryPage'
 import { LoginPage } from './pages/LoginPage'
 import { ChoosePasswordPage } from './pages/ChoosePasswordPage'
-import { AdminStartDialog } from './components/layout/AdminStartDialog'
 import { AcceptInvitePage, INVITE_PATH } from './pages/AcceptInvitePage'
 import { AdminPage } from './pages/AdminPage'
 import { UsersPage } from './pages/UsersPage'
@@ -51,8 +50,8 @@ import { BrowserLLMPage } from './pages/BrowserLLMPage'
 import { BeingsPage } from './pages/BeingsPage'
 import { PaymentsPage, paymentIdFromPath, purchaseIdFromPath } from './pages/PaymentsPage'
 import { PublicBeingPage } from './pages/PublicBeingPage'
-import { useUIStore } from './stores/uiStore'
-import { useConsoleStore, syncConsoleFromUrl, dropConsoleRequest } from './stores/consoleStore'
+import { useUIStore, startInConsoleUnlessChosen } from './stores/uiStore'
+import { useConsoleStore, syncConsoleFromUrl, dropConsoleRequest, selectConsoleAdmin, openConsole } from './stores/consoleStore'
 import { useAgentStore } from './stores/agentStore'
 import { useAuthStore, selectKioskLocked, awaitAuthStatus, refreshAccessToken, reloadAfterSessionEnd, DEFAULT_INSTANCE_NAME } from './stores/authStore'
 import { useChatStore } from './stores/chatStore'
@@ -168,16 +167,25 @@ function AppContent() {
   }, [])
   const layoutMode = useUIStore((s) => s.layoutMode)
   const kioskLocked = useAuthStore(selectKioskLocked)
-  // The Admin console: a signed-in admin who saved it as their layout or
-  // followed a <deck>/console address. Anyone else gets the usual layout.
-  const isAdmin = useAuthStore((s) => s.authEnabled && s.user?.role === 'admin')
+  // The Admin console: an admin (the user of a deck without sign-in included)
+  // who just signed in, has it as their layout — the default until they pick
+  // another — or followed a <deck>/console address. Anyone else gets the
+  // usual layout.
+  const consoleAdmin = useAuthStore(selectConsoleAdmin)
   const consoleRequested = useConsoleStore((s) => s.requested)
-  const inConsole = isAdmin && (layoutMode === 'console' || consoleRequested)
+  const adminSignedIn = useAuthStore((s) => s.adminStartPending)
+  const inConsole = consoleAdmin && (layoutMode === 'console' || consoleRequested || adminSignedIn)
   useEffect(() => {
     window.addEventListener('popstate', syncConsoleFromUrl)
     return () => window.removeEventListener('popstate', syncConsoleFromUrl)
   }, [])
-  useEffect(() => { if (!isAdmin) dropConsoleRequest() }, [isAdmin])
+  useEffect(() => { if (!consoleAdmin) dropConsoleRequest() }, [consoleAdmin])
+  // Signing in lands an admin on the console's Overview.
+  useEffect(() => {
+    if (!adminSignedIn) return
+    useAuthStore.getState().setAdminStartPending(false)
+    if (consoleAdmin) openConsole('overview')
+  }, [adminSignedIn, consoleAdmin])
   const chatOpen = useChatStore((s) => s.chatOpen)
   const chatFullscreen = useChatStore((s) => s.chatFullscreen)
   const { fetchInstances, fetchStats, fetchConcerns, setWsConnected, upsertInstance, removeInstance, updateInstanceActivity } = useAgentStore()
@@ -604,12 +612,7 @@ function App() {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated)
   const mustChangePassword = useAuthStore((s) => s.user?.must_change_password === true)
   const instanceName = useAuthStore((s) => s.branding.name)
-  const adminStartPending = useAuthStore((s) => s.adminStartPending)
   const [authChecked, setAuthChecked] = useState(false)
-  // The signed-in user's settings are in (hydrateAllStores after sign-in):
-  // until then their saved layout could still land on top of a choice made
-  // in AdminStartDialog.
-  const [settingsLoaded, setSettingsLoaded] = useState(false)
   const [fdUnreachable, setFdUnreachable] = useState(false)
   // An invitation link (<deck>/invite#<token>): choose a password, get an account.
   const [onInvitePage, setOnInvitePage] = useState(() => window.location.pathname === INVITE_PATH)
@@ -640,6 +643,7 @@ function App() {
         }
       } else {
         reportPublicOrigin()   // auth-off deck: no login to wait for
+        startInConsoleUnlessChosen()   // its user is its admin
       }
       setAuthChecked(true)
     }
@@ -657,7 +661,7 @@ function App() {
   const prevAuth = useRef(false)
   useEffect(() => {
     if (isAuthenticated && !prevAuth.current) {
-      hydrateAllStores().finally(() => setSettingsLoaded(true))
+      hydrateAllStores()
       // Tell Flight Deck the address this deck is reached at, so a public link
       // an agent makes points here rather than at the agent's internal FD URL.
       reportPublicOrigin()
@@ -692,14 +696,8 @@ function App() {
     return <ChoosePasswordPage />
   }
 
-  // Auth disabled or authenticated → show main app (an admin who just signed
-  // in is asked where to start first)
-  return (
-    <>
-      <AppContent />
-      {adminStartPending && settingsLoaded && <AdminStartDialog />}
-    </>
-  )
+  // Auth disabled or authenticated → show main app
+  return <AppContent />
 }
 
 export default App

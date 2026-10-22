@@ -33,7 +33,9 @@ import {
   ShieldCheck,
 } from 'lucide-react'
 import { useUIStore } from '../../stores/uiStore'
-import { openConsole } from '../../stores/consoleStore'
+import { openConsole, selectConsoleAdmin } from '../../stores/consoleStore'
+import { isDesktopApp } from '../../services/desktopShell'
+import { ShellModeSwitch } from '../console/ShellModeSwitch'
 import { useAgentStore } from '../../stores/agentStore'
 import { useAuthStore, logoutUser } from '../../stores/authStore'
 import { useChatStore, parseLaneKey, clearAgentSlices } from '../../stores/chatStore'
@@ -1049,6 +1051,8 @@ function AgentsColumn({
   const setLayoutMode = useUIStore((s) => s.setLayoutMode)
   const wsConnected = useAgentStore((s) => s.wsConnected)
   const { authEnabled, user: authUser, signingOut } = useAuthStore()
+  const consoleAdmin = useAuthStore(selectConsoleAdmin) && !locked
+  const desktopApp = isDesktopApp()
   const { theme, toggle: toggleTheme } = useThemeStore()
   const width = usePersistedSize('fd:simple-left-width', 260, 200, 440, 'x')
   const [search, setSearch] = useState('')
@@ -1075,7 +1079,7 @@ function AgentsColumn({
               <LayoutDashboard className="h-4 w-4" />
             </button>
           )}
-          {authEnabled && authUser?.role === 'admin' && (
+          {consoleAdmin && (
             <button onClick={() => openConsole()} className={iconBtn} title="Admin console — models, archetypes, connections, users, settings">
               <ShieldCheck className="h-4 w-4" />
             </button>
@@ -1218,7 +1222,7 @@ function AgentsColumn({
               <LayoutDashboard className="h-4 w-4" />
             </button>
           )}
-          {authEnabled && authUser?.role === 'admin' && (
+          {consoleAdmin && !desktopApp && (
             <button onClick={() => openConsole()} className={iconBtn} title="Admin console — models, archetypes, connections, users, settings">
               <ShieldCheck className="h-4 w-4" />
             </button>
@@ -1228,6 +1232,13 @@ function AgentsColumn({
           </button>
         </div>
       </div>
+
+      {/* The desktop app: this view ⇄ the Admin console */}
+      {consoleAdmin && desktopApp && (
+        <div className="border-b border-zinc-800 p-2">
+          <ShellModeSwitch current="user" />
+        </div>
+      )}
 
       {/* List header */}
       <div className="flex items-center justify-between px-3 pt-3 pb-1">

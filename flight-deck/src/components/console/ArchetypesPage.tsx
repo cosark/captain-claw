@@ -3,6 +3,7 @@ import {
   Library, Plus, Wand2, Search, Crown, Pencil, Trash2, Copy, Share2, Users, Sparkles,
   Check, Wrench, Gauge, Lock,
 } from 'lucide-react'
+import { useAuthStore } from '../../stores/authStore'
 import { useTierConfig, TIER_ORDER, type Archetype, type ArchetypeRegistry } from '../../services/tierConfig'
 import {
   createArchetype, updateArchetype, deleteArchetype, generateArchetype, type ArchetypeInput,
@@ -54,6 +55,8 @@ export function ArchetypesPage() {
   const [forgeOpen, setForgeOpen] = useState(false)
   const [shareTarget, setShareTarget] = useState<Archetype | null>(null)
   const [error, setError] = useState('')
+  // Sharing needs other users — none on a deck without sign-in.
+  const accounts = useAuthStore((s) => s.authEnabled !== false)
 
   const all = useMemo(() => registry?.archetypes || [], [registry])
   const counts = useMemo(() => ({
@@ -173,7 +176,7 @@ export function ArchetypesPage() {
               tierLabel={registry.tiers[a.tier]?.label || a.tier}
               onOpen={() => open(a)}
               onCopy={() => setDraft({ input: copyOf(a), id: null })}
-              onShare={() => setShareTarget(a)}
+              onShare={accounts ? () => setShareTarget(a) : undefined}
               onDelete={() => remove(a)}
             />
           ))}
@@ -233,7 +236,7 @@ function ArchetypeCard({ a, tierLabel, onOpen, onCopy, onShare, onDelete }: {
   tierLabel: string
   onOpen: () => void
   onCopy: () => void
-  onShare: () => void
+  onShare?: () => void
   onDelete: () => void
 }) {
   const mine = a.source === 'user'
@@ -263,7 +266,7 @@ function ArchetypeCard({ a, tierLabel, onOpen, onCopy, onShare, onDelete }: {
       <div className="flex items-center justify-end gap-0.5 px-3 pb-2.5">
         {mine ? (
           <>
-            <button onClick={onShare} className={iconBtn} title="Share with other users"><Share2 className="h-4 w-4" /></button>
+            {onShare && <button onClick={onShare} className={iconBtn} title="Share with other users"><Share2 className="h-4 w-4" /></button>}
             <button onClick={onOpen} className={iconBtn} title="Edit"><Pencil className="h-4 w-4" /></button>
             <button onClick={onDelete} className={`${iconBtn} hover:text-red-500`} title={a.overrides ? 'Delete (the built-in comes back)' : 'Delete'}><Trash2 className="h-4 w-4" /></button>
           </>
