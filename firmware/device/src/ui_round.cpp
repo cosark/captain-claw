@@ -13,6 +13,9 @@
 #include <M5Unified.h>
 #include <math.h>
 #include <time.h>
+#if defined(ESP_PLATFORM)
+#include <lgfx/v1/panel/Panel_AMOLED.hpp>
+#endif
 
 #include "audio.h"
 #include "fonts.h"
@@ -82,7 +85,34 @@ static int lineRoom(int top, int bottom) {
   return max(0, 2 * min(halfChord(top), halfChord(bottom)) - 2 * kMargin);
 }
 
-static void push() { canvas.pushSprite(0, 0); }
+#ifdef CLAW_PERF
+uint32_t g_perfDrawUs = 0, g_perfDrawMax = 0, g_perfPushUs = 0, g_perfPushMax = 0, g_perfFrames = 0;
+static uint32_t frameT0 = 0;
+#endif
+
+// Every screen starts here: a black canvas.
+static void beginFrame() {
+#ifdef CLAW_PERF
+  frameT0 = micros();
+#endif
+  canvas.fillScreen(kBlack);
+}
+
+static void push() {
+#ifdef CLAW_PERF
+  uint32_t t = micros();
+  uint32_t draw = t - frameT0;
+  canvas.pushSprite(0, 0);
+  uint32_t p = micros() - t;
+  g_perfDrawUs += draw;
+  g_perfPushUs += p;
+  g_perfDrawMax = max<uint32_t>(g_perfDrawMax, draw);
+  g_perfPushMax = max<uint32_t>(g_perfPushMax, p);
+  ++g_perfFrames;
+#else
+  canvas.pushSprite(0, 0);
+#endif
+}
 
 static int tw(const String& s) { return canvas.textWidth(s.c_str()); }
 
@@ -529,7 +559,32 @@ static void drawBadge(Tone tone, const String& name, Glyph glyph, int cy = kBadg
 
 // ── public ─────────────────────────────────────────────────────────────
 
+#if defined(ESP_PLATFORM)
+// M5GFX puts the StopWatch's AMOLED behind a framebuffer panel of its own:
+// a second copy of every frame on its way out, and a setSleep() that does
+// nothing, so before deep sleep the panel was never told to sleep and showed
+// white. Our canvas already is a whole-screen framebuffer, pushed from (0,0)
+// with an even width (the panel's one restriction): M5.Display draws straight
+// to the AMOLED. The framebuffer panel itself stays — M5Unified's touch reads
+// through its own copy of the display, which still points at it.
+struct AmoledFb : lgfx::Panel_AMOLED_Framebuffer {
+  lgfx::Panel_AMOLED* amoled() { return _panel; }
+};
+
+static void drawDirect() {
+  if (M5.getBoard() != m5::board_t::board_M5StopWatch || !ESP.getPsramSize()) return;  // no framebuffer then
+  auto* fb = static_cast<lgfx::Panel_AMOLED_Framebuffer*>(M5.Display.getPanel());
+  lgfx::Panel_AMOLED* panel = static_cast<AmoledFb*>(fb)->amoled();
+  if (!panel || panel->getPanelFb() != fb) return;  // not the framebuffer we know
+  panel->setAutoDisplay(false);  // never send the (unused) framebuffer over our frames
+  M5.Display.setPanel(panel);
+}
+#endif
+
 void begin() {
+#if defined(ESP_PLATFORM)
+  drawDirect();
+#endif
   M5.Display.setRotation(0);
   canvas.setPsram(true);
   canvas.setColorDepth(16);
@@ -568,7 +623,7 @@ void setHealth(Health wifi, Health agent) {
 }
 
 void showSetup(const char* reason, const char* apName, const char* ip) {
-  canvas.fillScreen(kBlack);
+  beginFrame();
   font(vlw::Title);
   text(reason, CX, 70, kAmber);
   const int q = 200;
@@ -583,7 +638,7 @@ void showSetup(const char* reason, const char* apName, const char* ip) {
 }
 
 void showLink(const char* title, const String& url, const String& note) {
-  canvas.fillScreen(kBlack);
+  beginFrame();
   font(vlw::Title);
   text(fit(title, lineRoom(52, 92)), CX, 70, kCyan);
   const int q = 190;
@@ -602,7 +657,7 @@ void showSleeping(const String& hint, uint8_t) { showMessage("Sleeping", hint, T
 
 // Notices: a round alert mark, the title, then the text.
 void showMessage(const char* title, const String& body, uint16_t color) {
-  canvas.fillScreen(kBlack);
+  beginFrame();
   drawChrome();
   // Warnings (red, orange…) get "!", everything else (white, grey, green) "i".
   const bool warn = !(color == kWhite || color == TFT_DARKGREY || color == rgb(40, 200, 90));
@@ -656,7 +711,7 @@ int showPanel(const char* title, uint16_t titleColor, const std::vector<Row>& ro
   const int pages = pg + 1;
   page = constrain(page, 0, pages - 1);
 
-  canvas.fillScreen(kBlack);
+  beginFrame();
   drawChrome();
   if (page == 0 && title && *title) {
     font(vlw::Title);
@@ -678,7 +733,7 @@ int showPanel(const char* title, uint16_t titleColor, const std::vector<Row>& ro
 }
 
 void showHome(const Home& home) {
-  canvas.fillScreen(kBlack);
+  beginFrame();
   Tone tone = home.ready ? TBlue : barState == "offline" ? TGrey : TAmber;
   String name = barAgent.length() ? barAgent : String("Captain Claw");
   drawBadge(tone, name, Glyph::Initials);
@@ -699,7 +754,7 @@ static int levels[15];
 void showListening(int level, uint32_t elapsedMs) {
   for (int i = 0; i < 14; ++i) levels[i] = levels[i + 1];
   levels[14] = level;
-  canvas.fillScreen(kBlack);
+  beginFrame();
   ringListening(elapsedMs, level);
   drawChrome();
   font(vlw::Title);
@@ -722,7 +777,7 @@ void showListening(int level, uint32_t elapsedMs) {
 
 void showWorking(const String& heard, const std::vector<String>& activity, const String& status,
                  uint32_t elapsedMs, int steps) {
-  canvas.fillScreen(kBlack);
+  beginFrame();
   ringWorking(steps);
   drawChrome();
   if (heard.length()) {  // the end of a long sentence matters most: last two lines
@@ -803,7 +858,7 @@ void setTextSize(uint8_t size) {
 bool hasReply() { return !replyPages.empty() && !replyText.isEmpty(); }
 
 void showReply() {
-  canvas.fillScreen(kBlack);
+  beginFrame();
   if (audio::playing()) ringSpeaking();
   drawChrome();
   if (!replyPages.empty()) {
@@ -841,7 +896,7 @@ static void drawCharacter(uint8_t kind, face::Pose pose, int level, int cy) {
 }
 
 void showFace(uint8_t kind, face::Pose pose, int level) {
-  canvas.fillScreen(kBlack);
+  beginFrame();
   drawCharacter(kind, pose, level, 214);  // first: its black corners would cover the ring
   if (pose == face::Pose::Listening) ringListening(0, level);
   else if (pose == face::Pose::Thinking) ringWorking(0);
@@ -856,7 +911,7 @@ void showFace(uint8_t kind, face::Pose pose, int level) {
 }
 
 void showCharPick(uint8_t kind, face::Pose pose, int level, int index) {
-  canvas.fillScreen(kBlack);
+  beginFrame();
   drawCharacter(kind, pose, level, 206);
   drawChrome();
   drawChevrons(206);
@@ -878,14 +933,14 @@ bool hasImage() { return imgLen > 0; }
 
 void showStoredImage() {
   if (!imgLen) return;
-  canvas.fillScreen(kBlack);
+  beginFrame();
   // Centred; a picture made for a smaller screen is shown at its own size.
   canvas.drawJpg(imgBuf, imgLen, 0, 0, W, H, 0, 0, 1.0f, 1.0f, lgfx::datum_t::middle_center);
   push();
 }
 
 void showPicker(const std::vector<Item>& items, int selected, int current, const char*) {
-  canvas.fillScreen(kBlack);
+  beginFrame();
   if (!items.empty()) {
     selected = constrain(selected, 0, (int)items.size() - 1);
     const Item& it = items[selected];
