@@ -240,8 +240,16 @@ void playPoll() {
     if (avail < playRate * 3 / 10 && !streamEnded) return;
     started = true;
   }
+#ifdef CLAW_PERF
+  {
+    extern uint32_t g_perfUnderruns;
+    if (queued == 0 && avail > 0) ++g_perfUnderruns;
+  }
+#endif
   if (queued < 2 && avail > 0 && (avail >= playRate / 10 || streamEnded)) {
-    size_t n = min(avail, (size_t)(playRate / 2));
+    // Up to 2 s a piece, two pieces queued: a main loop held up by the
+    // network for a second or two still finds the speaker busy.
+    size_t n = min(avail, (size_t)(playRate * 2));
     if (queued == 0) {  // from silence: outputLevel() counts from here
       soundStartMs = millis();
       soundStartPos = playPos;

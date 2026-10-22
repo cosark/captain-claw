@@ -41,13 +41,59 @@
 #include <M5PM1.h>
 #endif
 
-#define FW_VERSION "0.11.3"
+#define FW_VERSION "0.11.4"
 
 // The loop task's stack (Arduino's default is 8 KB). The smooth fonts on the
 // round and paper screens draw each glyph through a stack buffer — a timer
 // digit is ~5 KB — and screens are often drawn from inside the WebSocket
 // library's nested callbacks, already deep: 8 KB overflowed on the StopWatch.
 SET_LOOP_TASK_STACK_SIZE(20 * 1024);
+
+// Least time between two frames of an animation. The round screen's frames
+// cost ~50 ms each: at the stick's pace the loop would only ever draw, and
+// buttons and the speech stream would wait.
+static uint32_t frameGap(uint32_t ms) { return board::kRound ? max<uint32_t>(ms, 120) : ms; }
+
+#ifdef CLAW_PERF
+// Timing, one serial line a second (a build flag, not in normal builds).
+namespace ui {
+extern uint32_t g_perfDrawUs, g_perfDrawMax, g_perfPushUs, g_perfPushMax, g_perfFrames;
+}
+namespace audio {
+uint32_t g_perfUnderruns = 0;
+}
+using audio::g_perfUnderruns;
+using ui::g_perfDrawMax;
+using ui::g_perfDrawUs;
+using ui::g_perfFrames;
+using ui::g_perfPushMax;
+using ui::g_perfPushUs;
+static uint32_t pfLoops = 0, pfLoopMax = 0, pfWsMax = 0, pfUpdMax = 0, pfTelMax = 0, pfGapMax = 0, pfLastPoll = 0,
+                pfPrintMs = 0;
+#define PERF_T(var, stmt)              \
+  do {                                 \
+    uint32_t _t = micros();            \
+    stmt;                              \
+    uint32_t _d = micros() - _t;       \
+    if (_d > var) var = _d;            \
+  } while (0)
+static void perfReport(uint32_t loopUs) {
+  ++pfLoops;
+  pfLoopMax = max<uint32_t>(pfLoopMax, loopUs);
+  if (millis() - pfPrintMs < 1000) return;
+  pfPrintMs = millis();
+  uint32_t f = max<uint32_t>(1, g_perfFrames);
+  Serial.printf("[perf] loops %u max %u ms | frames %u draw avg %u max %u | push avg %u max %u | ws %u upd %u tel %u"
+                " | feed gap %u ms | dry %u | playing %d\n",
+                pfLoops, pfLoopMax / 1000, g_perfFrames, g_perfDrawUs / f / 1000, g_perfDrawMax / 1000,
+                g_perfPushUs / f / 1000, g_perfPushMax / 1000, pfWsMax / 1000, pfUpdMax / 1000, pfTelMax / 1000,
+                pfGapMax / 1000, g_perfUnderruns, (int)audio::playing());
+  pfLoops = pfLoopMax = pfWsMax = pfUpdMax = pfTelMax = pfGapMax = 0;
+  g_perfDrawUs = g_perfDrawMax = g_perfPushUs = g_perfPushMax = g_perfFrames = g_perfUnderruns = 0;
+}
+#else
+#define PERF_T(var, stmt) stmt
+#endif
 
 // Home: the PaperColor's home screen even while there's an answer (C hold).
 // Link: the "settings on your phone" address.
@@ -84,6 +130,8 @@ static uint32_t lastPingMs = 0, lastReplyMs = 0, turns = 0;
 static uint8_t* imgPart = nullptr;  // a picture arriving in parts (PSRAM)
 static size_t imgPartLen = 0;
 static uint32_t buzzOffMs = 0;       // vibration motor runs until then (0 = off)
+static uint32_t turnBusyMs = 0;      // last moment a turn was under way (Wi-Fi stays fully awake)
+static bool wifiAwake = false;
 static bool deckReplay = false;      // asked the deck to send the last answer again
 static uint32_t deckReplayMs = 0;
 static bool quietSpeech = false;     // replayed speech comes without the cue
@@ -1420,7 +1468,10 @@ static void onBinary(const uint8_t* data, size_t len) {
   }
 }
 
+static uint32_t wsEvents = 0;  // counts everything the WebSocket delivers
+
 static void onWs(WStype_t type, uint8_t* payload, size_t length) {
+  ++wsEvents;
   switch (type) {
     case WStype_CONNECTED:
       Serial.println("[claw] flight deck connected");
@@ -1571,7 +1622,10 @@ static const char* sleepHint() {
   // The paper's panel powers itself down after every redraw and keeps its
   // picture; its controller's deep sleep would need a reset pulse to wake,
   // which a boot that keeps the picture doesn't send.
-  if (!board::kEpaper) M5.Display.sleep();
+  if (!board::kEpaper) {
+    M5.Display.sleep();
+    M5.Display.waitDisplay();
+  }
   if (board::kEpaper) {
     for (gpio_num_t pin : {board::kTalkPin, board::kSidePin, board::kBackPin}) {
       if (pin < 0) continue;
@@ -1941,13 +1995,23 @@ void setup() {
 }
 
 void loop() {
-  M5.update();
+#ifdef CLAW_PERF
+  uint32_t loopT0 = micros();
+#endif
+  PERF_T(pfUpdMax, M5.update());
   noteButtonActivity();
   bool wasUp = wsUp;
-  ws.loop();
+  // Everything that's waiting, not one frame: the library reads one per
+  // call, and when a pass is slow (the round screen's frames take ~50 ms)
+  // one 4 KB speech frame per pass is slower than the voice plays.
+  for (int i = 0; i < 16; ++i) {
+    uint32_t seen = wsEvents;
+    PERF_T(pfWsMax, ws.loop());
+    if (wsEvents == seen) break;
+  }
   if (wsUp != wasUp) linkChangeMs = millis();
   keepWifi();
-  telemetry::poll();
+  PERF_T(pfTelMax, telemetry::poll());
   pumpPreroll();
   pumpUpload();
   if (phoneSettingsActive()) {
@@ -2088,7 +2152,7 @@ void loop() {
   if (mode == Mode::Listening) {
     // Live (mic → deck) or the background recording (talk from sleep, offline).
     int level = micLevel = prerollOn ? prerollLevel() : audio::micPoll(micSink);
-    if (millis() - lastDrawMs > 80) {
+    if (millis() - lastDrawMs > frameGap(80)) {
       lastDrawMs = millis();
       setBarState();
       if (settings.iconMode) ui::showFace(settings.character, face::Pose::Listening, level);
@@ -2100,8 +2164,21 @@ void loop() {
     M5.Power.setVibration(0);
     buzzOffMs = 0;
   }
+  // Wi-Fi power saving holds incoming packets until the radio's next wake-up
+  // (100–300 ms), which stalls the speech stream: during a turn — from the
+  // press until the answer has played — the radio stays fully awake.
+  if (mode == Mode::Listening || mode == Mode::Waiting || audio::playing()) turnBusyMs = millis();
+  bool awake = turnBusyMs && millis() - turnBusyMs < 5000;
+  if (awake != wifiAwake && WiFi.status() == WL_CONNECTED) {
+    wifiAwake = awake;
+    WiFi.setSleep(!awake);
+  }
   pollFlash();
   bool wasPlaying = audio::playing();
+#ifdef CLAW_PERF
+  if (audio::playing() && pfLastPoll) pfGapMax = max<uint32_t>(pfGapMax, micros() - pfLastPoll);
+  pfLastPoll = audio::playing() ? micros() : 0;
+#endif
   audio::playPoll();
   // The answer's sound played to its end: the cue again, the other way round
   // — a moment later, so an agent-made sound that follows comes first.
@@ -2121,24 +2198,26 @@ void loop() {
       // Changes at most ~6×/s; the timer (and the icon's dots) once in a while.
       static uint32_t lastSecond = 0;
       uint32_t secs = (millis() - workStartMs) / 1000;
-      if ((workDirty && since > 150) || secs != lastSecond || (settings.iconMode && since > face::frameMs(settings.character)) ||
-          (ui::animated() && since > 60)) {
+      if ((workDirty && since > 150) || secs != lastSecond ||
+          (settings.iconMode && since > frameGap(face::frameMs(settings.character))) ||
+          (ui::animated() && since > frameGap(60))) {
         lastSecond = secs;
         lastDrawMs = millis();
         workDirty = false;
         redraw();
       }
-    } else if (settings.iconMode && mode == Mode::Reply && audio::playing() && since > min<uint32_t>(60, face::frameMs(settings.character))) {
+    } else if (settings.iconMode && mode == Mode::Reply && audio::playing() &&
+               since > frameGap(min<uint32_t>(60, face::frameMs(settings.character)))) {
       lastDrawMs = millis();
       setBarState();
       ui::showFace(settings.character, face::Pose::Speaking, audio::outputLevel());
-    } else if (!settings.iconMode && ui::animated() && mode == Mode::Reply && audio::playing() && since > 60) {
+    } else if (!settings.iconMode && ui::animated() && mode == Mode::Reply && audio::playing() && since > frameGap(60)) {
       lastDrawMs = millis();  // the speaking ring follows the voice
       redraw();
-    } else if (settings.iconMode && mode == Mode::Idle && !ui::hasReply() && since > face::frameMs(settings.character)) {
+    } else if (settings.iconMode && mode == Mode::Idle && !ui::hasReply() && since > frameGap(face::frameMs(settings.character))) {
       lastDrawMs = millis();  // blinking, rain, bouncing…
       redraw();
-    } else if (mode == Mode::CharPick && since > face::frameMs(charSel)) {
+    } else if (mode == Mode::CharPick && since > frameGap(face::frameMs(charSel))) {
       lastDrawMs = millis();
       redraw();
     } else if ((mode == Mode::Status && since > 1000) || (ui::animated() && mode == Mode::Idle && since > 1000) ||
@@ -2176,5 +2255,8 @@ void loop() {
   updateLeds();
   noteButtonActivity();
   handleIdlePower();
+#ifdef CLAW_PERF
+  perfReport(micros() - loopT0);
+#endif
   delay(1);
 }
