@@ -41,7 +41,13 @@
 #include <M5PM1.h>
 #endif
 
-#define FW_VERSION "0.11.2"
+#define FW_VERSION "0.11.3"
+
+// The loop task's stack (Arduino's default is 8 KB). The smooth fonts on the
+// round and paper screens draw each glyph through a stack buffer — a timer
+// digit is ~5 KB — and screens are often drawn from inside the WebSocket
+// library's nested callbacks, already deep: 8 KB overflowed on the StopWatch.
+SET_LOOP_TASK_STACK_SIZE(20 * 1024);
 
 // Home: the PaperColor's home screen even while there's an answer (C hold).
 // Link: the "settings on your phone" address.
@@ -1293,6 +1299,7 @@ static void onText(const char* payload, size_t len) {
   } else if (type == "reply") {
     touch();
     ++turns;
+    Serial.printf("[claw] reply; loop stack never below %u bytes free\n", (unsigned)uxTaskGetStackHighWaterMark(nullptr));
     lastReplyMs = millis();
     String said = doc["text"] | "";
     ui::setReply(said);
