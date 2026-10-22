@@ -59,7 +59,7 @@ interface UIStore {
   simpleLeftOpen: boolean
   /** Simple layout: is the files + datastore column expanded? */
   simpleRightOpen: boolean
-  /** Simple layout: is the chat's queue column shown? */
+  /** Simple layout: is the chat's queue column shown? Hidden until asked for. */
   simpleQueueOpen: boolean
   setView: (v: ViewMode) => void
   toggleSidebar: () => void
@@ -82,6 +82,14 @@ interface UIStore {
  * sign-in (the desktop app), whose user is its admin, asks this on start.
  * Not saved: the first layout they pick is.
  */
+// A layout picked while signed-in settings are loading wins over the loaded one.
+let layoutChosenSinceHydrate = false
+
+/** Call right before hydrating the signed-in settings. */
+export function beginLayoutHydrate() {
+  layoutChosenSinceHydrate = false
+}
+
 export function startInConsoleUnlessChosen() {
   try { if (localStorage.getItem(LAYOUT_MODE_KEY) !== null) return } catch { /* storage blocked */ }
   useUIStore.setState({ layoutMode: 'console' })
@@ -97,7 +105,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
   layoutMode: loadLayoutMode(),
   simpleLeftOpen: loadBool(SIMPLE_LEFT_OPEN_KEY, true),
   simpleRightOpen: loadBool(SIMPLE_RIGHT_OPEN_KEY, true),
-  simpleQueueOpen: loadBool(SIMPLE_QUEUE_OPEN_KEY, true),
+  simpleQueueOpen: loadBool(SIMPLE_QUEUE_OPEN_KEY, false),
 
   setView: (view) => set({ view }),
   toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
@@ -112,6 +120,7 @@ export const useUIStore = create<UIStore>((set, get) => ({
     // Idempotent: a redundant call (e.g. a page shortcut fired while already
     // in the full layout) must not write localStorage or PUT /fd/settings.
     if (get().layoutMode === layoutMode) return
+    layoutChosenSinceHydrate = true
     persist(LAYOUT_MODE_KEY, layoutMode)
     set({ layoutMode })
   },
@@ -153,10 +162,11 @@ registerHydrator((settings) => {
   }
   const admin = useAuthStore.getState().user?.role === 'admin'
   const patch = {
-    layoutMode: mode === undefined && admin ? 'console' as const : asLayoutMode(mode),
+    layoutMode: layoutChosenSinceHydrate ? useUIStore.getState().layoutMode
+      : mode === undefined && admin ? 'console' as const : asLayoutMode(mode),
     simpleLeftOpen: bool(SIMPLE_LEFT_OPEN_KEY, true),
     simpleRightOpen: bool(SIMPLE_RIGHT_OPEN_KEY, true),
-    simpleQueueOpen: bool(SIMPLE_QUEUE_OPEN_KEY, true),
+    simpleQueueOpen: bool(SIMPLE_QUEUE_OPEN_KEY, false),
   }
   for (const key of [LAYOUT_MODE_KEY, SIMPLE_LEFT_OPEN_KEY, SIMPLE_RIGHT_OPEN_KEY, SIMPLE_QUEUE_OPEN_KEY]) {
     const v = settings[key]

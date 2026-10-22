@@ -63,13 +63,14 @@ function probeText(probe: MCPProbeResult): string {
 // an admin add / edit / test / remove one. With auth off the single local user
 // is the admin.
 function useCanManageStdio(): boolean {
-  return useAuthStore((s) => s.authEnabled === false || s.user?.role === 'admin')
+  // Not in the desktop app's users' kiosk (kioskView): the kiosk user is no admin.
+  return useAuthStore((s) => (s.authEnabled === false || s.user?.role === 'admin') && !s.kioskView)
 }
 
 // Only an admin on an auth-enabled deck can share a server with every user;
 // with auth off there is one user and nothing to share.
 function useCanShareDeckWide(): boolean {
-  return useAuthStore((s) => s.authEnabled === true && s.user?.role === 'admin')
+  return useAuthStore((s) => s.authEnabled === true && s.user?.role === 'admin' && !s.kioskView)
 }
 
 function useOwnershipShown(): boolean {
@@ -789,6 +790,7 @@ function ServerForm({ initial, onClose, allowStdio = true }: ServerFormProps) {
 }
 
 export default function MCPConnection() {
+  const kioskView = useAuthStore((s) => s.kioskView)
   const { servers, loading, error, notice, refresh, startMessageListener } = useMCPStore()
   const canManageStdio = useCanManageStdio()
   const [collapsed, setCollapsed] = useState(false)
@@ -879,9 +881,14 @@ export default function MCPConnection() {
           )}
 
           <div className="space-y-2">
-            {servers.map((srv) => {
+            {servers
+              // The users' kiosk (kioskView) lists what a kiosk user sees: no ownerless servers.
+              .filter((srv) => !(kioskView && srv.can_use === false))
+              .map((srv) => {
               const readOnly =
-                srv.can_manage === false || (srv.transport === 'stdio' && !canManageStdio)
+                srv.can_manage === false
+                || (kioskView && !!srv.deck_wide)   // deck-wide: admin-managed, as for a kiosk user
+                || (srv.transport === 'stdio' && !canManageStdio)
               return editingName === srv.name && !readOnly ? (
                 <ServerForm
                   key={srv.name}

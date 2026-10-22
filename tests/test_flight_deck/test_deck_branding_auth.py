@@ -147,7 +147,7 @@ async def test_instance_name_and_description(fd_db):
     db, admin = fd_db
     async with _client(_app(admin)) as c:
         cfg = (await c.get("/fd/admin/config")).json()
-        assert cfg["instance_name"] == "Flight Deck"
+        assert cfg["instance_name"] == "Captain"
         assert cfg["instance_description"] == "Agent Management Console"
 
         r = await c.put("/fd/admin/config", json={
@@ -158,7 +158,7 @@ async def test_instance_name_and_description(fd_db):
 
         # Blank name: the default again. Blank description: none.
         r = await c.put("/fd/admin/config", json={"instance_name": " ", "instance_description": ""})
-        assert r.json()["instance_name"] == "Flight Deck"
+        assert r.json()["instance_name"] == "Captain"
         assert r.json()["instance_description"] == ""
         assert "instance_name" not in json.loads(await db.get_system_setting("fd:system-config"))
 

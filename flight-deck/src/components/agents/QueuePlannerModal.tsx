@@ -1,8 +1,12 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { X, Wand2, Loader2, AlertTriangle, Trash2, Pin, ListPlus, Paperclip, FileText } from 'lucide-react'
 import { useAuthStore, refreshAccessToken } from '../../stores/authStore'
 import { useChatStore, WORK_LANES, LANE_MAIN, laneKey } from '../../stores/chatStore'
 import { uploadFileToAgent, formatSize } from '../../services/fileTransfer'
+import { Notice } from '../console/parts'
+
+// The `wide:` test (index.css): a phone's sheet scrolls as one column.
+const WIDE_QUERY = '(min-width: 640px) and (min-height: 501px), (min-width: 640px) and (pointer: fine)'
 
 /**
  * Turn one description of a repetitive job into a reviewed list of queue tasks.
@@ -125,6 +129,12 @@ export function QueuePlannerModal({ agentId, agentName, host, port, auth, onClos
   // ticked here, not pushed onto one queue. At least one stays selected.
   const [lanes, setLanes] = useState<string[]>([activeLane])
   const [newSession, setNewSession] = useState(true)
+  // Whether the queue moves on by itself after each task (the lanes' Auto).
+  // Until the user touches it, it only shows what the ticked lanes do today
+  // (checked when every one of them is on Auto) and Send changes no lane's
+  // mode; once touched, Send sets it on each ticked lane.
+  const [autoTouched, setAutoTouched] = useState(false)
+  const [autoMove, setAutoMove] = useState(false)
 
   // Attachments live on the AGENT: the tasks reference the path at run time,
   // and the planner reads a short preview so it can see the ids/headers inside
@@ -141,6 +151,12 @@ export function QueuePlannerModal({ agentId, agentName, host, port, auth, onClos
   const [pinned, setPinned] = useState<Set<number>>(new Set())
   const [warnings, setWarnings] = useState<string[]>([])
   const [sent, setSent] = useState(0)
+  // Where the last send went, for the confirmation (and which lanes are paused).
+  const [sentTo, setSentTo] = useState<{ lanes: string[]; paused: string[]; switched: { lane: string; auto: boolean }[] }>({ lanes: [], paused: [], switched: [] })
+  const [confirmAgain, setConfirmAgain] = useState(false)
+  // A plan nobody added yet isn't thrown away by a stray Esc or backdrop click.
+  const [confirmDiscard, setConfirmDiscard] = useState(false)
+  const resultRef = useRef<HTMLDivElement>(null)
   // The agent's real tables and columns, so table and key are PICKED, not
   // typed. A typo in either is a plan built against nothing.
   const [tables, setTables] = useState<TableInfo[]>([])
@@ -172,11 +188,28 @@ export function QueuePlannerModal({ agentId, agentName, host, port, auth, onClos
     if (keyColumn !== '_id' && !cols.some((c) => c.name === keyColumn)) setKeyColumn('_id')
   }, [table, tables, keyColumn])
 
+  const unsent = !!plan && messages.length > 0 && sent === 0
+  const requestClose = useCallback(() => {
+    if (unsent) setConfirmDiscard(true)
+    else onClose()
+  }, [unsent, onClose])
+
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      // Esc on the discard question means "keep editing".
+      if (confirmDiscard) setConfirmDiscard(false)
+      else requestClose()
+    }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [onClose])
+  }, [requestClose, confirmDiscard])
+
+  // A phone shows the request above the plan: bring the plan into view.
+  const showResult = () => {
+    if (window.matchMedia(WIDE_QUERY).matches) return
+    window.setTimeout(() => resultRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50)
+  }
 
   const addFiles = async (list: FileList | null) => {
     if (!list || list.length === 0) return
@@ -207,6 +240,8 @@ export function QueuePlannerModal({ agentId, agentName, host, port, auth, onClos
       setMessages(res.messages)
       setWarnings(res.warnings || [])
       setPinned(new Set())
+      setConfirmAgain(false)
+      showResult()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -234,6 +269,8 @@ export function QueuePlannerModal({ agentId, agentName, host, port, auth, onClos
       setTable(last.table)
       setKeyColumn(last.keyColumn)
       setBatchSize(last.batchSize)
+      setConfirmAgain(false)
+      showResult()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -278,6 +315,10 @@ export function QueuePlannerModal({ agentId, agentName, host, port, auth, onClos
     // Canonical A-B-C order regardless of the order lanes were ticked.
     const dest = WORK_LANES.filter((l) => lanes.includes(l))
     if (dest.length === 0 || messages.length === 0) return
+    const chat = useChatStore.getState()
+    // Opening a lane below also shows it: remember the lane on screen, so the
+    // visible chat doesn't jump to whichever lane was opened last.
+    const onScreen = chat.activeLane[agentId] || LANE_MAIN
     // A lane that has never been opened has no queue to land in — open each
     // target once so every one of them can receive its share.
     dest.forEach((l) => {
@@ -285,6 +326,19 @@ export function QueuePlannerModal({ agentId, agentName, host, port, auth, onClos
         useChatStore.getState().setActiveLane(agentId, l)
       }
     })
+    // How each target lane moves on, before its first task can start — only
+    // when the user chose it here. A lane that already had work and changes
+    // mode is named in the confirmation.
+    const switched: { lane: string; auto: boolean }[] = []
+    if (autoTouched) {
+      dest.forEach((l) => {
+        const key = laneKey(agentId, l)
+        const lane = useChatStore.getState().sessions.get(key)
+        if (!lane || lane.queueAutoMode === autoMove) return
+        if (lane.queue.some((q) => q.status !== 'done')) switched.push({ lane: l, auto: autoMove })
+        useChatStore.getState().setQueueAutoMode(key, autoMove)
+      })
+    }
     // Deal the tasks out evenly, one lane after the next (round-robin), so the
     // per-lane counts never differ by more than one. Within a lane a fresh
     // session (/new) still precedes every task after its first, so each batch
@@ -297,7 +351,17 @@ export function QueuePlannerModal({ agentId, agentName, host, port, auth, onClos
       opened.add(l)
       enqueue(key, m)
     })
+    if ((useChatStore.getState().activeLane[agentId] || LANE_MAIN) !== onScreen) {
+      useChatStore.getState().setActiveLane(agentId, onScreen)
+    }
     setSent(messages.length)
+    setSentTo({
+      lanes: dest,
+      paused: dest.filter((l) => useChatStore.getState().sessions.get(laneKey(agentId, l))?.queuePaused),
+      switched,
+    })
+    setConfirmAgain(false)
+    setConfirmDiscard(false)
     // Remember where this got to, so the next sitting can carry straight on.
     if (plan) {
       const to = highestTo(plan.batches)
@@ -327,6 +391,10 @@ export function QueuePlannerModal({ agentId, agentName, host, port, auth, onClos
   // across them. Counts are simulated with the SAME round-robin `send` uses, so
   // the breakdown on screen is exactly what will be queued.
   const targets = WORK_LANES.filter((l) => lanes.includes(l))
+  // Untouched, the box mirrors the ticked lanes: checked only if all are on Auto.
+  const autoChecked = autoTouched
+    ? autoMove
+    : targets.length > 0 && targets.every((l) => !!sessions.get(laneKey(agentId, l))?.queueAutoMode)
   const perLane = targets.map((l) => ({ lane: l, count: 0 }))
   if (perLane.length) messages.forEach((_, i) => { perLane[i % perLane.length].count++ })
   const newCount = perLane.reduce((s, p) => s + Math.max(0, p.count - 1), 0)
@@ -342,27 +410,71 @@ export function QueuePlannerModal({ agentId, agentName, host, port, auth, onClos
         : [...prev, l])
   }
 
+  // What the send confirmation says: where the tasks went, and which lane
+  // still has to be started by hand.
+  const sentNotice = (() => {
+    if (!sent) return ''
+    const where = sentTo.lanes.length <= 1
+      ? `Added ${sent} task${sent === 1 ? '' : 's'} to lane ${sentTo.lanes[0] ?? ''}.`
+      : `Added ${sent} tasks across lanes ${sentTo.lanes.join(', ')}.`
+    // (Its queue's button says Start, or Resume once something there ran.)
+    const paused = sentTo.paused.length === 0 ? ''
+      : sentTo.paused.length === 1 ? ` Lane ${sentTo.paused[0]} is paused: its tasks wait until you start it from its queue.`
+      : ` Lanes ${sentTo.paused.join(', ')} are paused: their tasks wait until you start them from their queues.`
+    const switched = sentTo.switched
+      .map((x) => ` Lane ${x.lane} switched to ${x.auto ? 'Auto' : 'step by step'}.`)
+      .join('')
+    return where + switched + paused
+  })()
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-50 flex bg-black/60 wide:items-center wide:justify-center wide:p-4" onClick={requestClose}>
       <div
-        className="flex h-[85vh] w-full max-w-6xl flex-col overflow-hidden rounded-lg border border-zinc-700 bg-zinc-900 shadow-2xl"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Plan tasks"
+        className="flex h-[100dvh] w-full flex-col overflow-hidden bg-zinc-900 shadow-2xl wide:h-[85vh] wide:max-w-6xl wide:rounded-2xl wide:border wide:border-zinc-700"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-3">
-          <div className="flex items-center gap-2">
-            <Wand2 className="h-4 w-4 text-violet-400" />
+        <div className="flex items-center justify-between gap-2 border-b border-zinc-800 px-4 py-3">
+          <div className="flex min-w-0 items-center gap-2">
+            <Wand2 className="h-4 w-4 shrink-0 text-violet-400" />
             <h2 className="text-sm font-semibold text-zinc-100">Plan tasks</h2>
-            <span className="text-xs text-zinc-500">— one description becomes a queue</span>
+            <span className="hidden truncate text-xs text-zinc-500 wide:inline">— one description becomes a queue</span>
           </div>
-          <button onClick={onClose} className="rounded p-1 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300">
+          <button onClick={requestClose} aria-label="Close" className="rounded-lg p-1.5 text-zinc-500 hover:bg-zinc-800 hover:text-zinc-300">
             <X className="h-4 w-4" />
           </button>
         </div>
+        {confirmDiscard && (
+          <div className="flex flex-wrap items-center gap-2 border-b border-amber-500/25 bg-amber-500/10 px-4 py-2.5 text-xs text-amber-800 dark:text-amber-200">
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+            <span className="min-w-0 flex-1">
+              <strong className="font-semibold">Discard this plan?</strong>{' '}
+              The {messages.length} task{messages.length === 1 ? '' : 's'} you planned haven't been added yet.
+            </span>
+            <div className="flex shrink-0 gap-1.5">
+              <button
+                onClick={onClose}
+                className="rounded-lg border border-amber-500/40 px-2.5 py-1 text-[11px] font-medium hover:bg-amber-500/20"
+              >
+                Discard
+              </button>
+              <button
+                autoFocus
+                onClick={() => setConfirmDiscard(false)}
+                className="rounded-lg bg-violet-600 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-violet-500"
+              >
+                Keep editing
+              </button>
+            </div>
+          </div>
+        )}
 
-        <div className="flex min-h-0 flex-1">
+        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto wide:flex-row wide:overflow-hidden">
           {/* ── Request ── */}
-          <div className="flex w-[380px] shrink-0 flex-col gap-3 overflow-y-auto border-r border-zinc-800 p-4">
+          <div className="flex w-full flex-col gap-3 border-b border-zinc-800 p-4 wide:w-[380px] wide:shrink-0 wide:overflow-y-auto wide:border-b-0 wide:border-r">
             {last && (
               <div className="rounded-md border border-violet-500/30 bg-violet-500/10 p-2">
                 <p className="text-[11px] text-violet-200">
@@ -510,10 +622,15 @@ export function QueuePlannerModal({ agentId, agentName, host, port, auth, onClos
               </p>
             </Field>
 
-            <label className="flex items-center gap-2 text-[11px] text-zinc-400">
+            <label className="flex items-center gap-2 text-[11px] text-zinc-400" title="The agent starts each task with a clean context (/new between tasks)">
               <input type="checkbox" checked={newSession}
                 onChange={(e) => setNewSession(e.target.checked)} className="accent-violet-500" />
-              Start a new session (<code>/new</code>) between tasks
+              Start each task in a fresh topic
+            </label>
+            <label className="flex items-center gap-2 text-[11px] text-zinc-400" title="The lanes' Auto: each task starts when the one before it finishes. Left as it is, no lane's mode changes.">
+              <input type="checkbox" checked={autoChecked}
+                onChange={(e) => { setAutoTouched(true); setAutoMove(e.target.checked) }} className="accent-violet-500" />
+              Move on automatically after each task ({targets.length === 1 ? 'lane' : 'lanes'} {targets.join(', ')})
             </label>
 
             <button
@@ -532,9 +649,9 @@ export function QueuePlannerModal({ agentId, agentName, host, port, auth, onClos
           </div>
 
           {/* ── Plan ── */}
-          <div className="flex min-w-0 flex-1 flex-col">
+          <div ref={resultRef} className="flex min-w-0 flex-1 flex-col">
             {!plan ? (
-              <div className="flex flex-1 items-center justify-center px-8 text-center">
+              <div className="flex flex-1 items-center justify-center px-8 py-8 text-center">
                 <p className="max-w-md text-xs leading-relaxed text-zinc-500">
                   The plan appears here for review before anything is queued. The model reads
                   the agent's real tables and id ranges, so batches cover rows that exist —
@@ -570,7 +687,7 @@ export function QueuePlannerModal({ agentId, agentName, host, port, auth, onClos
                   />
                 </details>
 
-                <div className="min-h-0 flex-1 overflow-y-auto px-4 py-2">
+                <div className="px-4 py-2 wide:min-h-0 wide:flex-1 wide:overflow-y-auto">
                   <ul className="flex flex-col gap-1.5">
                     {messages.map((m, i) => (
                       <li key={i} className="rounded-md border border-zinc-800 bg-zinc-950/60 p-2">
@@ -599,33 +716,53 @@ export function QueuePlannerModal({ agentId, agentName, host, port, auth, onClos
                   </ul>
                 </div>
 
-                <div className="flex items-center justify-between border-t border-zinc-800 px-4 py-2.5">
-                  <span className="text-[11px] text-zinc-500">
-                    {sent > 0
-                      ? (targets.length <= 1
-                          ? `${sent} task${sent === 1 ? '' : 's'} sent to lane ${targets[0] ?? ''}.`
-                          : `${sent} task${sent === 1 ? '' : 's'} distributed across ${targets.join(', ')}.`)
-                      : `${messages.length} tasks${newSession && newCount ? ` + ${newCount} /new` : ''} → ${distText}`}
-                  </span>
-                  <div className="flex items-center gap-2">
-                    {sent > 0 && (
-                      <button onClick={onClose}
-                        className="rounded-md px-2.5 py-1.5 text-xs text-zinc-400 hover:bg-zinc-800">
-                        Close
-                      </button>
-                    )}
-                    <button
-                      onClick={send}
-                      disabled={messages.length === 0 || targets.length === 0}
-                      className="flex items-center gap-1.5 rounded-md bg-violet-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-violet-500 disabled:opacity-40"
-                    >
-                      <ListPlus className="h-3.5 w-3.5" />
-                      {sent > 0
-                        ? 'Send again'
-                        : (targets.length <= 1
-                            ? `Send ${messages.length} to ${targets[0] ?? ''}`
-                            : `Send ${messages.length} across ${targets.length} lanes`)}
-                    </button>
+                <div className="sticky bottom-0 border-t border-zinc-800 bg-zinc-900 px-4 pt-2.5 pb-[max(0.625rem,env(safe-area-inset-bottom))] wide:static">
+                  {sent > 0 && <div className="mb-2.5"><Notice tone="emerald">{sentNotice}</Notice></div>}
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="min-w-0 text-[11px] text-zinc-500">
+                      {confirmAgain
+                        ? `Add the same ${messages.length} task${messages.length === 1 ? '' : 's'} again?`
+                        : sent > 0
+                          ? ''
+                          : `${messages.length} tasks${newSession && newCount ? ` + ${newCount} fresh starts` : ''} → ${distText}`}
+                    </span>
+                    <div className="ml-auto flex items-center gap-2">
+                      {sent > 0 && confirmAgain && (
+                        <>
+                          <button onClick={() => setConfirmAgain(false)}
+                            className="h-11 rounded-xl px-3 text-xs text-zinc-400 hover:bg-zinc-800 wide:h-auto wide:py-1.5">
+                            Cancel
+                          </button>
+                          <button onClick={send} disabled={messages.length === 0 || targets.length === 0}
+                            className="flex h-11 items-center gap-1.5 rounded-xl bg-violet-600 px-3 text-xs font-medium text-white hover:bg-violet-500 disabled:opacity-40 wide:h-auto wide:py-1.5">
+                            <ListPlus className="h-3.5 w-3.5" />
+                            Add again
+                          </button>
+                        </>
+                      )}
+                      {sent > 0 && !confirmAgain && (
+                        <>
+                          <button onClick={() => setConfirmAgain(true)} disabled={messages.length === 0 || targets.length === 0}
+                            className="h-11 rounded-xl border border-zinc-700 px-3 text-xs font-medium text-zinc-300 hover:bg-zinc-800 disabled:opacity-40 wide:h-auto wide:py-1.5">
+                            Add again
+                          </button>
+                          <button onClick={onClose}
+                            className="h-11 rounded-xl bg-violet-600 px-4 text-xs font-medium text-white hover:bg-violet-500 wide:h-auto wide:py-1.5">
+                            Done
+                          </button>
+                        </>
+                      )}
+                      {sent === 0 && (
+                        <button
+                          onClick={send}
+                          disabled={messages.length === 0 || targets.length === 0}
+                          className="flex h-11 items-center gap-1.5 rounded-xl bg-violet-600 px-4 text-xs font-medium text-white hover:bg-violet-500 disabled:opacity-40 wide:h-auto wide:py-1.5"
+                        >
+                          <ListPlus className="h-3.5 w-3.5" />
+                          Add {messages.length} task{messages.length === 1 ? '' : 's'}
+                        </button>
+                      )}
+                    </div>
                   </div>
                 </div>
               </>

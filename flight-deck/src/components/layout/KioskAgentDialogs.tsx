@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import {
   AlertTriangle,
@@ -6,6 +6,7 @@ import {
   BrainCog,
   Check,
   Cpu,
+  Database,
   Eye,
   Info,
   LibraryBig,
@@ -33,10 +34,10 @@ import { useProcessStore } from '../../stores/processStore'
 //
 // The "⋯" on a kiosk agent row opens what a kiosk user may do with one agent
 // of theirs besides chatting and the power switch: look at what it means to
-// do and what they talked about (Info: its intentions and topics), give it
-// standing instructions (Instructions), change its model, how it thinks and
-// whether it sees images itself (Settings), or remove it for good, folder and
-// all (Remove).
+// do and what they talked about (Info: its intentions and topics), open its
+// files and data, give it standing instructions (Instructions), change its
+// model, how it thinks and whether it sees images itself (Settings), or remove
+// it for good, folder and all (Remove).
 
 /** What these dialogs need of an agent row. */
 export interface KioskAgent {
@@ -64,6 +65,26 @@ export interface AgentMenuItem {
 // ── The "⋯" menu ──
 
 const MENU_WIDTH = 240
+/** Kept clear of the screen's edges, and the gap to the trigger. */
+const MENU_MARGIN = 8
+const MENU_GAP = 4
+
+type MenuPos = { left: number; top: number; maxHeight: number }
+
+/** Under the trigger, right edges aligned — above it when the menu doesn't fit
+ *  below. When it fits on neither side (a long menu on a short screen), it
+ *  sits as low as it can without leaving the screen and scrolls if it must:
+ *  never an item above the top, out of reach. */
+function placeMenu(t: DOMRect, height: number): MenuPos {
+  const vh = window.innerHeight
+  const left = Math.max(MENU_MARGIN, Math.min(t.right - MENU_WIDTH, window.innerWidth - MENU_WIDTH - MENU_MARGIN))
+  const below = vh - MENU_MARGIN - (t.bottom + MENU_GAP)
+  const above = t.top - MENU_GAP - MENU_MARGIN
+  if (height <= below) return { left, top: t.bottom + MENU_GAP, maxHeight: below }
+  if (height <= above) return { left, top: t.top - MENU_GAP - height, maxHeight: above }
+  const top = Math.max(MENU_MARGIN, vh - MENU_MARGIN - height)
+  return { left, top, maxHeight: vh - MENU_MARGIN - top }
+}
 
 export function AgentMenu({ agentName, items, phone = false, shown = false }: {
   agentName: string
@@ -74,24 +95,24 @@ export function AgentMenu({ agentName, items, phone = false, shown = false }: {
   shown?: boolean
 }) {
   const [open, setOpen] = useState(false)
-  const [pos, setPos] = useState<{ left: number; top?: number; bottom?: number }>({ left: 0, top: 0 })
+  // Where it sits (placeMenu); none yet while it is drawn unseen to be measured.
+  const [pos, setPos] = useState<MenuPos | null>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
 
-  // Under the trigger, right edges aligned — above it when the menu (about
-  // this tall) wouldn't fit below.
   const toggle = () => {
     if (open) { setOpen(false); return }
-    const t = triggerRef.current?.getBoundingClientRect()
-    if (t) {
-      const height = items.length * (phone ? 60 : 52) + 8
-      const left = Math.max(8, Math.min(t.right - MENU_WIDTH, window.innerWidth - MENU_WIDTH - 8))
-      setPos(t.bottom + 4 + height > window.innerHeight - 8
-        ? { left, bottom: window.innerHeight - t.top + 4 }
-        : { left, top: t.bottom + 4 })
-    }
+    setPos(null)
     setOpen(true)
   }
+  // Placed by its real height, before it shows: a hint that wraps makes its
+  // row taller than any guess.
+  useLayoutEffect(() => {
+    if (!open) return
+    const t = triggerRef.current?.getBoundingClientRect()
+    const m = menuRef.current
+    if (t && m) setPos(placeMenu(t, m.offsetHeight))
+  }, [open])
 
   useEffect(() => {
     if (!open) return
@@ -106,15 +127,19 @@ export function AgentMenu({ agentName, items, phone = false, shown = false }: {
       setOpen(false)
     }
     const close = () => setOpen(false)
+    // The page scrolling moves the trigger away; the menu's own scroll doesn't.
+    const onScroll = (e: Event) => {
+      if (!menuRef.current?.contains(e.target as Node)) setOpen(false)
+    }
     document.addEventListener('pointerdown', onDown)
     window.addEventListener('keydown', onKey, true)
     window.addEventListener('resize', close)
-    window.addEventListener('scroll', close, true)
+    window.addEventListener('scroll', onScroll, true)
     return () => {
       document.removeEventListener('pointerdown', onDown)
       window.removeEventListener('keydown', onKey, true)
       window.removeEventListener('resize', close)
-      window.removeEventListener('scroll', close, true)
+      window.removeEventListener('scroll', onScroll, true)
     }
   }, [open])
 
@@ -139,8 +164,8 @@ export function AgentMenu({ agentName, items, phone = false, shown = false }: {
           ref={menuRef}
           role="menu"
           aria-label={agentName}
-          className="fixed z-50 rounded-xl border border-zinc-700/60 bg-zinc-900 p-1 shadow-2xl shadow-black/40"
-          style={{ ...pos, width: MENU_WIDTH }}
+          className="fixed z-50 overflow-y-auto overscroll-contain rounded-xl border border-zinc-700/60 bg-zinc-900 p-1 shadow-2xl shadow-black/40"
+          style={pos ? { ...pos, width: MENU_WIDTH } : { left: 0, top: 0, width: MENU_WIDTH, visibility: 'hidden' }}
         >
           {items.map(({ icon: Icon, label, hint, onSelect, danger, disabled }) => (
             <button
@@ -189,7 +214,12 @@ export function AgentDialog({ title, icon: Icon, agentName, size = 'sm', onClose
   children: ReactNode
 }) {
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      // Wait for every listener: a file viewer, public link dialog or table
+      // open inside (Files & data) marks the Esc it used to close itself.
+      setTimeout(() => { if (!e.defaultPrevented) onClose() }, 0)
+    }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
@@ -720,7 +750,7 @@ export function KioskAgentInstructionsDialog({ agent, onClose }: {
 
 // ── Remove ──
 
-export function KioskRemoveAgentDialog({ agent, busy, onRemove, onOpenLibrary, onClose }: {
+export function KioskRemoveAgentDialog({ agent, busy, onRemove, onOpenLibrary, onOpenData, onClose }: {
   agent: KioskAgent
   /** At work right now (in a chat open here). */
   busy: boolean
@@ -728,6 +758,8 @@ export function KioskRemoveAgentDialog({ agent, busy, onRemove, onOpenLibrary, o
   onRemove: () => Promise<void>
   /** Opens the File library on its files — to keep some before they go. */
   onOpenLibrary?: () => void
+  /** Opens the Data library on its tables — likewise. */
+  onOpenData?: () => void
   onClose: () => void
 }) {
   const [removing, setRemoving] = useState(false)
@@ -766,15 +798,19 @@ export function KioskRemoveAgentDialog({ agent, busy, onRemove, onOpenLibrary, o
             <p className="mt-2 font-medium text-red-600 dark:text-red-400">This can't be undone.</p>
           </div>
         </div>
-        {onOpenLibrary && (
-          <button
-            onClick={onOpenLibrary}
-            disabled={removing}
-            className="flex w-full items-center gap-2.5 rounded-xl border border-zinc-800 bg-zinc-900/60 px-3.5 py-2.5 text-left text-xs text-zinc-400 transition-colors hover:border-violet-500/40 hover:bg-zinc-800/60 disabled:opacity-50"
-          >
-            <LibraryBig className="h-4 w-4 shrink-0 text-violet-600 dark:text-violet-400" />
-            <span>Want to keep a file? Download it from the <span className="font-medium text-zinc-200">File library</span> first.</span>
-          </button>
+        {(onOpenLibrary || onOpenData) && (
+          <div className="space-y-2">
+            {onOpenLibrary && (
+              <KeepLink icon={LibraryBig} iconClass="text-violet-600 dark:text-violet-400" onClick={onOpenLibrary} disabled={removing}>
+                Want to keep a file? Download it from the <span className="font-medium text-zinc-200">File library</span> first.
+              </KeepLink>
+            )}
+            {onOpenData && (
+              <KeepLink icon={Database} iconClass="text-emerald-600 dark:text-emerald-400" onClick={onOpenData} disabled={removing}>
+                Want to keep a table? Download it from the <span className="font-medium text-zinc-200">Data library</span> first.
+              </KeepLink>
+            )}
+          </div>
         )}
         {error && (
           <div className="flex items-start gap-2 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-700 dark:text-red-300">
@@ -801,5 +837,25 @@ export function KioskRemoveAgentDialog({ agent, busy, onRemove, onOpenLibrary, o
         </button>
       </div>
     </AgentDialog>
+  )
+}
+
+/** A way from the removal to the library that holds something of the agent's. */
+function KeepLink({ icon: Icon, iconClass, onClick, disabled, children }: {
+  icon: typeof Info
+  iconClass: string
+  onClick: () => void
+  disabled: boolean
+  children: ReactNode
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className="flex w-full items-center gap-2.5 rounded-xl border border-zinc-800 bg-zinc-900/60 px-3.5 py-2.5 text-left text-xs text-zinc-400 transition-colors hover:border-violet-500/40 hover:bg-zinc-800/60 disabled:opacity-50"
+    >
+      <Icon className={`h-4 w-4 shrink-0 ${iconClass}`} />
+      <span>{children}</span>
+    </button>
   )
 }

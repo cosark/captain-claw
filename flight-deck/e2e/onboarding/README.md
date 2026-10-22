@@ -19,6 +19,9 @@ regenerate them here.
 4. Runs `shots.cjs`, which signs in as Maya and shoots each screen in both
    themes, at 1280×800 and as a 390×700 phone; `to_webp.py` writes them into
    `src/assets/onboarding/`. `FORMS=wide` or `FORMS=phone` shoots one layout only.
+   `THEMES=dark` or `THEMES=light` shoots one theme only. Every visit after the
+   first to the demo chat adds a "New topic" divider, so for clean shots run
+   each layout and theme on a fresh deck (one `run.sh` per combination).
 
 With `MODE=guide`, `shots.cjs` instead shoots the guide itself into
 `.run/guide/` — wide in both themes; phones at 390×844 in both themes, 360×640,

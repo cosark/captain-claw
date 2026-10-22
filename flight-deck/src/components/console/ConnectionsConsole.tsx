@@ -69,6 +69,8 @@ function useStatuses(accounts: boolean): Partial<Record<ServiceId, Status>> {
     let cancelled = false
     const put = (id: ServiceId, st: Status) => { if (!cancelled) setOut((o) => ({ ...o, [id]: st })) }
     for (const p of ['google', 'microsoft'] as const) {
+      // Their sign-in needs accounts: a deck without sign-in can't connect them.
+      if (!accounts) { put(p, { tone: 'off', text: 'Needs sign-in' }); continue }
       getOAuthClientConfig(p)
         .then((c) => put(p, c.client_id_set && c.client_secret_set
           ? { tone: 'on', text: accounts ? 'Ready for everyone' : 'Ready' }

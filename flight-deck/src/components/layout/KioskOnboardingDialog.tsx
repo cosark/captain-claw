@@ -97,7 +97,7 @@ interface Step {
 const SHOTS = {
   overview: {
     dark: overviewDark, light: overviewLight, phoneDark: overviewPhoneDark, phoneLight: overviewPhoneLight,
-    alt: 'The deck: agents on the left, the chat in the middle, files and data on the right',
+    alt: 'The deck: agents on the left with Library and Data at the bottom, the chat in the middle',
     phoneAlt: 'Your agents, one per row, with New agent at the bottom',
   },
   newAgent: {
@@ -106,7 +106,7 @@ const SHOTS = {
   },
   chat: {
     dark: chatDark, light: chatLight, phoneDark: chatPhoneDark, phoneLight: chatPhoneLight,
-    alt: 'At work: a conversation, two tasks in the queue, the next request typed, files on the right',
+    alt: 'At work: a conversation, two tasks in the queue beside it, the next request typed',
     phoneAlt: 'A chat: the conversation, and the next request typed in the message box',
   },
   google: {
@@ -429,13 +429,13 @@ function buildSteps({ name, phone, authEnabled, sharingEnabled, info }: {
     points: phone
       ? [
           <><B>Your agents</B> are the first screen: tap one to chat. Green means running, amber working, blue a new reply.</>,
-          <><B>In a chat</B>, the folder icon at the top shows the files and data the agent saved for you.</>,
+          <><B>In a chat</B>, the folder icon at the top opens the files the agent saved for you.</>,
           <><B>Back</B> returns to the list: the agent keeps working meanwhile.</>,
         ]
       : [
           <><B>Left: your agents.</B> Click one to chat. Green means running, amber working, blue a new reply.</>,
           <><B>Middle: the conversation.</B> Ask, attach files, and follow its work as it goes.</>,
-          <><B>Right: files and data.</B> Documents, spreadsheets and tables the agent saved for you.</>,
+          <><B>Library and Data</B> (bottom left) gather what the agents you create here save: documents, spreadsheets, tables. An agent's <B>⋯</B> → <B>Files &amp; data</B> shows everything it keeps.</>,
         ],
     shot: SHOTS.overview,
   })
@@ -471,10 +471,10 @@ function buildSteps({ name, phone, authEnabled, sharingEnabled, info }: {
         : <><B>Attach files</B> with the paperclip, or drop or paste them into the message: documents, spreadsheets, images.</>,
       phone
         ? <><B>Line up several tasks</B> in the queue: the list icon on the row above the chat switches to it. On <B>Auto</B>, the agent works through them one after another.</>
-        : <><B>Line up several tasks</B> in the queue beside the chat (the list icon at the top shows or hides it). On <B>Auto</B>, the agent works through them one after another.</>,
-      <><B>Change topic</B> with <B>{phone ? '+ New' : '+ New topic'}</B>: the agent starts with a fresh context, and everything said so far stays above the divider. It keeps its memory and files.</>,
-      <><B>Topics</B> (the history icon next to it) lists earlier topics: tap one to jump back to it, or resume it so the agent picks that context up again.</>,
-      <><B>What it makes</B> lands in {phone ? 'files and data (the folder icon)' : 'Files and data on the right'}: open, preview or download it.</>,
+        : <><B>Line up several tasks</B> in the queue beside the chat (the list icon at the top shows it). On <B>Auto</B>, the agent works through them one after another.</>,
+      <><B>Change topic</B> with <B>{phone ? 'New' : 'New topic'}</B>: the agent starts with a fresh context, and everything said so far stays above the divider. It keeps its memory and files.</>,
+      <><B>Topics</B> (next to it) lists earlier topics: tap one to jump back to it, or resume it so the agent picks that context up again.</>,
+      <><B>What it makes</B> is under its <B>⋯</B> → <B>Files &amp; data</B>{phone ? ' (and the folder icon at the top)' : ''}. For the agents you create here, it is also in the <B>Library</B> (files) and <B>Data</B> (tables), {phone ? 'at the top of your agent list' : 'bottom left'}. Open, preview or download it there.</>,
     ],
     note: 'It keeps working while you chat with another agent: a blue dot tells you a reply is waiting.',
     shot: SHOTS.chat,

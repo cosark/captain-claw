@@ -10,6 +10,7 @@ import {
 } from '../../services/tierConfig'
 import { publishSharedTierSets, type PublishResult } from '../../services/sharedTierSets'
 import { useAuthStore } from '../../stores/authStore'
+import { useConsoleStore } from '../../stores/consoleStore'
 import { Switch } from '../admin/Switch'
 import { TEAM_KEY_PROVIDERS, fetchProviderKeys, saveProviderKey } from './consoleApi'
 import {
@@ -66,7 +67,8 @@ function keyHint(v: string): string {
 }
 
 export function ModelsPage() {
-  const tc = useTierConfig()
+  // The console never makes a starting set: the admin creates the first one.
+  const tc = useTierConfig({ seed: false })
   const {
     tiers, setTiers, forgeTier, setForgeTier, envVars, setEnvVars, registry, updateTier, setupSet, bootstrapped,
     sets, activeSetId, setActiveSet, addSet, duplicateSet, renameSet, deleteSet, sharedSets, adoptSharedSet,
@@ -80,7 +82,16 @@ export function ModelsPage() {
   const teamSet = accounts ? teamSets[0] || null : null
 
   const [editingTier, setEditingTier] = useState<string | null>(null)
-  const [newOpen, setNewOpen] = useState(false)
+  // Sent here to create the first tier set (the Overview, the launch): open "New tier set".
+  const [newOpen, setNewOpen] = useState(() => !!useConsoleStore.getState().intent.createSet)
+  useEffect(() => {
+    useConsoleStore.getState().takeIntent()
+    return useConsoleStore.subscribe((s) => {
+      if (!s.intent.createSet) return
+      setNewOpen(true)
+      useConsoleStore.getState().takeIntent()
+    })
+  }, [])
   const [oneModelOpen, setOneModelOpen] = useState(false)
   const [publishing, setPublishing] = useState(false)
   const [publishNote, setPublishNote] = useState<PublishResult | null>(null)
@@ -138,6 +149,19 @@ export function ModelsPage() {
 
   const editing = editingTier && tiers[editingTier] ? editingTier : null
 
+  const foreignNotice = foreignTeamSet && (
+    <Notice tone="zinc">
+      <div className="flex flex-wrap items-center gap-3">
+        <Users className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+        <span className="min-w-0 flex-1">
+          The team runs on <b className="text-zinc-200">{foreignTeamSet.name}</b>, which isn't one of your sets.
+          Copy it in to change it, then publish your copy.
+        </span>
+        <Button icon={Copy} onClick={() => adoptSharedSet(foreignTeamSet.id)}>Copy to my sets</Button>
+      </div>
+    </Notice>
+  )
+
   return (
     <Page>
       <PageHeader
@@ -150,8 +174,24 @@ export function ModelsPage() {
         actions={<Button variant="primary" icon={Plus} onClick={() => setNewOpen(true)}>New tier set</Button>}
       />
 
-      {!bootstrapped || !active ? (
+      {!bootstrapped ? (
         <Card><p className="text-sm text-zinc-500">Loading your tier sets…</p></Card>
+      ) : !active ? (
+        <>
+          <section className="flex flex-col items-center rounded-2xl border border-dashed border-violet-500/40 bg-violet-500/[0.04] px-6 py-12 text-center">
+            <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-violet-500/15 text-violet-600 dark:text-violet-400">
+              <Layers className="h-6 w-6" />
+            </span>
+            <h2 className="mt-4 text-lg font-semibold text-zinc-100">Create your first tier set</h2>
+            <p className="mt-1.5 max-w-md text-sm leading-relaxed text-zinc-500">
+              Agents need models before they can work. A tier set gives each kind of work a model — start with one
+              model for everything and fine-tune each tier later.
+            </p>
+            <Button variant="primary" icon={Plus} className="mt-5" onClick={() => setNewOpen(true)}>Create a tier set</Button>
+          </section>
+          {foreignNotice}
+          <TeamKeysCard keys={keys} onSaved={setKeys} needsKey={teamNeedsKey} team={accounts} />
+        </>
       ) : (
         <>
           {/* ── The sets ── */}
@@ -174,18 +214,7 @@ export function ModelsPage() {
             </button>
           </div>
 
-          {foreignTeamSet && (
-            <Notice tone="zinc">
-              <div className="flex flex-wrap items-center gap-3">
-                <Users className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
-                <span className="min-w-0 flex-1">
-                  The team runs on <b className="text-zinc-200">{foreignTeamSet.name}</b>, which isn't one of your sets.
-                  Copy it in to change it, then publish your copy.
-                </span>
-                <Button icon={Copy} onClick={() => adoptSharedSet(foreignTeamSet.id)}>Copy to my sets</Button>
-              </div>
-            </Notice>
-          )}
+          {foreignNotice}
 
           {/* ── The selected set ── */}
           <Card bodyClassName="p-5 space-y-5">
@@ -279,7 +308,7 @@ export function ModelsPage() {
         <NewSetDialog
           copyName={active?.name || ''}
           onClose={() => setNewOpen(false)}
-          onOneModel={(name, apply) => { setupSet(name, apply); setNewOpen(false) }}
+          onOneModel={(name, apply) => { setupSet(name, apply, { replaceSeed: false }); setNewOpen(false) }}
           onDefaults={(name) => { addSet(name); setNewOpen(false) }}
           onCopy={(name) => {
             if (!active) return

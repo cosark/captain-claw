@@ -9,9 +9,10 @@
  */
 
 const { app, BrowserWindow, Menu, shell, dialog } = require("electron");
-const { spawn } = require("child_process");
+const { spawn, execFileSync } = require("child_process");
 const path = require("path");
 const http = require("http");
+const net = require("net");
 const fs = require("fs");
 const log = require("electron-log/main");
 
@@ -20,7 +21,22 @@ const log = require("electron-log/main");
 const BACKEND_PORT = 23080;
 const BACKEND_HOST = "127.0.0.1";
 const BACKEND_URL = `http://${BACKEND_HOST}:${BACKEND_PORT}`;
-const FD_PORT = 25080;
+// The app's own Flight Deck port — not the usual 25080: a deck already
+// running there (a developer's) would answer the health check and the window
+// would show that deck instead. The next free port up to FD_PORT_LAST if busy.
+const FD_PORT = 25090;
+const FD_PORT_LAST = 25099;
+// Earlier builds ran it on 25080: an install upgraded from one keeps that
+// port (and its window's origin, with the page storage on it) while it's free.
+const LEGACY_FD_PORT = 25080;
+// The port is kept from launch to launch (desktop-fd.json in the user data
+// dir): the window's origin, and with it everything a deck without sign-in
+// keeps in the page's storage, stays the same.
+
+// One app at a time: a second launch focuses this window instead of starting
+// a second Flight Deck on the same data dir.
+const GOT_LOCK = app.requestSingleInstanceLock();
+if (!GOT_LOCK) app.quit();
 const FD_HOST = "127.0.0.1";
 const HEALTH_POLL_MS = 300;
 const HEALTH_TIMEOUT_MS = 30_000;
@@ -238,11 +254,11 @@ function spawnFlightDeck() {
 
   if (binary) {
     cmd = binary;
-    args = ["--host", FD_HOST, "--port", String(FD_PORT)];
+    args = ["--host", FD_HOST, "--port", String(actualFdPort)];
     log.info(`Starting Flight Deck: ${binary}`);
   } else if (DEV_MODE) {
     cmd = process.platform === "win32" ? "python" : "python3";
-    args = ["-m", "captain_claw.flight_deck.server", "--host", FD_HOST, "--port", String(FD_PORT)];
+    args = ["-m", "captain_claw.flight_deck.server", "--host", FD_HOST, "--port", String(actualFdPort)];
     env.PYTHONPATH = path.join(__dirname, "..");
     log.info("Starting Flight Deck from source (dev mode)");
   } else {
@@ -281,10 +297,97 @@ function spawnFlightDeck() {
     }
   });
 
+  writeFdState({ port: actualFdPort, pid: fdProcess.pid });
+
   fdProcess.on("exit", (code, signal) => {
     log.info(`Flight Deck exited: code=${code} signal=${signal}`);
     fdProcess = null;
+    writeFdState({ port: actualFdPort });
   });
+}
+
+// ── The app's own Flight Deck between launches ─────────────────
+
+function fdStateFile() {
+  return path.join(getUserDataDir(), "desktop-fd.json");
+}
+
+function readFdState() {
+  try {
+    return JSON.parse(fs.readFileSync(fdStateFile(), "utf8")) || {};
+  } catch {
+    return {};
+  }
+}
+
+function writeFdState(state) {
+  try {
+    fs.mkdirSync(getUserDataDir(), { recursive: true });
+    fs.writeFileSync(fdStateFile(), JSON.stringify(state));
+  } catch (err) {
+    log.warn(`Could not save ${fdStateFile()}: ${err.message}`);
+  }
+}
+
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Whether a pid is still the Flight Deck an earlier launch started (and not
+// some other process that got the number since). Windows can't be told
+// apart this way, so there it is left alone.
+function isOurFd(pid, port) {
+  if (process.platform === "win32" || !port) return false;
+  try {
+    const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf8" });
+    return /captain-claw-fd|captain_claw\.flight_deck\.server/.test(cmd)
+      && new RegExp(`--port\\s+${Number(port)}(\\s|$)`).test(cmd);
+  } catch {
+    return false;
+  }
+}
+
+// A crash or force-quit skips before-quit, leaving the earlier Flight Deck
+// running on its port: stop it, or this launch would start a second one on
+// the same data dir.
+async function stopLeftoverFd() {
+  const { pid, port } = readFdState();
+  if (!pid || !alive(pid) || !isOurFd(pid, port)) return;
+  log.warn(`Stopping the Flight Deck left over from an earlier run (pid ${pid})`);
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    return;
+  }
+  for (let i = 0; i < 50 && alive(pid); i++) await new Promise((r) => setTimeout(r, 100));
+  if (alive(pid)) {
+    try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+  }
+}
+
+function portFree(port) {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.once("error", () => resolve(false));
+    probe.once("listening", () => probe.close(() => resolve(true)));
+    probe.listen(port, FD_HOST);
+  });
+}
+
+async function pickFdPort(preferred) {
+  const ports = [];
+  if (preferred === LEGACY_FD_PORT || (preferred >= FD_PORT && preferred <= FD_PORT_LAST)) ports.push(preferred);
+  for (let port = FD_PORT; port <= FD_PORT_LAST; port++) if (port !== preferred) ports.push(port);
+  for (const port of ports) {
+    if (await portFree(port)) return port;
+    log.warn(`Port ${port} is busy — trying the next one`);
+  }
+  throw new Error(`No free port for Flight Deck between ${FD_PORT} and ${FD_PORT_LAST}`);
 }
 
 function getFdUrl() {
@@ -440,7 +543,14 @@ function buildMenu() {
 
 // ── App lifecycle ──────────────────────────────────────────────
 
+app.on("second-instance", () => {
+  if (!mainWindow) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.focus();
+});
+
 app.whenReady().then(async () => {
+  if (!GOT_LOCK) return;
   log.info("Captain Claw Desktop starting...");
   log.info(`Platform: ${process.platform} ${process.arch}`);
   log.info(`Dev mode: ${DEV_MODE}`);
@@ -462,6 +572,12 @@ app.whenReady().then(async () => {
       .catch((err) => log.warn("Backend failed to start (non-fatal):", err.message));
 
     // Flight Deck is the primary UI — must start
+    await stopLeftoverFd();
+    // No port saved yet but the window has page storage: an upgrade from a
+    // build that ran on 25080 — keep its origin while 25080 is free.
+    const saved = readFdState().port;
+    const upgraded = saved === undefined && fs.existsSync(path.join(app.getPath("userData"), "Local Storage"));
+    actualFdPort = await pickFdPort(saved ?? (upgraded ? LEGACY_FD_PORT : undefined));
     spawnFlightDeck();
     await waitForFlightDeck();
     mainWindow.loadURL(getFdUrl());

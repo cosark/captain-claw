@@ -6,8 +6,8 @@ import {
 } from 'lucide-react'
 import type { AgentFile, AgentEndpoint } from '../../services/fileTransfer'
 import {
-  listAgentFiles, formatSize, getDownloadUrl, getViewUrl,
-  getFileTypeGroup, isViewable,
+  listAgentFiles, formatSize, getDownloadUrl, getViewUrl, getDeckUrl,
+  getFileTypeGroup, isViewable, isEditable, processEndpoint,
 } from '../../services/fileTransfer'
 import { FileViewer } from './FileViewer'
 import { FileActionSheet } from './FileActionSheet'
@@ -21,9 +21,6 @@ import { useContainerStore } from '../../stores/containerStore'
 import { useProcessStore } from '../../stores/processStore'
 import { useLocalAgentStore } from '../../stores/localAgentStore'
 import { useChatStore } from '../../stores/chatStore'
-
-// File groups whose text content can be edited in place (mirrors FileBrowser).
-const EDITABLE_GROUPS = new Set(['markdown', 'code', 'data', 'text', 'html'])
 
 const TYPE_ICONS: Record<string, typeof FileText> = {
   image: Image, video: Film, audio: Music, code: FileCode,
@@ -52,10 +49,7 @@ export function useAgentEndpoint(containerId: string): AgentEndpoint | null {
     return { id: local.id, name: local.name, host: local.host, port: local.port, auth: local.authToken }
   }
   const proc = processes.find((p) => `proc-${p.slug}` === containerId)
-  if (proc && proc.web_port) {
-    return { id: `proc-${proc.slug}`, name: proc.name, host: 'localhost', port: proc.web_port, auth: proc.web_auth }
-  }
-  return null
+  return (proc && processEndpoint(proc)) || null
 }
 
 /** Goes up by one each time the agent's chat (any lane) gets through again
@@ -161,7 +155,6 @@ export function AgentFilesPanel({ containerId }: { containerId: string }) {
     )
   }
 
-  const isEditable = (f: AgentFile) => EDITABLE_GROUPS.has(getFileTypeGroup(f))
   // A member's HTML never runs as a deck (Flight Deck's /deck/view refuses it too).
   const isDeckable = (f: AgentFile) => getFileTypeGroup(f) === 'html' && !isMemberCreated(f.created_by)
 
@@ -183,10 +176,7 @@ export function AgentFilesPanel({ containerId }: { containerId: string }) {
     document.body.removeChild(a)
   }
   const handleDeck = (f: AgentFile) => {
-    const q = new URLSearchParams({
-      c: 'deck', path: f.physical, host: agent.host, port: String(agent.port), auth: agent.auth || '',
-    })
-    window.open(`${window.location.origin}/deck/view?${q.toString()}`, '_blank')
+    window.open(getDeckUrl(agent.host, agent.port, f.physical, agent.auth), '_blank')
   }
   const handlePin = (f: AgentFile) => {
     if (isFilePinned(agent.id, f.physical)) return

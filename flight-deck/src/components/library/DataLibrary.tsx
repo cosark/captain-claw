@@ -39,6 +39,7 @@ import {
   type DataRow,
   type DataSort,
   type DataTable,
+  type ExportFormat,
   type RowsPage,
 } from '../../services/dataLibraryApi'
 import { FacetGroup, Highlight, ScanStatus, libraryIconBtn as iconBtn } from './libraryParts'
@@ -153,8 +154,10 @@ function KindIcon({ kind, className = 'h-3.5 w-3.5' }: { kind: ColumnKind | unde
   return <Icon className={`${className} shrink-0 text-zinc-500`} />
 }
 
-export function DataLibrary({ phone = false, onClose, onOpenAgent }: {
+export function DataLibrary({ phone = false, initialAgent, onClose, onOpenAgent }: {
   phone?: boolean
+  /** Open filtered to this agent's tables. */
+  initialAgent?: string | null
   onClose: () => void
   /** Chat with the agent a table belongs to. */
   onOpenAgent?: (agentSlug: string) => void
@@ -163,7 +166,7 @@ export function DataLibrary({ phone = false, onClose, onOpenAgent }: {
   const [state, setState] = useState<LibraryState | null>(null)
   const [query, setQuery] = useState('')
   const [debounced, setDebounced] = useState('')
-  const [agent, setAgent] = useState('')
+  const [agent, setAgent] = useState(initialAgent || '')
   const [category, setCategory] = useState('')
   const [sort, setSort] = useState<DataSort>('recent')
   const [page, setPage] = useState<DataPage | null>(null)
@@ -174,6 +177,15 @@ export function DataLibrary({ phone = false, onClose, onOpenAgent }: {
   const [filtersOpen, setFiltersOpen] = useState(false)
   const reqId = useRef(0)
   const shown = useRef(PAGE)
+
+  // Opened again for another agent while it is open (from that agent's
+  // menu): the filter follows, and another agent's open table gives way to
+  // the list.
+  useEffect(() => {
+    const a = initialAgent || ''
+    setAgent(a)
+    if (a) setOpened((cur) => (cur && cur.agent_slug !== a ? null : cur))
+  }, [initialAgent])
 
   useEffect(() => {
     const t = setTimeout(() => setDebounced(query.trim()), query ? 250 : 0)
@@ -265,6 +277,9 @@ export function DataLibrary({ phone = false, onClose, onOpenAgent }: {
   const facets = page?.facets
   const terms = useMemo(() => debounced.toLowerCase().split(/\s+/).filter(Boolean), [debounced])
   const filtered = !!(debounced || agent || category)
+  // Only one agent's tables (how an agent's menu opens it): an empty list
+  // means that agent has no data yet, not that a search missed.
+  const agentOnly = !!agent && !debounced && !category
   const clearFilters = () => { setQuery(''); setAgent(''); setCategory('') }
 
   if (opened) {
@@ -280,6 +295,11 @@ export function DataLibrary({ phone = false, onClose, onOpenAgent }: {
           setOpened(fresh)
           setPage((cur) => cur && { ...cur, items: cur.items.map((i) => (i.id === fresh.id ? { ...i, ...fresh } : i)) })
           dataLibraryApi.status().then(setState).catch(() => {})
+        }}
+        onRescan={async () => {
+          // The scan's own answer: while it runs the list keeps reloading,
+          // and the open table follows its fresh copy when it ends.
+          try { setState(await dataLibraryApi.scan()) } catch { /* the rows reload all the same */ }
         }}
         onOpenAgent={onOpenAgent && opened.agent_running ? () => onOpenAgent(opened.agent_slug) : undefined}
       />
@@ -352,6 +372,7 @@ export function DataLibrary({ phone = false, onClose, onOpenAgent }: {
       loading={loading}
       error={error}
       filtered={filtered}
+      agentOnly={agentOnly}
       terms={terms}
       phone={phone}
       loadingMore={loadingMore}
@@ -433,10 +454,10 @@ function SearchBox({ value, onChange, placeholder, small = false }: {
 // ── The list of tables ──
 
 function TableList({
-  items, total, rowsTotal, state, loading, error, filtered, terms, phone, loadingMore, onOpen, onMore, onClear, onRetry,
+  items, total, rowsTotal, state, loading, error, filtered, agentOnly, terms, phone, loadingMore, onOpen, onMore, onClear, onRetry,
 }: {
   items: DataTable[]; total: number; rowsTotal: number; state: LibraryState | null; loading: boolean; error: string
-  filtered: boolean; terms: string[]; phone: boolean; loadingMore: boolean
+  filtered: boolean; agentOnly: boolean; terms: string[]; phone: boolean; loadingMore: boolean
   onOpen: (t: DataTable) => void; onMore: () => void; onClear: () => void; onRetry: () => void
 }) {
   if (loading && items.length === 0) {
@@ -458,17 +479,23 @@ function TableList({
           {scanning ? <Loader2 className="h-7 w-7 animate-spin" /> : <Database className="h-7 w-7" />}
         </span>
         <h3 className="mt-4 text-base font-semibold text-zinc-100">
-          {filtered ? 'Nothing matches' : scanning ? 'Gathering your tables…' : state?.agents === 0 ? 'No agents yet' : 'No tables yet'}
+          {filtered && !agentOnly
+            ? 'Nothing matches'
+            : scanning ? 'Gathering your tables…' : agentOnly ? 'No tables yet' : state?.agents === 0 ? 'No agents yet' : 'No tables yet'}
         </h3>
         <p className="mt-1.5 max-w-sm text-sm leading-relaxed text-zinc-400">
-          {filtered
+          {filtered && !agentOnly
             ? 'Try other words, or clear the filters.'
             : scanning
               ? 'Your agents\' tables show up here as soon as they\'re found and read.'
-              : 'When your agents collect data — contacts, companies, prices, results — it lands in their datastore and shows up here, summarised.'}
+              : agentOnly
+                ? 'This agent hasn\'t kept any data yet. When it collects some — contacts, companies, prices, results — it shows up here, summarised.'
+                : 'When your agents collect data — contacts, companies, prices, results — it lands in their datastore and shows up here, summarised.'}
         </p>
         {filtered && (
-          <button onClick={onClear} className="mt-4 text-sm font-medium text-emerald-700 hover:underline dark:text-emerald-400">Clear search and filters</button>
+          <button onClick={onClear} className="mt-4 text-sm font-medium text-emerald-700 hover:underline dark:text-emerald-400">
+            {agentOnly ? 'Show every agent\'s tables' : 'Clear search and filters'}
+          </button>
         )}
       </div>
     )
@@ -559,10 +586,12 @@ function TableCard({ t, terms, onClick }: { t: DataTable; terms: string[]; onCli
 
 type Tab = 'summary' | 'data' | 'columns'
 
-function TableView({ item, terms, phone, onBack, onClose, onChanged, onOpenAgent }: {
+function TableView({ item, terms, phone, onBack, onClose, onChanged, onRescan, onOpenAgent }: {
   item: DataTable; terms: string[]; phone: boolean
   onBack: () => void; onClose: () => void
   onChanged: (fresh: DataTable) => void
+  /** Have the library look for changed tables again. */
+  onRescan: () => Promise<void>
   onOpenAgent?: () => void
 }) {
   const notify = useNotificationStore((s) => s.add)
@@ -570,6 +599,10 @@ function TableView({ item, terms, phone, onBack, onClose, onChanged, onOpenAgent
   const [tab, setTab] = useState<Tab>(phone ? 'summary' : 'data')
   const [summaryOpen, setSummaryOpen] = useState(true)
   const [busy, setBusy] = useState(false)
+  const [refreshing, setRefreshing] = useState(false)
+  // Bumped by Refresh: the grid reloads its page even when nothing it knows
+  // of has changed.
+  const [nonce, setNonce] = useState(0)
 
   // The column profile comes with the table itself — again when a new
   // summary or a change arrives.
@@ -598,21 +631,29 @@ function TableView({ item, terms, phone, onBack, onClose, onChanged, onOpenAgent
       setBusy(false)
     }
   }
-  const download = () => {
-    const a = document.createElement('a')
-    a.href = dataLibraryApi.exportUrl(item.id)
-    a.download = `${item.table_name}.csv`
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
+  // The rows are read live, so the grid's page reloads straight away. The
+  // row count, summary and column profile are the library's from its last
+  // look at the table, so it looks again first; a change it finds arrives
+  // through the list like any other.
+  const refresh = async () => {
+    setRefreshing(true)
+    setNonce((n) => n + 1)
+    try {
+      await onRescan()
+      const fresh = await dataLibraryApi.table(item.id)
+      setDetail(fresh)
+      onChanged(fresh)
+    } catch (e) {
+      notify('error', 'Could not refresh the table', e instanceof Error ? e.message : String(e))
+    } finally {
+      setRefreshing(false)
+    }
   }
 
   const btn = 'flex items-center justify-center gap-1.5 rounded-lg border border-zinc-800 px-3 py-1.5 text-sm text-zinc-300 transition-colors hover:bg-zinc-800/60 disabled:opacity-50'
   const actions = (
     <>
-      <button onClick={download} className={btn} title="Download the whole table as CSV (opens in Excel)">
-        <Download className="h-4 w-4" />CSV
-      </button>
+      <ExportMenu item={item} className={btn} phone={phone} />
       <button onClick={redo} disabled={busy || t.status === 'pending'} className={btn} title="Read the table again and write a fresh summary">
         {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}{phone ? 'Summarise' : 'Summarise again'}
       </button>
@@ -637,6 +678,9 @@ function TableView({ item, terms, phone, onBack, onClose, onChanged, onOpenAgent
         <p className="truncate text-xs text-zinc-500"><span className="font-mono">{t.table_name}</span> · {t.agent_name}</p>
       </div>
       {!phone && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
+      <button onClick={refresh} disabled={refreshing} className={`${iconBtn} shrink-0`} title="Refresh — the table as it is now" aria-label="Refresh">
+        <RotateCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
+      </button>
       <button onClick={onClose} className={`${iconBtn} shrink-0`} title="Close" aria-label="Close">
         <X className="h-4 w-4" />
       </button>
@@ -663,7 +707,7 @@ function TableView({ item, terms, phone, onBack, onClose, onChanged, onOpenAgent
       kinds={kinds}
       notes={t.column_notes}
       phone={phone}
-      version={`${item.row_count}:${item.updated_at}`}
+      version={`${item.row_count}:${item.updated_at}:${nonce}`}
     />
   )
   const columns = (
@@ -713,6 +757,83 @@ function TableView({ item, terms, phone, onBack, onClose, onChanged, onOpenAgent
         </button>
       </div>
       <div className="min-h-0 flex-1">{tab === 'columns' ? columns : grid}</div>
+    </div>
+  )
+}
+
+const EXPORTS: { format: ExportFormat; label: string; hint: string }[] = [
+  { format: 'csv', label: 'CSV', hint: 'Opens in Excel, Numbers or Google Sheets' },
+  { format: 'json', label: 'JSON', hint: 'Every row as an object, for code and other tools' },
+  { format: 'xlsx', label: 'Excel (XLSX)', hint: 'A workbook, ready for Excel' },
+]
+
+/** Download the whole table as CSV, JSON or an Excel workbook. */
+function ExportMenu({ item, className, phone }: { item: DataTable; className: string; phone: boolean }) {
+  const notify = useNotificationStore((s) => s.add)
+  const [open, setOpen] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  // The menu closes on Escape before the table does.
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      e.stopPropagation()
+      setOpen(false)
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [open])
+
+  const save = async (format: ExportFormat) => {
+    setOpen(false)
+    setSaving(true)
+    try {
+      await dataLibraryApi.download(item.id, format, item.table_name)
+    } catch (e) {
+      notify('error', 'Could not export the table', e instanceof Error ? e.message : String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        disabled={saving}
+        className={`${className} w-full`}
+        title="Download the whole table"
+        aria-haspopup="menu"
+        aria-expanded={open}
+      >
+        {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}Export
+        <ChevronDown className="h-3.5 w-3.5 text-zinc-500" />
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-20" onClick={() => setOpen(false)} />
+          {/* On a phone the buttons sit at the end of the summary: the menu
+              opens upwards so it is never below the fold. */}
+          <div
+            role="menu"
+            className={`absolute z-30 min-w-[240px] rounded-lg border border-zinc-800 bg-zinc-900 py-1 shadow-xl ${
+              phone ? 'bottom-full left-0 mb-1' : 'right-0 top-full mt-1'}`}
+          >
+            {EXPORTS.map((x) => (
+              <button
+                key={x.format}
+                role="menuitem"
+                onClick={() => save(x.format)}
+                className="block w-full px-3 py-2 text-left transition-colors hover:bg-zinc-800"
+              >
+                <span className="block text-sm text-zinc-200">{x.label}</span>
+                <span className="block text-[11px] text-zinc-500">{x.hint}</span>
+              </button>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   )
 }

@@ -4,6 +4,10 @@ import { useAuthStore } from './authStore'
 import type { ViewMode } from '../types'
 import { USERS_TAB_KEY, type UsersTab } from '../components/admin/deckConfig'
 import { ADMIN_TAB_KEY } from '../services/sharedIntegrations'
+import { isDesktopApp } from '../services/desktopShell'
+import { hasTierSets } from '../services/tierConfig'
+import { listProcesses, listContainers } from '../services/docker'
+import { isManagedAgent } from '../utils/managedAgents'
 
 // The Admin console (layoutMode 'console'): the deck's admin work on pages of
 // its own — no chat, no agent desktop. Each page has an address,
@@ -42,6 +46,8 @@ function remember(page: ConsolePage) {
 export interface ConsoleIntent {
   usersTab?: UsersTab
   connection?: string
+  // Models: open "New tier set" straight away (no tier set exists yet).
+  createSet?: boolean
 }
 
 interface ConsoleStore {
@@ -50,6 +56,8 @@ interface ConsoleStore {
   // a click: it shows for an admin whatever layout their saved settings bring.
   requested: boolean
   intent: ConsoleIntent
+  // ConsoleLayout is on screen (not merely the saved layout).
+  shown: boolean
   go: (page: ConsolePage, intent?: ConsoleIntent) => void
   /** A page took its intent: don't apply it again on the next visit. */
   takeIntent: () => ConsoleIntent
@@ -61,6 +69,7 @@ export const useConsoleStore = create<ConsoleStore>((set, get) => ({
   page: initialPage ?? lastPage(),
   requested: initialPage !== null,
   intent: {},
+  shown: false,
 
   go: (page, intent = {}) => {
     remember(page)
@@ -71,7 +80,7 @@ export const useConsoleStore = create<ConsoleStore>((set, get) => ({
   },
   takeIntent: () => {
     const intent = get().intent
-    if (intent.usersTab || intent.connection) set({ intent: {} })
+    if (intent.usersTab || intent.connection || intent.createSet) set({ intent: {} })
     return intent
   },
 }))
@@ -89,13 +98,75 @@ export function openConsole(page?: ConsolePage, intent?: ConsoleIntent) {
   useConsoleStore.getState().go(page ?? useConsoleStore.getState().page, intent)
 }
 
-/** Back to Flight Deck — its full layout (optionally on one of its pages), or
- *  the chat-first simple one (the desktop app's "User" view). */
-export function leaveConsole(view?: ViewMode, layout: 'full' | 'simple' = 'full') {
+/** Back to Flight Deck's full layout, optionally on one of its pages. */
+export function leaveConsole(view?: ViewMode) {
+  useConsoleStore.setState({ requested: false })
+  useAuthStore.getState().setAdminStartPending(false)   // their choice beats the sign-in landing
+  if (pageFromPath(window.location.pathname)) window.history.pushState(null, '', '/')
+  useUIStore.getState().setLayoutMode('full')
+  if (view) useUIStore.getState().setView(view)
+}
+
+// ── The desktop app: the Admin console or the users' kiosk, nothing else ──
+
+// Set once per desktop-app window: a reload is not a new launch.
+const LAUNCHED_KEY = 'fd:desktop-launched'
+
+/** The page an admin with nothing set up should land on: Models, until a tier set exists. */
+export function consoleHome(): ConsolePage {
+  return hasTierSets() ? 'overview' : 'models'
+}
+
+// The user's own agents — what the users' kiosk would list (not the workers
+// Flight Deck runs for team runs). 0 when they can't be read in time.
+async function ownAgentCount(): Promise<number> {
+  // Each listing on its own clock: a slow one must not drop the other's count.
+  const within = (p: Promise<number>) =>
+    Promise.race([p.catch(() => 0), new Promise<number>((resolve) => setTimeout(() => resolve(0), 4000))])
+  const [p, c] = await Promise.all([
+    within(listProcesses().then((ps) => ps.filter((x) => !isManagedAgent(x.slug, x.description || '')).length)),
+    within(listContainers().then((cs) => cs.length)),
+  ])
+  return p + c
+}
+
+/**
+ * Where the desktop app opens for an admin. A launch (or a sign-in): the
+ * users' kiosk when there are agents to work with, else the Admin console —
+ * on Models while no tier set exists. A reload keeps the view it had.
+ */
+export async function startDesktop({ signedIn = false }: { signedIn?: boolean } = {}): Promise<void> {
+  let launched = false
+  try { launched = sessionStorage.getItem(LAUNCHED_KEY) === '1' } catch { /* storage blocked */ }
+  if (launched && !signedIn) {
+    if (!useAuthStore.getState().kioskView) useConsoleStore.setState({ requested: true })
+    return
+  }
+  try { sessionStorage.setItem(LAUNCHED_KEY, '1') } catch { /* storage blocked */ }
+  const viewBefore = [useAuthStore.getState().kioskView, useConsoleStore.getState().page].join()
+  const agents = await ownAgentCount()
+  // They picked a view while it counted: their choice beats the landing.
+  if ([useAuthStore.getState().kioskView, useConsoleStore.getState().page].join() !== viewBefore) return
+  if (agents > 0) {
+    useConsoleStore.setState({ requested: false })
+    useAuthStore.getState().setKioskView(true)
+    return
+  }
+  useAuthStore.getState().setKioskView(false)
+  useConsoleStore.setState({ requested: true, page: consoleHome() })
+}
+
+/** Admin | User → User: the kiosk exactly as a locked user gets it. */
+export function enterKioskView() {
   useConsoleStore.setState({ requested: false })
   if (pageFromPath(window.location.pathname)) window.history.pushState(null, '', '/')
-  useUIStore.getState().setLayoutMode(layout)
-  if (view) useUIStore.getState().setView(view)
+  useAuthStore.getState().setKioskView(true)
+}
+
+/** Admin | User → Admin. */
+export function leaveKioskView() {
+  useAuthStore.getState().setKioskView(false)
+  openConsole()
 }
 
 /** Back / Forward: into the console, to another of its pages, or out of it. */
@@ -107,6 +178,7 @@ export function syncConsoleFromUrl() {
     return
   }
   const ui = useUIStore.getState()
+  if (isDesktopApp()) return   // only the console or the users' kiosk: Back never means 'full'
   if (!useConsoleStore.getState().requested && ui.layoutMode !== 'console') return
   useConsoleStore.setState({ requested: false })
   ui.setLayoutMode('full')
@@ -118,7 +190,9 @@ export function syncConsoleFromUrl() {
 // console for any other page.
 let restoringView = false
 useUIStore.subscribe((s, prev) => {
-  if (restoringView || s.view === prev.view || s.layoutMode !== 'console') return
+  // Only links inside the console on screen — not a page the app opens itself
+  // (a payment link) or one from the kiosk, whatever layout is saved.
+  if (restoringView || s.view === prev.view || !useConsoleStore.getState().shown) return
   const { go } = useConsoleStore.getState()
   const take = (key: string) => {
     try { const v = sessionStorage.getItem(key); sessionStorage.removeItem(key); return v } catch { return null }
@@ -137,10 +211,11 @@ useUIStore.subscribe((s, prev) => {
     go('connections', tab ? { connection: tab } : {})
   } else if (s.view === 'library') {
     go('models')
-  } else {
+  } else if (!isDesktopApp()) {
     leaveConsole(s.view)
     return
   }
+  // (The desktop app has no full layout to leave for: it stays here.)
   // Put the view back, so the same link works again next time.
   restoringView = true
   useUIStore.setState({ view: prev.view })

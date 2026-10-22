@@ -4,6 +4,8 @@
 // Flight Deck dependency: use a global install (NODE_PATH) or point
 // PLAYWRIGHT_MODULE at one.
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright')
+// The chat's message box (the kiosk's says "Ask anything…").
+const CHAT_INPUT = 'textarea[placeholder^="Ask anything"], textarea[placeholder^="Message"]'
 const fs = require('fs')
 const path = require('path')
 
@@ -12,6 +14,7 @@ const RUN = process.env.E2E_RUN_DIR || path.join(__dirname, '.run')
 const MODE = process.env.MODE || 'assets'
 // Which layouts to shoot (assets mode): the desktop one, the phone one, or both.
 const FORMS = (process.env.FORMS || 'wide,phone').split(',')
+const THEMES = (process.env.THEMES || 'dark,light').split(',')
 const OUT = path.join(RUN, MODE === 'guide' ? 'guide' : 'png')
 const EMAIL = 'maya@example.com', PASSWORD = 'correct-horse-battery'
 fs.mkdirSync(OUT, { recursive: true })
@@ -84,7 +87,7 @@ async function pickArchetype(page, theme) {
 }
 
 async function assets(browser) {
-  for (const theme of ['dark', 'light']) {
+  for (const theme of THEMES) {
     await settings(theme, true)
     if (FORMS.includes('phone')) await phoneAssets(browser, theme)
     if (!FORMS.includes('wide')) continue
@@ -101,18 +104,19 @@ async function assets(browser) {
 
     // At work: the first queued task under way (the demo agent never finishes
     // it), the next one waiting, a question typed, files on the right.
-    await page.locator('button[aria-label="Show queue"]').click()
-    const queue = page.locator('textarea[placeholder^="Queue a message"]')
+    await page.locator('button[data-fd-queue-toggle]').click()
+    const queue = page.locator('textarea[aria-label="New task"]')
     for (const task of ['Draft a one-page pricing memo for the board from the comparison',
       'Check Dance and Rebike prices again next Monday and tell me what changed']) {
       await queue.fill(task)
-      await page.getByRole('button', { name: 'Add', exact: true }).click()
+      await queue.press('Enter')
     }
-    await page.locator('textarea[placeholder^="Message"]').fill('Which of the three has the best repair service in Munich?')
+    await queue.evaluate((el) => el.blur())
+    await page.locator(CHAT_INPUT).fill('Which of the three has the best repair service in Munich?')
     await sleep(500)
     const main = await page.locator('main').first().boundingBox()
     await page.screenshot({ path: path.join(OUT, `chat-${theme}.png`), clip: { x: main.x, y: main.y, width: 1280 - main.x, height: main.height } })
-    await page.locator('textarea[placeholder^="Message"]').fill('')
+    await page.locator(CHAT_INPUT).fill('')
 
     // New agent: an archetype picked, its name filled in.
     await page.locator('button[title="New agent from an archetype"]').first().click()
@@ -171,8 +175,8 @@ async function phoneAssets(browser, theme) {
 
   await page.locator('button', { hasText: 'Research Assistant' }).first().click()
   await page.getByText('position against').waitFor()
-  await page.locator('textarea[placeholder^="Message"]').fill('Which of the three has the best repair service in Munich?')
-  await page.locator('textarea[placeholder^="Message"]').evaluate((el) => el.blur())
+  await page.locator(CHAT_INPUT).fill('Which of the three has the best repair service in Munich?')
+  await page.locator(CHAT_INPUT).evaluate((el) => el.blur())
   await shoot('chat')
   await page.getByRole('button', { name: 'Back to agents' }).click()
 

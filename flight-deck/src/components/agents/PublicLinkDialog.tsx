@@ -85,8 +85,10 @@ export function PublicLinkDialog({ agent, file, onClose }: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [agent.id, agent.host, agent.port, file.physical])
 
+  // Esc closes this dialog only: marked, so a dialog it opened from (the
+  // kiosk's Files & data) stays open.
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') { e.preventDefault(); onClose() } }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])

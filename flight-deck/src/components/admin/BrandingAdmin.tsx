@@ -108,7 +108,7 @@ export function BrandingAdmin({ name, description, poweredBy, onSave }: Props) {
   }
 
   const removeLogo = async () => {
-    if (!confirm('Remove the logo? The panels and the sign-in page go back to the Flight Deck mark.')) return
+    if (!confirm('Remove the logo? The panels and the sign-in page go back to the Captain icon.')) return
     setLogoBusy(true)
     setError('')
     try {

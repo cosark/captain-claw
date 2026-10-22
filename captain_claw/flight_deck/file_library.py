@@ -706,6 +706,11 @@ def _item(row: dict, agents: dict[str, dict], terms: list[str] | None = None) ->
         "agent_name": agents.get(row["agent_slug"], {}).get("name", row["agent_slug"]),
         "agent_running": bool(agents.get(row["agent_slug"], {}).get("running")),
         "rel_path": row["rel_path"],
+        # Named as the Files panel names a file on disk (the agent-files
+        # proxy's workspace scan), so the agent's view, save, deck and
+        # public-link routes take a library file as they take one from there.
+        "physical": str(_workspace(row["agent_slug"]) / row["rel_path"]),
+        "logical": "workspace/" + row["rel_path"],
         "filename": row["filename"],
         "extension": row["extension"],
         "kind": row["kind"],

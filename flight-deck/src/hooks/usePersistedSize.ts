@@ -6,6 +6,11 @@ import { useState } from 'react'
 // — the handle sits on the panel's right/bottom edge — while 'backward' grows
 // on a leftward/upward drag, for a handle on the panel's LEFT/top edge (a
 // column docked to the right side of the screen).
+//
+// The drag follows pointer events, which fire for a mouse as well, so a
+// handle may start it from onMouseDown or onPointerDown (touch and pen too;
+// give the handle `touch-action: none` so the page doesn't scroll instead).
+// `nudge` moves the size from the keyboard, in the same screen direction.
 export function usePersistedSize(
   key: string,
   def: number,
@@ -29,30 +34,40 @@ export function usePersistedSize(
   // oversized persisted value can never paint off-screen; it heals to the
   // clamped value on the next drag (onUp persists Math.min(cap, ...)).
   const clamped = Math.min(size, cap)
-  const onResizeStart = (e: React.MouseEvent) => {
+  const sign = grow === 'backward' ? -1 : 1
+  const persist = (v: number) => {
+    try { localStorage.setItem(key, String(Math.round(v))) } catch { /* ignore */ }
+  }
+  const onResizeStart = (e: React.MouseEvent | React.PointerEvent) => {
     e.preventDefault()
     const startPos = axis === 'x' ? e.clientX : e.clientY
     const startSize = clamped
-    const sign = grow === 'backward' ? -1 : 1
     document.body.style.cursor = axis === 'x' ? 'col-resize' : 'row-resize'
     document.body.style.userSelect = 'none'
-    const onMove = (ev: MouseEvent) => {
+    const onMove = (ev: PointerEvent) => {
       const pos = axis === 'x' ? ev.clientX : ev.clientY
       setSize(Math.min(cap, Math.max(min, startSize + sign * (pos - startPos))))
     }
     const onUp = () => {
       document.body.style.cursor = ''
       document.body.style.userSelect = ''
-      window.removeEventListener('mousemove', onMove)
-      window.removeEventListener('mouseup', onUp)
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onUp)
       setSize((s) => {
         const v = Math.min(cap, Math.max(min, s))
-        try { localStorage.setItem(key, String(Math.round(v))) } catch { /* ignore */ }
+        persist(v)
         return v
       })
     }
-    window.addEventListener('mousemove', onMove)
-    window.addEventListener('mouseup', onUp)
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onUp)
   }
-  return { size: clamped, onResizeStart }
+  const nudge = (delta: number) => {
+    const v = Math.min(cap, Math.max(min, clamped + sign * delta))
+    setSize(v)
+    persist(v)
+  }
+  return { size: clamped, onResizeStart, nudge, min, max: cap }
 }

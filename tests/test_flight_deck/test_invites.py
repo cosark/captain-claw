@@ -317,7 +317,7 @@ async def test_send_from_gmail(fd_db, monkeypatch):
     raw = json.loads(req.content)["raw"]
     message = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode()
     assert "To: new.member@example.com" in message
-    assert "Boss invited you to Flight Deck" in message
+    assert "Boss invited you to Captain" in message
     assert _token(r.json()["url"]) in message.replace("=\r\n", "")
     assert "&lt;b&gt;soon&lt;/b&gt;" in message  # the note is escaped in the HTML part
 
@@ -432,7 +432,7 @@ async def test_approve_emails_the_applicant_from_gmail(fd_db, monkeypatch):
     assert req.url.path == "/gmail/v1/users/me/messages/send"
     message = _decoded(req)
     assert "To: applicant@example.com" in message
-    assert "your Flight Deck account is ready" in message
+    assert "your Captain account is ready" in message
     assert "Boss approved your application for CC Cohort 001" in message
     assert "http://fd.test/" in message
 

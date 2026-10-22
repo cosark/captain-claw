@@ -39,7 +39,9 @@ export default function MicrosoftConnection() {
 
   const authEnabled = useAuthStore((s) => s.authEnabled)
   const fdUser = useAuthStore((s) => s.user)
-  const canManageClient = !authEnabled || fdUser?.role === 'admin'
+  // Not in the desktop app's users' kiosk (kioskView): the kiosk user is no admin.
+  const kioskView = useAuthStore((s) => s.kioskView)
+  const canManageClient = (!authEnabled || fdUser?.role === 'admin') && !kioskView
   const fdUserLabel = authEnabled && fdUser ? (fdUser.display_name || fdUser.email) : ''
   const unavailable = authEnabled === false
 

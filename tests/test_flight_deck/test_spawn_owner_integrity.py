@@ -630,7 +630,9 @@ class TestSettingsDbOnlyWithAuth:
         """Auth-disabled decks open their DB for connector settings (origin_guard
         keeps web pages off the API), but /fd/auth/register refuses there — no
         one can plant the deck's first admin, who would later become primary
-        owner (legacy Google tokens included) once auth is switched on."""
+        owner (legacy Google tokens included) once auth is switched on. The one
+        row it does get — the local user's, so its settings can be saved — is
+        no admin, opens with no password and is never the primary owner."""
         monkeypatch.setattr(server, "AUTH_ENABLED", False)
         monkeypatch.setenv("FD_AUTH_ENABLED", "false")
         prev = fd_auth._db
@@ -643,7 +645,9 @@ class TestSettingsDbOnlyWithAuth:
                                      json={"email": "evil@x.co", "password": "secret123"})
                 assert r.status_code == 403
                 assert "access_token" not in r.text
-                assert await db.list_users(limit=10) == []
+                users = await db.list_users(limit=10)
+                assert [(u["id"], u["role"]) for u in users] == [(fd_auth._LOCAL_USER["id"], "user")]
+                assert await server._resolve_primary_owner(db) == ""
             finally:
                 await db.close()
         finally:

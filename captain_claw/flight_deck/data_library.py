@@ -801,10 +801,14 @@ def _read_rows(t: dict, limit: int, offset: int, q: str, sort: str, desc: bool) 
                          (*args, limit, offset)).fetchall()
         return {
             "columns": cols,
-            "rows": [{k: (f"<binary, {len(v)} bytes>" if isinstance(v, bytes) else v) for k, v in dict(r).items()}
-                     for r in rows],
+            "rows": [{k: _plain(v) for k, v in dict(r).items()} for r in rows],
             "total": int(total),
         }
+
+
+def _plain(v: Any) -> Any:
+    """A cell as the table view and the exports show it: a blob by its size."""
+    return f"<binary, {len(v)} bytes>" if isinstance(v, bytes) else v
 
 
 @router.get("/tables/{table_id}/rows")
@@ -822,6 +826,30 @@ async def data_rows(
         raise HTTPException(503, f"The datastore can't be read right now: {e}")
 
 
+def _export_rows(c: sqlite3.Connection, internal: str, names: list[str], neutralize: bool = False):
+    """What every export writes: the visible columns of each row, in the
+    table's own order, up to the export cap.
+
+    *neutralize* (the CSV export) does what the agent's own export does
+    (J13): in a row a member of a shared agent created, a text cell that
+    starts like a formula gets a leading ``'``, so a spreadsheet never runs
+    it. The owner's rows, and a table with no creator column, stay as they
+    are. The workbook needs none (every text cell is written as text) and
+    nothing runs JSON."""
+    if not names:
+        return []
+    stamped = neutralize and "_created_by" in {
+        r[1] for r in c.execute(f"PRAGMA table_info({_q(internal)})")}
+    select = [_q(n) for n in names] + (['"_created_by"'] if stamped else [])
+    rows = c.execute(f"SELECT {', '.join(select)} FROM {_q(internal)} "
+                     f"ORDER BY rowid LIMIT {_MAX_EXPORT_ROWS}")
+    if not stamped:
+        return rows
+    from captain_claw.datastore import creator_dict, neutralize_rows
+
+    return (neutralize_rows([list(r)[:-1]], [creator_dict(r[-1], "")], "members")[0] for r in rows)
+
+
 def _csv(t: dict) -> bytes:
     c, internal, cols = _open_table(t)
     with closing(c):
@@ -829,23 +857,80 @@ def _csv(t: dict) -> bytes:
         w = csv.writer(buf)
         names = [col["name"] for col in cols]
         w.writerow(names)
-        if names:
-            for r in c.execute(f"SELECT {', '.join(_q(n) for n in names)} FROM {_q(internal)} "
-                               f"ORDER BY rowid LIMIT {_MAX_EXPORT_ROWS}"):
-                w.writerow(["" if v is None else v for v in r])
+        for r in _export_rows(c, internal, names, neutralize=True):
+            w.writerow(["" if v is None else _plain(v) for v in r])
         return ("﻿" + buf.getvalue()).encode("utf-8")
 
 
+def _json(t: dict) -> bytes:
+    c, internal, cols = _open_table(t)
+    with closing(c):
+        names = [col["name"] for col in cols]
+        data = [{n: _plain(v) for n, v in zip(names, r)} for r in _export_rows(c, internal, names)]
+    return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+# The most characters an Excel cell holds; a longer one makes Excel "repair"
+# the whole workbook.
+_XLSX_CELL_CHARS = 32_767
+
+
+def _xlsx(t: dict) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.cell import WriteOnlyCell
+    from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+    from openpyxl.styles import Font
+
+    c, internal, cols = _open_table(t)
+    with closing(c):
+        names = [col["name"] for col in cols]
+        wb = Workbook(write_only=True)
+        ws = wb.create_sheet(t["table_name"][:31])  # Excel's cap on a sheet name
+        ws.freeze_panes = "A2"
+        bold = Font(bold=True)
+
+        def cell(v: Any, font: Font | None = None) -> Any:
+            v = _plain(v)
+            if not isinstance(v, str):
+                return v
+            out = WriteOnlyCell(ws, value=ILLEGAL_CHARACTERS_RE.sub("", v)[:_XLSX_CELL_CHARS])
+            # Text stays text: openpyxl would store "=…" as a formula Excel runs.
+            out.data_type = "s"
+            if font is not None:
+                out.font = font
+            return out
+
+        ws.append([cell(n, bold) for n in names])
+        for r in _export_rows(c, internal, names):
+            ws.append([cell(v) for v in r])
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# format → (writer, media type)
+_EXPORTS = {
+    "csv": (_csv, "text/csv; charset=utf-8"),
+    "json": (_json, "application/json; charset=utf-8"),
+    "xlsx": (_xlsx, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+}
+
+
 @router.get("/tables/{table_id}/export")
-async def data_export(table_id: str, user: dict = Depends(get_current_user)):
-    """The whole table as CSV (opens straight in Excel)."""
+async def data_export(table_id: str, format: str = "csv", user: dict = Depends(get_current_user)):
+    """The whole table as CSV (opens straight in Excel), JSON (one object
+    per row) or an Excel workbook."""
+    fmt = format.lower()
+    if fmt not in _EXPORTS:
+        raise HTTPException(400, f"Unsupported format: {format}. Use csv, json or xlsx.")
     t, _agents = _owned(table_id, user)
+    write, media_type = _EXPORTS[fmt]
     try:
-        body = await asyncio.to_thread(_csv, t)
+        body = await asyncio.to_thread(write, t)
     except sqlite3.Error as e:
         raise HTTPException(503, f"The datastore can't be read right now: {e}")
-    return Response(body, media_type="text/csv; charset=utf-8", headers={
-        "Content-Disposition": f'attachment; filename="{t["table_name"]}.csv"',
+    return Response(body, media_type=media_type, headers={
+        "Content-Disposition": f'attachment; filename="{t["table_name"]}.{fmt}"',
         "X-Content-Type-Options": "nosniff",
     })
 

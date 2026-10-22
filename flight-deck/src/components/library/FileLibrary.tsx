@@ -7,6 +7,7 @@ import {
   Eye,
   File,
   FileArchive,
+  FolderOpen,
   FileCode,
   FileSpreadsheet,
   FileText,
@@ -16,18 +17,31 @@ import {
   LibraryBig,
   Loader2,
   MessageSquare,
+  MonitorPlay,
+  Pencil,
   Presentation,
   RotateCw,
   Search,
   Settings2,
+  Share2,
   SlidersHorizontal,
   Sparkles,
   X,
 } from 'lucide-react'
+import { useChatStore } from '../../stores/chatStore'
 import { useNotificationStore } from '../../stores/notificationStore'
+import { useProcessStore } from '../../stores/processStore'
 import { FileViewer } from '../agents/FileViewer'
-import type { AgentFile } from '../../services/fileTransfer'
-import { formatSize, getFileTypeGroup, isViewable } from '../../services/fileTransfer'
+import { FileActionSheet } from '../agents/FileActionSheet'
+import { PublicLinkDialog } from '../agents/PublicLinkDialog'
+import { CreatorBadge } from '../agents/CreatorBadge'
+import { useAgentEndpoint } from '../agents/AgentFilesPanel'
+import type { AgentEndpoint, AgentFile } from '../../services/fileTransfer'
+import {
+  formatSize, getDeckUrl, getFileTypeGroup, isEditable, isViewable, listAgentFiles, processEndpoint,
+} from '../../services/fileTransfer'
+import { usePublicLinksEnabled } from '../../services/publicLinks'
+import { isMemberCreated, type Creator } from '../../utils/sharedWorkspace'
 import { fmtRelative, fmtWhen } from '../../services/schedulerApi'
 import {
   fileLibraryApi,
@@ -100,11 +114,13 @@ function categoryOf(item: LibraryItem): string {
   return item.category || 'pending'
 }
 
-/** The library's file in the shape the shared FileViewer reads. */
-function toViewerFile(item: LibraryItem): AgentFile {
+/** The library's file as the agent's Files panel names it, so the shared
+ *  viewer, public links and decks take it as they take one from there.
+ *  `creator` is who wrote it; undefined when nobody could say. */
+function toAgentFile(item: LibraryItem, creator?: Creator | null): AgentFile {
   return {
-    logical: item.rel_path,
-    physical: item.id,
+    logical: item.logical,
+    physical: item.physical,
     filename: item.filename,
     extension: item.extension,
     exists: true,
@@ -113,16 +129,122 @@ function toViewerFile(item: LibraryItem): AgentFile {
     mime_type: item.mime_type,
     is_text: ['document', 'data', 'code', 'web', 'config'].includes(item.kind),
     source: 'workspace',
+    created_by: creator,
   }
 }
 
-export function FileLibrary({ phone = false, initialAgent, onClose, onOpenAgent }: {
+/** What the viewer opens. A page or markdown nobody could vouch for (its agent
+ *  is off, or didn't list it) opens as someone else's would — no scripts, no
+ *  remote images — since a member may have written it. FileViewer trusts a
+ *  'shared' file only when it says it's the viewer's own. */
+function toViewerFile(item: LibraryItem, creator: Creator | null | undefined): AgentFile {
+  const file = toAgentFile(item, creator)
+  const risky = ['html', 'markdown'].includes(getFileTypeGroup(file))
+  return creator === undefined && risky ? { ...file, source: 'shared' } : file
+}
+
+// Whether this browser can hand a file to the phone's share sheet.
+const canShareFiles = typeof navigator !== 'undefined' && typeof navigator.share === 'function'
+  && typeof navigator.canShare === 'function'
+
+/** The agent a library file belongs to, while it runs. Editing, presenting and
+ *  public links go through the agent itself; a stopped one's files are still
+ *  on disk (the library serves those), but there's nobody to ask. */
+function useRunningAgent(slug: string): AgentEndpoint | null {
+  const agent = useAgentEndpoint(`proc-${slug}`)
+  const running = useProcessStore((s) => s.processes.some((p) => p.slug === slug && p.status === 'running'))
+  return running ? agent : null
+}
+
+/** Who wrote each file. A member of a shared agent writes into its saved/
+ *  folder, and that file must open as someone else's and carry their badge.
+ *  The library doesn't record it; a running agent's own file list does
+ *  (created_by). Each agent's list is fetched while the library is open, and
+ *  a file is matched to it by its path on disk. It is fetched again when the
+ *  agent couldn't say (it was still starting: only Flight Deck's own disk
+ *  scan came back) — every few seconds for a minute, and when a chat to it
+ *  gets through — when it runs again after being off, and when a file shows
+ *  up that it didn't list then. */
+const CREATOR_TRIES = 20
+const CREATOR_RETRY_MS = 3000
+
+type CreatorAsk =
+  | { state: 'asking' }
+  /** Its word, and every file it covered (listed, or in the library then). */
+  | { state: 'done'; seen: Set<string> }
+  /** Came back without its word `n` times, the last at `at`. */
+  | { state: 'missed'; n: number; at: number }
+
+function useFileCreators(items: LibraryItem[]): (item: LibraryItem) => Creator | null | undefined {
+  const processes = useProcessStore((s) => s.processes)
+  // Which agents' chats are through: one getting through is up.
+  const connected = useChatStore((s) => {
+    const ids = new Set<string>()
+    for (const x of s.sessions.values()) if (x.connected) ids.add(x.containerId)
+    return [...ids].sort().join(' ')
+  })
+  const [lists, setLists] = useState<Record<string, Map<string, Creator | null>>>({})
+  const asked = useRef(new Map<string, CreatorAsk>())
+  const [retry, setRetry] = useState(0)
+  const timers = useRef<ReturnType<typeof setTimeout>[]>([])
+  useEffect(() => () => { timers.current.forEach(clearTimeout) }, [])
+  // A chat got through (or dropped): an agent that couldn't say is asked
+  // again, its tries afresh.
+  useEffect(() => {
+    for (const [slug, a] of asked.current) if (a.state === 'missed') asked.current.delete(slug)
+  }, [connected])
+  useEffect(() => {
+    const bySlug = new Map<string, string[]>()
+    for (const i of items) {
+      const paths = bySlug.get(i.agent_slug)
+      if (paths) paths.push(i.physical)
+      else bySlug.set(i.agent_slug, [i.physical])
+    }
+    for (const [slug, paths] of bySlug) {
+      const was = asked.current.get(slug)
+      if (was?.state === 'asking') continue
+      const proc = processes.find((p) => p.slug === slug)
+      const agent = proc?.status === 'running' ? processEndpoint(proc) : null
+      // Off: asked afresh once it runs again.
+      if (!agent) { asked.current.delete(slug); continue }
+      if (was?.state === 'done' && paths.every((p) => was.seen.has(p))) continue
+      const misses = was?.state === 'missed' ? was.n : 0
+      if (was?.state === 'missed' && (misses >= CREATOR_TRIES || Date.now() - was.at < CREATOR_RETRY_MS)) continue
+      asked.current.set(slug, { state: 'asking' })
+      const miss = () => {
+        asked.current.set(slug, { state: 'missed', n: misses + 1, at: Date.now() })
+        if (misses + 1 < CREATOR_TRIES) timers.current.push(setTimeout(() => setRetry((n) => n + 1), CREATOR_RETRY_MS))
+      }
+      listAgentFiles(agent.host, agent.port, agent.auth)
+        .then((files) => {
+          // Only what the agent itself said: Flight Deck's own disk scan (all
+          // that comes back while the agent can't be reached) names no author.
+          if (!files.some((f) => f.created_by !== undefined)) { miss(); return }
+          const known = new Map<string, Creator | null>()
+          for (const f of files) if (f.created_by !== undefined) known.set(f.physical, f.created_by)
+          asked.current.set(slug, { state: 'done', seen: new Set([...paths, ...files.map((f) => f.physical)]) })
+          setLists((cur) => ({ ...cur, [slug]: known }))
+        })
+        .catch(miss)
+    }
+  }, [items, processes, retry, connected])
+  return useCallback((item: LibraryItem) => lists[item.agent_slug]?.get(item.physical), [lists])
+}
+
+export function FileLibrary({ phone = false, initialAgent, onClose, onOpenAgent, onOpenLive, liveReady }: {
   phone?: boolean
   /** Open filtered to this agent's files. */
   initialAgent?: string | null
   onClose: () => void
   /** Chat with the agent a file belongs to. */
   onOpenAgent?: (agentSlug: string) => void
+  /** Everything one agent keeps, read live from it (the kiosk's Files & data):
+   *  also what the library doesn't list — a type it doesn't read, a file in
+   *  a VFS or linked folder. */
+  onOpenLive?: (agentSlug: string) => void
+  /** Whether that agent can be opened live now — not while it is still
+   *  starting up. Without it: while it runs. */
+  liveReady?: (agentSlug: string) => boolean
 }) {
   const notify = useNotificationStore((s) => s.add)
   const [state, setState] = useState<LibraryState | null>(null)
@@ -138,6 +260,10 @@ export function FileLibrary({ phone = false, initialAgent, onClose, onOpenAgent 
   const [error, setError] = useState('')
   const [selected, setSelected] = useState<LibraryItem | null>(null)
   const [viewing, setViewing] = useState<LibraryItem | null>(null)
+  // Edit and Public link go through the file's agent, captured when tapped.
+  const [editing, setEditing] = useState<{ item: LibraryItem; agent: AgentEndpoint } | null>(null)
+  const [linking, setLinking] = useState<{ item: LibraryItem; agent: AgentEndpoint } | null>(null)
+  const [sharing, setSharing] = useState<LibraryItem | null>(null)
   const [filtersOpen, setFiltersOpen] = useState(false)
   const reqId = useRef(0)
   const shown = useRef(PAGE)
@@ -146,6 +272,13 @@ export function FileLibrary({ phone = false, initialAgent, onClose, onOpenAgent 
     const t = setTimeout(() => setDebounced(query.trim()), query ? 250 : 0)
     return () => clearTimeout(t)
   }, [query])
+
+  // The kiosk can point the open library at another agent: follow it, and
+  // let go of a file that belongs to a different one.
+  useEffect(() => {
+    setAgent(initialAgent || '')
+    setSelected((cur) => (cur && initialAgent && cur.agent_slug !== initialAgent ? null : cur))
+  }, [initialAgent])
 
   const load = useCallback(async (quiet = false) => {
     const id = ++reqId.current
@@ -225,7 +358,7 @@ export function FileLibrary({ phone = false, initialAgent, onClose, onOpenAgent 
   }
 
   const openFile = (item: LibraryItem) => {
-    if (getFileTypeGroup(toViewerFile(item)) === 'pdf') {
+    if (getFileTypeGroup(toAgentFile(item)) === 'pdf') {
       window.open(fileLibraryApi.viewUrl(item.id), '_blank')
       return
     }
@@ -239,17 +372,23 @@ export function FileLibrary({ phone = false, initialAgent, onClose, onOpenAgent 
     a.click()
     document.body.removeChild(a)
   }
+  // An edit may have changed the file: look again, so its summary catches up.
+  const closeEditor = () => {
+    setEditing(null)
+    fileLibraryApi.scan().then((s) => { setState(s); load(true) }).catch(() => {})
+  }
 
-  // Escape: the viewer closes itself; then the open file (phone), then the library.
-  const viewingRef = useRef(viewing)
-  viewingRef.current = viewing
+  // Escape: a viewer, dialog or sheet closes itself; then the open file
+  // (phone), then the library.
+  const overlayRef = useRef(false)
+  overlayRef.current = !!(viewing || editing || linking || sharing)
   const selectedRef = useRef(selected)
   selectedRef.current = selected
   const filtersRef = useRef(filtersOpen)
   filtersRef.current = filtersOpen
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape' || viewingRef.current) return
+      if (e.key !== 'Escape' || overlayRef.current) return
       if (filtersRef.current) { setFiltersOpen(false); return }
       if (phone && selectedRef.current) { setSelected(null); return }
       onClose()
@@ -262,9 +401,16 @@ export function FileLibrary({ phone = false, initialAgent, onClose, onOpenAgent 
   const facets = page?.facets
   const terms = useMemo(() => debounced.toLowerCase().split(/\s+/).filter(Boolean), [debounced])
   const filtered = !!(debounced || agent || category || kind)
+  // Only one agent's files (how an agent's menu opens it): an empty list
+  // means that agent has no files yet, not that a search missed.
+  const agentOnly = !!agent && !debounced && !category && !kind
   const clearFilters = () => { setQuery(''); setAgent(''); setCategory(''); setKind('') }
-  const viewable = items.filter((i) => isViewable(toViewerFile(i)) && getFileTypeGroup(toViewerFile(i)) !== 'pdf')
+  // One agent's files, while it runs (and is up): the way to everything it keeps.
+  const agentRunning = useProcessStore((s) => !!agent && s.processes.some((p) => p.slug === agent && p.status === 'running'))
+  const openLive = onOpenLive && agent && agentRunning && (liveReady?.(agent) ?? true) ? () => onOpenLive(agent) : undefined
+  const viewable = items.filter((i) => isViewable(toAgentFile(i)) && getFileTypeGroup(toAgentFile(i)) !== 'pdf')
   const viewIdx = viewing ? viewable.findIndex((i) => i.id === viewing.id) : -1
+  const creatorOf = useFileCreators(items)
 
   const header = (
     <div className="flex items-center gap-3 border-b border-zinc-800 px-4 py-3 wide:px-5">
@@ -338,13 +484,16 @@ export function FileLibrary({ phone = false, initialAgent, onClose, onOpenAgent 
       loading={loading}
       error={error}
       filtered={filtered}
+      agentOnly={agentOnly}
       terms={terms}
       selectedId={selected?.id ?? null}
       loadingMore={loadingMore}
+      creatorOf={creatorOf}
       onSelect={setSelected}
       onMore={loadMore}
       onClear={clearFilters}
       onRetry={() => load()}
+      onLive={openLive}
     />
   )
 
@@ -352,11 +501,15 @@ export function FileLibrary({ phone = false, initialAgent, onClose, onOpenAgent 
     <FileDetail
       key={selected.id}
       item={selected}
+      creator={creatorOf(selected)}
       terms={terms}
       phone={phone}
       onClose={() => setSelected(null)}
       onOpen={() => openFile(selected)}
+      onEdit={(a) => setEditing({ item: selected, agent: a })}
       onDownload={() => download(selected)}
+      onShare={() => setSharing(selected)}
+      onPublicLink={(a) => setLinking({ item: selected, agent: a })}
       onResummarize={() => resummarize(selected)}
       onTag={(t) => setQuery(t)}
       onAgent={() => setAgent(selected.agent_slug)}
@@ -364,9 +517,11 @@ export function FileLibrary({ phone = false, initialAgent, onClose, onOpenAgent 
     />
   )
 
-  const viewer = viewing && (
+  // The library's own routes open any file, its agent running or not; an
+  // edit is read and saved through the agent, like in its Files panel.
+  const viewer = viewing ? (
     <FileViewer
-      file={toViewerFile(viewing)}
+      file={toViewerFile(viewing, creatorOf(viewing))}
       urls={{ view: fileLibraryApi.viewUrl(viewing.id), download: fileLibraryApi.downloadUrl(viewing.id) }}
       readOnly
       onClose={() => setViewing(null)}
@@ -375,6 +530,40 @@ export function FileLibrary({ phone = false, initialAgent, onClose, onOpenAgent 
       onPrev={() => { if (viewIdx > 0) setViewing(viewable[viewIdx - 1]) }}
       onNext={() => { if (viewIdx >= 0 && viewIdx < viewable.length - 1) setViewing(viewable[viewIdx + 1]) }}
     />
+  ) : editing ? (
+    <FileViewer
+      file={toViewerFile(editing.item, creatorOf(editing.item))}
+      host={editing.agent.host}
+      port={editing.agent.port}
+      auth={editing.agent.auth}
+      startInEdit
+      onClose={closeEditor}
+    />
+  ) : null
+
+  const dialogs = (
+    <>
+      {linking && (
+        <PublicLinkDialog
+          agent={linking.agent}
+          file={toAgentFile(linking.item, creatorOf(linking.item))}
+          onClose={() => setLinking(null)}
+        />
+      )}
+      {/* Phone: hand the file itself to the share sheet (Messages, Mail…). */}
+      {sharing && (
+        <FileActionSheet
+          filename={sharing.filename}
+          size={sharing.size}
+          mime={sharing.mime_type}
+          icon={<KindIcon kind={sharing.kind} />}
+          detail={<CreatorBadge mode="owner" creator={creatorOf(sharing)} />}
+          downloadUrl={fileLibraryApi.downloadUrl(sharing.id)}
+          onDownload={() => download(sharing)}
+          onClose={() => setSharing(null)}
+        />
+      )}
+    </>
   )
 
   if (phone) {
@@ -415,6 +604,7 @@ export function FileLibrary({ phone = false, initialAgent, onClose, onOpenAgent 
           </div>
         )}
         {viewer}
+        {dialogs}
       </div>
     )
   }
@@ -429,6 +619,7 @@ export function FileLibrary({ phone = false, initialAgent, onClose, onOpenAgent 
         {selected && <aside className="w-[380px] shrink-0 border-l border-zinc-800 bg-zinc-900/30">{detail}</aside>}
       </div>
       {viewer}
+      {dialogs}
     </div>
   )
 }
@@ -461,12 +652,28 @@ function Filters({ facets, agent, category, kind, onAgent, onCategory, onKind }:
 
 // ── Results ──
 
+/** One agent's files, read live from it: what the library may leave out. */
+function LiveLink({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      title="Its files and tables, read live from the agent — also those the library doesn't list"
+      className="flex shrink-0 items-center gap-1 text-[11px] font-medium text-violet-600 hover:underline dark:text-violet-400"
+    >
+      <FolderOpen className="h-3.5 w-3.5" />Everything it keeps
+    </button>
+  )
+}
+
 function ResultList({
-  items, total, state, loading, error, filtered, terms, selectedId, loadingMore, onSelect, onMore, onClear, onRetry,
+  items, total, state, loading, error, filtered, agentOnly, terms, selectedId, loadingMore, creatorOf, onSelect, onMore, onClear, onRetry, onLive,
 }: {
   items: LibraryItem[]; total: number; state: LibraryState | null; loading: boolean; error: string
-  filtered: boolean; terms: string[]; selectedId: string | null; loadingMore: boolean
+  filtered: boolean; agentOnly: boolean; terms: string[]; selectedId: string | null; loadingMore: boolean
+  creatorOf: (i: LibraryItem) => Creator | null | undefined
   onSelect: (i: LibraryItem) => void; onMore: () => void; onClear: () => void; onRetry: () => void
+  /** The agent filtered to, live (it runs, in the kiosk). */
+  onLive?: () => void
 }) {
   if (loading && items.length === 0) {
     return <div className="flex h-full justify-center pt-16 text-zinc-500"><Loader2 className="h-5 w-5 animate-spin" /></div>
@@ -487,32 +694,44 @@ function ResultList({
           {scanning ? <Loader2 className="h-7 w-7 animate-spin" /> : <LibraryBig className="h-7 w-7" />}
         </span>
         <h3 className="mt-4 text-base font-semibold text-zinc-100">
-          {filtered ? 'Nothing matches' : scanning ? 'Gathering your files…' : state?.agents === 0 ? 'No agents yet' : 'No files yet'}
+          {filtered && !agentOnly
+            ? 'Nothing matches'
+            : scanning ? 'Gathering your files…' : agentOnly ? 'No files yet' : state?.agents === 0 ? 'No agents yet' : 'No files yet'}
         </h3>
         <p className="mt-1.5 max-w-sm text-sm leading-relaxed text-zinc-400">
-          {filtered
+          {filtered && !agentOnly
             ? 'Try other words, or clear the filters.'
             : scanning
-              ? 'Your agents\' files show up here as soon as they\'re found and read.'
-              : state?.agents === 0
-                ? 'Create an agent and the reports, notes and data it makes will collect here.'
-                : 'When your agents save reports, notes, spreadsheets or anything else, each one shows up here with a short summary.'}
+              ? agentOnly
+                ? 'This agent\'s files show up here as soon as they\'re found and read.'
+                : 'Your agents\' files show up here as soon as they\'re found and read.'
+              : agentOnly
+                ? 'This agent hasn\'t saved any files yet. When it saves reports, notes, spreadsheets or anything else, each one shows up here with a short summary.'
+                : state?.agents === 0
+                  ? 'Create an agent and the reports, notes and data it makes will collect here.'
+                  : 'When your agents save reports, notes, spreadsheets or anything else, each one shows up here with a short summary.'}
         </p>
         {filtered && (
-          <button onClick={onClear} className="mt-4 text-sm font-medium text-violet-600 hover:underline dark:text-violet-400">Clear search and filters</button>
+          <button onClick={onClear} className="mt-4 text-sm font-medium text-violet-600 hover:underline dark:text-violet-400">
+            {agentOnly ? 'Show every agent\'s files' : 'Clear search and filters'}
+          </button>
         )}
+        {onLive && <div className="mt-3"><LiveLink onClick={onLive} /></div>}
       </div>
     )
   }
   return (
     <div className="h-full overflow-y-auto px-3 py-3 wide:px-4">
-      <div className="mb-2 px-1 text-[11px] text-zinc-500">
-        {total} file{total === 1 ? '' : 's'}{terms.length ? <> for “{terms.join(' ')}”</> : null}
+      <div className="mb-2 flex items-center justify-between gap-2 px-1 text-[11px] text-zinc-500">
+        <span className="min-w-0 truncate">
+          {total} file{total === 1 ? '' : 's'}{terms.length ? <> for “{terms.join(' ')}”</> : null}
+        </span>
+        {onLive && <LiveLink onClick={onLive} />}
       </div>
       <ul className="flex flex-col gap-1.5">
         {items.map((i) => (
           <li key={i.id}>
-            <ResultRow item={i} terms={terms} active={i.id === selectedId} onClick={() => onSelect(i)} />
+            <ResultRow item={i} creator={creatorOf(i)} terms={terms} active={i.id === selectedId} onClick={() => onSelect(i)} />
           </li>
         ))}
       </ul>
@@ -545,8 +764,8 @@ function CategoryChip({ id }: { id: string }) {
   )
 }
 
-function ResultRow({ item, terms, active, onClick }: {
-  item: LibraryItem; terms: string[]; active: boolean; onClick: () => void
+function ResultRow({ item, creator, terms, active, onClick }: {
+  item: LibraryItem; creator: Creator | null | undefined; terms: string[]; active: boolean; onClick: () => void
 }) {
   const pending = item.status === 'pending' && !item.summary
   return (
@@ -563,6 +782,7 @@ function ResultRow({ item, terms, active, onClick }: {
           <span className="min-w-0 flex-1 truncate text-sm font-medium text-zinc-100">
             <Highlight text={item.title || item.filename} terms={terms} />
           </span>
+          <CreatorBadge mode="owner" creator={creator} />
           <CategoryChip id={categoryOf(item)} />
         </span>
         <span className="mt-0.5 block truncate text-[11px] text-zinc-500">
@@ -603,15 +823,35 @@ function ResultRow({ item, terms, active, onClick }: {
 
 // ── One file ──
 
-function FileDetail({ item, terms, phone, onClose, onOpen, onDownload, onResummarize, onTag, onAgent, onOpenAgent }: {
-  item: LibraryItem; terms: string[]; phone: boolean
-  onClose: () => void; onOpen: () => void; onDownload: () => void
+function FileDetail({
+  item, creator, terms, phone, onClose, onOpen, onEdit, onDownload, onShare, onPublicLink, onResummarize, onTag, onAgent, onOpenAgent,
+}: {
+  item: LibraryItem; creator: Creator | null | undefined; terms: string[]; phone: boolean
+  onClose: () => void; onOpen: () => void; onEdit: (agent: AgentEndpoint) => void
+  onDownload: () => void; onShare: () => void; onPublicLink: (agent: AgentEndpoint) => void
   onResummarize: () => Promise<void>; onTag: (t: string) => void; onAgent: () => void
   onOpenAgent?: () => void
 }) {
   const notify = useNotificationStore((s) => s.add)
   const [busy, setBusy] = useState(false)
-  const canView = isViewable(toViewerFile(item))
+  const agent = useRunningAgent(item.agent_slug)
+  const publicLinks = usePublicLinksEnabled()
+  const file = toAgentFile(item, creator)
+  const canView = isViewable(file)
+  // What the Files panel offers on a phone: no editing, no decks.
+  const canEdit = !phone && isEditable(file)
+  // A member's HTML never runs as a deck (Flight Deck's /deck/view refuses it too).
+  const canDeck = !phone && getFileTypeGroup(file) === 'html' && !isMemberCreated(creator)
+  const offTitle = `Start ${item.agent_name} first — this goes through the agent`
+  // Said under the buttons too: a phone has no hover for their titles.
+  const viaAgent = [canEdit && 'edit', canDeck && 'present', publicLinks && 'make a public link']
+    .filter((a): a is string => !!a)
+  const offNote = viaAgent.length > 1
+    ? `${viaAgent.slice(0, -1).join(', ')} or ${viaAgent[viaAgent.length - 1]}`
+    : viaAgent[0]
+  const present = () => {
+    if (agent) window.open(getDeckUrl(agent.host, agent.port, item.physical, agent.auth), '_blank')
+  }
   const redo = async () => {
     setBusy(true)
     try { await onResummarize() } catch (e) {
@@ -664,6 +904,7 @@ function FileDetail({ item, terms, phone, onClose, onOpen, onDownload, onResumma
         <div className="mt-3 flex flex-wrap items-center gap-1.5">
           <CategoryChip id={categoryOf(item)} />
           <span className="rounded-md bg-zinc-800 px-1.5 py-0.5 text-[10px] font-medium text-zinc-400">{item.extension.replace('.', '').toUpperCase() || 'FILE'}</span>
+          <CreatorBadge mode="owner" creator={creator} />
         </div>
 
         <div className="mt-4">
@@ -723,6 +964,24 @@ function FileDetail({ item, terms, phone, onClose, onOpen, onDownload, onResumma
           </button>
         )}
         <button onClick={onDownload} className={btn}><Download className="h-4 w-4" />Download</button>
+        {canEdit && (
+          <button onClick={() => agent && onEdit(agent)} disabled={!agent} className={btn} title={agent ? 'Edit the file' : offTitle}>
+            <Pencil className="h-4 w-4" />Edit
+          </button>
+        )}
+        {canDeck && (
+          <button onClick={present} disabled={!agent} className={btn} title={agent ? 'Present it as a slide deck in a new tab' : offTitle}>
+            <MonitorPlay className="h-4 w-4" />Present as deck
+          </button>
+        )}
+        {phone && canShareFiles && (
+          <button onClick={onShare} className={btn}><Share2 className="h-4 w-4" />Share</button>
+        )}
+        {publicLinks && (
+          <button onClick={() => agent && onPublicLink(agent)} disabled={!agent} className={btn} title={agent ? 'Share — public link' : offTitle}>
+            <Globe className="h-4 w-4" />Public link
+          </button>
+        )}
         {onOpenAgent && (
           <button onClick={onOpenAgent} className={btn} title={`Chat with ${item.agent_name}`}>
             <MessageSquare className="h-4 w-4" />Agent chat
@@ -731,6 +990,11 @@ function FileDetail({ item, terms, phone, onClose, onOpen, onDownload, onResumma
         <button onClick={redo} disabled={busy || item.status === 'pending'} className={btn} title="Read the file again and write a fresh summary">
           {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}Summarise again
         </button>
+        {offNote && !agent && (
+          <p className="col-span-2 text-center text-[11px] text-zinc-500">
+            Start {item.agent_name} to {offNote} — that goes through the agent.
+          </p>
+        )}
       </div>
     </div>
   )

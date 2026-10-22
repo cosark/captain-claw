@@ -1,18 +1,18 @@
 import { useEffect, useState } from 'react'
 import {
-  LayoutGrid, Gauge, Library, Plug, UserCog, BarChart3, Settings2, LayoutDashboard,
-  Sun, Moon, LogOut, Loader2, Menu, X, ShieldCheck, type LucideIcon,
+  LayoutGrid, Gauge, Library, Plug, UserCog, BarChart3, Settings2, LayoutDashboard, MessagesSquare,
+  Sun, Moon, LogOut, Loader2, Menu, X, type LucideIcon,
 } from 'lucide-react'
-import { useAuthStore, logoutUser } from '../../stores/authStore'
+import { useAuthStore, logoutUser, DEFAULT_LOGO } from '../../stores/authStore'
 import { useThemeStore } from '../../stores/themeStore'
 import { useUIStore } from '../../stores/uiStore'
 import {
-  useConsoleStore, leaveConsole, pageFromPath, CONSOLE_PATH, type ConsolePage,
+  useConsoleStore, leaveConsole, enterKioskView, pageFromPath, CONSOLE_PATH, type ConsolePage,
 } from '../../stores/consoleStore'
 import { APP_VERSION } from '../../version'
 import { isDesktopApp } from '../../services/desktopShell'
+import { hasTierSets, TIER_SETS_EVENT } from '../../services/tierConfig'
 import { fetchWaitlistPending } from './consoleApi'
-import { ShellModeSwitch } from './ShellModeSwitch'
 import { OverviewPage } from './OverviewPage'
 import { ModelsPage } from './ModelsPage'
 import { ArchetypesPage } from './ArchetypesPage'
@@ -51,6 +51,13 @@ export function ConsoleLayout() {
   const accounts = useAuthStore((s) => s.authEnabled !== false)
   const [menuOpen, setMenuOpen] = useState(false)
   const [waitlist, setWaitlist] = useState(0)
+  // No tier set yet: Models is marked as the place to start.
+  const [models, setModels] = useState(hasTierSets)
+  useEffect(() => {
+    const check = () => setModels(hasTierSets())
+    window.addEventListener(TIER_SETS_EVENT, check)
+    return () => window.removeEventListener(TIER_SETS_EVENT, check)
+  }, [])
   const nav = NAV.filter((n) => accounts || !n.accounts).map((n) => (!accounts && n.soloHint ? { ...n, hint: n.soloHint } : n))
   const current = nav.find((n) => n.id === asked) || nav[0]
   const page = current.id
@@ -60,6 +67,12 @@ export function ConsoleLayout() {
   useEffect(() => {
     if (layoutMode !== 'console') useUIStore.getState().setLayoutMode('console')
   }, [layoutMode])
+
+  // On screen: links in the cards it shows open console pages (consoleStore).
+  useEffect(() => {
+    useConsoleStore.setState({ shown: true })
+    return () => useConsoleStore.setState({ shown: false })
+  }, [])
 
   // The address shows the page (Back / Forward: syncConsoleFromUrl, in App).
   useEffect(() => {
@@ -84,8 +97,7 @@ export function ConsoleLayout() {
     <div className="flex h-[100dvh] overflow-hidden bg-zinc-950 text-zinc-200">
       <aside className="hidden w-64 shrink-0 flex-col border-r border-zinc-800 bg-zinc-900/40 wide:flex">
         <Brand />
-        <DesktopSwitch />
-        <Nav items={nav} page={page} waitlist={waitlist} onOpen={open} />
+        <Nav items={nav} page={page} waitlist={waitlist} needsModels={!models} onOpen={open} />
         <Footer />
       </aside>
 
@@ -124,8 +136,7 @@ export function ConsoleLayout() {
                 <X className="h-4 w-4" />
               </button>
             </div>
-            <DesktopSwitch />
-            <Nav items={nav} page={page} waitlist={waitlist} onOpen={open} />
+            <Nav items={nav} page={page} waitlist={waitlist} needsModels={!models} onOpen={open} />
             <Footer />
           </div>
         </div>
@@ -139,28 +150,26 @@ function Brand() {
   const logo = useAuthStore((s) => s.branding.logo)
   return (
     <div className="flex items-center gap-3 px-5 pb-4 pt-5">
-      {logo ? (
-        <img src={logo} alt="" className="h-9 w-9 shrink-0 rounded-xl object-contain" />
-      ) : (
-        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-violet-600 text-white">
-          <ShieldCheck className="h-[18px] w-[18px]" />
-        </span>
-      )}
+      <img src={logo || DEFAULT_LOGO} alt="" className="h-9 w-9 shrink-0 rounded-xl object-contain" />
       <div className="min-w-0">
         <div className="truncate text-sm font-semibold tracking-tight text-zinc-100" title={name}>{name}</div>
-        <div className="text-[11px] text-zinc-500">Admin console</div>
+        {/* The desktop app has two views of the deck: say which one this is. */}
+        {isDesktopApp()
+          ? <div className="text-[11px] font-medium text-violet-600 dark:text-violet-400">Admin view</div>
+          : <div className="text-[11px] text-zinc-500">Admin console</div>}
       </div>
     </div>
   )
 }
 
-// The desktop app: Admin console ⇄ the users' chat view, at the top.
-function DesktopSwitch() {
-  if (!isDesktopApp()) return null
-  return <div className="px-3 pb-3"><ShellModeSwitch current="admin" /></div>
-}
 
-function Nav({ items, page, waitlist, onOpen }: { items: NavItem[]; page: ConsolePage; waitlist: number; onOpen: (p: ConsolePage) => void }) {
+function Nav({ items, page, waitlist, needsModels, onOpen }: {
+  items: NavItem[]
+  page: ConsolePage
+  waitlist: number
+  needsModels: boolean
+  onOpen: (p: ConsolePage) => void
+}) {
   return (
     <nav className="flex-1 space-y-0.5 overflow-y-auto px-3 py-2" aria-label="Admin console">
       {items.map(({ id, icon: Icon, label, hint }) => {
@@ -179,6 +188,11 @@ function Nav({ items, page, waitlist, onOpen }: { items: NavItem[]; page: Consol
               <span className="block truncate text-sm font-medium">{label}</span>
               <span className="block truncate text-[11px] text-zinc-500">{hint}</span>
             </span>
+            {id === 'models' && needsModels && (
+              <span title="No tier set yet — start here" className="rounded-full bg-amber-500 px-1.5 py-0.5 text-[10px] font-semibold leading-none text-zinc-950">
+                Start
+              </span>
+            )}
             {id === 'users' && waitlist > 0 && (
               <span title={`${waitlist} waiting for approval`} className="rounded-full bg-violet-600 px-1.5 py-0.5 text-[10px] font-semibold leading-none text-white">
                 {waitlist}
@@ -199,9 +213,16 @@ function Footer() {
   const row = 'flex w-full items-center gap-3 rounded-xl px-3 py-2 text-sm text-zinc-400 transition-colors hover:bg-zinc-800/60 hover:text-zinc-200'
   return (
     <div className="space-y-0.5 border-t border-zinc-800 p-3">
-      <button onClick={() => leaveConsole('desktop')} className={row} title="The agents, their chats and every Flight Deck page">
-        <LayoutDashboard className="h-[18px] w-[18px] text-zinc-500" /> Open Flight Deck
-      </button>
+      {/* The desktop app has no full Flight Deck: its other side is the users' kiosk. */}
+      {isDesktopApp() ? (
+        <button onClick={enterKioskView} className={row} title="The kiosk your users get: their agents and chats">
+          <MessagesSquare className="h-[18px] w-[18px] text-zinc-500" /> Switch to user view
+        </button>
+      ) : (
+        <button onClick={() => leaveConsole('desktop')} className={row} title="The agents, their chats and every Flight Deck page">
+          <LayoutDashboard className="h-[18px] w-[18px] text-zinc-500" /> Open Flight Deck
+        </button>
+      )}
       <button onClick={toggle} className={row}>
         {theme === 'dark' ? <Sun className="h-[18px] w-[18px] text-zinc-500" /> : <Moon className="h-[18px] w-[18px] text-zinc-500" />}
         {theme === 'dark' ? 'Light theme' : 'Dark theme'}

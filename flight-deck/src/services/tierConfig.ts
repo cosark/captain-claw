@@ -6,7 +6,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useAuthStore } from '../stores/authStore'
-import { queueSave, registerHydrator, fetchSettings } from './settingsSync'
+import { queueSave, registerHydrator, fetchSettingsOrNull } from './settingsSync'
 import { fetchSharedTierSets } from './sharedTierSets'
 
 // ── Persistence keys (per-user / multi-tenant via /fd/settings) ──────
@@ -236,8 +236,26 @@ export function persistSetting(key: string, val: string) {
   if (useAuthStore.getState().authEnabled) queueSave(key, val)
 }
 
+// Fired on window whenever the saved tier sets change (hasTierSets readers).
+export const TIER_SETS_EVENT = 'fd:tier-sets'
+
 export function saveSets(sets: TierSet[], activeSetId: string) {
-  persistSetting(TIERS_KEY, JSON.stringify({ sets, activeSetId }))
+  const blob = JSON.stringify({ sets, activeSetId })
+  persistSetting(TIERS_KEY, blob)
+  // A deck without sign-in keeps settings in the browser only, but Flight Deck
+  // itself resolves an archetype's model from this setting when it creates an
+  // agent (the kiosk's "New agent"): its one user's sets go to the server too.
+  if (useAuthStore.getState().authEnabled === false) queueSave(TIERS_KEY, blob)
+  window.dispatchEvent(new Event(TIER_SETS_EVENT))
+}
+
+/** Whether this user has saved a tier set of their own (the local mirror of
+ *  their settings — current once signed-in settings are hydrated). */
+export function hasTierSets(): boolean {
+  try {
+    const blob = parseSetsBlob(localStorage.getItem(TIERS_KEY), localStorage.getItem(ENV_VARS_KEY))
+    return !!blob && blob.sets.length > 0
+  } catch { return false }
 }
 
 // Deep-copy a set (tiers + env vars are nested) so edits to a duplicate don't
@@ -336,8 +354,14 @@ registerHydrator((settings) => {
     const raw = settings[key]
     if (raw) {
       try { JSON.parse(raw); localStorage.setItem(key, raw) } catch { /* ignore */ }
+    } else {
+      // The server is the authority (hydrators run only after a good fetch):
+      // a previous user's sets left in this browser are not this user's.
+      localStorage.removeItem(key)
     }
   }
+  // hasTierSets readers that showed before the settings arrived look again.
+  queueMicrotask(() => window.dispatchEvent(new Event(TIER_SETS_EVENT)))
 })
 
 // ── Shared state hook ────────────────────────────────────────────────
@@ -358,7 +382,8 @@ export interface TierConfigState {
   // Create a fully-configured set where every tier shares one model + context
   // (the setup wizard). Replaces the lone untouched seed set on a fresh install
   // rather than stacking a second one. Returns the resulting set id.
-  setupSet: (name: string, apply: Partial<TierConfig>) => string
+  // `replaceSeed: false` (the console): always a new set.
+  setupSet: (name: string, apply: Partial<TierConfig>, opts?: { replaceSeed?: boolean }) => string
   // Multi-set management (Library page).
   sets: TierSet[]
   activeSetId: string
@@ -379,7 +404,12 @@ export interface TierConfigState {
  * (which manages sets) and by Agent Forge / Basna (which read the active set),
  * so there is ONE persisted source of truth.
  */
-export function useTierConfig(): TierConfigState {
+/**
+ * `seed: false` — the Admin console: never create a starting set for someone
+ * who has none (they create their first one there), where everywhere else a
+ * user with no set gets the team default or the registry's.
+ */
+export function useTierConfig({ seed = true }: { seed?: boolean } = {}): TierConfigState {
   // Compute the initial blob once from localStorage (avoids generating mismatched
   // migration ids across two lazy initializers).
   const initRef = useRef<SetsBlob | null>(null)
@@ -402,10 +432,12 @@ export function useTierConfig(): TierConfigState {
   useEffect(() => {
     if (!useAuthStore.getState().authEnabled) return
     let cancelled = false
-    fetchSettings().then((s) => {
-      if (cancelled) return
+    fetchSettingsOrNull().then((s) => {
+      if (cancelled || s === null) return   // unreadable: keep this browser's copy
       const blob = parseSetsBlob(s[TIERS_KEY], s[ENV_VARS_KEY])
-      if (blob) { setSets(blob.sets); setActiveSetId(blob.activeSetId) }
+      // None on the server: none for this user, whatever this browser held.
+      setSets(blob ? blob.sets : [])
+      setActiveSetId(blob ? blob.activeSetId : '')
     }).catch(() => {}).finally(() => { if (!cancelled) setBootstrapped(true) })
     return () => { cancelled = true }
   }, [])
@@ -439,7 +471,7 @@ export function useTierConfig(): TierConfigState {
   // default (so a teammate who configured nothing runs on the team's models)
   // over an empty registry seed; fall back to the registry default otherwise.
   useEffect(() => {
-    if (!bootstrapped || sets.length > 0) return
+    if (!seed || !bootstrapped || sets.length > 0) return
     const teamDefault = sharedSets.find((s) => s.id === sharedDefaultId) || sharedSets[0]
     if (teamDefault) {
       const adopted: TierSet = { ...cloneSet(teamDefault), id: newSetId(), name: `${teamDefault.name} (team)` }
@@ -449,7 +481,7 @@ export function useTierConfig(): TierConfigState {
     if (!registry) return
     const def = freshSet(registry, loadLegacyConfig(), 'Default')
     setSets([def]); setActiveSetId(def.id)
-  }, [bootstrapped, registry, sets, sharedSets, sharedDefaultId])
+  }, [seed, bootstrapped, registry, sets, sharedSets, sharedDefaultId])
 
   // Backfill saved sets with any registry tiers added after they were seeded
   // (e.g. `coding`/`vision`), so existing users get the new tier cards without
@@ -512,7 +544,7 @@ export function useTierConfig(): TierConfigState {
   }
   // Wizard: one model + context applied to every tier. On a fresh install the
   // only set is the untouched auto-seed, so overwrite it in place; otherwise add.
-  const setupSet = (name: string, apply: Partial<TierConfig>): string => {
+  const setupSet = (name: string, apply: Partial<TierConfig>, { replaceSeed = true }: { replaceSeed?: boolean } = {}): string => {
     const template = freshSet(registry, loadLegacyConfig(), name)
     let baseTiers = template.tiers
     if (Object.keys(baseTiers).length === 0) {
@@ -523,7 +555,7 @@ export function useTierConfig(): TierConfigState {
     const tiers: TierMap = Object.fromEntries(
       Object.entries(baseTiers).map(([k, v]) => [k, { ...v, ...apply }]),
     )
-    const replace = sets.length === 1 && isSetUnconfigured(sets[0])
+    const replace = replaceSeed && sets.length === 1 && isSetUnconfigured(sets[0])
     const id = replace ? sets[0].id : template.id
     const newSet: TierSet = { ...template, id, name, tiers }
     setSets((prev) => (replace ? prev.map((s) => (s.id === id ? newSet : s)) : [...prev, newSet]))

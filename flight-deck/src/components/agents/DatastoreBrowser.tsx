@@ -139,6 +139,19 @@ export function DatastoreBrowser({ host, port, auth, agentName, vfsProject, titl
 
   const [exportOpen, setExportOpen] = useState(false)
 
+  // Esc closes the export menu, then the browser — only that: marked, so a
+  // dialog it opened from (the kiosk's Files & data) stays open.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      e.preventDefault()
+      if (exportOpen) setExportOpen(false)
+      else onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [exportOpen, onClose])
+
   const exportTable = (format: string) => {
     if (!selectedTable) return
     const { token: storeToken, authEnabled } = useAuthStore.getState()

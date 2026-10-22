@@ -73,7 +73,7 @@ async def test_apply_then_approve_then_sign_in(fd_db):
     async with _client(_app(ADMIN)) as c:
         r = await _apply(c)
         assert r.status_code == 201, r.text
-        assert r.json()["cohort"] == "Flight Deck"  # the instance name
+        assert r.json()["cohort"] == "Captain"  # the instance name
 
         # Still waiting: the right password hears so, a wrong one doesn't.
         r = await c.post("/fd/auth/login", json={"email": "newbie@example.com", "password": "hunter22"})
@@ -91,7 +91,7 @@ async def test_apply_then_approve_then_sign_in(fd_db):
         assert entry["display_name"] == "New Bie"
         assert entry["referrer_name"] == "Ref Erer"
         assert entry["referrer_email"] == "ref@example.com"
-        assert entry["cohort"] == "Flight Deck"
+        assert entry["cohort"] == "Captain"
         assert "password_hash" not in entry
 
         r = await c.post(f"/fd/admin/waitlist/{entry['id']}/approve", json={})
