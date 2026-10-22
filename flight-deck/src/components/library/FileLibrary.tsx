@@ -51,6 +51,8 @@ import {
   type LibraryState,
 } from '../../services/fileLibraryApi'
 import { FacetGroup, Highlight, ScanStatus, libraryIconBtn } from './libraryParts'
+import { FilePreview } from './FilePreview'
+import { isUntrustedFile } from '../../utils/untrustedContent'
 
 // ── File library ────────────────────────────────────────────────────
 //
@@ -504,6 +506,7 @@ export function FileLibrary({ phone = false, initialAgent, onClose, onOpenAgent,
       creator={creatorOf(selected)}
       terms={terms}
       phone={phone}
+      viewerOpen={!!(viewing || editing)}
       onClose={() => setSelected(null)}
       onOpen={() => openFile(selected)}
       onEdit={(a) => setEditing({ item: selected, agent: a })}
@@ -824,9 +827,11 @@ function ResultRow({ item, creator, terms, active, onClick }: {
 // ── One file ──
 
 function FileDetail({
-  item, creator, terms, phone, onClose, onOpen, onEdit, onDownload, onShare, onPublicLink, onResummarize, onTag, onAgent, onOpenAgent,
+  item, creator, terms, phone, viewerOpen, onClose, onOpen, onEdit, onDownload, onShare, onPublicLink, onResummarize, onTag, onAgent, onOpenAgent,
 }: {
   item: LibraryItem; creator: Creator | null | undefined; terms: string[]; phone: boolean
+  /** A file is open in the viewer over the library (its preview pauses). */
+  viewerOpen: boolean
   onClose: () => void; onOpen: () => void; onEdit: (agent: AgentEndpoint) => void
   onDownload: () => void; onShare: () => void; onPublicLink: (agent: AgentEndpoint) => void
   onResummarize: () => Promise<void>; onTag: (t: string) => void; onAgent: () => void
@@ -955,6 +960,24 @@ function FileDetail({
             </div>
           ))}
         </dl>
+
+        {/* Keyed by the file's version: a new file (or a changed one) starts
+            its preview afresh. */}
+        <FilePreview
+          key={`${item.id}:${item.modified}`}
+          group={getFileTypeGroup(file)}
+          extension={item.extension}
+          size={item.size}
+          url={fileLibraryApi.viewUrl(item.id, item.modified)}
+          freshUrl={() => fileLibraryApi.viewUrl(item.id, item.modified)}
+          thumbUrl={fileLibraryApi.thumbUrl(item.id, item.modified)}
+          cacheKey={`${item.id}:${item.modified}`}
+          untrusted={isUntrustedFile(toViewerFile(item, creator))}
+          phone={phone}
+          viewerOpen={viewerOpen}
+          canOpen={canView}
+          onOpen={onOpen}
+        />
       </div>
 
       <div className="grid grid-cols-2 gap-2 border-t border-zinc-800 p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] wide:pb-3">

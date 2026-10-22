@@ -3,42 +3,16 @@ import {
   X, Download, Loader2, AlertCircle, Maximize2, Minimize2,
   ChevronLeft, ChevronRight, Copy, Check, Pencil, Save,
 } from 'lucide-react'
-import Markdown, { defaultUrlTransform } from 'react-markdown'
+import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import type { AgentFile } from '../../services/fileTransfer'
 import { getViewUrl, getDownloadUrl, formatSize, getFileTypeGroup, saveFileContent } from '../../services/fileTransfer'
-import { isMemberCreated } from '../../utils/sharedWorkspace'
+import { htmlFrame, isUntrustedFile, untrustedUrlTransform } from '../../utils/untrustedContent'
 import { CodeEditor } from './CodeEditor'
 import { useIsMobile } from '../../hooks/useMediaQuery'
 
 // File groups whose text content can be edited in place.
 const EDITABLE_GROUPS = new Set(['markdown', 'code', 'data', 'text', 'html'])
-
-// Markdown somebody else wrote (another member's file, or a member's file in
-// the owner's panels) must not make the viewer's browser fetch remote images —
-// a tracking pixel would tell its author who opened it, and when. An image
-// src that can reach another host (any scheme, `//`, or the `/\` spelling
-// browsers read as `//`) is dropped; links still render. Browsers drop tab/LF/CR
-// anywhere and every leading C0 control or space (`<\x01//host>` is a valid
-// markdown destination and loads from `host`), so the check does too.
-function untrustedUrlTransform(url: string, key: string): string {
-  // eslint-disable-next-line no-control-regex
-  if (key === 'src' && /^([a-z][a-z0-9+.-]*:|[\\/]{2})/i.test(url.replace(/[\t\n\r]/g, '').replace(/^[\x00-\x20\s]+/, ''))) return ''
-  return defaultUrlTransform(url)
-}
-
-// HTML somebody else wrote renders inert: no scripts (an empty sandbox), and a
-// CSP that lets it load nothing from anywhere — no remote image, stylesheet or
-// font that would tell its author who opened it. Inline styles and data:
-// images still show. The viewer's own (or, in the owner's panels, the owner's)
-// HTML keeps running scripts — never same-origin.
-const INERT_HTML_CSP = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:">`
-
-function htmlFrame(content: string, untrusted: boolean): { srcDoc: string; sandbox: string } {
-  return untrusted
-    ? { srcDoc: INERT_HTML_CSP + content, sandbox: '' }
-    : { srcDoc: content, sandbox: 'allow-scripts' }
-}
 
 interface FileViewerProps {
   file: AgentFile
@@ -97,7 +71,7 @@ export function FileViewer({ file, host = '', port = 0, auth = '', urls, readOnl
   }
   // Someone else's file: in a member's panel anything not theirs, in the
   // owner's panels what a member added. Its markdown loads no remote images.
-  const untrusted = file.source === 'shared' ? file.created_by?.kind !== 'me' : isMemberCreated(file.created_by)
+  const untrusted = isUntrustedFile(file)
 
   // Fetch text content for text-based files
   useEffect(() => {

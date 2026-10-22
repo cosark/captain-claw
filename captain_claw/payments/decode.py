@@ -57,19 +57,27 @@ def read(data: bytes, name: str = "") -> tuple[list[Found], str]:
     if is_pdf(data):
         import pypdfium2 as pdfium
 
-        pdf = pdfium.PdfDocument(data)
-        try:
-            found: list[Found] = []
-            texts: list[str] = []
-            for index in range(min(len(pdf), _MAX_PDF_PAGES)):
-                page = pdf[index]
-                texts.append(page.get_textpage().get_text_range())
-                for item in _scan_image(page.render(scale=_PDF_DPI / 72).to_pil()):
-                    if all(f.text != item.text for f in found):
-                        found.append(item)
-            return found, "\n".join(texts)
-        finally:
-            pdf.close()
+        from captain_claw.pdfium_lock import PDFIUM_LOCK
+
+        # pdfium isn't thread-safe: render the pages under the process-wide
+        # lock, then scan the pictures for barcodes outside it.
+        with PDFIUM_LOCK:
+            pdf = pdfium.PdfDocument(data)
+            try:
+                texts: list[str] = []
+                images = []
+                for index in range(min(len(pdf), _MAX_PDF_PAGES)):
+                    page = pdf[index]
+                    texts.append(page.get_textpage().get_text_range())
+                    images.append(page.render(scale=_PDF_DPI / 72).to_pil())
+            finally:
+                pdf.close()
+        found: list[Found] = []
+        for image in images:
+            for item in _scan_image(image):
+                if all(f.text != item.text for f in found):
+                    found.append(item)
+        return found, "\n".join(texts)
     if name.lower().endswith(_TEXT_SUFFIXES):
         return [], data.decode("utf-8", errors="replace")
     from PIL import Image, UnidentifiedImageError

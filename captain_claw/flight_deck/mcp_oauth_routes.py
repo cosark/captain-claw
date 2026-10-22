@@ -230,6 +230,13 @@ async def authorize_get(
     scope: str = Query(default="mcp"),
     resource: str = Query(default=""),
 ):
+    # Only a page in a browser window (or a frame) may be sent on: an <img>,
+    # script or stylesheet pointed here — markdown somebody else wrote, say —
+    # would otherwise follow the redirect to any host a client registered and
+    # tell it who looked, and when. Clients without the header are unaffected.
+    dest = request.headers.get("sec-fetch-dest", "")
+    if dest and dest not in ("document", "iframe", "frame"):
+        return _error_page("Open this in a browser window", "Sign-in pages can't be loaded from inside another page.", 400)
     db = get_db()
     client = await db.get_oauth_client(client_id) if client_id else None
     if not client:
