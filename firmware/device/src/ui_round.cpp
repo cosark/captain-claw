@@ -609,6 +609,9 @@ bool animated() { return true; }
 void tick() {}
 void flush() {}
 bool busy() { return false; }
+void idleSince(uint32_t) {}
+void drawNow() {}
+bool waiting() { return false; }
 void setRotation(uint8_t) {}
 
 void setBar(const String& agent, const char* state, uint16_t stateColor) {

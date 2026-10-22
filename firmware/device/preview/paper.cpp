@@ -70,6 +70,7 @@ static void save(const char* name) {
   fwrite(rgb.data(), 1, rgb.size(), f);
   fclose(f);
   printf("%s\n", path.c_str());
+  ui::drawNow();  // the gallery shows every screen as if the user asked for it
 }
 
 static uint8_t* readFile(const std::string& path, size_t* len) {
@@ -96,44 +97,6 @@ static constexpr uint16_t kGreen = ui::rgb(40, 200, 90), kYellow = ui::rgb(250, 
 static constexpr uint16_t kRed = ui::rgb(230, 50, 50), kCyan = ui::rgb(60, 210, 240);
 static constexpr uint16_t kOrange = ui::rgb(255, 150, 40), kText = ui::rgb(230, 230, 230);
 
-static ui::Item row(const char* title, const String& badge, const char* note = "", bool on = true,
-                    ui::Glyph glyph = ui::Glyph::None) {
-  ui::Item it;
-  it.title = title;
-  it.label = title;
-  it.badge = badge;
-  it.note = note;
-  it.on = on;
-  it.glyph = glyph;
-  return it;
-}
-
-static std::vector<ui::Item> menu() {
-  return {
-      row("Replay answer", "", "yellow = hear it again", true, ui::Glyph::Replay),
-      row("Pin answer", "", "keeps it on the home screen, asleep too"),
-      row("Status", "", "Wi-Fi, deck, battery…", true, ui::Glyph::Info),
-      row("Agent", "Captain Claw", "Captain Claw · change", true, ui::Glyph::Initials),
-      row("Volume", "75%", "yellow = change"),
-      row("Speech boost", "off", "yellow = change", false),
-      row("Voice", "female", "yellow = change"),
-      row("Text size", "Aa", "medium · change"),
-      row("Character", "Captain", "yellow = browse"),
-      row("Beeps around speech", "on", "yellow = change"),
-      row("Light before speech", "on", "yellow = change"),
-      row("Cue lead", "1 s", "how early the cue comes"),
-      row("Power off", "3 min", "after this long idle"),
-      row("Orientation", "portrait", "turns the paper"),
-      row("Status lights", "low", "red listens, amber works, cyan speaks"),
-      row("Key clicks", "on", "yellow = change"),
-      row("Redraw asleep", "every 1 h", "date, room and battery on the sleeping paper"),
-      row("Settings on phone", "", "every setting, from your phone", true, ui::Glyph::Wifi),
-      row("Software update", "0.10.0", "up to date · yellow = check"),
-      row("Auto update", "off", "installs when idle on USB", false),
-      row("Wi-Fi & settings", "", "opens the setup hotspot", true, ui::Glyph::Wifi),
-  };
-}
-
 static void bar(ui::Health wifi = ui::Up, ui::Health agent = ui::Up) {
   ui::setHealth(wifi, agent);
   ui::setBar("Captain Claw", "ready", kGreen);
@@ -141,7 +104,7 @@ static void bar(ui::Health wifi = ui::Up, ui::Health agent = ui::Up) {
 
 static ui::Home home(bool ready) {
   ui::Home h{ready, ready ? "All good" : "Getting ready", ready ? kGreen : kYellow,
-             ready ? "Ready — hold A to talk" : "Waiting for the agent", {}};
+             ready ? "Ready — hold B to talk" : "Waiting for the agent", {}};
   h.character = 0;
   return h;
 }
@@ -178,10 +141,6 @@ int main(int argc, char** argv) {
   ui::showHome(home(false));
   save("02_home_waiting");
 
-  bar();
-  ui::showWorking(kAsked, {"Reading the calendar"}, "Thinking…", 24000, 3);
-  save("03_working");
-
   ui::setQuestion("How warm is it in here?");
   ui::setReply("It's 22.6 °C with 44% humidity — comfortable. The battery is at 82%.");
   ui::showReply();
@@ -215,18 +174,6 @@ int main(int argc, char** argv) {
   ui::showHome(home(true));
   save("10_home_pinned");
 
-  auto items = menu();
-  ui::showPicker(items, 4, -1, "Menu");
-  save("11_menu");
-  ui::showPicker(items, 14, -1, "Menu");
-  save("12_menu_page2");
-
-  std::vector<ui::Item> agents = {row("Captain Claw", "Captain Claw", "current agent", true, ui::Glyph::Initials),
-                                  row("Research desk", "Research desk", "yellow = choose", true, ui::Glyph::Initials),
-                                  row("Kalup", "Kalup", "yellow = choose", true, ui::Glyph::Initials),
-                                  row("Back", "", "to the menu", true, ui::Glyph::Back)};
-  ui::showPicker(agents, 1, 0, "Agent");
-  save("13_agents");
 
   std::vector<ui::Row> rows = {
       {"Wi-Fi", "Kuharski-5G  -54 dBm", kGreen},
@@ -245,18 +192,15 @@ int main(int argc, char** argv) {
   ui::showMessage("Hmm", "The agent didn't answer in time. Try again in a moment.", kOrange);
   save("15_notice");
 
-  ui::showLink("Phone settings", "http://192.168.1.48/?k=3fa91c07be22",
-               "Scan it with your phone (same Wi-Fi). Saving restarts the PaperColor.");
-  save("16_phone_settings");
+  ui::showLink("Options · 0.11.5", "http://192.168.1.48/?k=3fa91c07be22",
+               "Scan it with your phone (same Wi-Fi): every setting is there.");
+  save("16_options");
 
   ui::showSetup("First-time setup", "Captain-PaperColor-b2c3", "192.168.4.1");
   save("17_setup");
 
-  ui::showCharPick(9, face::Pose::Idle, 0, 9);
-  save("18_character");
-
   ui::pin(false);
-  ui::showSleeping("Asleep · hold A and talk", 0);
+  ui::showSleeping("Asleep · hold B and talk", 0);
   save("19_sleeping");
 
   ui::showMessage("Battery empty", "Charge it over USB-C, then press the power button.", kRed);

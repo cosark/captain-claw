@@ -9,8 +9,8 @@
 //             double-click on an answer = hear it again (also Menu → Replay answer)
 //   Button C  (PaperColor only)
 //             click = previous page / previous row / back · hold = home screen
-//   Hold A while switching on (or no Wi-Fi saved) = setup hotspot
-//   Asleep: hold A and talk at once — it records while it reconnects
+//   Hold the talk button while switching on (or no Wi-Fi saved) = setup hotspot
+//   Asleep: hold the talk button and talk at once — it records while it reconnects
 //
 // Talks to Flight Deck's /device/ws (captain_claw/flight_deck/device_bridge.py):
 // 16 kHz PCM up, with the device's readings (telemetry.h) on each turn; reply
@@ -41,13 +41,18 @@
 #include <M5PM1.h>
 #endif
 
-#define FW_VERSION "0.11.4"
+#define FW_VERSION "0.11.5"
 
 // The loop task's stack (Arduino's default is 8 KB). The smooth fonts on the
 // round and paper screens draw each glyph through a stack buffer — a timer
 // digit is ~5 KB — and screens are often drawn from inside the WebSocket
 // library's nested callbacks, already deep: 8 KB overflowed on the StopWatch.
 SET_LOOP_TASK_STACK_SIZE(20 * 1024);
+
+// The talk button and the other one (the PaperColor talks on B, the easier
+// press; the others on A).
+static m5::Button_Class& talkBtn() { return board::kTalkOnB ? M5.BtnB : M5.BtnA; }
+static m5::Button_Class& sideBtn() { return board::kTalkOnB ? M5.BtnA : M5.BtnB; }
 
 // Least time between two frames of an animation. The round screen's frames
 // cost ~50 ms each: at the stick's pace the loop would only ever draw, and
@@ -385,17 +390,22 @@ static bool canReplay() { return audio::hasClip() || (audio::clipCut() && wsUp);
 // while there's an answer to replay; the paper has no backlight to switch
 // off and can't animate a character, but can turn and has lights).
 static bool rowShown(int row) {
+  // The PaperColor's menu is read aloud, so it keeps two rows: Options (a QR
+  // code for the settings page on the phone, where everything else is set)
+  // and the software update.
+  if (board::kEpaper) return row == MPhone || row == MUpdate;
   switch (row) {
     case MReplay: return canReplay();
     case MPin: return ui::canPin();
     case MBuzz: return board::kHasMotor;
     case MDisplay:
+    case MCharacter:  // the paper is text only
     case MScreenOff: return !board::kEpaper;
     case MRotation:
     case MLeds:
     case MClicks:
-    case MSayMenu:
     case MAsleep: return board::kEpaper;
+    case MSayMenu: return false;  // the paper's menu is only ever read aloud
     default: return true;
   }
 }
@@ -444,7 +454,7 @@ static String menuLabel(int row) {
     case MClicks: return String("Key clicks: ") + (settings.keyClicks ? "on" : "off");
     case MSayMenu: return String("Read menu aloud: ") + (settings.speakMenu ? "on" : "off");
     case MAsleep: return "Redraw asleep: " + asleepLabel();
-    case MPhone: return "Settings on phone »";
+    case MPhone: return board::kEpaper ? "Options »" : "Settings on phone »";
     case MUpdate: return offer.valid() ? "Update to " + offer.version + " »" : String("Software " FW_VERSION " · check");
     case MAutoUpdate: return String("Auto update: ") + (settings.autoUpdate ? "on" : "off");
     default: return "Wi-Fi & settings…";
@@ -527,7 +537,11 @@ static ui::Item menuItem(int row) {
       it.on = settings.asleepRefreshMin > 0;
       it.note = "date, room and battery on the sleeping paper";
       break;
-    case MPhone: it.title = "Settings on phone"; it.glyph = ui::Glyph::Wifi; it.note = "every setting, from your phone"; break;
+    case MPhone:
+      it.title = board::kEpaper ? "Options" : "Settings on phone";
+      it.glyph = ui::Glyph::Wifi;
+      it.note = "every setting, from your phone";
+      break;
     case MUpdate:
       it.title = "Software update";
       it.badge = offer.valid() ? offer.version : String(FW_VERSION);
@@ -656,8 +670,13 @@ static void redraw() {
     }
     case Mode::Notice: break;  // stays until the next event
     case Mode::Link:
-      ui::showLink("Phone settings", phoneUrl,
-                   "Scan it with your phone (same Wi-Fi). Saving restarts the " + String(board::kNoun) + ".");
+      if (board::kEpaper) {
+        String title = offer.valid() ? "Options · update ready" : "Options · " FW_VERSION;
+        ui::showLink(title.c_str(), phoneUrl, "Scan it with your phone (same Wi-Fi): every setting is there.");
+      } else {
+        ui::showLink("Phone settings", phoneUrl,
+                     "Scan it with your phone (same Wi-Fi). Saving restarts the " + String(board::kNoun) + ".");
+      }
       break;
     case Mode::Home: showIdle(); break;
     case Mode::Idle:
@@ -679,11 +698,40 @@ static void backToMain() {
 }
 
 static void openMenu() {
-  menuSel = canReplay() ? MReplay : MStatus;
+  menuSel = board::kEpaper ? MPhone : canReplay() ? MReplay : MStatus;
   menuOpenedMs = millis();
   mode = Mode::Menu;
   redraw();
   sayRow();
+}
+
+// Options: the settings page on the phone, its address as a QR code (on
+// the PaperColor this is the whole menu: every setting lives there).
+static void openOptions() {
+  phoneUrl = phoneSettingsBegin();
+  if (phoneUrl.isEmpty()) {
+    ui::drawNow();
+    notice("Not connected", "Join Wi-Fi first, or use Wi-Fi & settings.", kRed);
+    return;
+  }
+  menuOpenedMs = millis();
+  mode = Mode::Link;
+  ui::drawNow();  // asked to see it
+  redraw();
+}
+
+// Software update: install the build Flight Deck offers, or ask it for one.
+static void updateSoftware() {
+  ui::drawNow();  // the answer to a press: shown at once
+  if (offer.valid()) {
+    startInstall();
+  } else if (wsUp) {
+    checkingUpdate = true;
+    sendType("update_check");
+    notice("Software update", "Checking for a newer version…", kText);
+  } else {
+    notice("Offline", "Connect to Flight Deck to check for updates.", kRed);
+  }
 }
 
 static void chooseMenuRow() {
@@ -696,6 +744,7 @@ static void chooseMenuRow() {
     case MStatus:
       statusPage = 0;
       mode = Mode::Status;
+      ui::drawNow();  // asked to see it
       redraw();
       return;
     case MAgent:
@@ -721,13 +770,7 @@ static void chooseMenuRow() {
       redraw();
       return;
     case MPhone:
-      phoneUrl = phoneSettingsBegin();
-      if (phoneUrl.isEmpty()) {
-        notice("Not connected", "Join Wi-Fi first, or use Wi-Fi & settings.", kRed);
-        return;
-      }
-      mode = Mode::Link;
-      redraw();
+      openOptions();
       return;
     case MRotation:
       settings.rotation = (settings.rotation + 1) & 3;
@@ -782,15 +825,7 @@ static void chooseMenuRow() {
       else settings.powerOffS = settings.powerOffS == 15 ? 30 : settings.powerOffS == 30 ? 60 : 15;
       break;
     case MUpdate:
-      if (offer.valid()) {
-        startInstall();
-      } else if (wsUp) {
-        checkingUpdate = true;
-        sendType("update_check");
-        notice("Software update", "Checking for a newer version…", kText);
-      } else {
-        notice("Offline", "Connect to Flight Deck to check for updates.", kRed);
-      }
+      updateSoftware();
       return;
     case MAutoUpdate: settings.autoUpdate = !settings.autoUpdate; break;
   }
@@ -1610,8 +1645,8 @@ static void startInstall() {
 
 static volatile uint32_t buttonSeenMs = 0;
 
-static const char* sleepHint() {
-  return board::kEpaper ? "Asleep · hold A and talk" : "Press the talk button to wake.";
+static String sleepHint() {
+  return board::kEpaper ? String("Asleep · hold ") + board::kTalkKey + " and talk" : String("Press the talk button to wake.");
 }
 
 // Deep sleep. The talk button wakes it (on the paper any button does, and
@@ -1728,6 +1763,7 @@ static void noteSideClick(bool wokeOnly) {
 
 // One side click: next row / page, or back to the main screen.
 static void sideClick() {
+  ui::drawNow();  // a page, the status: asked to see it (the e-paper draws it now)
   if (mode == Mode::Menu) {
     do menuSel = (menuSel + 1) % MCount;
     while (!rowShown(menuSel));
@@ -1771,6 +1807,7 @@ static void sideClick() {
 // The PaperColor's C button: one step back — the row or page before, else
 // out to the main screen; from the home screen, to the answer.
 static void backClick() {
+  ui::drawNow();  // back, the answer, the home screen: asked to see it
   if (mode == Mode::Menu) {
     do menuSel = (menuSel + MCount - 1) % MCount;
     while (!rowShown(menuSel));
@@ -1794,6 +1831,8 @@ static void backClick() {
     } else {
       backToMain();
     }
+  } else if (mode == Mode::Reply && ui::waiting()) {
+    redraw();  // the e-paper was holding the answer for a quiet spell: show it now
   } else if (mode == Mode::Reply) {
     if (!ui::prevPage()) {  // on its first page: the home screen
       mode = Mode::Home;
@@ -1910,7 +1949,7 @@ void setup() {
   // starts before anything slow (it records while Wi-Fi connects).
   bool talking = settings.configured() && wokenToTalk();
   if (talking) startPreroll();
-  M5.BtnB.setHoldThresh(800);
+  sideBtn().setHoldThresh(800);
   M5.BtnC.setHoldThresh(800);
   esp_timer_create_args_t sampler = {};
   sampler.callback = sampleButtons;
@@ -1931,7 +1970,7 @@ void setup() {
   if (board::kEpaper && esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
     asleepRedraw();  // returns only when a button was pressed meanwhile
     if (settings.configured() && gpio_get_level(board::kTalkPin) == 0) {
-      talking = true;  // "hold A and talk", as the paper says
+      talking = true;  // "hold B and talk", as the paper says
       startPreroll();
     }
   }
@@ -1942,7 +1981,7 @@ void setup() {
                 settings.server.c_str());
 
   M5.update();
-  if ((!talking && M5.BtnA.isPressed()) || !settings.configured()) {
+  if ((!talking && talkBtn().isPressed()) || !settings.configured()) {
     runSetupPortal(settings.configured() ? "Setup" : "First-time setup");
   }
 
@@ -1976,7 +2015,7 @@ void setup() {
       offline = true;
       break;
     }
-    if (!goesOffline && ((!prerollOn && M5.BtnA.wasPressed()) || millis() - t0 > 30000)) {
+    if (!goesOffline && ((!prerollOn && talkBtn().wasPressed()) || millis() - t0 > 30000)) {
       if (prerollOn) stopPreroll();
       runSetupPortal("No Wi-Fi in reach");
     }
@@ -2025,13 +2064,13 @@ void loop() {
 
   // The paper changes slowly: a click says the press was heard.
   if (board::kEpaper && settings.keyClicks && !prerollOn &&
-      (M5.BtnB.wasPressed() || M5.BtnC.wasPressed() || (M5.BtnA.wasPressed() && (inMenu || mode == Mode::Link)))) {
+      (sideBtn().wasPressed() || M5.BtnC.wasPressed() || (talkBtn().wasPressed() && (inMenu || mode == Mode::Link)))) {
     audio::click();
   }
 
   // Front button: hold to talk, tap for quick actions; in the menu, choose.
   // (Not while a talk-from-sleep recording holds it.)
-  if (M5.BtnA.wasPressed() && !prerollOn) {
+  if (talkBtn().wasPressed() && !prerollOn) {
     touch();
     if (dark && inMenu) {
       // woken only
@@ -2048,14 +2087,15 @@ void loop() {
     } else if (mode == Mode::Status) {
       openMenu();
     } else if (mode == Mode::Link) {
-      backToMain();
+      if (board::kEpaper) updateSoftware();  // the Options screen: B updates
+      else backToMain();
     } else {
       bool wasSpeaking = audio::playing();
       startTalking();
       if (wasSpeaking) sendType("stop");
     }
   }
-  if (M5.BtnA.wasReleased() && mode == Mode::Listening && !prerollOn) {
+  if (talkBtn().wasReleased() && mode == Mode::Listening && !prerollOn) {
     bool tap = millis() - recStartMs < kTapMs;
     stopTalking(!tap);
     if (tap) {
@@ -2068,21 +2108,22 @@ void loop() {
   }
 
   // Side button: page / next row · hold = menu (hold again = close).
-  if (dark && (M5.BtnB.wasHold() || M5.BtnB.wasClicked())) {
+  if (dark && (sideBtn().wasHold() || sideBtn().wasClicked())) {
     touch();  // woken only — though a second click makes it a double-click
-    if (M5.BtnB.wasClicked() && onAnswer()) noteSideClick(true);
-  } else if (M5.BtnB.wasHold()) {
+    if (sideBtn().wasClicked() && onAnswer()) noteSideClick(true);
+  } else if (sideBtn().wasHold()) {
     touch();
     if (mode == Mode::CharPick) {  // back to the menu, keeping the old character
       mode = Mode::Menu;
       menuOpenedMs = millis();
       redraw();
-    } else if (inMenu) {
+    } else if (inMenu || (board::kEpaper && mode == Mode::Link)) {
       backToMain();
     } else if (mode != Mode::Listening) {
-      openMenu();
+      if (board::kEpaper) openOptions();  // the paper's whole menu
+      else openMenu();
     }
-  } else if (M5.BtnB.wasClicked()) {
+  } else if (sideBtn().wasClicked()) {
     touch();
     if (sideClickMs && mode == sideClickMode) {  // the second click: hear the answer again
       sideClickMs = 0;
@@ -2106,6 +2147,7 @@ void loop() {
         backToMain();
       } else if (mode != Mode::Listening) {
         mode = Mode::Home;
+        ui::drawNow();
         redraw();
       }
     } else if (M5.BtnC.wasClicked()) {
@@ -2251,6 +2293,7 @@ void loop() {
     startInstall();
   }
 
+  ui::idleSince(lastActivityMs);  // the e-paper redraws once it's been left alone
   ui::tick();
   updateLeds();
   noteButtonActivity();

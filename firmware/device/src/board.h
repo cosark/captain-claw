@@ -23,6 +23,9 @@ constexpr const char* kNoun = "watch";        // "the watch restarts…"
 constexpr const char* kIdPrefix = "watch";    // device id: watch-a1b2c3
 constexpr const char* kTalkButton = "yellow button";
 constexpr const char* kSideButton = "other button";
+constexpr bool kTalkOnB = false;              // talk = M5.BtnA
+constexpr const char* kTalkKey = "A";         // the letters a screen prints for them
+constexpr const char* kSideKey = "B";
 // M5.BtnA / M5.BtnB, read raw by the 20 ms sampler; the talk button also
 // wakes the device from deep sleep (G2 is an RTC GPIO).
 constexpr gpio_num_t kTalkPin = GPIO_NUM_2;   // KEYA (yellow)
@@ -48,12 +51,16 @@ constexpr const char* kModel = "PaperColor";
 constexpr const char* kHw = "papercolor";
 constexpr const char* kNoun = "PaperColor";
 constexpr const char* kIdPrefix = "paper";
-constexpr const char* kTalkButton = "A button";
-constexpr const char* kSideButton = "B button";
-// M5Unified: BtnA = KEY3 (G10), BtnB = KEY2 (G9), BtnC = KEY1 (G1). All
-// three are RTC GPIOs, so any of them wakes the device from deep sleep.
-constexpr gpio_num_t kTalkPin = GPIO_NUM_10;  // A: talk / choose
-constexpr gpio_num_t kSidePin = GPIO_NUM_9;   // B: next / menu
+constexpr const char* kTalkButton = "B button";
+constexpr const char* kSideButton = "A button";
+// M5Unified: BtnA = KEY3 (G10, top left), BtnB = KEY2 (G9, under it),
+// BtnC = KEY1 (G1, on top). All three are RTC GPIOs, so any of them wakes
+// the device from deep sleep. B is the easier press: it talks.
+constexpr bool kTalkOnB = true;               // talk = M5.BtnB
+constexpr const char* kTalkKey = "B";
+constexpr const char* kSideKey = "A";
+constexpr gpio_num_t kTalkPin = GPIO_NUM_9;   // B: talk / choose
+constexpr gpio_num_t kSidePin = GPIO_NUM_10;  // A: next / menu
 constexpr gpio_num_t kBackPin = GPIO_NUM_1;   // C: previous / back
 constexpr int kScreenW = 400, kScreenH = 600;  // portrait; the menu can turn it
 constexpr bool kRound = false;
@@ -74,6 +81,9 @@ constexpr const char* kNoun = "stick";
 constexpr const char* kIdPrefix = "stick";
 constexpr const char* kTalkButton = "front button";
 constexpr const char* kSideButton = "side button";
+constexpr bool kTalkOnB = false;
+constexpr const char* kTalkKey = "A";
+constexpr const char* kSideKey = "B";
 constexpr gpio_num_t kTalkPin = GPIO_NUM_11;  // front (A)
 constexpr gpio_num_t kSidePin = GPIO_NUM_12;  // side (B)
 constexpr gpio_num_t kBackPin = GPIO_NUM_NC;

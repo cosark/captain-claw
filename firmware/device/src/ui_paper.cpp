@@ -1,13 +1,20 @@
 // PaperColor screen: 4" E Ink Spectra 6 colour e-paper, 400×600 (portrait;
 // the menu turns it), six inks: black, white, red, yellow, blue, green.
 //
-// The panel takes 15–30 s to redraw and can't be interrupted, so the paper
-// shows what lasts — the answer with its picture, the home screen, the menu —
-// and sound plus the two status lights (leds.cpp) cover the moment:
-// listening, working, speaking. Every show…() only *asks* for a screen; the
-// scheduler in tick() draws it once it has settled, never the same screen
-// twice, and live readings (battery, temperature, Wi-Fi) at most every few
-// minutes. Listening and the first seconds of work never touch the paper.
+// The panel takes 15–30 s to redraw (every redraw: Spectra 6 has no faster
+// refresh, and its undocumented partial window takes as long and fades what
+// is outside it) and can't be interrupted, so the paper is voice-first
+// and redraws when it's put down: while it's in use (presses, talking, an
+// answer playing) nothing is drawn — speech, sound and the two status
+// lights (leds.cpp) carry it, and the menu is only read aloud. Once it has
+// been left alone for kIdleMs, the paper catches up with the latest answer.
+// Every show…() only *asks* for a screen; the scheduler in tick() draws it
+// when the device is idle (or at once when the user asked to see something:
+// drawNow()), never the same screen twice, and never the same answer again
+// just because it moved between the home, answer and sleeping screens or
+// its readings (battery, temperature) changed. What the paper shows is
+// remembered across deep sleep, so waking and sleeping don't redraw. Text
+// only: no characters.
 //
 // Drawing goes to an off-screen canvas. A background task turns it into the
 // six inks — pictures error-diffused (Floyd–Steinberg), text and shapes
@@ -24,6 +31,7 @@
 #include <initializer_list>
 #include <utility>
 
+#include "board.h"
 #include "fonts.h"
 #include "telemetry.h"
 #include "ui.h"
@@ -36,6 +44,13 @@
 namespace ui {
 
 // ── inks ───────────────────────────────────────────────────────────────
+
+// Black and white only. A Spectra 6 redraw always takes the same 15–30 s,
+// but the black settles within the first seconds and the colours come last:
+// a black-and-white page reads as done long before the redraw ends. Colours
+// in the drawing snap by lightness (blue, red, green text → black; yellow
+// fills → white), pictures are dithered to grey tones in black dots.
+static constexpr bool kMono = true;
 
 // The panel's six inks, as its driver (M5GFX Panel_ED2208) matches them.
 struct InkDef {
@@ -329,7 +344,7 @@ static volatile bool refreshing = false;
 static uint16_t snap(uint16_t c) {
   int r = ((c >> 11) & 31) * 255 / 31, g = ((c >> 5) & 63) * 255 / 63, b = (c & 31) * 255 / 31;
   int mx = max(r, max(g, b)), mn = min(r, min(g, b));
-  if (mx - mn < 64) return (r * 299 + g * 587 + b * 114) / 1000 < 150 ? kInk : kPaper;
+  if (kMono || mx - mn < 64) return (r * 299 + g * 587 + b * 114) / 1000 < 150 ? kInk : kPaper;
   int best = 0, bestD = 1 << 30;
   for (int i = 0; i < 6; ++i) {
     int dr = r - kInkDefs[i].r, dg = g - kInkDefs[i].g, db = b - kInkDefs[i].b;
@@ -342,7 +357,8 @@ static uint16_t snap(uint16_t c) {
 static inline uint16_t px(uint16_t* buf, int i) { return (uint16_t)((buf[i] >> 8) | (buf[i] << 8)); }
 static inline void setPx(uint16_t* buf, int i, uint16_t c) { buf[i] = (uint16_t)((c >> 8) | (c << 8)); }
 
-// Floyd–Steinberg (serpentine) over one picture, into the six inks.
+// Floyd–Steinberg (serpentine) over one picture, into the six inks (or,
+// black-and-white, two).
 static void diffuse(uint16_t* buf, const Rect& r) {
   const int w = r.w;
   int16_t* err = (int16_t*)calloc(2 * 3 * (w + 2), sizeof(int16_t));
@@ -360,10 +376,14 @@ static void diffuse(uint16_t* buf, const Rect& r) {
                   ((c >> 5) & 63) * 255 / 63 + cur[3 * (x + 1) + 1] / 16,
                   (c & 31) * 255 / 31 + cur[3 * (x + 1) + 2] / 16};
       int best = 0, bestD = 1 << 30;
-      for (int p = 0; p < 6; ++p) {
-        int dr = v[0] - kInkDefs[p].r, dg = v[1] - kInkDefs[p].g, db = v[2] - kInkDefs[p].b;
-        int dd = 2 * dr * dr + 4 * dg * dg + 3 * db * db;
-        if (dd < bestD) bestD = dd, best = p;
+      if (kMono) {
+        best = (v[0] * 299 + v[1] * 587 + v[2] * 114) / 1000 < 128 ? 0 : 1;  // black or white by lightness
+      } else {
+        for (int p = 0; p < 6; ++p) {
+          int dr = v[0] - kInkDefs[p].r, dg = v[1] - kInkDefs[p].g, db = v[2] - kInkDefs[p].b;
+          int dd = 2 * dr * dr + 4 * dg * dg + 3 * db * db;
+          if (dd < bestD) bestD = dd, best = p;
+        }
       }
       const InkDef& ink = kInkDefs[best];
       setPx(buf, i, rgb(ink.r, ink.g, ink.b));
@@ -471,49 +491,74 @@ static uint32_t settleMs(Kind k) {
     default: return 600;
   }
 }
-static uint32_t liveGapMs(Kind k) {
-  switch (k) {
-    case Kind::Panel: return 60000;
-    case Kind::Home:
-    case Kind::Reply: return 10 * 60000;
-    default: return 5 * 60000;
-  }
-}
 
 struct Want {
   Kind kind = Kind::None;
   String major, minor;  // what the screen says / its live readings
+  uint32_t answer = 0;  // which answer it shows (0: none)
   std::function<void()> draw;
   uint32_t dueMs = 0;
+  bool forced = false;  // asked for by the user: no waiting for a quiet spell
   bool active = false;
 };
 static Want want;
 static Kind shownKind = Kind::None;
 static String shownMajor, shownMinor;
-static uint32_t shownAtMs = 0;
+static uint32_t shownAnswer = 0;
 static bool everShown = false;
 
-static void ask(Kind kind, const String& major, const String& minor, std::function<void()> draw) {
+static constexpr uint32_t kIdleMs = 30000;  // left alone this long: the paper catches up
+static uint32_t idleFromMs = 0;
+static bool forceNext = false;
+
+#ifndef RTC_DATA_ATTR
+#define RTC_DATA_ATTR  // (the preview has no deep sleep)
+#endif
+// What the paper shows, across deep sleep (the panel keeps its picture).
+RTC_DATA_ATTR static bool rtcShown = false;
+RTC_DATA_ATTR static uint8_t rtcKind = 0;
+RTC_DATA_ATTR static uint32_t rtcAnswer = 0;
+
+// The home, answer and sleeping screens are the same answer in different
+// clothes: moving between them isn't worth a redraw.
+static bool answerScreen(Kind k) { return k == Kind::Home || k == Kind::Reply || k == Kind::Sleep; }
+
+// Setting up, a link to scan, a notice (it answers something just done or
+// gone wrong) and going to sleep can't wait for a quiet spell.
+static bool waitsForIdle(Kind k) {
+  return k != Kind::Setup && k != Kind::Link && k != Kind::Notice && k != Kind::Sleep;
+}
+
+void idleSince(uint32_t ms) { idleFromMs = ms; }
+void drawNow() { forceNext = true; }
+bool waiting() { return want.active && !want.forced && waitsForIdle(want.kind); }
+
+static void ask(Kind kind, const String& major, const String& minor, std::function<void()> draw,
+                uint32_t answer = 0) {
   const uint32_t now = millis();
-  if (everShown && kind == shownKind && major == shownMajor && minor == shownMinor) {
-    want.active = false;  // that's what the paper shows (or is drawing now)
+  const bool forced = forceNext;
+  forceNext = false;
+  if (everShown && kind == shownKind && major == shownMajor) {
+    want.active = false;  // what the paper shows (or is drawing now) — fresher readings wait for the next redraw
+    return;
+  }
+  if (!forced && everShown && answerScreen(kind) && answerScreen(shownKind) && answer == shownAnswer) {
+    want.active = false;  // the same answer, dressed differently
     return;
   }
   if (want.active && kind == want.kind && major == want.major) {
     want.minor = minor;  // same screen, fresher readings: keep its turn
     want.draw = std::move(draw);
+    want.forced = want.forced || forced;
     return;
-  }
-  uint32_t due = now + settleMs(kind);
-  if (everShown && kind == shownKind && major == shownMajor) {
-    uint32_t live = shownAtMs + liveGapMs(kind);  // only the readings changed
-    if ((int32_t)(live - due) > 0) due = live;
   }
   want.kind = kind;
   want.major = major;
   want.minor = minor;
+  want.answer = answer;
   want.draw = std::move(draw);
-  want.dueMs = due;
+  want.dueMs = now + settleMs(kind);
+  want.forced = forced;
   want.active = true;
 }
 
@@ -528,8 +573,11 @@ static void commit() {
   shownKind = w.kind;
   shownMajor = w.major;
   shownMinor = w.minor;
-  shownAtMs = millis();
+  shownAnswer = w.answer;
   everShown = true;
+  rtcShown = true;
+  rtcKind = (uint8_t)w.kind;
+  rtcAnswer = w.answer;
   startRefresh();
 }
 
@@ -538,6 +586,7 @@ void tick() {
   applyRotation();
   if (!want.active) return;
   if ((int32_t)(millis() - want.dueMs) < 0) return;
+  if (!want.forced && waitsForIdle(want.kind) && millis() - idleFromMs < kIdleMs) return;  // still in use
   commit();
 }
 
@@ -697,6 +746,13 @@ static void makeCanvas() {
 }
 
 void begin() {
+#ifndef PREVIEW
+  if (esp_reset_reason() == ESP_RST_DEEPSLEEP && rtcShown) {  // the panel kept its picture
+    everShown = true;
+    shownKind = (Kind)rtcKind;
+    shownAnswer = rtcAnswer;
+  }
+#endif
   M5.Display.setAutoDisplay(false);
   M5.Display.setEpdMode(epd_mode_t::epd_fastest);  // the frame is already in the six inks
   makeCanvas();
@@ -845,7 +901,7 @@ void showMessage(const char* title, const String& body, uint16_t color) {
       text(l, W / 2, y, kInk, top_center);
       y += ts().line;
     }
-    drawFooter({{"B", "back"}});
+    drawFooter({{board::kSideKey, "back"}});
   });
 }
 
@@ -857,7 +913,7 @@ void showLink(const char* title, const String& url, const String& note) {
     text(fit(t, W - 2 * PAD), W / 2, kHeadH + 18, kInk, top_center);
     drawQrWithLines(url, 4, kHeadH + 70, H - kFootH - 12,
                     {{url, vlw::Small, kBlue}, {note, vlw::BodyS, kInk}});
-    drawFooter({{"B", "done"}});
+    drawFooter({{board::kTalkKey, "update"}, {board::kSideKey, "done"}});
   });
 }
 
@@ -876,6 +932,13 @@ static const Card* homeCard(Card& scratch) {
   }
   return savedLast.valid() ? &savedLast : nullptr;
 }
+
+// Which answer a card or the current reply is, for "the paper shows that
+// already" (a picture that arrives later makes it a different one).
+static uint32_t answerId(time_t when, size_t picture) {
+  return when ? (uint32_t)when * 31u + (uint32_t)picture : 0;
+}
+static uint32_t answerId(const Card* c) { return c ? answerId(c->when, c->len) : 0; }
 
 static String cardKey(const Card* c) {
   if (!c) return "-";
@@ -967,14 +1030,22 @@ static void drawCard(const Card& c, int x0, int top, int width, int bottom, bool
   if (maxLines > 0) drawLines(clamp(wrap(c.a, cw), maxLines, cw), x, y, ts().line, kInk);
 }
 
-static void drawWelcome(uint8_t kind, int x0, int top, int width, int bottom) {
-  float scale = min(1.3f, min((width - 16) / 240.0f, (bottom - top - 70) / 150.0f));
-  int cy = top + (int)(135 * scale / 2) + 18;
-  drawCharacter(kind, face::Pose::Idle, x0 + width / 2, cy, scale);
+// Until there's an answer to keep: what to do, in words.
+static void drawWelcome(int x0, int top, int width, int bottom) {
+  font(vlw::Title);
+  auto big = clamp(wrap(String("Hold ") + board::kTalkKey + " and ask me anything.", width), 3, width);
   font(vlw::BodyS);
-  int y = cy + (int)(135 * scale / 2) + 22;
-  for (auto& l : clamp(wrap("Hold A and ask me anything.", width), max(1, (bottom - y) / 34), width)) {
+  auto small = clamp(wrap("You'll hear the answer, and it stays here.", width), 3, width);
+  int y = top + max(0, (bottom - top - (int)big.size() * 44 - 14 - (int)small.size() * 34) / 2);
+  font(vlw::Title);
+  for (auto& l : big) {
     text(l, x0 + width / 2, y, kInk, top_center);
+    y += 44;
+  }
+  y += 14;
+  font(vlw::BodyS);
+  for (auto& l : small) {
+    text(l, x0 + width / 2, y, kBlue, top_center);
     y += 34;
   }
 }
@@ -997,10 +1068,10 @@ static String dayKey() {
 }
 
 // The home screen (and, asleep, the sleeping screen): the date, the room,
-// the state, and the answer it keeps — or the character, until there is one.
+// the state, and the answer it keeps — or what to do, until there is one.
 // Landscape puts the answer in a second column.
 static void drawHomeScreen(bool asleep, uint16_t chipFill, uint16_t chipDot, uint16_t chipInk, const String& hint,
-                           uint8_t character, bool answerKey) {
+                           bool answerKey) {
   Card scratch;
   const Card* c = homeCard(scratch);
   bool isPin = c == &pinCard;
@@ -1017,15 +1088,15 @@ static void drawHomeScreen(bool asleep, uint16_t chipFill, uint16_t chipDot, uin
   const int cardTop = wide ? kHeadH + 22 : y;
   const int cardW = wide ? W - PAD - cardX : W - 2 * PAD;
   if (c) drawCard(*c, cardX, cardTop, cardW, H - kFootH - 14, isPin);
-  else drawWelcome(character, cardX, cardTop, cardW, H - kFootH - 10);
+  else drawWelcome(cardX, cardTop, cardW, H - kFootH - 10);
   if (asleep) {
     char when[24] = "";
     clockText(when, sizeof(when), "drawn %H:%M", time(nullptr));
-    drawFooter({{"A", "talk"}}, when);
+    drawFooter({{board::kTalkKey, "talk"}}, when);
   } else if (answerKey) {
-    drawFooter({{"A", "talk"}, {"B", "status"}, {"C", "answer"}});
+    drawFooter({{board::kTalkKey, "talk"}, {board::kSideKey, "status"}, {"C", "answer"}});
   } else {
-    drawFooter({{"A", "talk"}, {"B", "status"}});
+    drawFooter({{board::kTalkKey, "talk"}, {board::kSideKey, "status"}});
   }
 }
 
@@ -1035,22 +1106,24 @@ void showHome(const Home& home) {
   String hint = home.hint;
   bool ready = home.ready;
   uint16_t chip = inkOf(home.color, false) == kRed ? kRed : kYellow;
-  uint8_t character = home.character;
   bool answerKey = hasReply() || savedLast.valid();
+  uint32_t answer = answerId(homeCard(scratch));
   // A borrowed picture must stay valid until drawn: the home screen only
   // borrows the current answer's, which lives until the next answer.
-  ask(Kind::Home, String(ready) + hint + barAgent + key + healthKey() + dayKey() + String(character),
-      batteryKey() + climateKey(), [=] {
-        drawHomeScreen(false, ready ? kInk : chip, ready ? kGreen : kInk, ready || chip == kRed ? kPaper : kInk,
-                       hint, character, answerKey);
-      });
+  ask(
+      Kind::Home, String(ready) + hint + barAgent + key + healthKey() + dayKey(), batteryKey() + climateKey(),
+      [=] {
+        drawHomeScreen(false, ready ? kInk : chip, ready ? kGreen : kInk, ready || chip == kRed ? kPaper : kInk, hint,
+                       answerKey);
+      },
+      answer);
 }
 
-void showSleeping(const String& hint, uint8_t character) {
+void showSleeping(const String& hint, uint8_t) {
   Card scratch;
   String h = hint;
-  ask(Kind::Sleep, h + cardKey(homeCard(scratch)), "",
-      [=] { drawHomeScreen(true, kBlue, kPaper, kPaper, h, character, false); });
+  const Card* c = homeCard(scratch);
+  ask(Kind::Sleep, h + cardKey(c), "", [=] { drawHomeScreen(true, kBlue, kPaper, kPaper, h, false); }, answerId(c));
   flush();
 }
 
@@ -1060,39 +1133,9 @@ void showSleeping(const String& hint, uint8_t character) {
 // and anything still waiting to be drawn can wait for the answer.
 void showListening(int, uint32_t) { want.active = false; }
 
-void showWorking(const String& heard, const std::vector<String>&, const String&, uint32_t elapsedMs, int) {
-  // A quick answer arrives before a redraw could even finish: only a long
-  // wait gets the paper.
-  if (elapsedMs < 20000 || heard.isEmpty()) {
-    want.active = false;  // the answer is coming: nothing else is worth a redraw now
-    return;
-  }
-  String q = heard;
-  time_t started = time(nullptr) - elapsedMs / 1000;
-  ask(Kind::Working, q, "", [=] {
-    drawHeader();
-    const int width = W - 2 * PAD;
-    int y = kHeadH + 22;
-    drawLabel("YOU ASKED", PAD, y);
-    y += 34;
-    font(ts().body);
-    int room = (H - kFootH - 190 - y) / ts().line;
-    auto ql = clamp(wrap(String("“") + q + "”", width), max(1, room), width);
-    drawLines(ql, PAD, y, ts().line, kInk);
-    y += ql.size() * ts().line + 26;
-    canvas.fillRoundRect(PAD, y, width, 64, 14, kYellow);
-    font(vlw::Title);
-    text("Working on it…", W / 2, y + 33, kInk, middle_center);
-    y += 86;
-    font(vlw::BodyS);
-    auto nl = clamp(wrap("You'll hear the answer as soon as it's ready; it shows here too.", width),
-                    max(1, (H - kFootH - 8 - y) / 34), width);
-    drawLines(nl, PAD, y, 34, kInk);
-    char when[24];
-    if (clockText(when, sizeof(when), "started %H:%M", started)) drawFooter({{"A", "talk"}}, when);
-    else drawFooter({{"A", "talk"}});
-  });
-}
+// Working: the lights and the sounds say it; the answer is coming and is
+// worth the next redraw, not a "working" screen that would hold it up.
+void showWorking(const String&, const std::vector<String>&, const String&, uint32_t, int) { want.active = false; }
 
 // How the answer sits on the paper (layoutReply): in landscape with a
 // picture, the picture keeps the left column on every page and the words run
@@ -1197,9 +1240,9 @@ void showReply() {
     drawPageDots(pages, page, H - kFootH - 18);
     char when[16] = "";
     clockText(when, sizeof(when), "%H:%M", replyWhen);
-    if (pages > 1) drawFooter({{"A", "talk"}, {"B", "next"}, {"C", "back"}}, when);
-    else drawFooter({{"A", "talk"}, {"C", "home"}}, when);
-  });
+    if (pages > 1) drawFooter({{board::kTalkKey, "talk"}, {board::kSideKey, "next"}, {"C", "back"}}, when);
+    else drawFooter({{board::kTalkKey, "talk"}, {"C", "home"}}, when);
+  }, answerId(replyWhen, imgLen));
 }
 
 bool nextPage() {
@@ -1259,7 +1302,7 @@ void showStoredImage() {
   ask(Kind::Picture, String((uint32_t)imgLen) + ":" + String((uint32_t)replyWhen), "", [=] {
     drawHeader();
     drawPicture(imgBuf, imgLen, PAD, kHeadH + 14, W - 2 * PAD, H - kHeadH - kFootH - 28, true);
-    drawFooter({{"A", "text"}, {"B", "back"}});
+    drawFooter({{board::kTalkKey, "text"}, {board::kSideKey, "back"}});
   });
 }
 
@@ -1309,57 +1352,16 @@ int showPanel(const char* title, uint16_t titleColor, const std::vector<Row>& ro
       drawLines(laid[i].lines, PAD, laid[i].y + labelH, ts().line, inkOf(rs[i].color, true));
     }
     drawPageDots(pages, page, H - kFootH - 18);
-    drawFooter({{"A", "menu"}, {"B", page + 1 < pages ? "next" : "close"}, {"C", "back"}});
+    drawFooter({{board::kTalkKey, "menu"}, {board::kSideKey, page + 1 < pages ? "next" : "close"}, {"C", "back"}});
   });
   return pages;
 }
 
-void showPicker(const std::vector<Item>& items, int selected, int current, const char* title) {
-  if (items.empty()) return;
-  selected = constrain(selected, 0, (int)items.size() - 1);
-  const int rowH = 46;
-  const int top = kHeadH + 70, bottom = H - kFootH - 64;
-  const int per = max(1, (bottom - top) / rowH);
-  const int first = (selected / per) * per;  // whole pages: fewer redraws while moving within one
-  String t = title && *title ? title : "Menu";
-  String major = t + String(selected) + "/" + String(current);
-  for (int i = first; i < min((int)items.size(), first + per); ++i) major += items[i].label + "|";
-  std::vector<Item> its = items;
-  ask(Kind::Picker, major, "", [=] {
-    drawHeader();
-    font(vlw::Title);
-    text(t, PAD, kHeadH + 22, kInk);
-    font(vlw::Small);
-    text(String(selected + 1) + " / " + String((int)its.size()), W - PAD, kHeadH + 30, kBlue, top_right);
-    for (int i = first; i < min((int)its.size(), first + per); ++i) {
-      const Item& it = its[i];
-      int y = top + (i - first) * rowH;
-      bool sel = i == selected;
-      if (sel) canvas.fillRoundRect(PAD - 8, y, W - 2 * PAD + 16, rowH - 4, 10, kInk);
-      else canvas.fillRect(PAD, y + rowH - 3, W - 2 * PAD, 1, kInk);
-      uint16_t fg = sel ? kPaper : kInk;
-      String name = it.title.length() ? it.title : it.label;
-      String value = it.glyph == Glyph::None || it.glyph == Glyph::Initials ? it.badge : String("›");
-      if (value == name) value = "";  // an agent's own name
-      font(vlw::BodyS);
-      int vW = value.length() ? tw(value) : 0;
-      int room = W - 2 * PAD - (vW ? vW + 16 : 0);
-      if (i == current) name = "✓ " + name;
-      text(fit(name, room), PAD + 4, y + (rowH - 4) / 2, fg, middle_left);
-      if (vW) {
-        uint16_t vc = sel ? kYellow : (it.on ? kBlue : kRed);
-        text(value, W - PAD - 4, y + (rowH - 4) / 2, vc, middle_right);
-      }
-    }
-    const Item& s = its[selected];
-    if (s.note.length()) {
-      font(vlw::Small);
-      String note = s.note;
-      note.replace("yellow", "A");
-      text(fit(note, W - 2 * PAD), PAD, H - kFootH - 44, kBlue);
-    }
-    drawFooter({{"A", "choose"}, {"B", "next"}, {"C", "back"}});
-  });
+// Menus and lists are read aloud row by row (main.cpp sayRow), never drawn:
+// a redraw per step would take 20 s each. The paper keeps what it shows.
+void showPicker(const std::vector<Item>&, int, int, const char*) {
+  forceNext = false;
+  want.active = false;
 }
 
 void showFace(uint8_t, face::Pose, int) {}  // icon mode is off on paper (a character can't move)
@@ -1375,7 +1377,7 @@ void showCharPick(uint8_t kind, face::Pose, int, int index) {
     font(vlw::Small);
     text("shown on the home screen", W / 2, cy + (int)(135 * scale / 2) + 84, kBlue, top_center);
     drawPageDots(face::KindCount, index, H - kFootH - 26);
-    drawFooter({{"A", "pick"}, {"B", "next"}, {"C", "back"}});
+    drawFooter({{board::kTalkKey, "pick"}, {board::kSideKey, "next"}, {"C", "back"}});
   });
 }
 
