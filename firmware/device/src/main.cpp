@@ -45,7 +45,7 @@
 #include <M5PM1.h>
 #endif
 
-#define FW_VERSION "0.12.1"
+#define FW_VERSION "0.12.2"
 
 // The loop task's stack (Arduino's default is 8 KB). The smooth fonts on the
 // round and paper screens draw each glyph through a stack buffer — a timer
@@ -2003,10 +2003,19 @@ static void updateLeds() {
   if (prerollOn || mode == Mode::Listening) leds::set(S::Listening, micLevel);
   else if (audio::playing()) leds::set(S::Speaking, audio::outputLevel());
   else if (mode == Mode::Waiting) leds::set(S::Working);
+  else if (leds::startingUp()) leds::set(S::Startup);
   else if (!wsUp && millis() - linkChangeMs < 60000) leds::set(S::Connecting);  // not forever
   else if (ui::busy()) leds::set(S::Redrawing);
   else if (batteryPct >= 0 && batteryPct < 15) leds::set(S::LowBattery);
-  else leds::set(S::Off);
+  else leds::setIdle(millis() - lastActivityMs, settings.powerOffMs());
+  // Since start-up (this boot or wake): Wi-Fi gets the 30 s setup gives it,
+  // the agent a few seconds once the deck is reached.
+  using L = leds::Link;
+  const L wifi = WiFi.status() == WL_CONNECTED ? L::Up : millis() > 30000 ? L::Down : L::Trying;
+  const L agent = wsUp && agentLinked ? L::Up
+                  : wifi == L::Down || millis() > 60000 || (wsUp && millis() - linkChangeMs > 8000) ? L::Down
+                                                                                                   : L::Trying;
+  leds::links(wifi, agent);
   leds::tick();
 }
 
@@ -2132,10 +2141,11 @@ void setup() {
 
   ui::setHealth(ui::Down, ui::Down);
   ui::setBar("", "wi-fi…", kYellow);
-  leds::set(leds::State::Connecting);
+  leds::startup();  // both yellow; then left = Wi-Fi, right = the agent
+  if (!prerollOn) leds::set(leds::State::Startup);
   leds::tick();
   // The paper keeps the sleeping screen while it connects (a redraw would
-  // take longer than connecting); the lights blink blue.
+  // take longer than connecting); the lights say how it's going.
   if (!board::kEpaper) ui::showMessage("Connecting to Wi-Fi", settings.nets[0].ssid, kText);
   WiFi.mode(WIFI_STA);
   WiFi.setHostname(deviceId().c_str());
@@ -2165,6 +2175,8 @@ void setup() {
       runSetupPortal("No Wi-Fi in reach");
     }
   }
+  leds::links(offline ? leds::Link::Down : leds::Link::Up, offline ? leds::Link::Down : leds::Link::Trying);
+  leds::tick();
   if (offline) {
     Serial.println("[claw] no wi-fi in reach: carrying on offline (voice notes are kept)");
   } else {

@@ -37,6 +37,10 @@ static int level = 0;
 static uint8_t maxBright = 48;
 static uint32_t flashUntil = 0, alertUntil = 0, actionUntil = 0, lastMs = 0;
 static Step lastStep = Step::Narration;
+static uint32_t idleMs = 0, idleAt = 0, sleepMs = 1;  // State::Idle: how long, as of when
+static bool inStartup = false;
+static Link linkWifi = Link::Trying, linkAgent = Link::Trying;
+static uint32_t startupMs = 0, bothUpMs = 0;
 static uint32_t lastColor[2] = {1, 1};  // what the lights show (forces the first write)
 
 void begin() {
@@ -53,6 +57,36 @@ void set(State s, int lvl) {
   state = s;
   level = constrain(lvl, 0, 100);
 }
+
+void setIdle(uint32_t idle, uint32_t sleep) {
+  state = State::Idle;
+  idleMs = idle;
+  idleAt = millis();
+  sleepMs = sleep ? sleep : 1;
+}
+
+void startup() {
+  inStartup = true;
+  startupMs = millis();
+  bothUpMs = 0;
+  linkWifi = linkAgent = Link::Trying;
+}
+
+void links(Link wifi, Link agent) {
+  if (!inStartup) return;
+  linkWifi = wifi;
+  linkAgent = agent;
+  const uint32_t now = millis();
+  if (wifi == Link::Up && agent == Link::Up) {
+    if (!bothUpMs) bothUpMs = now ? now : 1;
+    if (now - bothUpMs >= 6000) inStartup = false;  // all good, said for 6 s: dark
+  } else {
+    bothUpMs = 0;
+  }
+  if (now - startupMs > 120000) inStartup = false;  // a red light, but not for ever
+}
+
+bool startingUp() { return inStartup; }
 
 void flash() { flashUntil = millis() + 700; }
 
@@ -77,6 +111,11 @@ static uint32_t scale(uint8_t r, uint8_t g, uint8_t b, float k) {
   k = k < 0 ? 0 : k > 1 ? 1 : k;
   k *= maxBright / 255.0f;
   return ((uint32_t)(r * k) << 16) | ((uint32_t)(g * k) << 8) | (uint32_t)(b * k);
+}
+
+// A start-up light: yellow while it tries, green when up, red when not.
+static uint32_t linkColor(Link l) {
+  return l == Link::Up ? scale(0, 255, 40, 1) : l == Link::Down ? scale(255, 0, 0, 1) : scale(255, 170, 0, 1);
 }
 
 static void show(uint32_t a, uint32_t b) {
@@ -148,6 +187,19 @@ void tick() {
     case State::LowBattery: {  // an orange blip every 5 s
       uint32_t c = fmodf(t, 5.0f) < 0.15f ? scale(255, 80, 0, 1) : 0;
       show(c, 0);
+      break;
+    }
+    case State::Startup:  // left: Wi-Fi, right: the agent
+      show(linkColor(linkWifi), linkColor(linkAgent));
+      break;
+    case State::Idle: {  // a blink 10 s into the quiet and every 10 s after, coloured by how near sleep is
+      const uint32_t idle = idleMs + (now - idleAt);
+      const float toSleep = (float)idle / sleepMs;
+      uint32_t c = 0;
+      if (idle >= 10000 && idle % 10000 < 150) {
+        c = toSleep < 0.3f ? scale(0, 255, 40, 1) : toSleep < 0.8f ? scale(0, 60, 255, 1) : scale(255, 170, 0, 1);
+      }
+      show(c, c);
       break;
     }
     default:

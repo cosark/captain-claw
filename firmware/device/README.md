@@ -85,7 +85,12 @@ at all. So it's voice-first and redraws when you put it down:
   louder); while the agent works, a blink for every step it takes — light
   blue for a tool, dark blue for narration and progress, purple for the model
   thinking; green blinking with the voice; a soft white glow while the paper
-  redraws; white blinks as the cue before speech. Off / low / bright in the
+  redraws; white blinks as the cue before speech. Starting up (a switch-on
+  or a wake), both are yellow; then the left one turns green when Wi-Fi is up
+  (red if there's none) and the right one green when the agent is reached
+  (red if it isn't); both green stay for 6 s, then go out. Idle, a short blink
+  every 10 s says how near sleep is: green for the first 30% of the wait,
+  blue for the next 50%, yellow for the last 20%. Off / low / bright in the
   settings.
 - **Options instead of a menu:** hold A for a QR code. Open it on a phone on
   the same Wi-Fi: every setting is there (the link carries a one-time key and
