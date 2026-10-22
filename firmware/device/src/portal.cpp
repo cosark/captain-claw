@@ -179,7 +179,9 @@ static void handleRoot() {
     const char* lv[] = {"Off", "Low", "Bright"};
     for (int k = 0; k < 3; ++k) h += option(String(k), lv[k], settings.ledLevel == k);
     h += F("</select><small>Red blinks while it records you; while the agent works, a blink for each step "
-           "(light blue a tool, dark blue narration, purple the model); green blinks with the voice.</small>"
+           "(light blue a tool, dark blue narration, purple the model); green blinks with the voice. Starting "
+           "up: left = Wi-Fi, right = agent (yellow trying, green up, red not). Idle: a blink every 10 s, "
+           "green, then blue, then yellow as sleep nears.</small>"
            "<label>Key clicks</label><select name=clicks>");
     h += option("1", "On", settings.keyClicks) + option("0", "Off", !settings.keyClicks);
     h += F("</select>");
