@@ -9,6 +9,7 @@ import {
   type TierSet, type TierConfig, type TierDef, type EnvVar,
 } from '../../services/tierConfig'
 import { publishSharedTierSets, type PublishResult } from '../../services/sharedTierSets'
+import { useAuthStore } from '../../stores/authStore'
 import { Switch } from '../admin/Switch'
 import { TEAM_KEY_PROVIDERS, fetchProviderKeys, saveProviderKey } from './consoleApi'
 import {
@@ -71,10 +72,12 @@ export function ModelsPage() {
     sets, activeSetId, setActiveSet, addSet, duplicateSet, renameSet, deleteSet, sharedSets, adoptSharedSet,
   } = tc
 
+  // A deck without sign-in (the desktop app) has no team to publish to.
+  const accounts = useAuthStore((s) => s.authEnabled !== false)
   // The team's published copy. Loaded with the sets; replaced when you publish.
   const [teamSets, setTeamSets] = useState<TierSet[]>([])
   useEffect(() => { setTeamSets(sharedSets) }, [sharedSets])
-  const teamSet = teamSets[0] || null
+  const teamSet = accounts ? teamSets[0] || null : null
 
   const [editingTier, setEditingTier] = useState<string | null>(null)
   const [newOpen, setNewOpen] = useState(false)
@@ -142,7 +145,7 @@ export function ModelsPage() {
         title="Models"
         description={<>
           A tier set gives each kind of work — reasoning, everyday, fast, long documents, code, images — a model.
-          Publish one to the team and everyone who hasn't set up models of their own runs on it.
+          {accounts && ' Publish one to the team and everyone who hasn\'t set up models of their own runs on it.'}
         </>}
         actions={<Button variant="primary" icon={Plus} onClick={() => setNewOpen(true)}>New tier set</Button>}
       />
@@ -201,11 +204,11 @@ export function ModelsPage() {
                   {isTeam(active) && (changedSincePublish
                     ? <Pill tone="amber" icon={AlertTriangle}>Changes not published</Pill>
                     : <Pill tone="emerald" icon={Users}>The team's models</Pill>)}
-                  {!isTeam(active) && <Pill>Only you</Pill>}
+                  {accounts && !isTeam(active) && <Pill>Only you</Pill>}
                 </div>
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                {(!isTeam(active) || changedSincePublish) && (
+                {accounts && (!isTeam(active) || changedSincePublish) && (
                   <Button variant="primary" icon={Upload} busy={publishing} onClick={publish}>
                     {isTeam(active) ? 'Publish changes' : 'Publish to team'}
                   </Button>
@@ -249,7 +252,7 @@ export function ModelsPage() {
             </div>
           </Card>
 
-          <TeamKeysCard keys={keys} onSaved={setKeys} needsKey={teamNeedsKey} />
+          <TeamKeysCard keys={keys} onSaved={setKeys} needsKey={teamNeedsKey} team={accounts} />
         </>
       )}
 
@@ -726,10 +729,12 @@ function ExtraKeys({ envVars, setEnvVars }: { envVars: EnvVar[]; setEnvVars: Rea
 
 // ── Team API keys (fd:provider-keys) ──
 
-function TeamKeysCard({ keys, onSaved, needsKey }: {
+function TeamKeysCard({ keys, onSaved, needsKey, team }: {
   keys: Record<string, string>
   onSaved: (keys: Record<string, string>) => void
   needsKey: Set<string>
+  // A deck with accounts: these are the whole team's keys.
+  team: boolean
 }) {
   const [editing, setEditing] = useState<string | null>(null)
   const [draft, setDraft] = useState('')
@@ -755,8 +760,10 @@ function TeamKeysCard({ keys, onSaved, needsKey }: {
   return (
     <Card
       icon={KeyRound}
-      title="Team API keys"
-      hint="One key per provider, used by everyone's agents that run on that provider without a key of their own. Publishing a set fills these in from its keys. Nobody else sees them."
+      title={team ? 'Team API keys' : 'API keys'}
+      hint={team
+        ? 'One key per provider, used by everyone\'s agents that run on that provider without a key of their own. Publishing a set fills these in from its keys. Nobody else sees them.'
+        : 'One key per provider, used by every agent on that provider that has no key of its own.'}
       bodyClassName="divide-y divide-zinc-800/80"
     >
       {rows.map((p) => {

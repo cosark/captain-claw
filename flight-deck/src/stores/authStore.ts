@@ -50,8 +50,8 @@ export interface AuthStore {
   signingOut: boolean
   signUp: SignUp
   branding: Branding
-  // An admin just signed in (a form, not a reload): the app asks where to
-  // start — Settings, Users or the agent desktop (AdminStartDialog).
+  // An admin just signed in (a form, not a reload): the app opens the Admin
+  // console on its Overview (App).
   adminStartPending: boolean
 
   setAuth: (user: User, token: string) => void
@@ -190,7 +190,7 @@ export async function loginUser(email: string, password: string): Promise<User> 
 }
 
 // Signed in from a form — sign in, sign up, an invitation — rather than a
-// session refresh: an admin is asked where to start (AdminStartDialog).
+// session refresh: an admin lands in the Admin console (App).
 function _signedIn(user: User, token: string): void {
   if (user?.role === 'admin') useAuthStore.getState().setAdminStartPending(true)
   useAuthStore.getState().setAuth(user, token)

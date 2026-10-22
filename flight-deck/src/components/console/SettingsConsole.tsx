@@ -23,6 +23,8 @@ const KIOSK_HINT: Record<KioskMode, string> = {
 export function SettingsConsole() {
   const go = useConsoleStore((s) => s.go)
   const signUpMode = useAuthStore((s) => s.signUp.mode)
+  // No sign-in (the desktop app): nobody signs up and nobody is locked.
+  const accounts = useAuthStore((s) => s.authEnabled !== false)
   const [config, setConfig] = useState<SystemConfig>({ ...CONFIG_DEFAULTS })
   const [loaded, setLoaded] = useState(false)
   const [cohort, setCohort] = useState('')
@@ -63,7 +65,9 @@ export function SettingsConsole() {
       <PageHeader
         icon={Settings2}
         title="Settings"
-        description="How the deck looks and who gets in: its name and logo, sign-up and the waitlist, kiosk mode, and what every agent knows about your company."
+        description={accounts
+          ? 'How the deck looks and who gets in: its name and logo, sign-up and the waitlist, kiosk mode, and what every agent knows about your company.'
+          : 'How the deck looks, how agents run, and what every agent knows about your company.'}
       />
 
       {error && <Notice tone="red">{error}</Notice>}
@@ -83,7 +87,7 @@ export function SettingsConsole() {
         />
       )}
 
-      <Card
+      {accounts && <Card
         icon={ClipboardList}
         title="Sign-up"
         hint={signUpMode === 'register'
@@ -121,9 +125,9 @@ export function SettingsConsole() {
             <Button type="submit" icon={Save} busy={busy === 'cohort'} disabled={cohort.trim() === config.waitlist_cohort}>Save</Button>
           </form>
         </div>
-      </Card>
+      </Card>}
 
-      <Card
+      {accounts && <Card
         icon={MessageSquare}
         title="Kiosk mode"
         hint="Locks people to the simple, chat-first layout: they chat, start an agent from an archetype, manage their own connections and profile, and sign out. Admins are never locked; a change reaches people already signed in within about 15 minutes."
@@ -156,7 +160,7 @@ export function SettingsConsole() {
             onToggle={() => save('kiosk-new', { kiosk_new_users: !config.kiosk_new_users })}
           />
         </SettingRow>
-      </Card>
+      </Card>}
 
       <Card icon={Boxes} title="Agents" bodyClassName="px-5 py-4">
         <SettingRow
