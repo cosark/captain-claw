@@ -104,7 +104,7 @@ static void bar(ui::Health wifi = ui::Up, ui::Health agent = ui::Up) {
 
 static ui::Home home(bool ready) {
   ui::Home h{ready, ready ? "All good" : "Getting ready", ready ? kGreen : kYellow,
-             ready ? "Ready — hold B to talk" : "Waiting for the agent", {}};
+             ready ? "Top button to talk" : "Waiting for the agent", {}};
   h.character = 0;
   return h;
 }
@@ -192,6 +192,9 @@ int main(int argc, char** argv) {
   ui::showMessage("Hmm", "The agent didn't answer in time. Try again in a moment.", kOrange);
   save("15_notice");
 
+  ui::showAsk("Saved voice notes", "3 voice notes recorded offline (1:24). Send them to the agent?", "send", "later");
+  save("15b_ask_notes");
+
   ui::showLink("Options · 0.11.5", "http://192.168.1.48/?k=3fa91c07be22",
                "Scan it with your phone (same Wi-Fi): every setting is there.");
   save("16_options");
@@ -200,7 +203,7 @@ int main(int argc, char** argv) {
   save("17_setup");
 
   ui::pin(false);
-  ui::showSleeping("Asleep · hold B and talk", 0);
+  ui::showSleeping("Top button to talk", 0);
   save("19_sleeping");
 
   ui::showMessage("Battery empty", "Charge it over USB-C, then press the power button.", kRed);

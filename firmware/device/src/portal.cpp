@@ -152,6 +152,13 @@ static void handleRoot() {
                            : F("<option value=text selected>Text (stages, activity)</option><option value=icons>Icons (animated character)</option>");
     h += F("</select>");
   }
+  if (board::kHasTouch) {
+    h += F("<label>Tap to talk</label><select name=taptalk>");
+    h += option("1", "On (a record button on the screen)", settings.tapTalk) + option("0", "Off", !settings.tapTalk);
+    h += F("</select><small>Tap the button and talk, tap it again to send. Holding the ");
+    h += board::kTalkButton;
+    h += F(" works either way.</small>");
+  }
   h += F("<label>Text size</label><select name=tsize>");
   {
     const char* sizes[] = {"Small", "Medium", "Large"};
@@ -171,7 +178,9 @@ static void handleRoot() {
     h += F("<label>Status lights</label><select name=leds>");
     const char* lv[] = {"Off", "Low", "Bright"};
     for (int k = 0; k < 3; ++k) h += option(String(k), lv[k], settings.ledLevel == k);
-    h += F("</select><label>Key clicks</label><select name=clicks>");
+    h += F("</select><small>Red blinks while it records you; while the agent works, a blink for each step "
+           "(light blue a tool, dark blue narration, purple the model); green blinks with the voice.</small>"
+           "<label>Key clicks</label><select name=clicks>");
     h += option("1", "On", settings.keyClicks) + option("0", "Off", !settings.keyClicks);
     h += F("</select>");
   }
@@ -266,6 +275,7 @@ static void handleSave() {
   settings.cueLeadS = server.arg("lead") == "2" ? 2 : 1;
   settings.talkSounds = server.arg("talksnd") != "0";
   if (board::kHasMotor) settings.cueBuzz = server.arg("buzz") != "0";
+  if (board::kHasTouch) settings.tapTalk = server.arg("taptalk") == "1";
   if (board::kRound || board::kEpaper) {
     String tz = server.arg("tz");
     tz.trim();

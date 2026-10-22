@@ -52,6 +52,9 @@ bool animated();
 // Full-screen notices.
 void showSetup(const char* reason, const char* apName, const char* ip);
 void showMessage(const char* title, const String& body, uint16_t color = 0xFFFF);
+// A yes/no question: the talk button answers `yes`, the side (or back)
+// button `no` — the screen names them.
+void showAsk(const char* title, const String& body, const char* yes, const char* no);
 // An address to open on a phone: a QR code, the address and a note.
 void showLink(const char* title, const String& url, const String& note);
 // What the screen shows while the device sleeps (e-paper keeps it, with the
@@ -106,7 +109,13 @@ void setTextSize(uint8_t size);
 void showReply();                   // redraw the current page
 bool nextPage();                    // false when it wrapped back to page 1
 bool prevPage();                    // false on page 1 (stays there)
+bool onLastPage();                  // the current page is the answer's last
 bool hasReply();
+
+// While an answer plays (text mode), every frame or so: a light indicator
+// that follows the voice, `level` 0..100 (round: a short line at the bottom,
+// only that strip redrawn). The others show nothing.
+void showSpeaking(int level);
 
 // Icon mode: the character in a pose.
 void showFace(uint8_t kind, face::Pose pose, int level);
@@ -136,5 +145,13 @@ void showPicker(const std::vector<Item>& items, int selected, int current, const
 
 // Attention flash before speech: on = the screen (stick) / ring (round) is white.
 void flashFrame(bool on);
+
+// Tap to talk (touch screens, an option): a record button on the main
+// screens (home, answer, character), a stop button while a recording that
+// was tapped on listens.
+enum class TapButton : uint8_t { Off, Talk, Stop };
+void setTapButton(TapButton button);
+// A touch at (x, y) lands on the button on the screen now.
+bool tapButtonHit(int x, int y);
 
 }  // namespace ui

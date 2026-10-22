@@ -23,9 +23,15 @@ constexpr const char* kNoun = "watch";        // "the watch restarts…"
 constexpr const char* kIdPrefix = "watch";    // device id: watch-a1b2c3
 constexpr const char* kTalkButton = "yellow button";
 constexpr const char* kSideButton = "other button";
-constexpr bool kTalkOnB = false;              // talk = M5.BtnA
+constexpr const char* kTalkHint = "Hold the yellow button to talk";  // the home screen's call to action
+// Hold to talk, let go to send (false), or press to start and press again to
+// send (true).
+constexpr bool kTalkToggles = false;
+// Which of M5Unified's buttons (A/B/C) talks, goes next and goes back (0: none).
+constexpr char kTalkM5 = 'A', kSideM5 = 'B', kBackM5 = 0;
 constexpr const char* kTalkKey = "A";         // the letters a screen prints for them
 constexpr const char* kSideKey = "B";
+constexpr const char* kBackKey = "";
 // M5.BtnA / M5.BtnB, read raw by the 20 ms sampler; the talk button also
 // wakes the device from deep sleep (G2 is an RTC GPIO).
 constexpr gpio_num_t kTalkPin = GPIO_NUM_2;   // KEYA (yellow)
@@ -37,10 +43,11 @@ constexpr bool kEpaper = false;
 constexpr bool kHasMotor = true;
 constexpr bool kHasLeds = false;
 constexpr bool kHasClimate = false;
-// Voice notes recorded offline are kept (no TF slot: in internal flash) and
-// sent when the deck is back (notes.cpp).
+// Voice notes recorded offline are kept in internal flash and sent when the
+// deck is back and the user says yes (notes.cpp).
 constexpr bool kOfflineNotes = true;
-constexpr bool kHasSdCard = false;
+// A touch screen: "tap to talk" puts a record button on it (an option).
+constexpr bool kHasTouch = true;
 constexpr bool kLoudPeakRestarts = false;  // not seen (yet) on the StopWatch
 // Pictures bigger than one WebSocket frame arrive in parts (0x03 … 0x02).
 constexpr bool kChunkedImages = true;
@@ -51,17 +58,20 @@ constexpr const char* kModel = "PaperColor";
 constexpr const char* kHw = "papercolor";
 constexpr const char* kNoun = "PaperColor";
 constexpr const char* kIdPrefix = "paper";
-constexpr const char* kTalkButton = "B button";
+constexpr const char* kTalkButton = "top button";
 constexpr const char* kSideButton = "A button";
+constexpr const char* kTalkHint = "Top button to talk";  // fits the home screen's chip
+constexpr bool kTalkToggles = true;  // press to start, press again to send: no holding on
 // M5Unified: BtnA = KEY3 (G10, top left), BtnB = KEY2 (G9, under it),
 // BtnC = KEY1 (G1, on top). All three are RTC GPIOs, so any of them wakes
-// the device from deep sleep. B is the easier press: it talks.
-constexpr bool kTalkOnB = true;               // talk = M5.BtnB
-constexpr const char* kTalkKey = "B";
+// the device from deep sleep. The top one (C) talks; A goes next, B back.
+constexpr char kTalkM5 = 'C', kSideM5 = 'A', kBackM5 = 'B';
+constexpr const char* kTalkKey = "C";
 constexpr const char* kSideKey = "A";
-constexpr gpio_num_t kTalkPin = GPIO_NUM_9;   // B: talk / choose
-constexpr gpio_num_t kSidePin = GPIO_NUM_10;  // A: next / menu
-constexpr gpio_num_t kBackPin = GPIO_NUM_1;   // C: previous / back
+constexpr const char* kBackKey = "B";
+constexpr gpio_num_t kTalkPin = GPIO_NUM_1;   // C (top): talk / choose
+constexpr gpio_num_t kSidePin = GPIO_NUM_10;  // A: next / status / Options
+constexpr gpio_num_t kBackPin = GPIO_NUM_9;   // B: previous / back / home
 constexpr int kScreenW = 400, kScreenH = 600;  // portrait; the menu can turn it
 constexpr bool kRound = false;
 constexpr bool kEpaper = true;
@@ -69,7 +79,7 @@ constexpr bool kHasMotor = false;
 constexpr bool kHasLeds = true;
 constexpr bool kHasClimate = true;
 constexpr bool kOfflineNotes = true;
-constexpr bool kHasSdCard = true;   // TF slot (SPI, shared with the panel); flash when there's no card
+constexpr bool kHasTouch = false;
 constexpr bool kLoudPeakRestarts = false;
 constexpr bool kChunkedImages = true;
 
@@ -81,9 +91,12 @@ constexpr const char* kNoun = "stick";
 constexpr const char* kIdPrefix = "stick";
 constexpr const char* kTalkButton = "front button";
 constexpr const char* kSideButton = "side button";
-constexpr bool kTalkOnB = false;
+constexpr const char* kTalkHint = "Hold the front button to talk";
+constexpr bool kTalkToggles = false;
+constexpr char kTalkM5 = 'A', kSideM5 = 'B', kBackM5 = 0;
 constexpr const char* kTalkKey = "A";
 constexpr const char* kSideKey = "B";
+constexpr const char* kBackKey = "";
 constexpr gpio_num_t kTalkPin = GPIO_NUM_11;  // front (A)
 constexpr gpio_num_t kSidePin = GPIO_NUM_12;  // side (B)
 constexpr gpio_num_t kBackPin = GPIO_NUM_NC;
@@ -94,7 +107,7 @@ constexpr bool kHasMotor = false;
 constexpr bool kHasLeds = false;
 constexpr bool kHasClimate = false;
 constexpr bool kOfflineNotes = false;
-constexpr bool kHasSdCard = false;
+constexpr bool kHasTouch = false;
 constexpr bool kLoudPeakRestarts = true;   // M5Stack's note: >75% volume on battery
 constexpr bool kChunkedImages = false;
 

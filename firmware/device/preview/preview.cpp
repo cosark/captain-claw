@@ -163,6 +163,7 @@ int main(int argc, char** argv) {
   ui::setReply("Tomorrow you have three meetings: stand-up at 9:30, lunch with Ana at 12:00 and the dentist at "
                "16:00. I moved the dentist to Friday at 15:00.");
   ui::showReply();
+  ui::showSpeaking(70);  // the speaking line, drawn over the page
   save("05_reply_speaking");
   gPlaying = false;
 
@@ -263,5 +264,31 @@ int main(int argc, char** argv) {
   bar("ready", kGreen);
   ui::showHome(home);
   save("25_home_low_battery");
+  M5.Power.level = 82;
+  g_previewMillis = 1000000;
+
+  // Tap to talk: the record button, the stop button, under an answer.
+  ui::setTapButton(ui::TapButton::Talk);
+  bar("ready", kGreen);
+  ui::showHome(home);
+  save("26_tap_home");
+  ui::setTapButton(ui::TapButton::Stop);
+  bar("listening", kRed);
+  for (int l : lv) ui::showListening(l, 7300);
+  save("27_tap_listening");
+  ui::setTapButton(ui::TapButton::Talk);
+  bar("ready", kGreen);
+  ui::setReply("Tomorrow you have three meetings: stand-up at 9:30, lunch with Ana at 12:00 and the dentist at "
+               "16:00. I moved the dentist to Friday at 15:00.");
+  ui::showReply();
+  save("28_tap_reply");
+  ui::setReply("");
+  ui::showFace(0, face::Pose::Idle, 0);
+  save("29_tap_icon");
+  ui::setTapButton(ui::TapButton::Off);
+
+  bar("ready", kGreen);
+  ui::showAsk("Saved voice notes", "3 voice notes recorded offline (1:24). Send them to the agent?", "send", "later");
+  save("30_ask_notes");
   return 0;
 }

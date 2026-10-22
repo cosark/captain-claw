@@ -18,6 +18,7 @@
 #endif
 
 #include "audio.h"
+#include "board.h"
 #include "fonts.h"
 #include "ui.h"
 
@@ -31,6 +32,9 @@ static constexpr int kBottom = 410;        // …and ends above the page dots
 static constexpr int kChromeY = 42;        // clock / health dots
 static constexpr int kBadgeY = 196, kBadgeR = 80, kGlowR = 128;
 static constexpr int kTitleY = 322, kNoteY = 360, kDotsY = 402, kBatteryY = 438;
+// Tap to talk's button: under the name (home, listening), or lower and a
+// little smaller under an answer or a character, whose text then ends higher.
+static constexpr int kTapY = 386, kTapR = 30, kTapLowY = 414, kTapLowR = 26, kTapReplyBottom = 352;
 
 static constexpr uint16_t kBlack = 0x0000, kWhite = 0xFFFF;
 static constexpr uint16_t kText = rgb(236, 238, 244), kDim = rgb(140, 146, 160), kFaint = rgb(78, 82, 94);
@@ -62,6 +66,8 @@ static int replyPage = 0;
 static bool replyCentred = false;  // one short page: the block sits mid-screen
 static uint8_t* imgBuf = nullptr;
 static size_t imgLen = 0;
+static TapButton tapMode = TapButton::Off;
+static int tapX = 0, tapY = 0, tapR = 0;  // the button on the screen now (tapR 0: none)
 
 // ── basics ─────────────────────────────────────────────────────────────
 
@@ -96,6 +102,7 @@ static void beginFrame() {
   frameT0 = micros();
 #endif
   canvas.fillScreen(kBlack);
+  tapR = 0;
 }
 
 static void push() {
@@ -379,11 +386,48 @@ static void ringWorking(int steps) {
   }
 }
 
-// Speaking: cyan, as thick as the voice is loud.
-static void ringSpeaking() {
-  ringTrack(kCyan);
-  int level = audio::sounding() ? audio::outputLevel() : 0;
-  ringArc(0, 360, kCyan, 4 + level * 12 / 100);
+// Speaking: a short cyan line under the text, as long as the voice is loud.
+// Only its strip is redrawn (an even x and width: the AMOLED's one rule),
+// a few hundred bytes a frame instead of the whole screen.
+static constexpr int kSpeakW = 160, kSpeakH = 8, kSpeakX = 152, kSpeakY = 446;
+
+void showSpeaking(int level) {
+  static M5Canvas strip;
+  if (!strip.width()) {
+    strip.setColorDepth(16);
+    if (!strip.createSprite(kSpeakW, kSpeakH)) return;
+  }
+  strip.fillSprite(kBlack);
+  int len = 14 + min(level, 100) * (kSpeakW - 14) / 100;
+  strip.fillSmoothRoundRect((kSpeakW - len) / 2, 2, len, 4, 2, kCyan);
+  strip.pushSprite(&M5.Display, kSpeakX, kSpeakY);
+}
+
+// Tap to talk: a record button (a red dot in a ring), or a stop button (a
+// red square) while a recording that was tapped on listens.
+static void drawTapButton(int cy, int r) {
+  canvas.fillSmoothCircle(CX, cy, r, mix(kBlack, kText, 0.85f));
+  canvas.fillSmoothCircle(CX, cy, r - 4, kBlack);
+  if (tapMode == TapButton::Stop) {
+    const int side = r * 7 / 10;
+    canvas.fillSmoothRoundRect(CX - side / 2, cy - side / 2, side, side, 5, kRed);
+  } else {
+    canvas.fillSmoothCircle(CX, cy, r - 9, kRed);
+  }
+  tapX = CX, tapY = cy, tapR = r;
+}
+
+static void layoutReply();
+
+void setTapButton(TapButton button) {
+  const bool relayout = (button == TapButton::Off) != (tapMode == TapButton::Off);
+  tapMode = button;
+  if (relayout && replyText.length()) layoutReply();  // the answer makes room for it, or takes it back
+}
+
+bool tapButtonHit(int x, int y) {
+  const int dx = x - tapX, dy = y - tapY, reach = tapR + 30;  // a fingertip's slack round it
+  return tapR && dx * dx + dy * dy <= reach * reach;
 }
 
 // ── the glowing badge ──────────────────────────────────────────────────
@@ -658,15 +702,20 @@ void showLink(const char* title, const String& url, const String& note) {
 
 void showSleeping(const String& hint, uint8_t) { showMessage("Sleeping", hint, TFT_DARKGREY); }
 
-// Notices: a round alert mark, the title, then the text.
-void showMessage(const char* title, const String& body, uint16_t color) {
+// Notices: a round alert mark, the title, then the text — and for a
+// question, which button says what under it (two short lines: `foot`, `foot2`).
+static void drawNotice(const char* title, const String& body, uint16_t color, const String& foot,
+                       const String& foot2 = "") {
   beginFrame();
   drawChrome();
   // Warnings (red, orange…) get "!", everything else (white, grey, green) "i".
   const bool warn = !(color == kWhite || color == TFT_DARKGREY || color == rgb(40, 200, 90));
   uint16_t mark = color == kWhite ? kBlue : color;
   canvas.fillSmoothCircle(CX, 128, 30, mark);
-  if (warn) {
+  if (foot.length()) {
+    font(vlw::Title);
+    text("?", CX, 130, kBlack);
+  } else if (warn) {
     canvas.fillSmoothRoundRect(CX - 4, 110, 8, 24, 4, kBlack);
     canvas.fillSmoothCircle(CX, 143, 4, kBlack);
   } else {
@@ -677,9 +726,30 @@ void showMessage(const char* title, const String& body, uint16_t color) {
   text(fit(title, lineRoom(170, 210)), CX, 190, color == kWhite ? kText : color);
   font(ts().body);
   int first = 0;
-  auto lines = wrapCentred(body, 222, kBottom + 20, ts().line, 6, &first);
+  auto lines = wrapCentred(body, 222, foot.length() ? 362 : kBottom + 20, ts().line, 6, &first);
   drawLines(lines, first, ts().line, kDim);
+  if (foot.length()) {
+    font(vlw::Small);
+    text(fit(foot, lineRoom(366, 394)), CX, 380, kText);
+    text(fit(foot2, lineRoom(394, 422)), CX, 408, kDim);
+  }
   push();
+}
+
+void showMessage(const char* title, const String& body, uint16_t color) { drawNotice(title, body, color, ""); }
+
+// "yellow button" → "Yellow"
+static String buttonWord(const char* name) {
+  String w = name;
+  int sp = w.indexOf(' ');
+  if (sp > 0) w = w.substring(0, sp);
+  if (w.length()) w.setCharAt(0, toupper(w[0]));
+  return w;
+}
+
+void showAsk(const char* title, const String& body, const char* yes, const char* no) {
+  drawNotice(title, body, kWhite, buttonWord(board::kTalkButton) + ": " + yes,
+             buttonWord(board::kSideButton) + ": " + no);
 }
 
 int showPanel(const char* title, uint16_t titleColor, const std::vector<Row>& rows, int page) {
@@ -743,10 +813,14 @@ void showHome(const Home& home) {
   drawChrome(false);
   font(vlw::Title);
   text(fit(name, lineRoom(kTitleY - 20, kTitleY + 20)), CX, kTitleY, kText);
-  font(vlw::Small);
-  int first = 0;
-  auto lines = wrapCentred(home.hint, kNoteY - 16, kNoteY + 46, 28, 2, &first);
-  drawLines(lines, first, 28, home.ready ? kDim : home.color);
+  if (tapMode == TapButton::Talk) {
+    drawTapButton(kTapY, kTapR);  // in place of "hold the yellow button…"
+  } else {
+    font(vlw::Small);
+    int first = 0;
+    auto lines = wrapCentred(home.hint, kNoteY - 16, kNoteY + 46, 28, 2, &first);
+    drawLines(lines, first, 28, home.ready ? kDim : home.color);
+  }
   drawBatteryAt(kBatteryY, true);
   push();
 }
@@ -773,8 +847,12 @@ void showListening(int level, uint32_t elapsedMs) {
     int x = CX - 7 * 18 + i * 18;
     canvas.fillSmoothRoundRect(x - 4, 322 - h / 2, 8, h, 4, levels[i] > 85 ? kAmber : mix(kRed, kWhite, 0.25f));
   }
-  font(vlw::Small);
-  text("release to send", CX, 396, kDim);
+  if (tapMode == TapButton::Stop) {
+    drawTapButton(kTapY, kTapR);
+  } else {
+    font(vlw::Small);
+    text("release to send", CX, 396, kDim);
+  }
   push();
 }
 
@@ -820,25 +898,30 @@ void showWorking(const String& heard, const std::vector<String>& activity, const
   push();
 }
 
+// Where an answer's text ends: higher when the tap button sits under it.
+static int replyBottom() { return tapMode == TapButton::Off ? kBottom : kTapReplyBottom; }
+
 static void layoutReply() {
   replyPages.clear();
   replyCentred = false;
   font(ts().body);
   const int line = ts().line;
-  const int per = (kBottom - kTop) / line;
+  const int bottom = replyBottom();
+  const int per = (bottom - kTop) / line;
   auto lines = wrap(replyText, [&](int k) {
     int y = kTop + (k % per) * line;
     return lineRoom(y, y + line);
   });
   if ((int)lines.size() <= per) {  // one page: centred, where the lines are wider
     int first = 0;
-    replyPages.push_back(wrapCentred(replyText, kTop, kBottom, line, per, &first));
+    replyPages.push_back(wrapCentred(replyText, kTop, bottom, line, per, &first));
     replyCentred = true;
-    return;
+  } else {
+    for (int i = 0; i < (int)lines.size(); i += per) {
+      replyPages.emplace_back(lines.begin() + i, lines.begin() + min((int)lines.size(), i + per));
+    }
   }
-  for (int i = 0; i < (int)lines.size(); i += per) {
-    replyPages.emplace_back(lines.begin() + i, lines.begin() + min((int)lines.size(), i + per));
-  }
+  if (replyPage >= (int)replyPages.size()) replyPage = 0;  // re-wrapped into fewer pages
 }
 
 void setQuestion(const String&) {}
@@ -862,16 +945,16 @@ bool hasReply() { return !replyPages.empty() && !replyText.isEmpty(); }
 
 void showReply() {
   beginFrame();
-  if (audio::playing()) ringSpeaking();
   drawChrome();
   if (!replyPages.empty()) {
     font(ts().body);
     const auto& lines = replyPages[replyPage];
     int line = ts().line;
-    int top = replyCentred ? kTop + ((kBottom - kTop) - (int)lines.size() * line) / 2 : kTop;
+    int top = replyCentred ? kTop + ((replyBottom() - kTop) - (int)lines.size() * line) / 2 : kTop;
     drawLines(lines, top, line, kText);
-    drawPageDots(replyPages.size(), replyPage, kBottom + 22);
+    drawPageDots(replyPages.size(), replyPage, replyBottom() + 22);
   }
+  if (tapMode == TapButton::Talk) drawTapButton(kTapLowY, kTapLowR);
   push();
 }
 
@@ -889,6 +972,8 @@ bool prevPage() {
   return true;
 }
 
+bool onLastPage() { return replyPage + 1 >= (int)replyPages.size(); }
+
 // Characters are drawn for the stick's 240×135 screen (under its 16 px bar),
 // then scaled up smoothly into the middle of the round one.
 static void drawCharacter(uint8_t kind, face::Pose pose, int level, int cy) {
@@ -903,13 +988,20 @@ void showFace(uint8_t kind, face::Pose pose, int level) {
   drawCharacter(kind, pose, level, 214);  // first: its black corners would cover the ring
   if (pose == face::Pose::Listening) ringListening(0, level);
   else if (pose == face::Pose::Thinking) ringWorking(0);
-  else if (pose == face::Pose::Speaking) ringSpeaking();
+
   drawChrome();
   font(vlw::Title);
   String name = barAgent.length() ? barAgent : String("Captain Claw");
   text(fit(name, lineRoom(342, 378)), CX, 360, kText);
-  font(vlw::Small);
-  text(fit(barState, lineRoom(382, 410)), CX, 396, pose == face::Pose::Idle ? kDim : barColor);
+  // The tap button takes the state line's place: to talk, or to stop.
+  const bool listening = pose == face::Pose::Listening;
+  if ((tapMode == TapButton::Talk && !listening && pose != face::Pose::Thinking) ||
+      (tapMode == TapButton::Stop && listening)) {
+    drawTapButton(kTapLowY, kTapLowR);
+  } else {
+    font(vlw::Small);
+    text(fit(barState, lineRoom(382, 410)), CX, 396, pose == face::Pose::Idle ? kDim : barColor);
+  }
   push();
 }
 

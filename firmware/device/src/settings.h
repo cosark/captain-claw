@@ -32,6 +32,7 @@ struct Settings {
   bool cueFlash = true;     // flash the screen before speech starts
   bool cueBuzz = true;      // buzz before speech starts (devices with a motor)
   uint8_t cueLeadS = 1;     // the cue comes this many seconds (1 or 2) before speech
+  bool tapTalk = false;     // touch screens: a record button — tap to talk, tap again to send
   bool autoUpdate = false;  // install offered updates by itself (idle + USB power)
   String lastFw;            // the version that last ran (shows "Updated to …" once)
   uint8_t textSize = 0;     // reading text: 0 small, 1 medium, 2 large

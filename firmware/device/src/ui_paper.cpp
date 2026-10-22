@@ -871,7 +871,9 @@ static String withoutDigits(const String& s) {
   return o;
 }
 
-void showMessage(const char* title, const String& body, uint16_t color) {
+// A notice, or (with `yes`) a question the talk button answers.
+static void notice(const char* title, const String& body, uint16_t color, const char* yes = nullptr,
+                   const char* no = nullptr) {
   String t = title;
   uint16_t ink = inkOf(color, false), textInk = inkOf(color, true);
   ask(Kind::Notice, withoutDigits(t + "\n" + body), t + body, [=] {
@@ -901,8 +903,15 @@ void showMessage(const char* title, const String& body, uint16_t color) {
       text(l, W / 2, y, kInk, top_center);
       y += ts().line;
     }
-    drawFooter({{board::kSideKey, "back"}});
+    if (yes) drawFooter({{board::kTalkKey, yes}, {board::kBackKey, no}});
+    else drawFooter({{board::kSideKey, "back"}});
   });
+}
+
+void showMessage(const char* title, const String& body, uint16_t color) { notice(title, body, color); }
+
+void showAsk(const char* title, const String& body, const char* yes, const char* no) {
+  notice(title, body, kInk, yes, no);
 }
 
 void showLink(const char* title, const String& url, const String& note) {
@@ -1033,9 +1042,12 @@ static void drawCard(const Card& c, int x0, int top, int width, int bottom, bool
 // Until there's an answer to keep: what to do, in words.
 static void drawWelcome(int x0, int top, int width, int bottom) {
   font(vlw::Title);
-  auto big = clamp(wrap(String("Hold ") + board::kTalkKey + " and ask me anything.", width), 3, width);
+  auto big = clamp(wrap(String(board::kTalkToggles ? "Press the " : "Hold the ") + board::kTalkButton +
+                            " and ask me anything.", width), 3, width);
   font(vlw::BodyS);
-  auto small = clamp(wrap("You'll hear the answer, and it stays here.", width), 3, width);
+  auto small = clamp(wrap(board::kTalkToggles ? "Press it again when you're done. You'll hear the answer, and it "
+                                                "stays here."
+                                              : "You'll hear the answer, and it stays here.", width), 4, width);
   int y = top + max(0, (bottom - top - (int)big.size() * 44 - 14 - (int)small.size() * 34) / 2);
   font(vlw::Title);
   for (auto& l : big) {
@@ -1094,7 +1106,7 @@ static void drawHomeScreen(bool asleep, uint16_t chipFill, uint16_t chipDot, uin
     clockText(when, sizeof(when), "drawn %H:%M", time(nullptr));
     drawFooter({{board::kTalkKey, "talk"}}, when);
   } else if (answerKey) {
-    drawFooter({{board::kTalkKey, "talk"}, {board::kSideKey, "status"}, {"C", "answer"}});
+    drawFooter({{board::kTalkKey, "talk"}, {board::kSideKey, "status"}, {board::kBackKey, "answer"}});
   } else {
     drawFooter({{board::kTalkKey, "talk"}, {board::kSideKey, "status"}});
   }
@@ -1240,8 +1252,8 @@ void showReply() {
     drawPageDots(pages, page, H - kFootH - 18);
     char when[16] = "";
     clockText(when, sizeof(when), "%H:%M", replyWhen);
-    if (pages > 1) drawFooter({{board::kTalkKey, "talk"}, {board::kSideKey, "next"}, {"C", "back"}}, when);
-    else drawFooter({{board::kTalkKey, "talk"}, {"C", "home"}}, when);
+    if (pages > 1) drawFooter({{board::kTalkKey, "talk"}, {board::kSideKey, "next"}, {board::kBackKey, "back"}}, when);
+    else drawFooter({{board::kTalkKey, "talk"}, {board::kBackKey, "home"}}, when);
   }, answerId(replyWhen, imgLen));
 }
 
@@ -1258,6 +1270,8 @@ bool prevPage() {
   showReply();
   return true;
 }
+
+bool onLastPage() { return replyPage + 1 >= (int)replyPages.size(); }
 
 bool canPin() { return replyText.length() > 0 || pinCard.valid(); }
 
@@ -1352,7 +1366,7 @@ int showPanel(const char* title, uint16_t titleColor, const std::vector<Row>& ro
       drawLines(laid[i].lines, PAD, laid[i].y + labelH, ts().line, inkOf(rs[i].color, true));
     }
     drawPageDots(pages, page, H - kFootH - 18);
-    drawFooter({{board::kTalkKey, "menu"}, {board::kSideKey, page + 1 < pages ? "next" : "close"}, {"C", "back"}});
+    drawFooter({{board::kTalkKey, "menu"}, {board::kSideKey, page + 1 < pages ? "next" : "close"}, {board::kBackKey, "back"}});
   });
   return pages;
 }
@@ -1364,6 +1378,7 @@ void showPicker(const std::vector<Item>&, int, int, const char*) {
   want.active = false;
 }
 
+void showSpeaking(int) {}  // the lights carry it (leds.cpp)
 void showFace(uint8_t, face::Pose, int) {}  // icon mode is off on paper (a character can't move)
 
 void showCharPick(uint8_t kind, face::Pose, int, int index) {
@@ -1377,10 +1392,13 @@ void showCharPick(uint8_t kind, face::Pose, int, int index) {
     font(vlw::Small);
     text("shown on the home screen", W / 2, cy + (int)(135 * scale / 2) + 84, kBlue, top_center);
     drawPageDots(face::KindCount, index, H - kFootH - 26);
-    drawFooter({{board::kTalkKey, "pick"}, {board::kSideKey, "next"}, {"C", "back"}});
+    drawFooter({{board::kTalkKey, "pick"}, {board::kSideKey, "next"}, {board::kBackKey, "back"}});
   });
 }
 
 void flashFrame(bool) {}  // the status lights flash instead
+
+void setTapButton(TapButton) {}  // no touch screen
+bool tapButtonHit(int, int) { return false; }
 
 }  // namespace ui

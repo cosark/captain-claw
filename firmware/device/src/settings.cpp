@@ -39,6 +39,7 @@ void Settings::load() {
   cueFlash = p.getBool("cueflash", true);
   cueBuzz = p.getBool("cuebuzz", true);
   cueLeadS = constrain(p.getUChar("cuelead", 1), 1, 2);
+  tapTalk = board::kHasTouch && p.getBool("taptalk", false);
   textSize = min<uint8_t>(p.getUChar("tsize", 0), 2);
   autoUpdate = p.getBool("autoupd", false);
   lastFw = p.getString("lastfw", "");
@@ -94,6 +95,7 @@ void Settings::save() const {
   p.putBool("talksnd", talkSounds);
   p.putBool("cueflash", cueFlash);
   p.putBool("cuebuzz", cueBuzz);
+  p.putBool("taptalk", tapTalk);
   p.putUChar("cuelead", cueLeadS);
   p.putUChar("tsize", textSize);
   p.putBool("autoupd", autoUpdate);

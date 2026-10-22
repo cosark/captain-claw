@@ -34,17 +34,25 @@ the user's words.
 ## Offline voice notes (StopWatch, PaperColor)
 
 Out of Wi-Fi, or Flight Deck down? Hold the talk button and talk as usual:
-the recording (up to 60 s) is kept as a voice note — on the PaperColor's TF
-card when one is in, otherwise in the device's own flash (the StopWatch has
-no TF slot; its flash holds about 1½ minutes of notes). The screen says
-"Saved offline". Once the device is back online and idle, the waiting notes
-go to Flight Deck, which transcribes them and gives the agent all of them as
-one message, oldest first, each with when it was recorded, marked as
-recorded offline. The agent handles them and answers once. A note is
-deleted from the device only after the deck has it; one Soniox couldn't
-transcribe stays for a later try. The status page shows how many are
-waiting. The notes are plain WAV files (16 kHz mono) in `/claw-notes/`, so
-a card read on a computer plays them.
+the recording (up to 60 s) is kept as a voice note in the device's own flash.
+The screen says "Saved offline". Notes are kept at telephone quality —
+8 kHz, 4-bit IMA ADPCM (`src/adpcm.h`), 4 KB a second, an eighth of the
+16 kHz PCM the mic records — which is as low as speech goes and still
+transcribes well. The 3.4 MB flash partition holds about 13 minutes of
+notes (it held 1½ minutes as WAV). The status page shows how many are
+waiting and the room left.
+
+Once the device is back online, it asks first. The deck says "There are
+saved voice notes. Would you like to send them to the agent?" and the screen
+shows the question. The talk button sends them; the side button (PaperColor:
+B) keeps them for later. A "later" holds until a new note is recorded or the
+device starts cold; on the StopWatch, Menu → *Send voice notes* sends them
+any time. Sent notes go to Flight Deck, which transcribes them (as 8 kHz PCM)
+and gives the agent all of them as one message, oldest first, each with when
+it was recorded, marked as recorded offline. The agent handles them and
+answers once. A note is deleted from the device only after the deck has it;
+one Soniox couldn't transcribe stays for a later try. Notes kept by older
+firmware (16 kHz WAV) still go up as they are.
 
 Without Wi-Fi at switch-on these two carry on offline (and keep looking for
 it) instead of opening the setup hotspot. Setup is a switch-on with the talk
@@ -54,45 +62,48 @@ button held, or Menu → *Wi-Fi & settings*.
 
 Asleep, hold the talk button and start speaking at once. The device records
 while it wakes up and reconnects (a few seconds), then sends all of it as if
-you had spoken just now. A short press only wakes it. (On the StopWatch and
-PaperColor, a recording that can't reach Flight Deck is kept as an offline
-voice note.)
+you had spoken just now. A short press only wakes it. On the PaperColor,
+press the top button and talk, then press it again to send; a wake-up press
+that's followed by silence sends nothing. (On the StopWatch and PaperColor,
+a recording that can't reach Flight Deck is kept as an offline voice note.)
 
 ## PaperColor (colour e-paper)
 
-The paper takes 15–30 s to redraw and keeps its picture with no power at all,
-so it shows what lasts and leaves the moment to sound and light:
+Every redraw of its Spectra 6 panel takes 15–30 s (there is no faster or
+partial refresh worth having), and the paper keeps its picture with no power
+at all. So it's voice-first and redraws when you put it down:
 
-- **Status lights:** red while it listens (brighter when you're louder), amber
-  breathing while the agent works, cyan with the voice, a soft blue glow while
-  the paper redraws, white blinks as the cue before speech. Menu → *Status
-  lights* sets off / low / bright.
-- **The answer card:** what you asked (blue), the agent's picture in colour
-  (dithered into the six inks), then the answer. Long answers turn pages
-  (B / C). In landscape the picture keeps a column of its own.
+- **While you use it, the paper doesn't change:** you talk (press the top
+  button, C, talk, press it again — no holding on), hear the answer, and the status lights show what's happening. About 30 s after you
+  stop, the paper draws the newest answer once. Waking up and falling asleep
+  don't redraw when it already shows that answer. Pages, the status page and
+  B (show the waiting answer now) draw at once.
+- **Black and white, text only:** the black settles in the first seconds of a
+  redraw and the colours come last, so a black-and-white page reads as done
+  much sooner. Pictures are dithered to grey.
+- **Status lights:** red blinking while it records you (brighter when you're
+  louder); while the agent works, a blink for every step it takes — light
+  blue for a tool, dark blue for narration and progress, purple for the model
+  thinking; green blinking with the voice; a soft white glow while the paper
+  redraws; white blinks as the cue before speech. Off / low / bright in the
+  settings.
+- **Options instead of a menu:** hold A for a QR code. Open it on a phone on
+  the same Wi-Fi: every setting is there (the link carries a one-time key and
+  closes when you leave the screen). On that screen the top button checks for
+  (and installs) a software update.
 - **Home screen:** the date, the room (temperature, humidity), whether it's
-  ready, and the answer it keeps: the newest one, or one you pinned
-  (Menu → *Pin answer*). Before any answer, it shows your character.
-- **Asleep** (after 1 / 3 / 10 idle minutes) the paper keeps the home screen
-  with "Asleep · hold A and talk". It redraws it every 30 min / 1 h / 3 h
-  (Menu → *Redraw asleep*) without Wi-Fi, for the date, the room and the
-  battery. The last and the pinned answer live in flash, so they survive the
-  sleep. Press C after waking to read the last answer again.
-- **Menus are slow to draw, so they talk:** each press clicks, and the
-  highlighted row is read aloud by Flight Deck (*Read menu aloud*). The paper
-  catches up once you stop pressing.
-- **Settings on your phone:** Menu → *Settings on phone* shows a QR code. Open
-  it on a phone on the same Wi-Fi to change every setting there. The link
-  carries a one-time key and closes when you leave that screen.
-- **Orientation:** portrait or landscape, either way up (Menu →
-  *Orientation*), because the buttons' best side is a matter of how you hold it.
+  ready, and the newest answer.
+- **Asleep** (after 1 / 3 / 10 idle minutes) the paper keeps what it shows. It
+  redraws it every 30 min / 1 h / 3 h without Wi-Fi (settings), for the date,
+  the room and the battery. The last answer lives in flash, so it survives
+  the sleep; press B after waking to read it again.
 - **Battery empty:** it leaves "Battery empty" on the paper and switches off.
 
-| | A | B | C |
+| | C (top) | A | B |
 |---|---|---|---|
-| hold | talk (release sends) | menu (hold again closes) | home screen |
-| click | stop speaking · picture ↔ text · choose (menus) | next page / next row | previous page / previous row / back |
-| double-click (on an answer) | | hear the answer again | |
+| click | talk, click again to send · while it speaks: stop · on Options: update | home: status · answer: next page · Options: done | previous page / back · a waiting answer: show it now |
+| hold | | Options (QR code; hold again closes) | home screen |
+| double-click | hear the last answer again | (on an answer) hear it again | |
 
 To see every paper screen without the device (Mac, SDL2 from Homebrew):
 
@@ -107,8 +118,21 @@ The round screen follows M5Stack's own StopWatch look: black, a glowing badge
 in the middle with a name under it, page dots and chevrons for lists. The ring
 round the edge shows what the watch is doing — red while it listens (filling
 toward the 110 s recording limit), amber while the agent works (a tick per
-tool step), cyan while it speaks. The clock sits at the top between the Wi-Fi
+tool step). While it speaks, a short cyan line under the text follows the voice
+(only that strip redraws, so it costs next to nothing). The clock sits at the top between the Wi-Fi
 (left) and agent (right) dots; its time zone is set in the setup page.
+
+Swipe an answer to page it: left or up for the next page, right or down for
+the one before — and from the first page back to its picture, when it came
+with one. Swipes stop at either end. A double tap (off the record button)
+goes to the home screen from an answer, a picture, the menu or a notice; a
+swipe there brings the answer back.
+
+*Tap to talk* (Menu, or the settings page; off by default) puts a record
+button on the screen: under the name at home, under an answer or the
+character. Tap it and talk; the button turns into a stop square, and a second
+tap sends the recording (offline it's kept as a voice note). Holding the
+yellow button works as before, and its press also ends a tapped recording.
 Text uses Inter (`fonts/`, made by `tools/make_fonts.py`; SIL OFL, see
 `fonts/OFL.txt`), laid out to the circle.
 
